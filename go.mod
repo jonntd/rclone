@@ -16,7 +16,7 @@ require (
 	github.com/abbot/go-http-auth v0.4.0
 	github.com/aead/ecdh v0.2.0
 	github.com/aliyun/aliyun-oss-go-sdk v2.2.10+incompatible
-	github.com/anacrolix/dms v1.6.0
+	github.com/anacrolix/dms v1.6.1-0.20240419232543-6b89c448141b
 	github.com/anacrolix/log v0.15.2
 	github.com/andreburgaud/crypt2go v1.3.2
 	github.com/atotto/clipboard v0.1.4
@@ -99,6 +99,7 @@ require (
 	github.com/ProtonMail/gopenpgp/v2 v2.7.4 // indirect
 	github.com/PuerkitoBio/goquery v1.8.1 // indirect
 	github.com/akavel/rsrc v0.10.2 // indirect
+	github.com/anacrolix/ffprobe v1.0.0 // indirect
 	github.com/anacrolix/generics v0.0.0-20230911070922-5dd7545c6b13 // indirect
 	github.com/andybalholm/cascadia v1.3.2 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
@@ -151,6 +152,7 @@ require (
 	github.com/minio/sha256-simd v1.0.1 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
+	github.com/nfnt/resize v0.0.0-20180221191011-83c6a9932646 // indirect
 	github.com/pengsrc/go-shared v0.2.1-0.20190131101655-1999055a4a14 // indirect
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
 	github.com/pkg/errors v0.9.1 // indirect
