@@ -40,7 +40,7 @@ jobs:
 
             ## How to Update
             ```bash
-            curl -fsSL https://raw.githubusercontent.com/Sakura-Byte/rclone/mod/install.sh | sudo bash 
+            curl -fsSL https://raw.githubusercontent.com/Sakura-Byte/rclone/master/install.sh | sudo bash 
             ```
           draft: true
           prerelease: false
