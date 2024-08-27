@@ -200,7 +200,7 @@ func (f *Fs) initUpload(ctx context.Context, size int64, name, dirID, sha1sum, s
 	if decrypted, err = ecdhCipher.Decrypt(body); err != nil {
 		// FIXME failed to decrypt intermittenly
 		// seems to be caused by corrupted body
-		// low level retry deosn't help
+		// low level retry doesn't help
 		return
 	}
 	if err = json.Unmarshal(decrypted, &info); err != nil {
@@ -308,12 +308,18 @@ func calcBlockSHA1(ctx context.Context, in io.Reader, src fs.ObjectInfo, rangeSp
 
 // upload uploads the object with or without using a temporary file name
 func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote string, options ...fs.OpenOption) (fs.Object, error) {
+	if f.isShare {
+		return nil, errors.New("unsupported for shared filesystem")
+	}
 	size := src.Size()
 
 	// check upload available
-	if f.userID == "" {
+	if f.userkey == "" {
 		if err := f.getUploadBasicInfo(ctx); err != nil {
 			return nil, fmt.Errorf("failed to get upload basic info: %w", err)
+		}
+		if f.userID == "" || f.userkey == "" {
+			return nil, fmt.Errorf("empty userid or userkey")
 		}
 	}
 	if size > maxUploadSize {

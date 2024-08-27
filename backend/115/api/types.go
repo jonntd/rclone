@@ -109,7 +109,7 @@ type File struct {
 	FID       string      `json:"fid,omitempty"` // file; empty if dir
 	UID       json.Number `json:"uid,omitempty"` // user
 	AID       json.Number `json:"aid,omitempty"` // area
-	CID       string      `json:"cid,omitempty"` // category == directory
+	CID       json.Number `json:"cid,omitempty"` // category == directory
 	PID       string      `json:"pid,omitempty"` // parent
 	Name      string      `json:"n,omitempty"`
 	Size      int64       `json:"s,omitempty"`
@@ -133,10 +133,17 @@ func (f *File) IsDir() bool {
 }
 
 func (f *File) ID() string {
-	if f.FID == "" {
-		return f.CID
+	if f.IsDir() {
+		return f.CID.String()
 	}
 	return f.FID
+}
+
+func (f *File) ParentID() string {
+	if f.IsDir() {
+		return f.PID
+	}
+	return f.CID.String()
 }
 
 type FilePath struct {
@@ -213,24 +220,24 @@ type DirID struct {
 }
 
 type FileStats struct {
-	// Count        json.Number `json:"count,omitempty"`
-	// Size         string      `json:"size,omitempty"`
-	// FolderCount  json.Number `json:"folder_count,omitempty"`
-	// ShowPlayLong int         `json:"show_play_long,omitempty"`
-	// PlayLong     int         `json:"play_long,omitempty"`
-	// Ptime        string      `json:"ptime,omitempty"` // ctime
-	// Utime        string      `json:"utime,omitempty"` // mtime
-	// IsShare      string      `json:"is_share,omitempty"`
-	// PickCode     string      `json:"pick_code,omitempty"`
-	// Sha1         string      `json:"sha1,omitempty"`
-	// IsMark       string      `json:"is_mark,omitempty"`
-	// Fvs          int         `json:"fvs,omitempty"`
-	// OpenTime     int         `json:"open_time,omitempty"` // atime
-	// Score        int         `json:"score,omitempty"`
-	// Desc         string      `json:"desc,omitempty"`
-	// FileCategory string      `json:"file_category,omitempty"` // "0" if dir
-	FileName string `json:"file_name,omitempty"`
-	Paths    []struct {
+	Count        json.Number `json:"count,omitempty"`
+	Size         string      `json:"size,omitempty"`
+	FolderCount  json.Number `json:"folder_count,omitempty"`
+	ShowPlayLong int         `json:"show_play_long,omitempty"`
+	PlayLong     int         `json:"play_long,omitempty"`
+	Ptime        string      `json:"ptime,omitempty"` // ctime
+	Utime        string      `json:"utime,omitempty"` // mtime
+	IsShare      string      `json:"is_share,omitempty"`
+	FileName     string      `json:"file_name,omitempty"`
+	PickCode     string      `json:"pick_code,omitempty"`
+	Sha1         string      `json:"sha1,omitempty"`
+	IsMark       string      `json:"is_mark,omitempty"`
+	Fvs          int         `json:"fvs,omitempty"`
+	OpenTime     int         `json:"open_time,omitempty"` // atime
+	Score        int         `json:"score,omitempty"`
+	Desc         string      `json:"desc,omitempty"`
+	FileCategory string      `json:"file_category,omitempty"` // "0" if dir
+	Paths        []struct {
 		FileID   json.Number `json:"file_id,omitempty"`
 		FileName string      `json:"file_name,omitempty"`
 	} `json:"paths,omitempty"`
@@ -366,4 +373,52 @@ type NewURL struct {
 		} `json:"files,omitempty"`
 	} `json:"result,omitempty"`
 	Errcode int `json:"errcode,omitempty"`
+}
+
+type ShareSnap struct {
+	State bool           `json:"state,omitempty"`
+	Error string         `json:"error,omitempty"`
+	Errno Int            `json:"errno,omitempty"`
+	Data  *ShareSnapData `json:"data,omitempty"`
+}
+
+type ShareSnapData struct {
+	Userinfo struct {
+		UserID   string `json:"user_id,omitempty"`
+		UserName string `json:"user_name,omitempty"`
+		Face     string `json:"face,omitempty"`
+	} `json:"userinfo,omitempty"`
+	Shareinfo struct {
+		SnapID           string `json:"snap_id,omitempty"`
+		FileSize         string `json:"file_size,omitempty"`
+		ShareTitle       string `json:"share_title,omitempty"`
+		ShareState       string `json:"share_state,omitempty"`
+		ForbidReason     string `json:"forbid_reason,omitempty"`
+		CreateTime       string `json:"create_time,omitempty"`
+		ReceiveCode      string `json:"receive_code,omitempty"`
+		ReceiveCount     string `json:"receive_count,omitempty"`
+		ExpireTime       int    `json:"expire_time,omitempty"`
+		FileCategory     int    `json:"file_category,omitempty"`
+		AutoRenewal      string `json:"auto_renewal,omitempty"`
+		AutoFillRecvcode string `json:"auto_fill_recvcode,omitempty"`
+		CanReport        int    `json:"can_report,omitempty"`
+		CanNotice        int    `json:"can_notice,omitempty"`
+		HaveVioFile      int    `json:"have_vio_file,omitempty"`
+	} `json:"shareinfo,omitempty"`
+	Count      int     `json:"count,omitempty"`
+	List       []*File `json:"list,omitempty"`
+	ShareState string  `json:"share_state,omitempty"`
+	UserAppeal struct {
+		CanAppeal       int `json:"can_appeal,omitempty"`
+		CanShareAppeal  int `json:"can_share_appeal,omitempty"`
+		PopupAppealPage int `json:"popup_appeal_page,omitempty"`
+		CanGlobalAppeal int `json:"can_global_appeal,omitempty"`
+	} `json:"user_appeal,omitempty"`
+}
+
+type ShareDownloadInfo struct {
+	FileID   string      `json:"fid"`
+	FileName string      `json:"fn"`
+	FileSize Int64       `json:"fs"`
+	URL      DownloadURL `json:"url"`
 }

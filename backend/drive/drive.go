@@ -907,6 +907,7 @@ type Fs struct {
 	changeSAmu       *sync.Mutex                  // mod
 	changeSAtime     time.Time                    // mod
 	fileObj          *fs.Object                   // mod
+	gdsSvc           *drive.Service               // mod
 	dirResourceKeys  *sync.Map                    // map directory ID to resource key
 	permissionsMu    *sync.Mutex                  // protect the below
 	permissions      map[string]*drive.Permission // map permission IDs to Permissions
@@ -1157,6 +1158,9 @@ func (f *Fs) list(ctx context.Context, dirIDs []string, title string, directorie
 	}
 
 	list := f.svc.Files.List()
+	if f.gdsSvc != nil { // mod
+		list = f.gdsSvc.Files.List()
+	}
 	queryString := strings.Join(query, " and ")
 	if queryString != "" {
 		list.Q(queryString)
@@ -1446,33 +1450,40 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 	if err != nil {
 		return nil, err
 	}
-	if err := pool.LoadSA(); err == nil {
-		if sa, err := pool.GetSA(); err == nil {
-			opt.ServiceAccountFile = sa[0].ServiceAccountFile
-			opt.Impersonate = sa[0].Impersonate
-			if opt.Impersonate != "" {
-				fs.Debugf(nil, "Starting newFs with %q as %q", filepath.Base(opt.ServiceAccountFile), opt.Impersonate)
-			} else {
-				fs.Debugf(nil, "Starting newFs with %q", filepath.Base(opt.ServiceAccountFile))
-			}
-
+	if sa, err := pool.GetSA(); err == nil {
+		opt.ServiceAccountFile = sa[0].ServiceAccountFile
+		opt.Impersonate = sa[0].Impersonate
+		if opt.Impersonate != "" {
+			fs.Debugf(nil, "Starting newFs with %q as %q", filepath.Base(opt.ServiceAccountFile), opt.Impersonate)
+		} else {
+			fs.Debugf(nil, "Starting newFs with %q", filepath.Base(opt.ServiceAccountFile))
 		}
 	}
 
 	// mod
+	var gdsSvc *drive.Service
 	if gds, ok, err := newGdsClient(ctx, opt); err != nil {
 		return nil, err
 	} else if ok {
 		gdsRemote, authErr := gds.getGdsRemote(ctx)
 		if authErr != nil {
-			return nil, fmt.Errorf("drive: failed to get remote from gds: %w", authErr)
-		} else {
-			opt.Scope = gdsRemote.Scope
-			opt.ServiceAccountCredentials = string(gdsRemote.SA)
-			opt.Impersonate = gdsRemote.Impersonate
-			opt.RootFolderID = gdsRemote.RootFolderID
-			fs.Debugf(nil, "Starting newFs with remote from gds")
+			return nil, fmt.Errorf("gds: failed to get remote: %w", authErr)
 		}
+		if token, ok := m.Get("token"); ok && token != "" {
+			cli, _, err := oauthutil.NewClientWithBaseClient(ctx, name, m, driveConfig, getClient(ctx, opt))
+			if err != nil {
+				return nil, fmt.Errorf("gds: failed to create oauth client: %w", err)
+			}
+			gdsSvc, err = drive.NewService(context.Background(), option.WithHTTPClient(cli))
+			if err != nil {
+				return nil, fmt.Errorf("gds: couldn't create Drive client: %w", err)
+			}
+		}
+		opt.Scope = gdsRemote.Scope
+		opt.ServiceAccountCredentials = string(gdsRemote.SA)
+		opt.Impersonate = gdsRemote.Impersonate
+		opt.RootFolderID = gdsRemote.RootFolderID
+		fs.Debugf(nil, "Starting newFs with remote from gds")
 	}
 
 	oAuthClient, err := createOAuthClient(ctx, opt, name, m)
@@ -1525,6 +1536,7 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 		f.changeSAmu = new(sync.Mutex)
 		fs.Infof(nil, "Changing service account is enabled")
 	}
+	f.gdsSvc = gdsSvc
 
 	// Create a new authorized Drive client.
 	f.client = oAuthClient
@@ -1550,36 +1562,27 @@ func NewFs(ctx context.Context, name, path string, m configmap.Mapper) (fs.Fs, e
 		return nil, err
 	}
 
-	// mod -  parse object id from path remote:{ID}
+	// mod - parse object id from path remote:{ID}
 	var srcFile *drive.File
 	if rootID, _ := parseRootID(path); len(rootID) > 6 {
-		f.opt.RootFolderID = rootID
-
-		err = f.pacer.Call(func() (bool, error) {
-			srcFile, err = f.svc.Files.Get(rootID).
-				Fields("name", "id", "size", "mimeType", "driveId", "md5Checksum").
-				SupportsAllDrives(true).
-				Context(ctx).Do()
-			return f.shouldRetry(ctx, err)
-		})
-		if err == nil {
-			if srcFile.MimeType != "" && srcFile.MimeType != "application/vnd.google-apps.folder" {
-				fs.Debugf(nil, "Root ID (File): %s", rootID)
-			} else {
-				if srcFile.DriveId == rootID {
-					fs.Debugf(nil, "Root ID (Drive): %s", rootID)
-					f.opt.RootFolderID = ""
-					f.opt.TeamDriveID = rootID
-				} else {
-					fs.Debugf(nil, "Root ID (Folder): %s", rootID)
-					f.opt.RootFolderID = rootID
-				}
-				srcFile = nil
-			}
-			f.isTeamDrive = f.opt.TeamDriveID != ""
-		} else {
+		srcFile, err = f.getFile(ctx, rootID, "name,id,size,mimeType,driveId,md5Checksum")
+		if err != nil {
 			return nil, err
 		}
+		f.opt.RootFolderID = rootID
+		if srcFile.MimeType != "" && srcFile.MimeType != "application/vnd.google-apps.folder" {
+			fs.Debugf(nil, "Root ID (File): %s", rootID)
+		} else {
+			if srcFile.DriveId == rootID {
+				fs.Debugf(nil, "Root ID (Drive): %s", rootID)
+				f.opt.RootFolderID = ""
+				f.opt.TeamDriveID = rootID
+			} else {
+				fs.Debugf(nil, "Root ID (Folder): %s", rootID)
+			}
+			srcFile = nil
+		}
+		f.isTeamDrive = f.opt.TeamDriveID != ""
 	}
 
 	// Set the root folder ID
@@ -3740,6 +3743,9 @@ func (f *Fs) copyID(ctx context.Context, id, dest string) (err error) {
 
 func (f *Fs) query(ctx context.Context, query string) (entries []*drive.File, err error) {
 	list := f.svc.Files.List()
+	if f.gdsSvc != nil { // mod
+		list = f.gdsSvc.Files.List()
+	}
 	if query != "" {
 		list.Q(query)
 	}
