@@ -48,7 +48,7 @@ import (
 const (
 	domain           = "www.115.com"
 	rootURL          = "https://webapi.115.com"
-	appVer           = "23.9.3.2"
+	appVer           = "27.0.3.7"
 	defaultUserAgent = "Mozilla/5.0 115Browser/" + appVer
 
 	defaultMinSleep = fs.Duration(250 * time.Millisecond) // 4 transactions per second
