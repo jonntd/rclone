@@ -1,5 +1,3 @@
-//go:build go1.21
-
 // Package dlna provides DLNA server.
 package dlna
 
@@ -50,6 +48,10 @@ Rclone will list all files present in the remote, without filtering
 based on media formats or file extensions. Additionally, there is no
 media transcoding support. This means that some players might show
 files that they are not able to play back correctly.
+
+Rclone will add external subtitle files (.srt) to videos if they have the same
+filename as the video file itself (except the extension), either in the same
+directory as the video, or in a "Subs" subdirectory.
 
 ` + dlnaflags.Help + vfs.Help(),
 	Annotations: map[string]string{

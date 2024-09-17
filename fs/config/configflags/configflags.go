@@ -4,7 +4,7 @@ package configflags
 
 // Options set by command line flags
 import (
-	"log"
+	"context"
 	"net"
 	"os"
 	"strconv"
@@ -67,7 +67,7 @@ func ParseHeaders(headers []string) []*fs.HTTPOption {
 	for _, header := range headers {
 		parts := strings.SplitN(header, ":", 2)
 		if len(parts) == 1 {
-			log.Fatalf("Failed to parse '%s' as an HTTP header. Expecting a string like: 'Content-Encoding: gzip'", header)
+			fs.Fatalf(nil, "Failed to parse '%s' as an HTTP header. Expecting a string like: 'Content-Encoding: gzip'", header)
 		}
 		option := &fs.HTTPOption{
 			Key:   strings.TrimSpace(parts[0]),
@@ -100,7 +100,7 @@ func SetFlags(ci *fs.ConfigInfo) {
 	// Process -q flag
 	if quiet {
 		if verbose > 0 {
-			log.Fatalf("Can't set -v and -q")
+			fs.Fatalf(nil, "Can't set -v and -q")
 		}
 		ci.LogLevel = fs.LogLevelError
 	}
@@ -109,10 +109,10 @@ func SetFlags(ci *fs.ConfigInfo) {
 	logLevelFlag := pflag.Lookup("log-level")
 	if logLevelFlag != nil && logLevelFlag.Changed {
 		if verbose > 0 {
-			log.Fatalf("Can't set -v and --log-level")
+			fs.Fatalf(nil, "Can't set -v and --log-level")
 		}
 		if quiet {
-			log.Fatalf("Can't set -q and --log-level")
+			fs.Fatalf(nil, "Can't set -q and --log-level")
 		}
 	}
 
@@ -120,7 +120,7 @@ func SetFlags(ci *fs.ConfigInfo) {
 	switch {
 	case deleteBefore && (deleteDuring || deleteAfter),
 		deleteDuring && deleteAfter:
-		log.Fatalf(`Only one of --delete-before, --delete-during or --delete-after can be used.`)
+		fs.Fatalf(nil, `Only one of --delete-before, --delete-during or --delete-after can be used.`)
 	case deleteBefore:
 		ci.DeleteMode = fs.DeleteModeBefore
 	case deleteDuring:
@@ -135,10 +135,10 @@ func SetFlags(ci *fs.ConfigInfo) {
 	if bindAddr != "" {
 		addrs, err := net.LookupIP(bindAddr)
 		if err != nil {
-			log.Fatalf("--bind: Failed to parse %q as IP address: %v", bindAddr, err)
+			fs.Fatalf(nil, "--bind: Failed to parse %q as IP address: %v", bindAddr, err)
 		}
 		if len(addrs) != 1 {
-			log.Fatalf("--bind: Expecting 1 IP address for %q but got %d", bindAddr, len(addrs))
+			fs.Fatalf(nil, "--bind: Expecting 1 IP address for %q but got %d", bindAddr, len(addrs))
 		}
 		ci.BindAddr = addrs[0]
 	}
@@ -146,7 +146,7 @@ func SetFlags(ci *fs.ConfigInfo) {
 	// Process --disable
 	if disableFeatures != "" {
 		if disableFeatures == "help" {
-			log.Fatalf("Possible backend features are: %s\n", strings.Join(new(fs.Features).List(), ", "))
+			fs.Fatalf(nil, "Possible backend features are: %s\n", strings.Join(new(fs.Features).List(), ", "))
 		}
 		ci.DisableFeatures = strings.Split(disableFeatures, ",")
 	}
@@ -168,7 +168,7 @@ func SetFlags(ci *fs.ConfigInfo) {
 		for _, kv := range metadataSet {
 			equal := strings.IndexRune(kv, '=')
 			if equal < 0 {
-				log.Fatalf("Failed to parse '%s' as metadata key=value.", kv)
+				fs.Fatalf(nil, "Failed to parse '%s' as metadata key=value.", kv)
 			}
 			ci.MetadataSet[strings.ToLower(kv[:equal])] = kv[equal+1:]
 		}
@@ -180,31 +180,36 @@ func SetFlags(ci *fs.ConfigInfo) {
 		if value, ok := parseDSCP(dscp); ok {
 			ci.TrafficClass = value << 2
 		} else {
-			log.Fatalf("--dscp: Invalid DSCP name: %v", dscp)
+			fs.Fatalf(nil, "--dscp: Invalid DSCP name: %v", dscp)
 		}
 	}
 
 	// Process --config path
 	if err := config.SetConfigPath(configPath); err != nil {
-		log.Fatalf("--config: Failed to set %q as config path: %v", configPath, err)
+		fs.Fatalf(nil, "--config: Failed to set %q as config path: %v", configPath, err)
 	}
 
 	// Process --cache-dir path
 	if err := config.SetCacheDir(cacheDir); err != nil {
-		log.Fatalf("--cache-dir: Failed to set %q as cache dir: %v", cacheDir, err)
+		fs.Fatalf(nil, "--cache-dir: Failed to set %q as cache dir: %v", cacheDir, err)
 	}
 
 	// Process --temp-dir path
 	if err := config.SetTempDir(tempDir); err != nil {
-		log.Fatalf("--temp-dir: Failed to set %q as temp dir: %v", tempDir, err)
+		fs.Fatalf(nil, "--temp-dir: Failed to set %q as temp dir: %v", tempDir, err)
 	}
 
 	// Process --multi-thread-streams - set whether multi-thread-streams was set
 	multiThreadStreamsFlag := pflag.Lookup("multi-thread-streams")
 	ci.MultiThreadSet = multiThreadStreamsFlag != nil && multiThreadStreamsFlag.Changed
+
+	// Reload any changes
+	if err := ci.Reload(context.Background()); err != nil {
+		fs.Fatalf(nil, "Failed to reload config changes: %v", err)
+	}
 }
 
-// parseHeaders converts DSCP names to value
+// parseDSCP converts DSCP names to value
 func parseDSCP(dscp string) (uint8, bool) {
 	if s, err := strconv.ParseUint(dscp, 10, 6); err == nil {
 		return uint8(s), true

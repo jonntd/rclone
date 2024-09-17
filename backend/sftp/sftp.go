@@ -75,8 +75,18 @@ func init() {
 			Help:       "SSH password, leave blank to use ssh-agent.",
 			IsPassword: true,
 		}, {
-			Name:      "key_pem",
-			Help:      "Raw PEM-encoded private key.\n\nIf specified, will override key_file parameter.",
+			Name: "key_pem",
+			Help: `Raw PEM-encoded private key.
+
+Note that this should be on a single line with line endings replaced with '\n', eg
+
+    key_pem = -----BEGIN RSA PRIVATE KEY-----\nMaMbaIXtE\n0gAMbMbaSsd\nMbaass\n-----END RSA PRIVATE KEY-----
+
+This will generate the single line correctly:
+
+    awk '{printf "%s\\n", $0}' < ~/.ssh/id_rsa
+
+If specified, it will override the key_file parameter.`,
 			Sensitive: true,
 		}, {
 			Name: "key_file",
@@ -334,7 +344,7 @@ cost of using more memory.
 			Advanced: true,
 		}, {
 			Name: "connections",
-			Help: strings.Replace(`Maximum number of SFTP simultaneous connections, 0 for unlimited.
+			Help: strings.ReplaceAll(`Maximum number of SFTP simultaneous connections, 0 for unlimited.
 
 Note that setting this is very likely to cause deadlocks so it should
 be used with care.
@@ -348,7 +358,7 @@ maximum of |--checkers| and |--transfers|.
 So for |connections 3| you'd use |--checkers 2 --transfers 2
 --check-first| or |--checkers 1 --transfers 1|.
 
-`, "|", "`", -1),
+`, "|", "`"),
 			Default:  0,
 			Advanced: true,
 		}, {
