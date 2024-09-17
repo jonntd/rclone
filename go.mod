@@ -1,6 +1,6 @@
 module github.com/rclone/rclone
 
-go 1.21
+go 1.23
 
 require (
 	bazil.org/fuse v0.0.0-20230120002735-62a210ff1fd5
@@ -16,7 +16,7 @@ require (
 	github.com/abbot/go-http-auth v0.4.0
 	github.com/anacrolix/dms v1.7.1
 	github.com/anacrolix/log v0.15.2
-	github.com/andreburgaud/crypt2go v1.3.2
+	github.com/andreburgaud/crypt2go v1.8.0
 	github.com/atotto/clipboard v0.1.4
 	github.com/aws/aws-sdk-go-v2 v1.30.3
 	github.com/aws/aws-sdk-go-v2/config v1.27.27
@@ -55,7 +55,7 @@ require (
 	github.com/ncw/swift/v2 v2.0.3
 	github.com/oracle/oci-go-sdk/v65 v65.69.2
 	github.com/patrickmn/go-cache v2.1.0+incompatible
-	github.com/pierrec/lz4/v4 v4.1.18
+	github.com/pierrec/lz4/v4 v4.1.21
 	github.com/pkg/sftp v1.13.6
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2
 	github.com/prometheus/client_golang v1.19.1
@@ -80,12 +80,12 @@ require (
 	github.com/yunify/qingstor-sdk-go/v3 v3.2.0
 	go.etcd.io/bbolt v1.3.10
 	goftp.io/server/v2 v2.0.1
-	golang.org/x/crypto v0.25.0
+	golang.org/x/crypto v0.26.0
 	golang.org/x/exp v0.0.0-20240719175910-8a7402abbf56
 	golang.org/x/net v0.27.0
 	golang.org/x/oauth2 v0.21.0
 	golang.org/x/sync v0.8.0
-	golang.org/x/sys v0.22.0
+	golang.org/x/sys v0.25.0
 	golang.org/x/text v0.17.0
 	golang.org/x/time v0.5.0
 	google.golang.org/api v0.188.0
@@ -225,9 +225,11 @@ require (
 require (
 	github.com/Microsoft/go-winio v0.6.1 // indirect
 	github.com/ProtonMail/go-crypto v1.0.0
+	github.com/aead/ecdh v0.2.0
+	github.com/aliyun/aliyun-oss-go-sdk v3.0.2+incompatible
 	github.com/golang-jwt/jwt/v4 v4.5.0
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
 	github.com/pkg/xattr v0.4.9
 	golang.org/x/mobile v0.0.0-20240716161057-1ad2df20a8b6
-	golang.org/x/term v0.22.0
+	golang.org/x/term v0.24.0
 )

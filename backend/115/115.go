@@ -48,10 +48,10 @@ import (
 const (
 	domain           = "www.115.com"
 	rootURL          = "https://webapi.115.com"
-	appVer           = "2.0.3.6"
-	defaultUserAgent = "Mozilla/5.0 115Desktop/" + appVer
+	appVer           = "23.9.3.2"
+	defaultUserAgent = "Mozilla/5.0 115Browser/" + appVer
 
-	defaultMinSleep = fs.Duration(150 * time.Millisecond) // 6.67 transactions per second
+	defaultMinSleep = fs.Duration(250 * time.Millisecond) // 4 transactions per second
 	maxSleep        = 2 * time.Second
 	decayConstant   = 2 // bigger for slower decay, exponential
 
@@ -121,7 +121,7 @@ Fill in for rclone to use a non root folder as its starting point.
 			Sensitive: true,
 		}, {
 			Name:     "list_chunk",
-			Default:  115,
+			Default:  11500,
 			Help:     "Size of listing chunk.",
 			Advanced: true,
 		}, {
