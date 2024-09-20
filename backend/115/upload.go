@@ -127,7 +127,7 @@ func generateSignature(userID, fileID, target, userKey string) string {
 	return strings.ToUpper(hex.EncodeToString(sh1Sig[:]))
 }
 
-func generateToken(userID, fileID, fileSize, signKey, signVal, timeStamp string) string {
+func generateToken(userID, fileID, fileSize, signKey, signVal, timeStamp, appVer string) string {
 	userIDMd5 := md5.Sum([]byte(userID))
 	tokenMd5 := md5.Sum([]byte(md5Salt + fileID + fileSize + signKey + signVal + userID + timeStamp + hex.EncodeToString(userIDMd5[:]) + appVer))
 	return hex.EncodeToString(tokenMd5[:])
@@ -135,13 +135,11 @@ func generateToken(userID, fileID, fileSize, signKey, signVal, timeStamp string)
 
 func (f *Fs) initUpload(ctx context.Context, size int64, name, dirID, sha1sum, signKey, signVal string) (info *api.UploadInitInfo, err error) {
 	var (
-		userID       = f.userID
-		userKey      = f.userkey
 		filename     = f.opt.Enc.FromStandardName(name)
 		filesize     = strconv.FormatInt(size, 10)
 		fileID       = strings.ToUpper(sha1sum)
 		target       = "U_1_" + dirID            // target id
-		ts           = time.Now().Unix()         // timestamp in int64
+		ts           = time.Now().UnixMilli()    // timestamp in int64
 		t            = strconv.FormatInt(ts, 10) // timestamp in string
 		ecdhCipher   *cipher.EcdhCipher
 		encodedToken string
@@ -161,15 +159,15 @@ func (f *Fs) initUpload(ctx context.Context, size int64, name, dirID, sha1sum, s
 	// form that will be encrypted
 	form := url.Values{}
 	form.Set("appid", "0")
-	form.Set("appversion", appVer) // const
-	form.Set("userid", userID)
+	form.Set("appversion", f.appVer)
+	form.Set("userid", f.userID)
 	form.Set("filename", filename)
 	form.Set("filesize", filesize)
 	form.Set("fileid", fileID)
 	form.Set("target", target)
-	form.Set("sig", generateSignature(userID, fileID, target, userKey))
+	form.Set("sig", generateSignature(f.userID, fileID, target, f.userkey))
 	form.Set("t", t)
-	form.Set("token", generateToken(userID, fileID, filesize, signKey, signVal, t))
+	form.Set("token", generateToken(f.userID, fileID, filesize, signKey, signVal, t, f.appVer))
 	if signKey != "" && signVal != "" {
 		form.Set("sign_key", signKey)
 		form.Set("sign_val", signVal)
@@ -279,6 +277,18 @@ func (f *Fs) newOSSBucket(ctx context.Context, ui *api.UploadInitInfo) (bucket *
 	return
 }
 
+// unWrapObjectInfo returns the underlying Object unwrapped as much as
+// possible or nil.
+func unWrapObjectInfo(oi fs.ObjectInfo) fs.Object {
+	if o, ok := oi.(fs.Object); ok {
+		return fs.UnWrapObject(o)
+	} else if do, ok := oi.(*fs.OverrideRemote); ok {
+		// Unwrap if it is an operations.OverrideRemote
+		return do.UnWrap()
+	}
+	return nil
+}
+
 func calcBlockSHA1(ctx context.Context, in io.Reader, src fs.ObjectInfo, rangeSpec string) (sha1sum string, err error) {
 	var start, end int64
 	if _, err = fmt.Sscanf(rangeSpec, "%d-%d", &start, &end); err != nil {
@@ -288,7 +298,7 @@ func calcBlockSHA1(ctx context.Context, in io.Reader, src fs.ObjectInfo, rangeSp
 	var reader io.Reader
 	if ra, ok := in.(io.ReaderAt); ok {
 		reader = io.NewSectionReader(ra, start, end-start+1)
-	} else if srcObj := fs.UnWrapObjectInfo(src); srcObj != nil {
+	} else if srcObj := unWrapObjectInfo(src); srcObj != nil {
 		rc, err := srcObj.Open(ctx, &fs.RangeOption{Start: start, End: end})
 		if err != nil {
 			return "", fmt.Errorf("failed to open source: %w", err)

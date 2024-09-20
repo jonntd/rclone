@@ -17,6 +17,8 @@ require (
 	github.com/anacrolix/dms v1.7.1
 	github.com/anacrolix/log v0.15.2
 	github.com/andreburgaud/crypt2go v1.8.0
+	github.com/aead/ecdh v0.2.0
+	github.com/aliyun/aliyun-oss-go-sdk v3.0.2+incompatible
 	github.com/atotto/clipboard v0.1.4
 	github.com/aws/aws-sdk-go-v2 v1.30.3
 	github.com/aws/aws-sdk-go-v2/config v1.27.27
