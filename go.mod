@@ -14,6 +14,8 @@ require (
 	github.com/a8m/tree v0.0.0-20240104212747-2c8764a5f17e
 	github.com/aalpar/deheap v0.0.0-20210914013432-0cc84d79dec3
 	github.com/abbot/go-http-auth v0.4.0
+	github.com/aead/ecdh v0.2.0
+	github.com/aliyun/alibabacloud-oss-go-sdk-v2 v1.1.1
 	github.com/anacrolix/dms v1.7.1
 	github.com/anacrolix/log v0.15.2
 	github.com/andreburgaud/crypt2go v1.8.0

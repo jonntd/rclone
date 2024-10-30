@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -112,13 +113,13 @@ type File struct {
 	CID       json.Number `json:"cid,omitempty"` // category == directory
 	PID       string      `json:"pid,omitempty"` // parent
 	Name      string      `json:"n,omitempty"`
-	Size      int64       `json:"s,omitempty"`
+	Size      Int64       `json:"s,omitempty"`
 	PickCode  string      `json:"pc,omitempty"`
-	T         string      `json:"t,omitempty"`  // mtime "2024-05-19 03:54" or "1715919337"
-	Te        Time        `json:"te,omitempty"` // mtime
-	Tp        Time        `json:"tp,omitempty"` // ctime
-	Tu        Time        `json:"tu,omitempty"` // mtime
-	To        Time        `json:"to,omitempty"` // atime 0 if never accessed or "1716165082"
+	T         string      `json:"t,omitempty"`  // representative time? "2024-05-19 03:54" or "1715919337"
+	Te        Time        `json:"te,omitempty"` // modify time
+	Tp        Time        `json:"tp,omitempty"` // create time
+	Tu        Time        `json:"tu,omitempty"` // update time?
+	To        Time        `json:"to,omitempty"` // last opened 0 if never accessed or "1716165082"
 	Ico       string      `json:"ico,omitempty"`
 	Class     string      `json:"class,omitempty"`
 	Sha       string      `json:"sha,omitempty"`
@@ -146,6 +147,20 @@ func (f *File) ParentID() string {
 	return f.CID.String()
 }
 
+func (f *File) ModTime() time.Time {
+	if t := time.Time(f.Te); !t.IsZero() {
+		return t
+	}
+	if t := time.Time(f.Tu); !t.IsZero() {
+		return t
+	}
+	// file object in ShareSnap.Data.List[] has T field only
+	if ts, err := strconv.ParseInt(f.T, 10, 64); err == nil {
+		return time.Unix(ts, 0)
+	}
+	return time.Time{}
+}
+
 type FilePath struct {
 	Name string      `json:"name,omitempty"`
 	AID  json.Number `json:"aid,omitempty"` // area
@@ -168,7 +183,7 @@ type FileList struct {
 	PageSize       int         `json:"page_size,omitempty"`
 	AID            string      `json:"aid,omitempty"`
 	CID            json.Number `json:"cid,omitempty"`
-	IsAsc          int         `json:"is_asc,omitempty"`
+	IsAsc          json.Number `json:"is_asc,omitempty"`
 	Star           int         `json:"star,omitempty"`
 	IsShare        int         `json:"is_share,omitempty"`
 	Type           int         `json:"type,omitempty"`
@@ -225,15 +240,15 @@ type FileStats struct {
 	FolderCount  json.Number `json:"folder_count,omitempty"`
 	ShowPlayLong int         `json:"show_play_long,omitempty"`
 	PlayLong     int         `json:"play_long,omitempty"`
-	Ptime        string      `json:"ptime,omitempty"` // ctime
-	Utime        string      `json:"utime,omitempty"` // mtime
+	Ptime        string      `json:"ptime,omitempty"` // create time
+	Utime        string      `json:"utime,omitempty"` // update time?
 	IsShare      string      `json:"is_share,omitempty"`
 	FileName     string      `json:"file_name,omitempty"`
 	PickCode     string      `json:"pick_code,omitempty"`
 	Sha1         string      `json:"sha1,omitempty"`
 	IsMark       string      `json:"is_mark,omitempty"`
 	Fvs          int         `json:"fvs,omitempty"`
-	OpenTime     int         `json:"open_time,omitempty"` // atime
+	OpenTime     int         `json:"open_time,omitempty"` // last opened
 	Score        int         `json:"score,omitempty"`
 	Desc         string      `json:"desc,omitempty"`
 	FileCategory string      `json:"file_category,omitempty"` // "0" if dir
@@ -313,7 +328,7 @@ type UploadInitInfo struct {
 	ErrorMsg  string `json:"statusmsg"`
 
 	Status   Int    `json:"status"`
-	PickCode string `json:"pickcode"` // this pickcode is not the same as for downloading!
+	PickCode string `json:"pickcode"` // valid depending on Status
 	Target   string `json:"target"`
 	Version  string `json:"version"`
 
@@ -334,12 +349,41 @@ type UploadInitInfo struct {
 	SignCheck string `json:"sign_check"`
 }
 
+func (ui *UploadInitInfo) GetCallback() string {
+	return base64.StdEncoding.EncodeToString([]byte(ui.Callback.Callback))
+}
+
+func (ui *UploadInitInfo) GetCallbackVar() string {
+	return base64.StdEncoding.EncodeToString([]byte(ui.Callback.CallbackVar))
+}
+
+type CallbackInfo struct {
+	Code    Int           `json:"code,omitempty"`
+	Data    *CallbackData `json:"data,omitempty"`
+	Message string        `json:"message,omitempty"`
+	State   bool          `json:"state,omitempty"`
+}
+
+type CallbackData struct {
+	AID      int    `json:"aid,omitempty"`
+	CID      string `json:"cid,omitempty"`
+	FileID   string `json:"file_id,omitempty"`
+	FileName string `json:"file_name,omitempty"`
+	FileSize Int64  `json:"file_size,omitempty"`
+	IsVideo  int    `json:"is_video,omitempty"`
+	PickCode string `json:"pick_code,omitempty"`
+	Sha      string `json:"sha1,omitempty"`
+	ThumbURL string `json:"thumb_url,omitempty"`
+}
+
 type OSSToken struct {
 	AccessKeyID     string    `json:"AccessKeyID"`
 	AccessKeySecret string    `json:"AccessKeySecret"`
 	Expiration      time.Time `json:"Expiration"`
 	SecurityToken   string    `json:"SecurityToken"`
 	StatusCode      string    `json:"StatusCode"`
+	ErrorCode       string    `json:"ErrorCode,omitempty"`
+	ErrorMessage    string    `json:"ErrorMessage,omitempty"`
 }
 
 func (t *OSSToken) TimeToExpiry() time.Duration {
@@ -389,25 +433,25 @@ type ShareSnapData struct {
 		Face     string `json:"face,omitempty"`
 	} `json:"userinfo,omitempty"`
 	Shareinfo struct {
-		SnapID           string `json:"snap_id,omitempty"`
-		FileSize         string `json:"file_size,omitempty"`
-		ShareTitle       string `json:"share_title,omitempty"`
-		ShareState       string `json:"share_state,omitempty"`
-		ForbidReason     string `json:"forbid_reason,omitempty"`
-		CreateTime       string `json:"create_time,omitempty"`
-		ReceiveCode      string `json:"receive_code,omitempty"`
-		ReceiveCount     string `json:"receive_count,omitempty"`
-		ExpireTime       int    `json:"expire_time,omitempty"`
-		FileCategory     int    `json:"file_category,omitempty"`
-		AutoRenewal      string `json:"auto_renewal,omitempty"`
-		AutoFillRecvcode string `json:"auto_fill_recvcode,omitempty"`
-		CanReport        int    `json:"can_report,omitempty"`
-		CanNotice        int    `json:"can_notice,omitempty"`
-		HaveVioFile      int    `json:"have_vio_file,omitempty"`
+		SnapID           string      `json:"snap_id,omitempty"`
+		FileSize         string      `json:"file_size,omitempty"`
+		ShareTitle       string      `json:"share_title,omitempty"`
+		ShareState       json.Number `json:"share_state,omitempty"`
+		ForbidReason     string      `json:"forbid_reason,omitempty"`
+		CreateTime       string      `json:"create_time,omitempty"`
+		ReceiveCode      string      `json:"receive_code,omitempty"`
+		ReceiveCount     string      `json:"receive_count,omitempty"`
+		ExpireTime       int         `json:"expire_time,omitempty"`
+		FileCategory     int         `json:"file_category,omitempty"`
+		AutoRenewal      string      `json:"auto_renewal,omitempty"`
+		AutoFillRecvcode string      `json:"auto_fill_recvcode,omitempty"`
+		CanReport        int         `json:"can_report,omitempty"`
+		CanNotice        int         `json:"can_notice,omitempty"`
+		HaveVioFile      int         `json:"have_vio_file,omitempty"`
 	} `json:"shareinfo,omitempty"`
-	Count      int     `json:"count,omitempty"`
-	List       []*File `json:"list,omitempty"`
-	ShareState string  `json:"share_state,omitempty"`
+	Count      int         `json:"count,omitempty"`
+	List       []*File     `json:"list,omitempty"`
+	ShareState json.Number `json:"share_state,omitempty"`
 	UserAppeal struct {
 		CanAppeal       int `json:"can_appeal,omitempty"`
 		CanShareAppeal  int `json:"can_share_appeal,omitempty"`

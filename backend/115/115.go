@@ -31,6 +31,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pierrec/lz4/v4"
 	"github.com/rclone/rclone/backend/115/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
@@ -49,7 +50,7 @@ import (
 const (
 	domain           = "www.115.com"
 	rootURL          = "https://webapi.115.com"
-	defaultUserAgent = "Mozilla/5.0 115Browser/27.0.3.7"
+	defaultUserAgent = "Mozilla/5.0 115Browser/27.0.6.3"
 
 	defaultMinSleep = fs.Duration(250 * time.Millisecond) // 4 transactions per second
 	maxSleep        = 2 * time.Second
@@ -62,7 +63,6 @@ const (
 	maxUploadParts      = 10000                          // Part number must be an integer between 1 and 10000, inclusive.
 	minChunkSize        = fs.SizeSuffix(1024 * 1024 * 5) // Part size should be in [100KB, 5GB]
 	defaultUploadCutoff = fs.SizeSuffix(200 * 1024 * 1024)
-	maxUploadCutoff     = fs.SizeSuffix(5 * 1024 * 1024 * 1024)
 )
 
 // Register with Fs
@@ -273,9 +273,7 @@ type Object struct {
 	size        int64
 	sha1sum     string
 	pickCode    string
-	mTime       time.Time        // modified/updated at
-	cTime       time.Time        // created at
-	aTime       time.Time        // last accessed at
+	modTime     time.Time        // modification time of the object
 	durl        *api.DownloadURL // link to download the object
 	durlMu      *sync.Mutex
 }
@@ -416,13 +414,6 @@ func checkUploadChunkSize(cs fs.SizeSuffix) error {
 	return nil
 }
 
-func checkUploadCutoff(cs fs.SizeSuffix) error {
-	if cs > maxUploadCutoff {
-		return fmt.Errorf("%s is greater than %s", cs, maxUploadCutoff)
-	}
-	return nil
-}
-
 // newFs partially constructs Fs from the path
 //
 // It constructs a valid Fs but doesn't attempt to figure out whether
@@ -437,10 +428,6 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 	err = checkUploadChunkSize(opt.ChunkSize)
 	if err != nil {
 		return nil, fmt.Errorf("115: chunk size: %w", err)
-	}
-	err = checkUploadCutoff(opt.UploadCutoff)
-	if err != nil {
-		return nil, fmt.Errorf("115: upload cutoff: %w", err)
 	}
 
 	// mod - override rootID from path remote:{ID}
@@ -637,6 +624,18 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 // FindLeaf finds a directory of name leaf in the folder with ID pathID
 func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut string, found bool, err error) {
+	// try using getDirID first
+	if f.rootFolderID == "0" && !f.isShare {
+		if path, ok := f.dirCache.GetInv(pathID); ok {
+			if pathIDOut, err = f.getDirID(ctx, path+"/"+leaf); err != nil {
+				if err == fs.ErrorDirNotFound {
+					return pathIDOut, found, nil
+				}
+				return
+			}
+			return pathIDOut, true, err
+		}
+	}
 	// Find the leaf in pathID
 	found, err = f.listAll(ctx, pathID, func(item *api.File) bool {
 		if item.Name == leaf && item.IsDir() {
@@ -726,9 +725,17 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 	// upload src with the name of remote
 	newObj, err := f.upload(ctx, in, src, remote, options...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to upload: %w", err)
+		if !errors.Is(err, lz4.ErrInvalidSourceShortBuffer) {
+			return nil, fmt.Errorf("failed to upload: %w", err)
+		}
+		// In this case, the upload (perhaps via hash) could be successful,
+		/// so let the subsequent process locate the uploaded object.
 	}
 	o := newObj.(*Object)
+
+	if o.hasMetaData {
+		return o, nil
+	}
 
 	var info *api.File
 	found, err := f.listAll(ctx, o.parent, func(item *api.File) bool {
@@ -739,7 +746,7 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 		return false
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to located updated file: %w", err)
+		return nil, fmt.Errorf("failed to locate updated file: %w", err)
 	}
 	if !found {
 		return nil, fs.ErrorObjectNotFound
@@ -849,8 +856,8 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, err
 	}
 
-	// Create temporary object - still needs id, sha1sum, pickCode, mTime, cTime, aTime
-	dstObj, dstLeaf, dstParentID, err := f.createObject(ctx, remote, srcObj.mTime, srcObj.size)
+	// Create temporary object - still needs id, sha1sum, pickCode
+	dstObj, dstLeaf, dstParentID, err := f.createObject(ctx, remote, srcObj.modTime, srcObj.size)
 	if err != nil {
 		return nil, err
 	}
@@ -864,9 +871,6 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	dstObj.id = srcObj.id
 	dstObj.sha1sum = srcObj.sha1sum
 	dstObj.pickCode = srcObj.pickCode
-	dstObj.mTime = srcObj.mTime
-	dstObj.cTime = srcObj.cTime
-	dstObj.aTime = srcObj.aTime
 	dstObj.hasMetaData = true
 
 	if srcLeaf != dstLeaf {
@@ -951,8 +955,8 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, err
 	}
 
-	// Create temporary object - still needs id, sha1sum, pickCode, mTime, cTime, aTime
-	dstObj, dstLeaf, dstParentID, err := f.createObject(ctx, remote, srcObj.mTime, srcObj.size)
+	// Create temporary object - still needs id, sha1sum, pickCode
+	dstObj, dstLeaf, dstParentID, err := f.createObject(ctx, remote, srcObj.modTime, srcObj.size)
 	if err != nil {
 		return nil, err
 	}
@@ -1083,7 +1087,7 @@ func (f *Fs) itemToDirEntry(ctx context.Context, remote string, item *api.File) 
 	case item.IsDir(): // in case of dir
 		// cache the directory ID for later lookups
 		f.dirCache.Put(remote, item.ID())
-		d := fs.NewDir(remote, time.Time(item.Te)).SetID(item.ID()).SetParentID(item.ParentID())
+		d := fs.NewDir(remote, item.ModTime()).SetID(item.ID()).SetParentID(item.ParentID())
 		return d, nil
 	default:
 		entry, err = f.newObjectWithInfo(ctx, remote, item)
@@ -1153,12 +1157,12 @@ func (f *Fs) createObject(ctx context.Context, remote string, modTime time.Time,
 	}
 	// Temporary Object under construction
 	o = &Object{
-		fs:     f,
-		remote: remote,
-		parent: dirID,
-		size:   size,
-		mTime:  modTime,
-		durlMu: new(sync.Mutex),
+		fs:      f,
+		remote:  remote,
+		parent:  dirID,
+		size:    size,
+		modTime: modTime,
+		durlMu:  new(sync.Mutex),
 	}
 	return o, leaf, dirID, nil
 }
@@ -1287,7 +1291,7 @@ func (o *Object) ModTime(ctx context.Context) time.Time {
 		fs.Logf(o, "failed to read metadata: %v", err)
 		return time.Now()
 	}
-	return o.mTime
+	return o.modTime
 }
 
 // Size returns the size of the file
@@ -1416,12 +1420,19 @@ func (o *Object) setMetaData(info *api.File) error {
 	o.hasMetaData = true
 	o.id = info.ID()
 	o.parent = info.ParentID()
-	o.size = info.Size
+	o.size = int64(info.Size)
 	o.sha1sum = strings.ToLower(info.Sha)
 	o.pickCode = info.PickCode
-	o.mTime = time.Time(info.Te)
-	o.cTime = time.Time(info.Tp)
-	o.aTime = time.Time(info.To)
+	o.modTime = info.ModTime()
+	return nil
+}
+
+// setMetaDataFromCallBack sets the metadata from callback
+func (o *Object) setMetaDataFromCallBack(data *api.CallbackData) error {
+	// parent, size, sha1sum and modTime are assumed to be set
+	o.hasMetaData = true
+	o.id = data.FileID
+	o.pickCode = data.PickCode
 	return nil
 }
 

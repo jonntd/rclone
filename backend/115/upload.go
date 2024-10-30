@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/sha1"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,7 +17,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aliyun/aliyun-oss-go-sdk/oss"
+	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss"
+	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss/credentials"
 	"github.com/rclone/rclone/backend/115/api"
 	"github.com/rclone/rclone/backend/115/cipher"
 	"github.com/rclone/rclone/fs"
@@ -32,7 +32,7 @@ import (
 const (
 	cachePrefix  = "rclone-115-sha1sum-"
 	md5Salt      = "Qclm8MGWUv59TnrR0XPg"
-	OSSEndpoint  = "http://oss-cn-shenzhen.aliyuncs.com" // https://uplb.115.com/3.0/getuploadinfo.php
+	OSSRegion    = "cn-shenzhen" // https://uplb.115.com/3.0/getuploadinfo.php
 	OSSUserAgent = "aliyun-sdk-android/2.9.1"
 )
 
@@ -214,6 +214,21 @@ func (f *Fs) initUpload(ctx context.Context, size int64, name, dirID, sha1sum, s
 	}
 }
 
+func (f *Fs) postUpload(v map[string]any) (*api.CallbackData, error) {
+	callbackJson, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	var info api.CallbackInfo
+	if err := json.Unmarshal(callbackJson, &info); err != nil {
+		return nil, err
+	}
+	if !info.State {
+		return nil, fmt.Errorf("API State false: %s (%d)", info.Message, info.Code)
+	}
+	return info.Data, nil
+}
+
 // ------------------------------------------------------------
 
 func (f *Fs) getOSSToken(ctx context.Context) (info *api.OSSToken, err error) {
@@ -227,54 +242,32 @@ func (f *Fs) getOSSToken(ctx context.Context) (info *api.OSSToken, err error) {
 		return shouldRetry(ctx, resp, info, err)
 	})
 	if err == nil && info.StatusCode != "200" {
-		return nil, fmt.Errorf("StateCode: %s", info.StatusCode)
+		return nil, fmt.Errorf("failed to get OSS token: %s (%s)", info.ErrorMessage, info.ErrorCode)
 	}
 	return
 }
 
-func ossOpts(ossOptions []oss.Option, options ...fs.OpenOption) []oss.Option {
-	opts := ossOptions
-
-	// Apply upload options
-	for _, option := range options {
-		key, value := option.Header()
-		lowerKey := strings.ToLower(key)
-		switch lowerKey {
-		case "":
-			// ignore
-		case "cache-control":
-			opts = append(opts, oss.CacheControl(value))
-		case "content-disposition":
-			opts = append(opts, oss.ContentDisposition(value))
-		case "content-encoding":
-			opts = append(opts, oss.ContentEncoding(value))
+func (f *Fs) newOSSClient() (client *oss.Client) {
+	fetcher := credentials.CredentialsFetcherFunc(func(ctx context.Context) (credentials.Credentials, error) {
+		t, err := f.getOSSToken(ctx)
+		if err != nil {
+			return credentials.Credentials{}, err
 		}
-	}
-	return opts
-}
+		return credentials.Credentials{
+			AccessKeyID:     t.AccessKeyID,
+			AccessKeySecret: t.AccessKeySecret,
+			SecurityToken:   t.SecurityToken,
+			Expires:         &t.Expiration}, nil
+	})
+	provider := credentials.NewCredentialsFetcherProvider(fetcher)
 
-func (f *Fs) newOSSBucket(ctx context.Context, ui *api.UploadInitInfo) (bucket *oss.Bucket, callback []oss.Option, token *api.OSSToken, err error) {
-	token, err = f.getOSSToken(ctx)
-	if err != nil {
-		err = fmt.Errorf("failed to get OSS token: %w", err)
-		return
-	}
-	client, err := oss.New(OSSEndpoint, token.AccessKeyID, token.AccessKeySecret, []oss.ClientOption{
-		oss.HTTPClient(f.client),
-		oss.SecurityToken(token.SecurityToken),
-		oss.UserAgent(OSSUserAgent),
-	}...)
-	if err != nil {
-		err = fmt.Errorf("failed to create a new OSS client: %w", err)
-		return
-	}
-	if bucket, err = client.Bucket(ui.Bucket); err == nil {
-		callback = []oss.Option{
-			oss.Callback(base64.StdEncoding.EncodeToString([]byte(ui.Callback.Callback))),
-			oss.CallbackVar(base64.StdEncoding.EncodeToString([]byte(ui.Callback.CallbackVar))),
-		}
-	}
-	return
+	cfg := oss.LoadDefaultConfig().
+		WithCredentialsProvider(provider).
+		WithRegion(OSSRegion).
+		WithUserAgent(OSSUserAgent).
+		WithHttpClient(f.client)
+
+	return oss.NewClient(cfg)
 }
 
 // unWrapObjectInfo returns the underlying Object unwrapped as much as
@@ -367,7 +360,9 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 	for retry := true; retry; {
 		ui, err = f.initUpload(ctx, size, leaf, dirID, hashStr, signKey, signVal)
 		if err != nil {
-			return nil, fmt.Errorf("failed to init upload: %w", err)
+			// In this case, the upload (perhaps via hash) could be successful,
+			/// so let the subsequent process locate the uploaded object.
+			return o, fmt.Errorf("failed to init upload: %w", err)
 		}
 		retry = ui.Status == 7
 		switch ui.Status {
@@ -399,13 +394,50 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 		if err != nil {
 			return nil, fmt.Errorf("multipart upload failed to initialise: %w", err)
 		}
-		return o, mu.Upload(ctx)
+		if err = mu.Upload(ctx); err != nil {
+			return nil, err
+		}
+		data, err := f.postUpload(mu.callbackRes)
+		if err != nil {
+			return nil, fmt.Errorf("multipart upload failed to finalize: %w", err)
+		}
+		return o, o.setMetaDataFromCallBack(data)
 	}
 
 	// upload singlepart
-	bucket, callback, _, err := f.newOSSBucket(ctx, ui)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create a new OSS bucket: %w", err)
+	client := f.newOSSClient()
+	req := &oss.PutObjectRequest{
+		Bucket:      oss.Ptr(ui.Bucket),
+		Key:         oss.Ptr(ui.Object),
+		Body:        in,
+		Callback:    oss.Ptr(ui.GetCallback()),
+		CallbackVar: oss.Ptr(ui.GetCallbackVar()),
 	}
-	return o, bucket.PutObject(ui.Object, in, ossOpts(callback, options...)...)
+	// Apply upload options
+	for _, option := range options {
+		key, value := option.Header()
+		lowerKey := strings.ToLower(key)
+		switch lowerKey {
+		case "":
+			// ignore
+		case "cache-control":
+			req.CacheControl = oss.Ptr(value)
+		case "content-disposition":
+			req.ContentDisposition = oss.Ptr(value)
+		case "content-encoding":
+			req.ContentEncoding = oss.Ptr(value)
+		case "content-type":
+			req.ContentType = oss.Ptr(value)
+		}
+	}
+
+	res, err := client.PutObject(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	data, err := f.postUpload(res.CallbackResult)
+	if err != nil {
+		return nil, fmt.Errorf("failed to finalize upload: %w", err)
+	}
+	return o, o.setMetaDataFromCallBack(data)
 }
