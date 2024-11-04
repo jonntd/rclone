@@ -55,11 +55,7 @@ func NewRW() *pool.RW {
 // It returns the chunkWriter used in case the caller needs to extract any private info from it.
 func (w *ossChunkWriter) Upload(ctx context.Context) (err error) {
 	// make concurrency machinery
-	concurrency := w.f.opt.UploadConcurrency
-	if concurrency < 1 {
-		concurrency = 1
-	}
-	tokens := pacer.NewTokenDispenser(concurrency)
+	tokens := pacer.NewTokenDispenser(w.con)
 
 	uploadCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -148,6 +144,7 @@ var warnStreamUpload sync.Once
 type ossChunkWriter struct {
 	chunkSize     int64
 	size          int64
+	con           int
 	f             *Fs
 	o             *Object
 	in            io.Reader
@@ -167,12 +164,7 @@ func (f *Fs) newChunkWriter(ctx context.Context, remote string, src fs.ObjectInf
 		remote: remote,
 	}
 
-	uploadParts := f.opt.MaxUploadParts
-	if uploadParts < 1 {
-		uploadParts = 1
-	} else if uploadParts > maxUploadParts {
-		uploadParts = maxUploadParts
-	}
+	uploadParts := min(max(1, f.opt.MaxUploadParts), maxUploadParts)
 	size := src.Size()
 
 	// calculate size of parts
@@ -193,6 +185,7 @@ func (f *Fs) newChunkWriter(ctx context.Context, remote string, src fs.ObjectInf
 	w = &ossChunkWriter{
 		chunkSize: int64(chunkSize),
 		size:      size,
+		con:       max(1, f.opt.UploadConcurrency),
 		f:         f,
 		o:         o,
 		in:        in,
@@ -202,6 +195,10 @@ func (f *Fs) newChunkWriter(ctx context.Context, remote string, src fs.ObjectInf
 	req := &oss.InitiateMultipartUploadRequest{
 		Bucket: oss.Ptr(ui.Bucket),
 		Key:    oss.Ptr(ui.Object),
+	}
+	req.Parameters = map[string]string{"x-oss-enable-sha1": ""}
+	if w.con == 1 {
+		req.Parameters["sequential"] = ""
 	}
 	// Apply upload options
 	for _, option := range options {

@@ -142,7 +142,10 @@ Fill in for rclone to use a non root folder as its starting point.
 			Default:  false,
 			Advanced: true,
 			Hide:     fs.OptionHideBoth,
-			Help:     `Do not upload files with no SHA1 hash from source`,
+			Help: `Skip uploading files that require network traffic, including
+
+	1) Incoming traffic for calculating file hashes locally
+	2) Outgoing traffic for uploading to the storage server`,
 		}, {
 			Name:     "hash_memory_limit",
 			Help:     "Files bigger than this will be cached on disk to calculate hash if required.",
@@ -202,7 +205,7 @@ concurrently for multipart uploads and copies.
 If you are uploading small numbers of large files over high-speed links
 and these uploads do not fully utilize your bandwidth, then increasing
 this may help to speed up the transfers.`,
-			Default:  4,
+			Default:  1,
 			Advanced: true,
 		}, {
 			Name:     config.ConfigEncoding,
