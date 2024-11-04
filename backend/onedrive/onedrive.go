@@ -827,7 +827,7 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 				retry = true
 				fs.Debugf(nil, "HTTP 401: Unable to initialize RPS. Trying again.")
 			}
-		case 429: // Too Many Requests.
+		case 429, 503: // Too Many Requests, Server Too Busy
 			// see https://docs.microsoft.com/en-us/sharepoint/dev/general-development/how-to-avoid-getting-throttled-or-blocked-in-sharepoint-online
 			if values := resp.Header["Retry-After"]; len(values) == 1 && values[0] != "" {
 				retryAfter, parseErr := strconv.Atoi(values[0])
@@ -1545,9 +1545,12 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 
 // Precision return the precision of this Fs
 func (f *Fs) Precision() time.Duration {
-	if f.driveType == driveTypePersonal {
-		return time.Millisecond
-	}
+	// While this is true for some OneDrive personal accounts, it
+	// isn't true for all of them. See #8101 for details
+	//
+	// if f.driveType == driveTypePersonal {
+	// 	return time.Millisecond
+	// }
 	return time.Second
 }
 
