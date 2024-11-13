@@ -172,15 +172,16 @@ case "$OS" in
     makewhatis
     ;;
   'osx')
-    #binary
-    mkdir -p ${binTgtDir} && chmod -m 0555 ${binTgtDir}
-    cp rclone ${binTgtDir}/rclone.new
-    mv ${binTgtDir}/rclone.new ${binTgtDir}/rclone
-    chmod a=x ${binTgtDir}/rclone
-    #manual
-    mkdir -p ${man1TgtDir} && chmod -m 0555 ${man1TgtDir}
-    cp rclone.1 ${man1TgtDir}
-    chmod a=r ${man1TgtDir}/rclone.1
+    # Set binary target directory
+    mkdir -p "${binTgtDir}" && chmod 555 "${binTgtDir}"
+    cp rclone "${binTgtDir}/rclone.new"
+    mv "${binTgtDir}/rclone.new" "${binTgtDir}/rclone"
+    chmod a=x "${binTgtDir}/rclone"
+    
+    # Set manual target directory
+    mkdir -p "${man1TgtDir}" && chmod 555 "${man1TgtDir}"
+    cp rclone.1 "${man1TgtDir}"
+    chmod a=r "${man1TgtDir}/rclone.1"
     ;;
   'termux')
     cd ../..
