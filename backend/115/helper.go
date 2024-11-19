@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -47,7 +48,7 @@ func (f *Fs) listOrder(ctx context.Context, cid, order, asc string) (err error) 
 	if err != nil {
 		return
 	} else if !info.State {
-		return fmt.Errorf("API State false: %s (%d)", info.Error, info.Errno)
+		return fmt.Errorf("API Error: %s (%d)", info.Error, info.Errno)
 	}
 	return
 }
@@ -55,42 +56,17 @@ func (f *Fs) listOrder(ctx context.Context, cid, order, asc string) (err error) 
 // Lists the directory required calling the user function on each item found
 //
 // If the user fn ever returns true then it early exits with found = true
-func (f *Fs) listAll(ctx context.Context, dirID string, fn listAllFn) (found bool, err error) {
+func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly, dirsOnly bool, fn listAllFn) (found bool, err error) {
 	if f.isShare {
-		return f.listShare(ctx, dirID, fn)
+		return f.listShare(ctx, dirID, limit, fn)
 	}
 	order := "user_ptime"
 	asc := "0"
 
 	// Url Parameters
-	params := url.Values{}
-	params.Set("aid", "1")
-	params.Set("cid", dirID)
-	params.Set("o", order) // following options are avaialbe for listing order
-	// * file_name
-	// * file_size
-	// * file_type
-	// * user_ptime (create_time) == sorted by tp
-	// * user_utime (modify_time) == sorted by te
-	// * user_otime (last_opened) == sorted by to
-	params.Set("asc", asc)      // ascending order "0" or "1"
-	params.Set("show_dir", "1") // this is not for showing dirs_only. It will list all files in dir recursively if "0".
-	params.Set("limit", strconv.Itoa(f.opt.ListChunk))
-	params.Set("snap", "0")
-	params.Set("record_open_time", "1")
-	params.Set("count_folders", "1")
-	params.Set("format", "json")
-	params.Set("fc_mix", "0")
-
-	opts := rest.Opts{
-		Method:     "GET",
-		RootURL:    "https://webapi.115.com/files",
-		Parameters: params,
-	}
-	if order == "file_name" {
-		params.Set("natsort", "1")
-		opts.RootURL = "https://aps.115.com/natsort/files.php"
-	}
+	params := listParams(dirID, limit)
+	params.Set("o", order)
+	params.Set("asc", asc)
 
 	offset := 0
 	retries := 0 // to prevent infinite loop
@@ -98,18 +74,17 @@ OUTER:
 	for {
 		params.Set("offset", strconv.Itoa(offset))
 
-		var info api.FileList
-		var resp *http.Response
-		err = f.pacer.Call(func() (bool, error) {
-			resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
-			return shouldRetry(ctx, resp, &info, err)
-		})
+		info, err := f.getFiles(ctx, params)
 		if err != nil {
-			return found, fmt.Errorf("couldn't list files: %w", err)
-		} else if !info.State {
-			return found, fmt.Errorf("API State false: %q (%d)", info.Error, info.ErrNo)
+			return found, fmt.Errorf("couldn't get files: %w", err)
 		}
-		if len(info.Files) == 0 {
+		if info.Count == 0 {
+			break
+		}
+		if filesOnly && info.FileCount == 0 {
+			break
+		}
+		if dirsOnly && info.FolderCount == 0 {
 			break
 		}
 		if order != info.Order || asc != info.IsAsc.String() {
@@ -123,16 +98,89 @@ OUTER:
 			continue // retry with same offset
 		}
 		for _, item := range info.Files {
+			if filesOnly && item.IsDir() {
+				continue
+			}
+			if dirsOnly && !item.IsDir() {
+				continue
+			}
 			item.Name = f.opt.Enc.ToStandardName(item.Name)
 			if fn(item) {
 				found = true
 				break OUTER
 			}
 		}
-		offset = info.Offset + f.opt.ListChunk
+		offset = info.Offset + len(info.Files)
 		if offset >= info.Count {
 			break
 		}
+	}
+	return
+}
+
+// listParams generates a default parameter set for list API
+func listParams(dirID string, limit int) url.Values {
+	params := url.Values{}
+	params.Set("aid", "1")
+	params.Set("cid", dirID)
+	params.Set("o", "user_ptime") // following options are avaialbe for listing order
+	// * file_name
+	// * file_size
+	// * file_type
+	// * user_ptime (create_time) == sorted by tp
+	// * user_utime (modify_time) == sorted by te
+	// * user_otime (last_opened) == sorted by to
+	params.Set("asc", "0")      // ascending order "0" or "1"
+	params.Set("show_dir", "1") // this is not for showing dirs_only. It will list all files in dir recursively if "0".
+	params.Set("limit", strconv.Itoa(limit))
+	params.Set("snap", "0")
+	params.Set("record_open_time", "1")
+	params.Set("count_folders", "1")
+	params.Set("format", "json")
+	params.Set("fc_mix", "0")
+	params.Set("offset", "0")
+	return params
+}
+
+// getFiles fetches a single chunk of file lists filtered by the given parameters
+func (f *Fs) getFiles(ctx context.Context, params url.Values) (info *api.FileList, err error) {
+	opts := rest.Opts{
+		Method:     "GET",
+		RootURL:    "https://webapi.115.com/files",
+		Parameters: params,
+	}
+	if params.Get("o") == "file_name" {
+		params.Set("natsort", "1")
+		opts.RootURL = "https://aps.115.com/natsort/files.php"
+	}
+
+	var resp *http.Response
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
+		return shouldRetry(ctx, resp, &info, err)
+	})
+	if err != nil {
+		return
+	} else if !info.State {
+		return nil, fmt.Errorf("API Error: %q (%d)", info.Error, info.ErrNo)
+	}
+	return
+}
+
+// getDirPath returns an absolute path of dirID
+func (f *Fs) getDirPath(ctx context.Context, dirID string) (dir string, err error) {
+	if dirID == "0" {
+		return "", nil
+	}
+	info, err := f.getFiles(ctx, listParams(dirID, 32))
+	if err != nil {
+		return "", fmt.Errorf("couldn't get files: %w", err)
+	}
+	for _, p := range info.Path {
+		if p.CID.String() == "0" {
+			continue
+		}
+		dir = path.Join(dir, f.opt.Enc.ToStandardName(p.Name))
 	}
 	return
 }
@@ -159,7 +207,7 @@ func (f *Fs) makeDir(ctx context.Context, pid, name string) (info *api.NewDir, e
 		if info.Errno == 20004 {
 			return nil, fs.ErrorDirExists
 		}
-		return nil, fmt.Errorf("API State false: %s (%d)", info.Error, info.Errno)
+		return nil, fmt.Errorf("API Error: %s (%d)", info.Error, info.Errno)
 	}
 	return
 }
@@ -184,7 +232,7 @@ func (f *Fs) renameFile(ctx context.Context, fid, newName string) (err error) {
 	if err != nil {
 		return
 	} else if !info.State {
-		return fmt.Errorf("API State false: %s (%d)", info.Error, info.Errno)
+		return fmt.Errorf("API Error: %s (%d)", info.Error, info.Errno)
 	}
 	return
 }
@@ -211,7 +259,7 @@ func (f *Fs) deleteFiles(ctx context.Context, fids []string) (err error) {
 	if err != nil {
 		return
 	} else if !info.State {
-		return fmt.Errorf("API State false: %s (%d)", info.Error, info.Errno)
+		return fmt.Errorf("API Error: %s (%d)", info.Error, info.Errno)
 	}
 	return
 }
@@ -239,7 +287,7 @@ func (f *Fs) moveFiles(ctx context.Context, fids []string, pid string) (err erro
 	if err != nil {
 		return
 	} else if !info.State {
-		return fmt.Errorf("API State false: %s (%d)", info.Error, info.Errno)
+		return fmt.Errorf("API Error: %s (%d)", info.Error, info.Errno)
 	}
 	return
 }
@@ -266,7 +314,7 @@ func (f *Fs) copyFiles(ctx context.Context, fids []string, pid string) (err erro
 	if err != nil {
 		return
 	} else if !info.State {
-		return fmt.Errorf("API State false: %s (%d)", info.Error, info.Errno)
+		return fmt.Errorf("API Error: %s (%d)", info.Error, info.Errno)
 	}
 	return
 }
@@ -286,7 +334,7 @@ func (f *Fs) indexInfo(ctx context.Context) (data *api.IndexInfo, err error) {
 	if err != nil {
 		return
 	} else if !info.State {
-		return nil, fmt.Errorf("API State false: %s (%d)", info.Error, info.Errno)
+		return nil, fmt.Errorf("API Error: %s (%d)", info.Error, info.Errno)
 	}
 	if data = info.Data.IndexInfo; data == nil {
 		return nil, errors.New("no data")
@@ -316,7 +364,7 @@ func (f *Fs) _getDownloadURL(ctx context.Context, input []byte) (output []byte, 
 	if err != nil {
 		return
 	} else if !info.State {
-		return nil, nil, fmt.Errorf("API State false: %s (%d)", info.Error, info.Errno)
+		return nil, nil, fmt.Errorf("API Error: %s (%d)", info.Error, info.Errno)
 	}
 	if info.Data.EncodedData == "" {
 		return nil, nil, errors.New("no data")
@@ -377,7 +425,7 @@ func (f *Fs) getDirID(ctx context.Context, dir string) (cid string, err error) {
 	if err != nil {
 		return
 	} else if !info.State {
-		return "", fmt.Errorf("API State false: %s (%d)", info.Error, info.Errno)
+		return "", fmt.Errorf("API Error: %s (%d)", info.Error, info.Errno)
 	}
 	cid = info.ID.String()
 	if cid == "0" && dir != "/" {
@@ -386,13 +434,18 @@ func (f *Fs) getDirID(ctx context.Context, dir string) (cid string, err error) {
 	return
 }
 
-// getFile gets information of a file or directory by its ID
-func (f *Fs) getFile(ctx context.Context, fid string) (file *api.File, err error) {
+// getFile gets information of a file or directory by its ID or pickCode
+func (f *Fs) getFile(ctx context.Context, fid, pc string) (file *api.File, err error) {
 	if fid == "0" {
 		return nil, errors.New("can't get information about root directory")
 	}
 	params := url.Values{}
-	params.Set("file_id", fid)
+	if fid != "" {
+		params.Set("file_id", fid)
+	}
+	if pc != "" {
+		params.Set("pick_code", pc)
+	}
 	opts := rest.Opts{
 		Method:     "GET",
 		Path:       "/files/get_info",
@@ -408,7 +461,7 @@ func (f *Fs) getFile(ctx context.Context, fid string) (file *api.File, err error
 	if err != nil {
 		return
 	} else if !info.State {
-		return nil, fmt.Errorf("API State false: %s (%d)", info.Message, info.Code)
+		return nil, fmt.Errorf("API Error: %s (%d)", info.Message, info.Code)
 	}
 	if len(info.Data) > 0 {
 		file = info.Data[0]
@@ -524,13 +577,13 @@ func parseShareLink(rawURL string) (shareCode, receiveCode string, err error) {
 // listing filesystem from share link
 //
 // no need user authorization by cookies
-func (f *Fs) listShare(ctx context.Context, dirID string, fn listAllFn) (found bool, err error) {
+func (f *Fs) listShare(ctx context.Context, dirID string, limit int, fn listAllFn) (found bool, err error) {
 	// Url Parameters
 	params := url.Values{}
 	params.Set("share_code", f.opt.ShareCode)
 	params.Set("receive_code", f.opt.ReceiveCode)
 	params.Set("cid", dirID)
-	params.Set("limit", strconv.Itoa(f.opt.ListChunk))
+	params.Set("limit", strconv.Itoa(limit))
 
 	opts := rest.Opts{
 		Method:     "GET",
@@ -552,7 +605,7 @@ OUTER:
 		if err != nil {
 			return found, fmt.Errorf("couldn't list files: %w", err)
 		} else if !info.State {
-			return found, fmt.Errorf("API State false: %q (%d)", info.Error, info.Errno)
+			return found, fmt.Errorf("API Error: %q (%d)", info.Error, info.Errno)
 		}
 		if len(info.Data.List) == 0 {
 			break
@@ -598,7 +651,7 @@ func (f *Fs) copyFromShare(ctx context.Context, shareCode, receiveCode, fid, cid
 	if err != nil {
 		return
 	} else if !info.State {
-		return fmt.Errorf("API State false: %s (%d)", info.Error, info.Errno)
+		return fmt.Errorf("API Error: %s (%d)", info.Error, info.Errno)
 	}
 	return
 }

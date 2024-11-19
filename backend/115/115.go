@@ -33,6 +33,7 @@ import (
 
 	"github.com/pierrec/lz4/v4"
 	"github.com/rclone/rclone/backend/115/api"
+	"github.com/rclone/rclone/backend/115/dircache"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
@@ -40,7 +41,6 @@ import (
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
-	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
@@ -52,7 +52,7 @@ const (
 	rootURL          = "https://webapi.115.com"
 	defaultUserAgent = "Mozilla/5.0 115Browser/27.0.6.3"
 
-	defaultMinSleep = fs.Duration(250 * time.Millisecond) // 4 transactions per second
+	defaultMinSleep = fs.Duration(1000 * time.Millisecond) // 1 transactions per second
 	maxSleep        = 2 * time.Second
 	decayConstant   = 2 // bigger for slower decay, exponential
 
@@ -258,6 +258,7 @@ type Fs struct {
 	srv          *rest.Client
 	dirCache     *dircache.DirCache // Map of directory path to directory id
 	pacer        *fs.Pacer
+	rootFolder   string // path of the absolute root
 	rootFolderID string
 	appVer       string     // parsed from user-agent; // https://appversion.115.com/1/web/1.0/api/getMultiVer
 	userID       string     // for uploads, adding offline tasks, and receiving from share link
@@ -303,10 +304,10 @@ func shouldRetry(ctx context.Context, resp *http.Response, info interface{}, err
 			if !apiInfo.State && apiInfo.Errno == 990009 {
 				time.Sleep(time.Second)
 				// 删除[subdir]操作尚未执行完成，请稍后再试！ (990009)
-				return true, fserrors.RetryErrorf("API State false: %s (%d)", apiInfo.Error, apiInfo.Errno)
+				return true, fserrors.RetryErrorf("API Error: %s (%d)", apiInfo.Error, apiInfo.Errno)
 			} else if !apiInfo.State && apiInfo.Errno == 50038 {
-				// can't download: API State false:  (50038)
-				return true, fserrors.RetryErrorf("API State false: %s (%d)", apiInfo.Error, apiInfo.Errno)
+				// can't download: API Error:  (50038)
+				return true, fserrors.RetryErrorf("API Error: %s (%d)", apiInfo.Error, apiInfo.Errno)
 			}
 		}
 		return false, nil
@@ -469,22 +470,6 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 	return f, nil
 }
 
-// wraps dirCache.FindRoot() with warm-up cache
-func (f *Fs) dirCacheFindRoot(ctx context.Context) (err error) {
-	if f.rootFolderID != "0" || f.isShare {
-		return f.dirCache.FindRoot(ctx, false)
-	}
-	for dir, dirID := f.root, "-1"; dirID != f.rootFolderID && dir != ""; {
-		dirID, err = f.getDirID(ctx, dir)
-		if err != nil {
-			return err
-		}
-		f.dirCache.Put(dir, dirID)
-		dir, _ = dircache.SplitPath(dir)
-	}
-	return f.dirCache.FindRoot(ctx, false)
-}
-
 // NewFs constructs an Fs from the path, container:path
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	f, err := newFs(ctx, name, root, m)
@@ -493,19 +478,23 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	// mod - parse object id from path remote:{ID}
-	var srcFile *api.File
 	if rootID, receiveCode, _ := parseRootID(root); len(rootID) == 19 {
-		srcFile, err = f.getFile(ctx, rootID)
+		info, err := f.getFile(ctx, rootID, "")
 		if err != nil {
 			return nil, err
 		}
-		f.opt.RootFolderID = rootID
-		if !srcFile.IsDir() {
-			fs.Debugf(nil, "Root ID (File): %s", rootID)
-		} else {
-			fs.Debugf(nil, "Root ID (Folder): %s", rootID)
-			srcFile = nil
+		if !info.IsDir() {
+			// When the parsed `rootID` points to a file,
+			// commands requiring listing operations (e.g., `ls*`, `cat`) are not supported
+			// `copy` has been verified to work correctly
+			f.dirCache = dircache.New("", info.ParentID(), f)
+			_ = f.dirCache.FindRoot(ctx, false)
+			obj, _ := f.newObjectWithInfo(ctx, info.Name, info)
+			f.root = "isFile:" + info.Name
+			f.fileObj = &obj
+			return f, fs.ErrorIsFile
 		}
+		f.opt.RootFolderID = rootID
 	} else if len(rootID) == 11 {
 		f.opt.ShareCode = rootID
 		f.opt.ReceiveCode = receiveCode
@@ -515,40 +504,37 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.isShare = f.opt.ShareCode != "" && f.opt.ReceiveCode != ""
 
 	// Set the root folder ID
-	if f.opt.RootFolderID != "" {
+	if f.isShare {
+		// should be empty to let dircache run with forward search
+		f.rootFolderID = ""
+	} else if f.opt.RootFolderID != "" {
 		// use root_folder ID if set
 		f.rootFolderID = f.opt.RootFolderID
 	} else {
 		f.rootFolderID = "0" //根目录 = root directory
 	}
 
-	f.dirCache = dircache.New(f.root, f.rootFolderID, f)
-
-	// mod - in case parsed rootID is pointing to a file
-	if srcFile != nil {
-		tempF := *f
-		newRoot := ""
-		tempF.dirCache = dircache.New(newRoot, f.rootFolderID, &tempF)
-		tempF.root = newRoot
-		f.dirCache = tempF.dirCache
-		f.root = tempF.root
-
-		obj, _ := f.newObjectWithInfo(ctx, srcFile.Name, srcFile)
-		f.root = "isFile:" + srcFile.Name
-		f.fileObj = &obj
-		return f, fs.ErrorIsFile
+	// Set the root folder path if it is not on the absolute root
+	if f.rootFolderID != "" && f.rootFolderID != "0" {
+		f.rootFolder, err = f.getDirPath(ctx, f.rootFolderID)
+		if err != nil {
+			return nil, err
+		}
 	}
 
+	f.dirCache = dircache.New(f.root, f.rootFolderID, f)
+
 	// Find the current root
-	err = f.dirCacheFindRoot(ctx)
+	err = f.dirCache.FindRoot(ctx, false)
 	if err != nil {
 		// Assume it is a file
 		newRoot, remote := dircache.SplitPath(f.root)
 		tempF := *f
 		tempF.dirCache = dircache.New(newRoot, f.rootFolderID, &tempF)
 		tempF.root = newRoot
+		tempF.dirCache.Fill(f.dirCache)
 		// Make new Fs which is the parent
-		err = tempF.dirCacheFindRoot(ctx)
+		err = tempF.dirCache.FindRoot(ctx, false)
 		if err != nil {
 			// No root so return old f
 			return f, nil
@@ -640,14 +626,19 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut strin
 		}
 	}
 	// Find the leaf in pathID
-	found, err = f.listAll(ctx, pathID, func(item *api.File) bool {
-		if item.Name == leaf && item.IsDir() {
+	found, err = f.listAll(ctx, pathID, f.opt.ListChunk, false, true, func(item *api.File) bool {
+		if item.Name == leaf {
 			pathIDOut = item.ID()
 			return true
 		}
 		return false
 	})
 	return pathIDOut, found, err
+}
+
+// GetDirID wraps `getDirID` to provide an interface for DirCacher
+func (f *Fs) GetDirID(ctx context.Context, dir string) (string, error) {
+	return f.getDirID(ctx, f.rootFolder+"/"+dir)
 }
 
 // List the objects and directories in dir into entries.  The
@@ -666,7 +657,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		return nil, err
 	}
 	var iErr error
-	_, err = f.listAll(ctx, dirID, func(item *api.File) bool {
+	_, err = f.listAll(ctx, dirID, f.opt.ListChunk, false, false, func(item *api.File) bool {
 		entry, err := f.itemToDirEntry(ctx, path.Join(dir, item.Name), item)
 		if err != nil {
 			iErr = err
@@ -708,6 +699,9 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 // will return the object and the error, otherwise will return
 // nil and the error
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	if fs.GetConfig(ctx).NoCheckDest {
+		return f.PutUnchecked(ctx, in, src, options...)
+	}
 	existingObj, err := f.NewObject(ctx, src.Remote())
 	switch err {
 	case nil:
@@ -741,8 +735,8 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 	}
 
 	var info *api.File
-	found, err := f.listAll(ctx, o.parent, func(item *api.File) bool {
-		if strings.ToLower(item.Sha) == o.sha1sum && !item.IsDir() {
+	found, err := f.listAll(ctx, o.parent, 32, true, false, func(item *api.File) bool {
+		if strings.ToLower(item.Sha) == o.sha1sum {
 			info = item
 			return true
 		}
@@ -778,7 +772,7 @@ func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) (err error) {
 	for _, srcDir := range dirs[1:] {
 		// list the objects
 		var IDs []string
-		_, err = f.listAll(ctx, srcDir.ID(), func(item *api.File) bool {
+		_, err = f.listAll(ctx, srcDir.ID(), f.opt.ListChunk, false, false, func(item *api.File) bool {
 			fs.Infof(srcDir, "listing for merging %q", item.Name)
 			IDs = append(IDs, item.ID())
 			// API doesn't allow to move a large number of objects at once, so doing it in chunked
@@ -1018,7 +1012,7 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 	}
 
 	if check {
-		found, err := f.listAll(ctx, rootID, func(item *api.File) bool {
+		found, err := f.listAll(ctx, rootID, 32, false, false, func(item *api.File) bool {
 			fs.Debugf(dir, "Rmdir: contains file: %q", item.Name)
 			return true
 		})
@@ -1130,8 +1124,8 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.Fi
 	}
 
 	// checking whether fileObj with name of leaf exists in dirID
-	found, err := f.listAll(ctx, dirID, func(item *api.File) bool {
-		if item.Name == leaf && !item.IsDir() {
+	found, err := f.listAll(ctx, dirID, f.opt.ListChunk, true, false, func(item *api.File) bool {
+		if item.Name == leaf {
 			info = item
 			return true
 		}
@@ -1402,7 +1396,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	// updating object with the same contents(sha1) simply updates some attributes
 	// rather than creating a new one. So we shouldn't delete old object
 	newO := newObj.(*Object)
-	if !(newO.id == o.id && newO.pickCode == o.pickCode && newO.sha1sum == o.sha1sum) {
+	if o.hasMetaData && !(newO.id == o.id && newO.pickCode == o.pickCode && newO.sha1sum == o.sha1sum) {
 		// Delete duplicate after successful upload
 		if err = o.Remove(ctx); err != nil {
 			return fmt.Errorf("failed to remove old version: %w", err)

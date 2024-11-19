@@ -575,6 +575,7 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 		if strings.Contains(err.Error(), "invalid_grant") {
 			return f, f.reAuthorize(ctx)
 		}
+		return nil, err
 	}
 
 	return f, nil
