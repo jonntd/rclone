@@ -25,7 +25,6 @@ import (
 	"io"
 	"net/http"
 	"path"
-	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -50,7 +49,7 @@ import (
 const (
 	domain           = "www.115.com"
 	rootURL          = "https://webapi.115.com"
-	defaultUserAgent = "Mozilla/5.0 115Browser/27.0.6.3"
+	defaultUserAgent = "Mozilla/5.0 115Browser/27.0.7.5"
 
 	defaultMinSleep = fs.Duration(1000 * time.Millisecond) // 1 transactions per second
 	maxSleep        = 2 * time.Second
@@ -74,22 +73,35 @@ func init() {
 		CommandHelp: commandHelp,
 		Options: []fs.Option{{
 			Name:      "uid",
-			Help:      "UID from cookie",
+			Help:      "UID from cookie (deprecated, consider migrating to option cookie)",
 			Required:  true,
 			Sensitive: true,
+			Hide:      fs.OptionHideBoth,
 		}, {
 			Name:      "cid",
-			Help:      "CID from cookie",
+			Help:      "CID from cookie (deprecated, consider migrating to option cookie)",
 			Required:  true,
 			Sensitive: true,
+			Hide:      fs.OptionHideBoth,
 		}, {
 			Name:      "seid",
-			Help:      "SEID from cookie",
+			Help:      "SEID from cookie (deprecated, consider migrating to option cookie)",
 			Required:  true,
 			Sensitive: true,
+			Hide:      fs.OptionHideBoth,
 		}, {
-			Name:      "cookie",
-			Help:      "cookie including UID, CID, SEID",
+			Name:      "kid",
+			Help:      "KID from cookie (deprecated, consider migrating to option cookie)",
+			Required:  true,
+			Sensitive: true,
+			Hide:      fs.OptionHideBoth,
+		}, {
+			Name: "cookie",
+			Help: `Provide a cookie in the format "UID=...; CID=...; SEID=...; KID=...;".
+
+This setting takes precedence over any individually defined UID, CID, SEID or KID options.
+Additionally, you can provide a comma-separated list of cookies to distribute requests 
+across multiple client instances for load balancing.`,
 			Required:  true,
 			Sensitive: true,
 		}, {
@@ -104,7 +116,6 @@ func init() {
 			Name:     "user_agent",
 			Default:  defaultUserAgent,
 			Advanced: true,
-			Hide:     fs.OptionHideBoth,
 			Help: fmt.Sprintf(`HTTP user agent used for 115.
 
 Defaults to "%s" or "--115-user-agent" provided on command line.`, defaultUserAgent),
@@ -141,7 +152,6 @@ Fill in for rclone to use a non root folder as its starting point.
 			Name:     "upload_hash_only",
 			Default:  false,
 			Advanced: true,
-			Hide:     fs.OptionHideBoth,
 			Help: `Skip uploading files that require network traffic, including
 
 	1) Incoming traffic for calculating file hashes locally
@@ -208,6 +218,20 @@ this may help to speed up the transfers.`,
 			Default:  1,
 			Advanced: true,
 		}, {
+			Name:      "download_cookie",
+			Sensitive: true,
+			Advanced:  true,
+			Help: `Set a comma-separated list of cookies for the download-only clients. 
+
+This enables separate client instances dedicated to downloading files`,
+		}, {
+			Name:     "download_no_proxy",
+			Default:  false,
+			Advanced: true,
+			Help: `Disable proxy settings for the download-only client.
+			
+Use this flag with the "--115-download-cookie" option to bypass proxy settings for downloads.`,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -230,6 +254,7 @@ type Options struct {
 	UID                 string               `config:"uid"`
 	CID                 string               `config:"cid"`
 	SEID                string               `config:"seid"`
+	KID                 string               `config:"kid"`
 	Cookie              string               `config:"cookie"`
 	ShareCode           string               `config:"share_code"`
 	ReceiveCode         string               `config:"receive_code"`
@@ -245,6 +270,8 @@ type Options struct {
 	ChunkSize           fs.SizeSuffix        `config:"chunk_size"`
 	MaxUploadParts      int                  `config:"max_upload_parts"`
 	UploadConcurrency   int                  `config:"upload_concurrency"`
+	DownloadCookie      string               `config:"download_cookie"`
+	DownloadNoProxy     bool                 `config:"download_no_proxy"`
 	Enc                 encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -254,8 +281,8 @@ type Fs struct {
 	root         string
 	opt          Options
 	features     *fs.Features
-	client       *http.Client // authorized client
-	srv          *rest.Client
+	srv          *poolClient        // authorized client
+	dsrv         *poolClient        // download-only client
 	dirCache     *dircache.DirCache // Map of directory path to directory id
 	pacer        *fs.Pacer
 	rootFolder   string // path of the absolute root
@@ -350,64 +377,117 @@ func errorHandler(resp *http.Response) error {
 	return errResponse
 }
 
+// getCookies extracts UID, CID, SEID and KID from a cookie string and returns of a list of *http.Cookie
+func getCookies(cookie string) (cks []*http.Cookie) {
+	if cookie == "" {
+		return
+	}
+
+	items := strings.Split(cookie, ";")
+	for _, item := range items {
+		kv := strings.Split(strings.TrimSpace(item), "=")
+		if len(kv) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(strings.ToUpper(kv[0]))
+		val := strings.TrimSpace(kv[1])
+		switch key {
+		case "UID", "CID", "SEID", "KID":
+			if val != "" {
+				cks = append(cks, &http.Cookie{Name: key, Value: val, Domain: domain, Path: "/", HttpOnly: true})
+			}
+		}
+	}
+	return
+}
+
 // getClient makes an http client according to the options
 func getClient(ctx context.Context, opt *Options) *http.Client {
 	t := fshttp.NewTransportCustom(ctx, func(t *http.Transport) {
 		t.TLSHandshakeTimeout = time.Duration(opt.ConTimeout)
 		t.ResponseHeaderTimeout = time.Duration(opt.Timeout)
+		if opt.DownloadCookie != "" && opt.DownloadNoProxy {
+			t.Proxy = nil
+		}
 	})
 	return &http.Client{
 		Transport: t,
 	}
 }
 
-// newClientWithPacer sets a new http/rest client with a pacer to Fs
+// poolClient wraps a pool of rest.Client for load-balancing requests
+type poolClient struct {
+	clients      []*rest.Client
+	clientMu     *sync.Mutex
+	currentIndex int
+}
+
+func (p *poolClient) client() *rest.Client {
+	if len(p.clients) == 1 {
+		return p.clients[0]
+	}
+	p.clientMu.Lock()
+	defer p.clientMu.Unlock()
+	cli := p.clients[p.currentIndex]
+	p.currentIndex = (p.currentIndex + 1) % len(p.clients)
+	return cli
+}
+
+func (p *poolClient) CallJSON(ctx context.Context, opts *rest.Opts, request interface{}, response interface{}) (resp *http.Response, err error) {
+	return p.client().CallJSON(ctx, opts, request, response)
+}
+
+func (p *poolClient) Call(ctx context.Context, opts *rest.Opts) (resp *http.Response, err error) {
+	return p.client().Call(ctx, opts)
+}
+
+func (p *poolClient) Do(req *http.Request) (*http.Response, error) {
+	return p.client().Do(req)
+}
+
+func newPoolClient(ctx context.Context, opt *Options, cookies string) *poolClient {
+	var clients []*rest.Client
+	for _, cookie := range strings.Split(cookies, ",") {
+		if cks := getCookies(cookie); len(cks) == 4 {
+			cli := rest.NewClient(getClient(ctx, opt)).SetRoot(rootURL).SetErrorHandler(errorHandler)
+			cli.SetCookie(cks...)
+			clients = append(clients, cli)
+		}
+	}
+	if len(clients) == 0 {
+		return nil
+	}
+	return &poolClient{
+		clients:  clients,
+		clientMu: new(sync.Mutex),
+	}
+}
+
+// newClientWithPacer sets a new pool client with a pacer to Fs
 func (f *Fs) newClientWithPacer(ctx context.Context, opt *Options) (err error) {
 	// Override few config settings and create a client
 	newCtx, ci := fs.AddConfig(ctx)
 	ci.UserAgent = opt.UserAgent
-	f.client = getClient(newCtx, opt)
 
-	f.srv = rest.NewClient(f.client).SetRoot(rootURL).SetErrorHandler(errorHandler)
-
-	// UID, CID, SEID from cookie
-	if opt.Cookie != "" {
-		if items := strings.Split(opt.Cookie, ";"); len(items) > 2 {
-			for _, item := range items {
-				kv := strings.Split(strings.TrimSpace(item), "=")
-				if len(kv) != 2 {
-					continue
-				}
-				key := strings.TrimSpace(strings.ToUpper(kv[0]))
-				val := strings.TrimSpace(kv[1])
-				switch key {
-				case "UID", "CID", "SEID":
-					reflect.ValueOf(opt).Elem().FieldByName(key).SetString(val)
-				}
-			}
-		}
+	f.srv = newPoolClient(newCtx, opt, opt.Cookie)
+	if f.srv == nil {
+		// if not found from opt.Cookie
+		cookie := fmt.Sprintf("UID=%s;CID=%s;SEID=%s;KID=%s", opt.UID, opt.CID, opt.SEID, opt.KID)
+		f.srv = newPoolClient(newCtx, opt, cookie)
 	}
-	f.srv.SetCookie(&http.Cookie{
-		Name:     "UID",
-		Value:    opt.UID,
-		Domain:   domain,
-		Path:     "/",
-		HttpOnly: true,
-	}, &http.Cookie{
-		Name:     "CID",
-		Value:    opt.CID,
-		Domain:   domain,
-		Path:     "/",
-		HttpOnly: true,
-	}, &http.Cookie{
-		Name:     "SEID",
-		Value:    opt.SEID,
-		Domain:   domain,
-		Path:     "/",
-		HttpOnly: true,
-	})
+	if f.srv == nil {
+		return fmt.Errorf("no cookies")
+	}
+
+	// download-only clients
+	f.dsrv = newPoolClient(newCtx, opt, opt.DownloadCookie)
 	f.userID, _, _ = strings.Cut(opt.UID, "_")
-	f.pacer = fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(opt.PacerMinSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))
+	adjustedMinSleep := time.Duration(opt.PacerMinSleep)
+	if numClients := len(f.srv.clients); numClients > 1 {
+		adjustedMinSleep /= time.Duration(numClients)
+		fs.Debugf(nil, "Starting newFs with %d clients", numClients)
+	}
+	f.pacer = fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(adjustedMinSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))
 	return nil
 }
 
@@ -463,8 +543,9 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 		fs.Debugf(nil, "Using App Version %q from User-Agent %q", f.appVer, opt.UserAgent)
 	}
 
-	if err := f.newClientWithPacer(ctx, opt); err != nil {
-		return nil, err
+	err = f.newClientWithPacer(ctx, opt)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize clients: %w", err)
 	}
 
 	return f, nil
@@ -1344,8 +1425,12 @@ func (o *Object) open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		delete(req.Header, "Range")
 	}
 	var res *http.Response
+	srv := o.fs.srv
+	if o.fs.dsrv != nil {
+		srv = o.fs.dsrv
+	}
 	err = o.fs.pacer.Call(func() (bool, error) {
-		res, err = o.fs.client.Do(req)
+		res, err = srv.Do(req)
 		return shouldRetry(ctx, res, nil, err)
 	})
 	if err != nil {
