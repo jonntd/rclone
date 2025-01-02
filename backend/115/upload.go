@@ -368,7 +368,7 @@ func (f *Fs) sampleUploadForm(ctx context.Context, in io.Reader, initResp *api.S
 	// Handle pipeReader.Close() error
 	defer func() {
 		if err := pipeReader.Close(); err != nil {
-			fs.Printf("failed to close pipeReader: %v", err)
+			fs.Errorf(nil, "failed to close pipe reader: %v", err)
 		}
 	}()
 
@@ -378,7 +378,7 @@ func (f *Fs) sampleUploadForm(ctx context.Context, in io.Reader, initResp *api.S
 	// Handle multipartWriter.Close() error in the writer goroutine
 	defer func() {
 		if err := multipartWriter.Close(); err != nil {
-			fs.Printf("failed to close multipartWriter: %v", err)
+			fs.Errorf(nil, "failed to close multipart writer: %v", err)
 		}
 	}()
 
@@ -390,7 +390,7 @@ func (f *Fs) sampleUploadForm(ctx context.Context, in io.Reader, initResp *api.S
 		// Ensure pipeWriter is closed and handle its error
 		defer func() {
 			if err := pipeWriter.Close(); err != nil {
-				fs.Printf("failed to close pipeWriter: %v", err)
+				errChan <- fmt.Errorf("failed to close pipe writer: %w", err)
 			}
 		}()
 
