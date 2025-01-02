@@ -415,7 +415,11 @@ func (f *Fs) sampleUploadForm(ctx context.Context, in io.Reader, initResp *api.S
 	if err != nil {
 		return nil, fmt.Errorf("post form error: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
