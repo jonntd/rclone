@@ -223,34 +223,19 @@ func (f *Fs) initUpload(ctx context.Context, size int64, name, dirID, sha1sum, s
 }
 
 // postUpload processes the callback data after upload
-func (f *Fs) postUpload(v interface{}) (*api.CallbackData, error) {
-	// v can be either a byte slice or already unmarshaled
-	var info api.CallbackInfo
-	var dataBytes []byte
-	switch v := v.(type) {
-	case []byte:
-		if err := json.Unmarshal(v, &info); err != nil {
-			return nil, err
-		}
-	default:
-		// Assume it's already unmarshaled into CallbackInfo
-		// You might need to adjust based on actual implementation
-		return nil, errors.New("unsupported type for postUpload")
-	}
-
-	if !info.State {
-		return nil, fmt.Errorf("API Error: %s (%d)", info.Message, info.Code)
-	}
-	// Assuming info.Data can be marshaled into CallbackData
-	dataBytes, err := json.Marshal(info.Data)
+func (f *Fs) postUpload(v map[string]any) (*api.CallbackData, error) {
+	callbackJson, err := json.Marshal(v)
 	if err != nil {
 		return nil, err
 	}
-	var callbackData api.CallbackData
-	if err := json.Unmarshal(dataBytes, &callbackData); err != nil {
+	var info api.CallbackInfo
+	if err := json.Unmarshal(callbackJson, &info); err != nil {
 		return nil, err
 	}
-	return &callbackData, nil
+	if !info.State {
+		return nil, fmt.Errorf("API Error: %s (%d)", info.Message, info.Code)
+	}
+	return info.Data, nil
 }
 
 // getOSSToken retrieves OSS token information
@@ -362,7 +347,6 @@ func (f *Fs) sampleInitUpload(ctx context.Context, size int64, name, dirID strin
 }
 
 // sampleUploadForm performs the multipart form upload to OSS using streaming to limit memory usage
-// sampleUploadForm performs the multipart form upload to OSS using streaming to limit memory usage
 func (f *Fs) sampleUploadForm(ctx context.Context, in io.Reader, initResp *api.SampleInitResp, name string, size int64, options ...fs.OpenOption) (*api.CallbackData, error) {
 	// Create a pipe for streaming multipart data
 	pipeReader, pipeWriter := io.Pipe()
@@ -469,9 +453,15 @@ func (f *Fs) sampleUploadForm(ctx context.Context, in io.Reader, initResp *api.S
 		return nil, fmt.Errorf("simple upload error: HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 
+	// **New Code to Unmarshal respBody into a map before passing to postUpload**
+	var respMap map[string]any
+	if err := json.Unmarshal(respBody, &respMap); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response body: %w", err)
+	}
+
 	// The response is the JSON callback from 115
 	// Parse it using postUpload
-	return f.postUpload(respBody)
+	return f.postUpload(respMap)
 }
 
 // upload uploads the object with or without using a temporary file name
