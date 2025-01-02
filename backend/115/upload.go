@@ -362,39 +362,33 @@ func (f *Fs) sampleInitUpload(ctx context.Context, size int64, name, dirID strin
 }
 
 // sampleUploadForm performs the multipart form upload to OSS using streaming to limit memory usage
+// sampleUploadForm performs the multipart form upload to OSS using streaming to limit memory usage
 func (f *Fs) sampleUploadForm(ctx context.Context, in io.Reader, initResp *api.SampleInitResp, name string, size int64, options ...fs.OpenOption) (*api.CallbackData, error) {
 	// Create a pipe for streaming multipart data
 	pipeReader, pipeWriter := io.Pipe()
-	// Handle pipeReader.Close() error
-	defer func() {
-		if err := pipeReader.Close(); err != nil {
-			fs.Errorf(nil, "failed to close pipe reader: %v", err)
-		}
-	}()
+	// Channel to capture any errors from the writer goroutine
+	errChan := make(chan error, 1)
 
 	// Create a multipart writer that writes to the pipe writer
 	multipartWriter := multipart.NewWriter(pipeWriter)
 
-	// Handle multipartWriter.Close() error in the writer goroutine
-	defer func() {
-		if err := multipartWriter.Close(); err != nil {
-			fs.Errorf(nil, "failed to close multipart writer: %v", err)
-		}
-	}()
-
-	// Channel to capture any errors from the writer goroutine
-	errChan := make(chan error, 1)
-
 	// Start a goroutine to write the multipart form data
 	go func() {
-		// Ensure pipeWriter is closed and handle its error
+		// Ensure that both the multipart writer and pipe writer are closed properly
 		defer func() {
+			// Close the multipart writer and send any errors to errChan
+			if err := multipartWriter.Close(); err != nil {
+				errChan <- fmt.Errorf("failed to close multipart writer: %w", err)
+				return
+			}
+			// Close the pipe writer and send any errors to errChan
 			if err := pipeWriter.Close(); err != nil {
 				errChan <- fmt.Errorf("failed to close pipe writer: %w", err)
+				return
 			}
+			// If everything is successful, send nil to indicate no errors
+			errChan <- nil
 		}()
-
-		defer multipartWriter.Close()
 
 		// Add normal form fields
 		fields := map[string]string{
@@ -438,9 +432,6 @@ func (f *Fs) sampleUploadForm(ctx context.Context, in io.Reader, initResp *api.S
 			errChan <- fmt.Errorf("failed to copy file data: %w", err)
 			return
 		}
-
-		// Signal completion without errors
-		errChan <- nil
 	}()
 
 	// Build the HTTP request with the pipe reader as the body
@@ -453,6 +444,8 @@ func (f *Fs) sampleUploadForm(ctx context.Context, in io.Reader, initResp *api.S
 	// Perform the HTTP request
 	resp, err := f.srv.client().Do(req)
 	if err != nil {
+		// Ensure that the pipe writer is closed to avoid goroutine leaks
+		_ = pipeWriter.CloseWithError(err)
 		return nil, fmt.Errorf("post form error: %w", err)
 	}
 	defer func() {
@@ -462,7 +455,8 @@ func (f *Fs) sampleUploadForm(ctx context.Context, in io.Reader, initResp *api.S
 	}()
 
 	// Wait for the writer goroutine to finish and check for errors
-	if writeErr := <-errChan; writeErr != nil {
+	writeErr := <-errChan
+	if writeErr != nil {
 		return nil, writeErr
 	}
 
