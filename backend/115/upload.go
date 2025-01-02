@@ -361,56 +361,78 @@ func (f *Fs) sampleInitUpload(ctx context.Context, size int64, name, dirID strin
 	return info, nil
 }
 
-// sampleUploadForm performs the multipart form upload to OSS
+// sampleUploadForm performs the multipart form upload to OSS using streaming to limit memory usage
 func (f *Fs) sampleUploadForm(ctx context.Context, in io.Reader, initResp *api.SampleInitResp, name string, size int64, options ...fs.OpenOption) (*api.CallbackData, error) {
-	// Prepare a multipart form body
-	var bodyBuf bytes.Buffer
-	w := multipart.NewWriter(&bodyBuf)
+	// Create a pipe for streaming multipart data
+	pipeReader, pipeWriter := io.Pipe()
+	defer pipeReader.Close()
 
-	// Add normal form fields
-	_ = w.WriteField("name", name)
-	_ = w.WriteField("key", initResp.Object)
-	_ = w.WriteField("policy", initResp.Policy)
-	_ = w.WriteField("OSSAccessKeyId", initResp.AccessID)
-	_ = w.WriteField("success_action_status", "200")
-	_ = w.WriteField("callback", initResp.Callback)
-	_ = w.WriteField("signature", initResp.Signature)
+	// Create a multipart writer that writes to the pipe writer
+	multipartWriter := multipart.NewWriter(pipeWriter)
 
-	// Apply additional upload options (e.g., headers like Cache-Control)
-	for _, option := range options {
-		key, value := option.Header()
-		switch strings.ToLower(key) {
-		case "cache-control":
-			_ = w.WriteField("Cache-Control", value)
-		case "content-disposition":
-			_ = w.WriteField("Content-Disposition", value)
-		case "content-encoding":
-			_ = w.WriteField("Content-Encoding", value)
-		case "content-type":
-			_ = w.WriteField("Content-Type", value)
+	// Channel to capture any errors from the writer goroutine
+	errChan := make(chan error, 1)
+
+	// Start a goroutine to write the multipart form data
+	go func() {
+		defer pipeWriter.Close()
+		defer multipartWriter.Close()
+
+		// Add normal form fields
+		fields := map[string]string{
+			"name":                  name,
+			"key":                   initResp.Object,
+			"policy":                initResp.Policy,
+			"OSSAccessKeyId":        initResp.AccessID,
+			"success_action_status": "200",
+			"callback":              initResp.Callback,
+			"signature":             initResp.Signature,
 		}
-	}
 
-	// Finally add the actual file
-	filePart, err := w.CreateFormFile("file", name)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create multipart file field: %w", err)
-	}
-	if _, err = io.Copy(filePart, in); err != nil {
-		return nil, fmt.Errorf("failed to copy file data: %w", err)
-	}
-	if err = w.Close(); err != nil {
-		return nil, fmt.Errorf("failed to finalize multipart body: %w", err)
-	}
+		for key, value := range fields {
+			if err := multipartWriter.WriteField(key, value); err != nil {
+				errChan <- fmt.Errorf("failed to write field %s: %w", key, err)
+				return
+			}
+		}
 
-	// Build the HTTP request
-	req, err := http.NewRequestWithContext(ctx, "POST", initResp.Host, &bodyBuf)
+		// Apply additional upload options (e.g., headers like Cache-Control)
+		for _, option := range options {
+			key, value := option.Header()
+			switch strings.ToLower(key) {
+			case "cache-control", "content-disposition", "content-encoding", "content-type":
+				if err := multipartWriter.WriteField(key, value); err != nil {
+					errChan <- fmt.Errorf("failed to write field %s: %w", key, err)
+					return
+				}
+			}
+		}
+
+		// Add the actual file part
+		filePart, err := multipartWriter.CreateFormFile("file", name)
+		if err != nil {
+			errChan <- fmt.Errorf("failed to create form file: %w", err)
+			return
+		}
+
+		// Stream the file content directly to the multipart writer
+		if _, err := io.Copy(filePart, in); err != nil {
+			errChan <- fmt.Errorf("failed to copy file data: %w", err)
+			return
+		}
+
+		// Signal completion without errors
+		errChan <- nil
+	}()
+
+	// Build the HTTP request with the pipe reader as the body
+	req, err := http.NewRequestWithContext(ctx, "POST", initResp.Host, pipeReader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build upload request: %w", err)
 	}
-	req.Header.Set("Content-Type", w.FormDataContentType())
+	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
 
-	// Fire the request
+	// Perform the HTTP request
 	resp, err := f.srv.client().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("post form error: %w", err)
@@ -421,6 +443,12 @@ func (f *Fs) sampleUploadForm(ctx context.Context, in io.Reader, initResp *api.S
 		}
 	}()
 
+	// Wait for the writer goroutine to finish and check for errors
+	if writeErr := <-errChan; writeErr != nil {
+		return nil, writeErr
+	}
+
+	// Read the response body
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response body: %w", err)
