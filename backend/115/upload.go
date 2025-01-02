@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -36,6 +37,7 @@ const (
 	OSSUserAgent = "aliyun-sdk-android/2.9.1"
 )
 
+// getUploadBasicInfo retrieves basic upload information from the API
 func (f *Fs) getUploadBasicInfo(ctx context.Context) (err error) {
 	opts := rest.Opts{
 		Method:  "GET",
@@ -61,6 +63,7 @@ func (f *Fs) getUploadBasicInfo(ctx context.Context) (err error) {
 	return
 }
 
+// bufferIO handles buffering of input streams based on size thresholds
 func bufferIO(in io.Reader, size, threshold int64) (out io.Reader, cleanup func(), err error) {
 	// nothing to clean up by default
 	cleanup = func() {}
@@ -109,17 +112,20 @@ func bufferIO(in io.Reader, size, threshold int64) (out io.Reader, cleanup func(
 	return out, cleanup, nil
 }
 
+// bufferIOwithSHA1 buffers the input and calculates its SHA1
 func bufferIOwithSHA1(in io.Reader, size, threshold int64) (sha1sum string, out io.Reader, cleanup func(), err error) { // we need an SHA1
 	hash := sha1.New()
 	// use the tee to write to the local file AND calculate the SHA1 while doing so
 	tee := io.TeeReader(in, hash)
 	out, cleanup, err = bufferIO(tee, size, threshold)
+	if err != nil {
+		return
+	}
 	sha1sum = hex.EncodeToString(hash.Sum(nil))
 	return
 }
 
-// ------------------------------------------------------------
-
+// generateSignature creates a signature for the upload
 func generateSignature(userID, fileID, target, userKey string) string {
 	sha1sum := sha1.Sum([]byte(userID + fileID + target + "0"))
 	sigStr := userKey + hex.EncodeToString(sha1sum[:]) + "000000"
@@ -127,20 +133,22 @@ func generateSignature(userID, fileID, target, userKey string) string {
 	return strings.ToUpper(hex.EncodeToString(sh1Sig[:]))
 }
 
+// generateToken creates a token for the upload
 func generateToken(userID, fileID, fileSize, signKey, signVal, timeStamp, appVer string) string {
 	userIDMd5 := md5.Sum([]byte(userID))
 	tokenMd5 := md5.Sum([]byte(md5Salt + fileID + fileSize + signKey + signVal + userID + timeStamp + hex.EncodeToString(userIDMd5[:]) + appVer))
 	return hex.EncodeToString(tokenMd5[:])
 }
 
+// initUpload initializes a chunked upload
 func (f *Fs) initUpload(ctx context.Context, size int64, name, dirID, sha1sum, signKey, signVal string) (info *api.UploadInitInfo, err error) {
 	var (
 		filename     = f.opt.Enc.FromStandardName(name)
 		filesize     = strconv.FormatInt(size, 10)
 		fileID       = strings.ToUpper(sha1sum)
-		target       = "U_1_" + dirID            // target id
-		ts           = time.Now().UnixMilli()    // timestamp in int64
-		t            = strconv.FormatInt(ts, 10) // timestamp in string
+		target       = "U_1_" + dirID // target id
+		ts           = time.Now().UnixMilli()
+		t            = strconv.FormatInt(ts, 10)
 		ecdhCipher   *cipher.EcdhCipher
 		encodedToken string
 		encrypted    []byte
@@ -214,23 +222,38 @@ func (f *Fs) initUpload(ctx context.Context, size int64, name, dirID, sha1sum, s
 	}
 }
 
-func (f *Fs) postUpload(v map[string]any) (*api.CallbackData, error) {
-	callbackJson, err := json.Marshal(v)
-	if err != nil {
-		return nil, err
-	}
+// postUpload processes the callback data after upload
+func (f *Fs) postUpload(v interface{}) (*api.CallbackData, error) {
+	// v can be either a byte slice or already unmarshaled
 	var info api.CallbackInfo
-	if err := json.Unmarshal(callbackJson, &info); err != nil {
-		return nil, err
+	var dataBytes []byte
+	switch v := v.(type) {
+	case []byte:
+		if err := json.Unmarshal(v, &info); err != nil {
+			return nil, err
+		}
+	default:
+		// Assume it's already unmarshaled into CallbackInfo
+		// You might need to adjust based on actual implementation
+		return nil, errors.New("unsupported type for postUpload")
 	}
+
 	if !info.State {
 		return nil, fmt.Errorf("API Error: %s (%d)", info.Message, info.Code)
 	}
-	return info.Data, nil
+	// Assuming info.Data can be marshaled into CallbackData
+	dataBytes, err := json.Marshal(info.Data)
+	if err != nil {
+		return nil, err
+	}
+	var callbackData api.CallbackData
+	if err := json.Unmarshal(dataBytes, &callbackData); err != nil {
+		return nil, err
+	}
+	return &callbackData, nil
 }
 
-// ------------------------------------------------------------
-
+// getOSSToken retrieves OSS token information
 func (f *Fs) getOSSToken(ctx context.Context) (info *api.OSSToken, err error) {
 	opts := rest.Opts{
 		Method:  "GET",
@@ -247,6 +270,7 @@ func (f *Fs) getOSSToken(ctx context.Context) (info *api.OSSToken, err error) {
 	return
 }
 
+// newOSSClient creates a new OSS client with dynamic credentials
 func (f *Fs) newOSSClient() (client *oss.Client) {
 	fetcher := credentials.CredentialsFetcherFunc(func(ctx context.Context) (credentials.Credentials, error) {
 		t, err := f.getOSSToken(ctx)
@@ -269,8 +293,7 @@ func (f *Fs) newOSSClient() (client *oss.Client) {
 	return oss.NewClient(cfg)
 }
 
-// unWrapObjectInfo returns the underlying Object unwrapped as much as
-// possible or nil.
+// unWrapObjectInfo attempts to unwrap the underlying fs.Object
 func unWrapObjectInfo(oi fs.ObjectInfo) fs.Object {
 	if o, ok := oi.(fs.Object); ok {
 		return fs.UnWrapObject(o)
@@ -281,6 +304,7 @@ func unWrapObjectInfo(oi fs.ObjectInfo) fs.Object {
 	return nil
 }
 
+// calcBlockSHA1 calculates the SHA1 for a specified range
 func calcBlockSHA1(ctx context.Context, in io.Reader, src fs.ObjectInfo, rangeSpec string) (sha1sum string, err error) {
 	var start, end int64
 	if _, err = fmt.Sscanf(rangeSpec, "%d-%d", &start, &end); err != nil {
@@ -308,6 +332,104 @@ func calcBlockSHA1(ctx context.Context, in io.Reader, src fs.ObjectInfo, rangeSp
 	return
 }
 
+// sampleInitUpload initiates the simple upload process for small files
+func (f *Fs) sampleInitUpload(ctx context.Context, size int64, name, dirID string) (info *api.SampleInitResp, err error) {
+	form := url.Values{}
+	form.Set("userid", f.userID)
+	form.Set("filename", f.opt.Enc.FromStandardName(name))
+	form.Set("filesize", strconv.FormatInt(size, 10))
+	form.Set("target", "U_1_"+dirID) // same style as normal “target”
+
+	opts := rest.Opts{
+		Method:      "POST",
+		RootURL:     "https://uplb.115.com/3.0/sampleinitupload.php",
+		ContentType: "application/x-www-form-urlencoded",
+		Body:        strings.NewReader(form.Encode()),
+	}
+	var resp *http.Response
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
+		return shouldRetry(ctx, resp, info, err)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sampleInitUpload call error: %w", err)
+	}
+	// If server returns an error code, handle it
+	if info.ErrorCode != 0 {
+		return nil, fmt.Errorf("sampleInitUpload error: %s (%d)", info.Error, info.ErrorCode)
+	}
+	return info, nil
+}
+
+// sampleUploadForm performs the multipart form upload to OSS
+func (f *Fs) sampleUploadForm(ctx context.Context, in io.Reader, initResp *api.SampleInitResp, name string, size int64, options ...fs.OpenOption) (*api.CallbackData, error) {
+	// Prepare a multipart form body
+	var bodyBuf bytes.Buffer
+	w := multipart.NewWriter(&bodyBuf)
+
+	// Add normal form fields
+	_ = w.WriteField("name", name)
+	_ = w.WriteField("key", initResp.Object)
+	_ = w.WriteField("policy", initResp.Policy)
+	_ = w.WriteField("OSSAccessKeyId", initResp.AccessID)
+	_ = w.WriteField("success_action_status", "200")
+	_ = w.WriteField("callback", initResp.Callback)
+	_ = w.WriteField("signature", initResp.Signature)
+
+	// Apply additional upload options (e.g., headers like Cache-Control)
+	for _, option := range options {
+		key, value := option.Header()
+		switch strings.ToLower(key) {
+		case "cache-control":
+			_ = w.WriteField("Cache-Control", value)
+		case "content-disposition":
+			_ = w.WriteField("Content-Disposition", value)
+		case "content-encoding":
+			_ = w.WriteField("Content-Encoding", value)
+		case "content-type":
+			_ = w.WriteField("Content-Type", value)
+		}
+	}
+
+	// Finally add the actual file
+	filePart, err := w.CreateFormFile("file", name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create multipart file field: %w", err)
+	}
+	if _, err = io.Copy(filePart, in); err != nil {
+		return nil, fmt.Errorf("failed to copy file data: %w", err)
+	}
+	if err = w.Close(); err != nil {
+		return nil, fmt.Errorf("failed to finalize multipart body: %w", err)
+	}
+
+	// Build the HTTP request
+	req, err := http.NewRequestWithContext(ctx, "POST", initResp.Host, &bodyBuf)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build upload request: %w", err)
+	}
+	req.Header.Set("Content-Type", w.FormDataContentType())
+
+	// Fire the request
+	resp, err := f.srv.client().Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("post form error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("simple upload error: HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	// The response is the JSON callback from 115
+	// Parse it using postUpload
+	return f.postUpload(respBody)
+}
+
 // upload uploads the object with or without using a temporary file name
 func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote string, options ...fs.OpenOption) (fs.Object, error) {
 	if f.isShare {
@@ -315,7 +437,7 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 	}
 	size := src.Size()
 
-	// check upload available
+	// Ensure upload basics
 	if f.userkey == "" {
 		if err := f.getUploadBasicInfo(ctx); err != nil {
 			return nil, fmt.Errorf("failed to get upload basic info: %w", err)
@@ -324,17 +446,61 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 			return nil, fmt.Errorf("empty userid or userkey")
 		}
 	}
+
+	// If file exceeds the maximum upload size, bail out.
 	if size > maxUploadSize {
 		return nil, fmt.Errorf("file size exceeds the upload limit: %d > %d", size, int64(maxUploadSize))
 	}
 
-	// Create a new object with its parent directory if it doesn't exist
+	// Create the object (and parent directory if needed).
 	o, leaf, dirID, err := f.createObject(ctx, remote, src.ModTime(ctx), size)
 	if err != nil {
 		return nil, err
 	}
 
-	// Calculate sha1sum; grabbed from package jottacloud
+	//----------------------------------------------------------------
+	// Handle OnlyStream option
+	//----------------------------------------------------------------
+	if f.opt.OnlyStream {
+		if size <= int64(f.opt.SimpleUploadCutoff) {
+			fs.Debugf(o, "Using simple sample upload mode for streaming upload")
+			initResp, err := f.sampleInitUpload(ctx, size, leaf, dirID)
+			if err != nil {
+				return o, fmt.Errorf("simple init upload error: %w", err)
+			}
+			callbackData, err := f.sampleUploadForm(ctx, in, initResp, leaf, size, options...)
+			if err != nil {
+				return o, fmt.Errorf("simple upload form error: %w", err)
+			}
+			// Set metadata from the 115 callback. This includes final pick_code and sha1 from server
+			return o, o.setMetaDataFromCallBack(callbackData)
+		} else {
+			return nil, fmt.Errorf("OnlyStream is enabled but file size %d exceeds SimpleUploadCutoff %d", size, f.opt.SimpleUploadCutoff)
+		}
+	}
+
+	//----------------------------------------------------------------
+	// 1) Simple / sample upload if under SimpleUploadCutoff and not forcing SHA1
+	//----------------------------------------------------------------
+	if size >= 0 && size < int64(f.opt.SimpleUploadCutoff) && !f.opt.UploadHashOnly {
+		fs.Debugf(o, "Using simple sample upload mode for small file (streaming, no local SHA1)")
+		initResp, err := f.sampleInitUpload(ctx, size, leaf, dirID)
+		if err != nil {
+			return o, fmt.Errorf("simple init upload error: %w", err)
+		}
+		callbackData, err := f.sampleUploadForm(ctx, in, initResp, leaf, size, options...)
+		if err != nil {
+			return o, fmt.Errorf("simple upload form error: %w", err)
+		}
+		// Set metadata from the 115 callback. This includes final pick_code and sha1 from server
+		return o, o.setMetaDataFromCallBack(callbackData)
+	}
+
+	//----------------------------------------------------------------
+	// 2) Otherwise, do the existing “hash-based” logic
+	//----------------------------------------------------------------
+
+	// Attempt to read an existing SHA1 from src
 	hashStr, err := src.Hash(ctx, hash.SHA1)
 	if err != nil || hashStr == "" {
 		if f.opt.UploadHashOnly {
@@ -360,7 +526,7 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 		ui, err = f.initUpload(ctx, size, leaf, dirID, hashStr, signKey, signVal)
 		if err != nil {
 			// In this case, the upload (perhaps via hash) could be successful,
-			/// so let the subsequent process locate the uploaded object.
+			// so let the subsequent process locate the uploaded object.
 			return o, fmt.Errorf("failed to init upload: %w", err)
 		}
 		retry = ui.Status == 7

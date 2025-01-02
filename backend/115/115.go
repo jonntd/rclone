@@ -63,6 +63,7 @@ const (
 	maxUploadParts      = 10000                          // Part number must be an integer between 1 and 10000, inclusive.
 	minChunkSize        = fs.SizeSuffix(1024 * 1024 * 5) // Part size should be in [100KB, 5GB]
 	defaultUploadCutoff = fs.SizeSuffix(200 * 1024 * 1024)
+	defaultSimpleUpload = fs.SizeSuffix(100 * 1024 * 1024) // 100MB
 )
 
 // Register with Fs
@@ -162,6 +163,11 @@ Fill in for rclone to use a non root folder as its starting point.
 	1) Incoming traffic for calculating file hashes locally
 	2) Outgoing traffic for uploading to the storage server`,
 		}, {
+			Name:     "only_stream",
+			Default:  false,
+			Advanced: true,
+			Help:     `Enable streaming for all files.`,
+		}, {
 			Name:     "hash_memory_limit",
 			Help:     "Files bigger than this will be cached on disk to calculate hash if required.",
 			Default:  fs.SizeSuffix(10 * 1024 * 1024),
@@ -173,6 +179,11 @@ Fill in for rclone to use a non root folder as its starting point.
 Any files larger than this will be uploaded in chunks of chunk_size.
 The minimum is 0 and the maximum is 5 GiB.`,
 			Default:  defaultUploadCutoff,
+			Advanced: true,
+		}, {
+			Name:     "simple_upload_cutoff",
+			Help:     `Stream files lower than this directly to the server. Max is 20GiB`,
+			Default:  defaultSimpleUpload,
 			Advanced: true,
 		}, {
 			Name: "chunk_size",
@@ -272,7 +283,9 @@ type Options struct {
 	Timeout             fs.Duration          `config:"timeout"`
 	HashMemoryThreshold fs.SizeSuffix        `config:"hash_memory_limit"`
 	UploadHashOnly      bool                 `config:"upload_hash_only"`
+	OnlyStream          bool                 `config:"only_stream"`
 	UploadCutoff        fs.SizeSuffix        `config:"upload_cutoff"`
+	SimpleUploadCutoff  fs.SizeSuffix        `config:"simple_upload_cutoff"`
 	ChunkSize           fs.SizeSuffix        `config:"chunk_size"`
 	MaxUploadParts      int                  `config:"max_upload_parts"`
 	UploadConcurrency   int                  `config:"upload_concurrency"`

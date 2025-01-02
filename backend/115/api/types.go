@@ -491,3 +491,16 @@ type ShareDownloadInfo struct {
 	FileSize Int64       `json:"fs"`
 	URL      DownloadURL `json:"url"`
 }
+
+// SampleInitResp represents the response from sampleinitupload.php
+type SampleInitResp struct {
+	Object    string `json:"object"`
+	AccessID  string `json:"accessid"`
+	Host      string `json:"host"`
+	Policy    string `json:"policy"`
+	Signature string `json:"signature"`
+	Expire    int64  `json:"expire"`
+	Callback  string `json:"callback"`
+	ErrorCode int    `json:"errno,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
