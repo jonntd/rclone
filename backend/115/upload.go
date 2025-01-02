@@ -365,17 +365,35 @@ func (f *Fs) sampleInitUpload(ctx context.Context, size int64, name, dirID strin
 func (f *Fs) sampleUploadForm(ctx context.Context, in io.Reader, initResp *api.SampleInitResp, name string, size int64, options ...fs.OpenOption) (*api.CallbackData, error) {
 	// Create a pipe for streaming multipart data
 	pipeReader, pipeWriter := io.Pipe()
-	defer pipeReader.Close()
+	// Handle pipeReader.Close() error
+	defer func() {
+		if err := pipeReader.Close(); err != nil {
+			fs.Printf("failed to close pipeReader: %v", err)
+		}
+	}()
 
 	// Create a multipart writer that writes to the pipe writer
 	multipartWriter := multipart.NewWriter(pipeWriter)
+
+	// Handle multipartWriter.Close() error in the writer goroutine
+	defer func() {
+		if err := multipartWriter.Close(); err != nil {
+			fs.Printf("failed to close multipartWriter: %v", err)
+		}
+	}()
 
 	// Channel to capture any errors from the writer goroutine
 	errChan := make(chan error, 1)
 
 	// Start a goroutine to write the multipart form data
 	go func() {
-		defer pipeWriter.Close()
+		// Ensure pipeWriter is closed and handle its error
+		defer func() {
+			if err := pipeWriter.Close(); err != nil {
+				fs.Printf("failed to close pipeWriter: %v", err)
+			}
+		}()
+
 		defer multipartWriter.Close()
 
 		// Add normal form fields
