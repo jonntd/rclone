@@ -1202,7 +1202,7 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 	}
 
 	if check {
-		found, err := f.listAll(ctx, rootID, 32, false, false, func(item *api.File) bool {
+		found, err := f.listAll(ctx, rootID, f.opt.ListChunk, false, false, func(item *api.File) bool {
 			fs.Debugf(dir, "Rmdir: contains file: %q", item.Name)
 			return true
 		})
