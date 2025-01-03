@@ -136,7 +136,7 @@ Fill in for rclone to use a non root folder as its starting point.
 			Sensitive: true,
 		}, {
 			Name:     "list_chunk",
-			Default:  11500,
+			Default:  1150,
 			Help:     "Size of listing chunk.",
 			Advanced: true,
 		}, {
@@ -925,7 +925,7 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 	}
 
 	var info *api.File
-	found, err := f.listAll(ctx, o.parent, 32, true, false, func(item *api.File) bool {
+	found, err := f.listAll(ctx, o.parent, f.opt.ListChunk, true, false, func(item *api.File) bool {
 		if strings.ToLower(item.Sha) == o.sha1sum {
 			info = item
 			return true
