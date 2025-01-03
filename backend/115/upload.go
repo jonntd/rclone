@@ -20,6 +20,7 @@ import (
 
 	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss"
 	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss/credentials"
+	"github.com/cenkalti/backoff/v4"
 	"github.com/rclone/rclone/backend/115/api"
 	"github.com/rclone/rclone/backend/115/cipher"
 	"github.com/rclone/rclone/fs"
@@ -130,80 +131,104 @@ func generateToken(userID, fileID, fileSize, signKey, signVal, timeStamp, appVer
 
 // initUpload calls 115's initupload endpoint. This is used for both 秒传 checks and actual uploads.
 func (f *Fs) initUpload(ctx context.Context, size int64, name, dirID, sha1sum, signKey, signVal string) (*api.UploadInitInfo, error) {
-	filename := f.opt.Enc.FromStandardName(name)
-	filesize := strconv.FormatInt(size, 10)
-	fileID := strings.ToUpper(sha1sum) // if sha1 not known, pass ""
-	target := "U_1_" + dirID           // 115 style
-	ts := time.Now().UnixMilli()
-	t := strconv.FormatInt(ts, 10)
+	operation := func() (*api.UploadInitInfo, error) {
+		filename := f.opt.Enc.FromStandardName(name)
+		filesize := strconv.FormatInt(size, 10)
+		fileID := strings.ToUpper(sha1sum) // if sha1 not known, pass ""
+		target := "U_1_" + dirID           // 115 style
+		ts := time.Now().UnixMilli()
+		t := strconv.FormatInt(ts, 10)
 
-	ecdhCipher, err := cipher.NewEcdhCipher()
-	if err != nil {
-		return nil, err
-	}
-	encodedToken, err := ecdhCipher.EncodeToken(ts)
-	if err != nil {
-		return nil, err
+		ecdhCipher, err := cipher.NewEcdhCipher()
+		if err != nil {
+			return nil, err
+		}
+		encodedToken, err := ecdhCipher.EncodeToken(ts)
+		if err != nil {
+			return nil, err
+		}
+
+		form := url.Values{}
+		form.Set("appid", "0")
+		form.Set("appversion", f.appVer)
+		form.Set("userid", f.userID)
+		form.Set("filename", filename)
+		form.Set("filesize", filesize)
+		form.Set("fileid", fileID) // uppercase
+		form.Set("target", target)
+		form.Set("sig", generateSignature(f.userID, fileID, target, f.userkey))
+		form.Set("t", t)
+		form.Set("token", generateToken(f.userID, fileID, filesize, signKey, signVal, t, f.appVer))
+		if signKey != "" && signVal != "" {
+			form.Set("sign_key", signKey)
+			form.Set("sign_val", signVal)
+		}
+		encryptedBody, err := ecdhCipher.Encrypt([]byte(form.Encode()))
+		if err != nil {
+			return nil, err
+		}
+
+		opts := rest.Opts{
+			Method:      "POST",
+			RootURL:     "https://uplb.115.com/4.0/initupload.php",
+			ContentType: "application/x-www-form-urlencoded",
+			Parameters:  url.Values{"k_ec": {encodedToken}},
+			Body:        bytes.NewReader(encryptedBody),
+		}
+		var resp *http.Response
+		err = f.pacer.Call(func() (bool, error) {
+			resp, err = f.srv.Call(ctx, &opts)
+			return shouldRetry(ctx, resp, nil, err)
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		// Ensure resp is not nil before proceeding
+		if resp == nil {
+			return nil, errors.New("initUpload: received nil response without error")
+		}
+
+		body, err := rest.ReadBody(resp)
+		if err != nil {
+			return nil, err
+		}
+		decrypted, err := ecdhCipher.Decrypt(body)
+		if err != nil {
+			return nil, err
+		}
+		var info api.UploadInitInfo
+		if err = json.Unmarshal(decrypted, &info); err != nil {
+			return nil, err
+		}
+		if info.ErrorCode != 0 && info.ErrorCode != 701 {
+			return nil, fmt.Errorf("%s (%d)", info.ErrorMsg, info.ErrorCode)
+		}
+		return &info, nil
 	}
 
-	form := url.Values{}
-	form.Set("appid", "0")
-	form.Set("appversion", f.appVer)
-	form.Set("userid", f.userID)
-	form.Set("filename", filename)
-	form.Set("filesize", filesize)
-	form.Set("fileid", fileID) // uppercase
-	form.Set("target", target)
-	form.Set("sig", generateSignature(f.userID, fileID, target, f.userkey))
-	form.Set("t", t)
-	form.Set("token", generateToken(f.userID, fileID, filesize, signKey, signVal, t, f.appVer))
-	if signKey != "" && signVal != "" {
-		form.Set("sign_key", signKey)
-		form.Set("sign_val", signVal)
-	}
-	encryptedBody, err := ecdhCipher.Encrypt([]byte(form.Encode()))
-	if err != nil {
-		return nil, err
+	var ui *api.UploadInitInfo
+	operationWithRetry := func() (*api.UploadInitInfo, error) {
+		expBackoff := backoff.NewExponentialBackOff()
+		expBackoff.MaxElapsedTime = 2 * time.Minute
+		err := backoff.RetryNotify(func() error {
+			var err error
+			ui, err = operation()
+			if err != nil {
+				return err
+			}
+			return nil
+		}, expBackoff, func(err error, duration time.Duration) {
+			fs.Logf(nil, "initUpload failed: %v. Retrying in %v", err, duration)
+		})
+		return ui, err
 	}
 
-	opts := rest.Opts{
-		Method:      "POST",
-		RootURL:     "https://uplb.115.com/4.0/initupload.php",
-		ContentType: "application/x-www-form-urlencoded",
-		Parameters:  url.Values{"k_ec": {encodedToken}},
-		Body:        bytes.NewReader(encryptedBody),
-	}
-	var resp *http.Response
-	err = f.pacer.Call(func() (bool, error) {
-		// Use = instead of := to assign to the outer variables
-		resp, err = f.srv.Call(ctx, &opts)
-		return shouldRetry(ctx, resp, nil, err)
-	})
+	ui, err := operationWithRetry()
 	if err != nil {
 		return nil, err
 	}
-
-	// Ensure resp is not nil before proceeding
-	if resp == nil {
-		return nil, errors.New("initUpload: received nil response without error")
-	}
-
-	body, err := rest.ReadBody(resp)
-	if err != nil {
-		return nil, err
-	}
-	decrypted, err := ecdhCipher.Decrypt(body)
-	if err != nil {
-		return nil, err
-	}
-	var info api.UploadInitInfo
-	if err = json.Unmarshal(decrypted, &info); err != nil {
-		return nil, err
-	}
-	if info.ErrorCode != 0 && info.ErrorCode != 701 {
-		return nil, fmt.Errorf("%s (%d)", info.ErrorMsg, info.ErrorCode)
-	}
-	return &info, nil
+	return ui, nil
 }
 
 // postUpload processes the JSON callback after an upload to OSS or sample upload.
@@ -513,65 +538,86 @@ func (f *Fs) uploadToOSS(
 	o *Object,
 	leaf, dirID string,
 	size int64,
-	ui *api.UploadInitInfo, // New parameter
+	ui *api.UploadInitInfo, // Existing parameter
 	options ...fs.OpenOption,
 ) (fs.Object, error) {
 	if ui == nil {
 		return nil, fmt.Errorf("uploadToOSS: initUpload info is nil")
 	}
 
-	// Decide between single-part and multipart uploads
-	cutoff := int64(o.fs.opt.UploadCutoff)
-	if size < cutoff {
-		// Single-part upload
-		fs.Debugf(o, "uploadToOSS: single-part => size=%d < cutoff=%d", size, cutoff)
-		client := f.newOSSClient()
-		req := &oss.PutObjectRequest{
-			Bucket:      oss.Ptr(ui.Bucket),
-			Key:         oss.Ptr(ui.Object),
-			Body:        in,
-			Callback:    oss.Ptr(ui.GetCallback()),
-			CallbackVar: oss.Ptr(ui.GetCallbackVar()),
-		}
-		// Apply options
-		for _, opt := range options {
-			k, v := opt.Header()
-			switch strings.ToLower(k) {
-			case "cache-control":
-				req.CacheControl = oss.Ptr(v)
-			case "content-disposition":
-				req.ContentDisposition = oss.Ptr(v)
-			case "content-encoding":
-				req.ContentEncoding = oss.Ptr(v)
-			case "content-type":
-				req.ContentType = oss.Ptr(v)
+	// Define the upload operation
+	operation := func() error {
+		// Decide between single-part and multipart uploads
+		cutoff := int64(o.fs.opt.UploadCutoff)
+		if size < cutoff {
+			// Single-part upload
+			fs.Debugf(o, "uploadToOSS: single-part => size=%d < cutoff=%d", size, cutoff)
+			client := f.newOSSClient()
+			req := &oss.PutObjectRequest{
+				Bucket:      oss.Ptr(ui.Bucket),
+				Key:         oss.Ptr(ui.Object),
+				Body:        in,
+				Callback:    oss.Ptr(ui.GetCallback()),
+				CallbackVar: oss.Ptr(ui.GetCallbackVar()),
 			}
+			// Apply options
+			for _, opt := range options {
+				k, v := opt.Header()
+				switch strings.ToLower(k) {
+				case "cache-control":
+					req.CacheControl = oss.Ptr(v)
+				case "content-disposition":
+					req.ContentDisposition = oss.Ptr(v)
+				case "content-encoding":
+					req.ContentEncoding = oss.Ptr(v)
+				case "content-type":
+					req.ContentType = oss.Ptr(v)
+				}
+			}
+			res, err := client.PutObject(ctx, req)
+			if err != nil {
+				return fmt.Errorf("uploadToOSS: single-part putObject error: %w", err)
+			}
+			data, err := f.postUpload(res.CallbackResult)
+			if err != nil {
+				return fmt.Errorf("uploadToOSS: single-part finalize error: %w", err)
+			}
+			if err = o.setMetaDataFromCallBack(data); err != nil {
+				return fmt.Errorf("uploadToOSS: setting metadata error: %w", err)
+			}
+			return nil
 		}
-		res, err := client.PutObject(ctx, req)
+
+		// Multipart upload
+		fs.Debugf(o, "uploadToOSS: starting multipart for size=%d >= cutoff=%d", size, cutoff)
+		mu, err := f.newChunkWriter(ctx, remote(o), src, ui, in, options...)
 		if err != nil {
-			return nil, fmt.Errorf("uploadToOSS: single-part putObject error: %w", err)
+			return fmt.Errorf("uploadToOSS: multipart init error: %w", err)
 		}
-		data, err := f.postUpload(res.CallbackResult)
+		if err = mu.Upload(ctx); err != nil {
+			return fmt.Errorf("uploadToOSS: multipart upload error: %w", err)
+		}
+		data, err := f.postUpload(mu.callbackRes)
 		if err != nil {
-			return nil, fmt.Errorf("uploadToOSS: single-part finalize error: %w", err)
+			return fmt.Errorf("uploadToOSS: multipart finalize error: %w", err)
 		}
-		return o, o.setMetaDataFromCallBack(data)
+		if err = o.setMetaDataFromCallBack(data); err != nil {
+			return fmt.Errorf("uploadToOSS: setting metadata error: %w", err)
+		}
+		return nil
 	}
 
-	// Multipart upload
-	fs.Debugf(o, "uploadToOSS: starting multipart for size=%d >= cutoff=%d", size, cutoff)
-	mu, err := f.newChunkWriter(ctx, remote(o), src, ui, in, options...)
+	// Execute the upload operation with retries
+	expBackoff := backoff.NewExponentialBackOff()
+	expBackoff.MaxElapsedTime = 2 * time.Minute
+	err := backoff.RetryNotify(operation, expBackoff, func(err error, duration time.Duration) {
+		fs.Logf(o, "uploadToOSS failed: %v. Retrying in %v", err, duration)
+	})
 	if err != nil {
-		return nil, fmt.Errorf("uploadToOSS: multipart init error: %w", err)
+		return nil, err
 	}
-	if err = mu.Upload(ctx); err != nil {
-		return nil, fmt.Errorf("uploadToOSS: multipart upload error: %w", err)
-	}
-	data, err := f.postUpload(mu.callbackRes)
-	if err != nil {
-		return nil, fmt.Errorf("uploadToOSS: multipart finalize error: %w", err)
-	}
-	return o, o.setMetaDataFromCallBack(data)
+
+	return o, nil
 }
 
 // doSampleUpload is a helper to perform the "simple form" approach for small files.
@@ -632,7 +678,11 @@ func (f *Fs) upload(
 	//----------------------------------------------------------------
 	if f.opt.OnlyStream {
 		if size <= int64(StreamUploadLimit) {
-			return f.doSampleUpload(ctx, in, o, leaf, dirID, size, options...)
+			obj, err := f.doSampleUpload(ctx, in, o, leaf, dirID, size, options...)
+			if err != nil {
+				return nil, err
+			}
+			return obj, nil
 		}
 		return nil, fmt.Errorf("OnlyStream is enabled but file size %d exceeds StreamUploadLimit %d",
 			size, StreamUploadLimit)
@@ -645,7 +695,11 @@ func (f *Fs) upload(
 		noHashSize := int64(f.opt.NohashSize)
 		if size <= noHashSize {
 			// Tiny files use sample upload
-			return f.doSampleUpload(ctx, in, o, leaf, dirID, size, options...)
+			obj, err := f.doSampleUpload(ctx, in, o, leaf, dirID, size, options...)
+			if err != nil {
+				return nil, err
+			}
+			return obj, nil
 		}
 		// Attempt fast upload (秒传)
 		gotIt, ui, err := f.tryHashUpload(ctx, in, src, o, leaf, dirID, size)
@@ -653,24 +707,36 @@ func (f *Fs) upload(
 			return nil, fmt.Errorf("FastUpload: 秒传 error: %w", err)
 		}
 		if gotIt {
-			// Fast upload successful
-			if o == nil {
-				return nil, fmt.Errorf("秒传 upload returned nil object without error")
-			}
 			return o, nil
 		}
 		// Fallback to uploadToOSS using the obtained UploadInitInfo
 		if ui != nil {
 			if size <= int64(StreamUploadLimit) {
-				return f.doSampleUpload(ctx, in, o, leaf, dirID, size, options...)
+				obj, err := f.doSampleUpload(ctx, in, o, leaf, dirID, size, options...)
+				if err != nil {
+					return nil, err
+				}
+				return obj, nil
 			}
-			return f.uploadToOSS(ctx, in, src, o, leaf, dirID, size, ui, options...)
+			obj, err := f.uploadToOSS(ctx, in, src, o, leaf, dirID, size, ui, options...)
+			if err != nil {
+				return nil, err
+			}
+			return obj, nil
 		}
 		// If ui is nil, fallback to standard upload
 		if size <= int64(StreamUploadLimit) {
-			return f.doSampleUpload(ctx, in, o, leaf, dirID, size, options...)
+			obj, err := f.doSampleUpload(ctx, in, o, leaf, dirID, size, options...)
+			if err != nil {
+				return nil, err
+			}
+			return obj, nil
 		}
-		return f.uploadToOSS(ctx, in, src, o, leaf, dirID, size, nil, options...)
+		obj, err := f.uploadToOSS(ctx, in, src, o, leaf, dirID, size, nil, options...)
+		if err != nil {
+			return nil, err
+		}
+		return obj, nil
 	}
 
 	//----------------------------------------------------------------
@@ -686,9 +752,6 @@ func (f *Fs) upload(
 			return nil, err
 		}
 		if gotIt {
-			if o == nil {
-				return nil, fmt.Errorf("秒传 upload returned nil object without error")
-			}
 			return o, nil
 		}
 		// No fallback for UploadHashOnly
@@ -700,22 +763,31 @@ func (f *Fs) upload(
 	//----------------------------------------------------------------
 	if size >= 0 && size < int64(f.opt.NohashSize) && !f.opt.UploadHashOnly {
 		// Use sample upload for small files
-		return f.doSampleUpload(ctx, in, o, leaf, dirID, size, options...)
+		obj, err := f.doSampleUpload(ctx, in, o, leaf, dirID, size, options...)
+		if err != nil {
+			return nil, err
+		}
+		return obj, nil
 	}
 
 	// Attempt fast upload (秒传)
 	gotIt, ui, err := f.tryHashUpload(ctx, in, src, o, leaf, dirID, size)
 	if err != nil {
 		fs.Debugf(o, "normal: 秒传 error => fallback to uploadToOSS: %v", err)
-		return f.uploadToOSS(ctx, in, src, o, leaf, dirID, size, ui, options...)
+		obj, uploadErr := f.uploadToOSS(ctx, in, src, o, leaf, dirID, size, ui, options...)
+		if uploadErr != nil {
+			return nil, uploadErr
+		}
+		return obj, nil
 	}
 	if gotIt {
-		if o == nil {
-			return nil, fmt.Errorf("秒传 upload returned nil object without error")
-		}
 		// Fast upload successful
 		return o, nil
 	}
 	// Fallback to actual upload to OSS
-	return f.uploadToOSS(ctx, in, src, o, leaf, dirID, size, ui, options...)
+	obj, err := f.uploadToOSS(ctx, in, src, o, leaf, dirID, size, ui, options...)
+	if err != nil {
+		return nil, err
+	}
+	return obj, nil
 }
