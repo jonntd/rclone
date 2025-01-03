@@ -59,12 +59,12 @@ const (
 	defaultConTimeout = fs.Duration(10 * time.Second) // from rclone global flags - Connect timeout (default 1m0s)
 	defaultTimeout    = fs.Duration(45 * time.Second) // from rclone global flags - IO idle timeout (default 5m0s)
 
-	maxUploadSize       = 123480309760               // 115 GiB from https://proapi.115.com/app/uploadinfo
-	maxUploadParts      = 10000                      // Part number must be an integer between 1 and 10000, inclusive.
-	minChunkSize        = fs.SizeSuffix(5 * fs.Mebi) // Part size should be in [100KB, 5GB]
-	defaultUploadCutoff = fs.SizeSuffix(200 * fs.Mebi)
-	defaultNohashSize   = fs.SizeSuffix(100 * fs.Mebi) // 100MB
-	StreamUploadLimit   = fs.SizeSuffix(20 * fs.Gibi)  // 20GB
+	maxUploadSize       = 115 * fs.Gibi // 115 GiB from https://proapi.115.com/app/uploadinfo
+	maxUploadParts      = 10000         // Part number must be an integer between 1 and 10000, inclusive.
+	minChunkSize        = 5 * fs.Mebi   // Part size should be in [100KB, 5GB]
+	defaultUploadCutoff = 200 * fs.Mebi
+	defaultNohashSize   = 100 * fs.Mebi
+	StreamUploadLimit   = 20 * fs.Gibi
 )
 
 // Register with Fs
