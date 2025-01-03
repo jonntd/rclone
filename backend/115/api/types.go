@@ -390,14 +390,14 @@ type CallbackInfo struct {
 }
 
 type CallbackData struct {
-	AID      int    `json:"aid,omitempty"`
-	CID      string `json:"cid,omitempty"`
-	FileID   string `json:"file_id,omitempty"`
-	FileName string `json:"file_name,omitempty"`
-	FileSize Int64  `json:"file_size,omitempty"`
-	IsVideo  int    `json:"is_video,omitempty"`
-	PickCode string `json:"pick_code,omitempty"`
-	Sha      string `json:"sha1,omitempty"`
+	AID      int    `json:"aid"`
+	CID      string `json:"cid"`
+	FileID   string `json:"file_id"`
+	FileName string `json:"file_name"`
+	FileSize Int64  `json:"file_size"`
+	IsVideo  int    `json:"is_video"`
+	PickCode string `json:"pick_code"`
+	Sha      string `json:"sha1"`
 	ThumbURL string `json:"thumb_url,omitempty"`
 }
 
