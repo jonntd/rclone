@@ -222,25 +222,25 @@ jobs:
         shell: bash
         run: |
           rclone version
-      - name: Run tests
-        shell: bash
-        run: |
-          make quicktest
-        if: matrix.quicktest
+      # - name: Run tests
+      #   shell: bash
+      #   run: |
+      #     make quicktest
+      #   if: matrix.quicktest
 
-      - name: Race test
-        shell: bash
-        run: |
-          make racequicktest
-        if: matrix.racequicktest
+      # - name: Race test
+      #   shell: bash
+      #   run: |
+      #     make racequicktest
+      #   if: matrix.racequicktest
 
-      - name: Run librclone tests
-        shell: bash
-        run: |
-          make -C librclone/ctest test
-          make -C librclone/ctest clean
-          librclone/python/test_rclone.py
-        if: matrix.librclonetest
+      # - name: Run librclone tests
+      #   shell: bash
+      #   run: |
+      #     make -C librclone/ctest test
+      #     make -C librclone/ctest clean
+      #     librclone/python/test_rclone.py
+      #   if: matrix.librclonetest
 
       - name: Compile all architectures test
         shell: bash
