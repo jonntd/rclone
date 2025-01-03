@@ -659,7 +659,7 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 	}
 
 	// If file exceeds the maximum upload size, bail out immediately (same as original).
-	if size > maxUploadSize {
+	if size > int64(maxUploadSize) {
 		return nil, fmt.Errorf("file size exceeds the upload limit: %d > %d", size, int64(maxUploadSize))
 	}
 
@@ -740,7 +740,7 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 				return o, fmt.Errorf("sample upload form error: %w", err)
 			}
 			return o, o.setMetaDataFromCallBack(callbackData)
-		} else if size < maxUploadSize {
+		} else if size < int64(maxUploadSize) {
 			// chunked/multipart upload
 			fs.Debugf(o, "Fallback to multipart upload: size=%d < maxUploadSize", size)
 			return f.doMultipartUpload(ctx, in, src, o, leaf, dirID, size, options...)
