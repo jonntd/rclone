@@ -59,11 +59,12 @@ const (
 	defaultConTimeout = fs.Duration(10 * time.Second) // from rclone global flags - Connect timeout (default 1m0s)
 	defaultTimeout    = fs.Duration(45 * time.Second) // from rclone global flags - IO idle timeout (default 5m0s)
 
-	maxUploadSize       = 123480309760                   // 115 GiB from https://proapi.115.com/app/uploadinfo
-	maxUploadParts      = 10000                          // Part number must be an integer between 1 and 10000, inclusive.
-	minChunkSize        = fs.SizeSuffix(1024 * 1024 * 5) // Part size should be in [100KB, 5GB]
-	defaultUploadCutoff = fs.SizeSuffix(200 * 1024 * 1024)
-	defaultSimpleUpload = fs.SizeSuffix(100 * 1024 * 1024) // 100MB
+	maxUploadSize       = 123480309760               // 115 GiB from https://proapi.115.com/app/uploadinfo
+	maxUploadParts      = 10000                      // Part number must be an integer between 1 and 10000, inclusive.
+	minChunkSize        = fs.SizeSuffix(5 * fs.Mebi) // Part size should be in [100KB, 5GB]
+	defaultUploadCutoff = fs.SizeSuffix(200 * fs.Mebi)
+	defaultNohashSize   = fs.SizeSuffix(100 * fs.Mebi) // 100MB
+	StreamUploadLimit   = fs.SizeSuffix(20 * fs.Gibi)  // 20GB
 )
 
 // Register with Fs
@@ -168,6 +169,14 @@ Fill in for rclone to use a non root folder as its starting point.
 			Advanced: true,
 			Help:     `Enable streaming for all files.`,
 		}, {
+			Name:     "fast_upload",
+			Default:  false,
+			Advanced: true,
+			Help: `For file under nohash_size, upload directly to the server.
+			For other file, try hash-upload first.
+			If failed, if nohash_size<size<StreamUploadLimit, upload directly to the server.
+			If StreamUploadLimit<size<maxUploadSize, upload by multipart upload.`,
+		}, {
 			Name:     "hash_memory_limit",
 			Help:     "Files bigger than this will be cached on disk to calculate hash if required.",
 			Default:  fs.SizeSuffix(10 * 1024 * 1024),
@@ -181,9 +190,9 @@ The minimum is 0 and the maximum is 5 GiB.`,
 			Default:  defaultUploadCutoff,
 			Advanced: true,
 		}, {
-			Name:     "simple_upload_cutoff",
-			Help:     `Stream files lower than this directly to the server. Max is 20GiB`,
-			Default:  defaultSimpleUpload,
+			Name:     "nohash_size",
+			Help:     `Files lower than this directly to the server. Max is 20GiB`,
+			Default:  defaultNohashSize,
 			Advanced: true,
 		}, {
 			Name: "chunk_size",
@@ -284,8 +293,9 @@ type Options struct {
 	HashMemoryThreshold fs.SizeSuffix        `config:"hash_memory_limit"`
 	UploadHashOnly      bool                 `config:"upload_hash_only"`
 	OnlyStream          bool                 `config:"only_stream"`
+	FastUpload          bool                 `config:"fast_upload"`
 	UploadCutoff        fs.SizeSuffix        `config:"upload_cutoff"`
-	SimpleUploadCutoff  fs.SizeSuffix        `config:"simple_upload_cutoff"`
+	NohashSize          fs.SizeSuffix        `config:"nohash_size"`
 	ChunkSize           fs.SizeSuffix        `config:"chunk_size"`
 	MaxUploadParts      int                  `config:"max_upload_parts"`
 	UploadConcurrency   int                  `config:"upload_concurrency"`
@@ -618,6 +628,18 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 	if err != nil {
 		return nil, err
 	}
+
+	// Add validation to ensure fast_upload, only_stream and upload_hash_only are not set simultaneously
+	if opt.FastUpload && opt.OnlyStream {
+		return nil, errors.New("fast_upload and only_stream cannot be set simultaneously")
+	}
+	if opt.FastUpload && opt.UploadHashOnly {
+		return nil, errors.New("fast_upload and upload_hash_only cannot be set simultaneously")
+	}
+	if opt.OnlyStream && opt.UploadHashOnly {
+		return nil, errors.New("only_stream and upload_hash_only cannot be set simultaneously")
+	}
+
 	err = checkUploadChunkSize(opt.ChunkSize)
 	if err != nil {
 		return nil, fmt.Errorf("115: chunk size: %w", err)

@@ -464,6 +464,183 @@ func (f *Fs) sampleUploadForm(ctx context.Context, in io.Reader, initResp *api.S
 	return f.postUpload(respMap)
 }
 
+// tryHashUpload tries the hash-based upload.
+// If successful, it returns nil. If it fails, return an error so the caller can fallback to something else.
+func (f *Fs) tryHashUpload(ctx context.Context, in io.Reader, src fs.ObjectInfo, o *Object, leaf, dirID string, size int64, options ...fs.OpenOption) error {
+	// 1) Check if src already has a SHA1
+	hashStr, err := src.Hash(ctx, hash.SHA1)
+	if err != nil || hashStr == "" {
+		// If no SHA1, let's attempt to compute it ourselves.
+		// (Or you might choose to bail out – up to you.)
+		fs.Debugf(o, "tryHashUpload: Computing SHA1 locally...")
+		var cleanup func()
+		hashStr, in, cleanup, err = bufferIOwithSHA1(in, size, int64(f.opt.HashMemoryThreshold))
+		defer cleanup()
+		if err != nil {
+			return fmt.Errorf("failed to calculate SHA1: %w", err)
+		}
+	} else {
+		fs.Debugf(o, "tryHashUpload: Using precomputed SHA1=%s", hashStr)
+	}
+
+	// 2) Do the actual “hash-based” init + single- or multi- part logic.
+	//    If it fails, return an error.
+	_, err = f.doHashBasedUpload(ctx, in, src, o, leaf, dirID, size, hashStr, options...)
+	return err
+}
+
+// doHashBasedUpload does your existing hashed initialization and upload flow.
+func (f *Fs) doHashBasedUpload(ctx context.Context, in io.Reader, src fs.ObjectInfo, o *Object,
+	leaf, dirID string, size int64, knownSha1 string, options ...fs.OpenOption) (fs.Object, error) {
+
+	//----------------------------------------------------------------
+	// 1) initUpload with knownSha1 (or compute if empty).
+	//----------------------------------------------------------------
+	hashStr := knownSha1
+	if hashStr == "" {
+		// compute if not provided
+		fs.Debugf(o, "doHashBasedUpload: no knownSha1 => computing...")
+		var cleanup func()
+		var err error
+		hashStr, in, cleanup, err = bufferIOwithSHA1(in, size, int64(f.opt.HashMemoryThreshold))
+		defer cleanup()
+		if err != nil {
+			return nil, fmt.Errorf("failed to calculate SHA1: %w", err)
+		}
+	}
+	o.sha1sum = strings.ToLower(hashStr)
+
+	ui, err := f.initUpload(ctx, size, leaf, dirID, hashStr, "", "")
+	if err != nil {
+		return o, fmt.Errorf("failed to init upload: %w", err)
+	}
+
+	//----------------------------------------------------------------
+	// 2) Possibly handle repeated status=7 block checks
+	//    (the exact logic you have for repeated init calls).
+	//----------------------------------------------------------------
+	signKey, signVal := "", ""
+	for retry := true; retry; {
+		retry = ui.Status == 7
+		switch ui.Status {
+		case 1:
+			fs.Debugf(o, "Hash-based: Ready to upload to OSS (status=1)")
+		case 2:
+			fs.Debugf(o, "Hash-based: Upload finished instantly (status=2). No traffic!")
+			if acc, ok := in.(*accounting.Account); ok && acc != nil {
+				acc.ServerSideTransferStart()
+				acc.ServerSideCopyEnd(size)
+			}
+			if info, err2 := f.getFile(ctx, "", ui.PickCode); err2 == nil {
+				return o, o.setMetaData(info)
+			}
+			return o, nil
+		case 7:
+			// do the partial block hash check
+			signKey = ui.SignKey
+			if signVal, err = calcBlockSHA1(ctx, in, src, ui.SignCheck); err != nil {
+				return nil, fmt.Errorf("failed to calculate block hash: %w", err)
+			}
+			fs.Debugf(o, "Retrying init upload: Status 7 with signKey=%q signVal=%q", signKey, signVal)
+
+			// re-init with updated signKey, signVal
+			ui, err = f.initUpload(ctx, size, leaf, dirID, hashStr, signKey, signVal)
+			if err != nil {
+				return nil, fmt.Errorf("failed to init upload: %w", err)
+			}
+		default:
+			return nil, fmt.Errorf("unexpected status: %#v", ui)
+		}
+	}
+
+	//----------------------------------------------------------------
+	// 3) If size < cutoff => single part. Else => chunked/multipart.
+	//----------------------------------------------------------------
+	if size < 0 || size >= int64(o.fs.opt.UploadCutoff) {
+		// chunked
+		mu, err := f.newChunkWriter(ctx, remote(o), src, ui, in, options...)
+		if err != nil {
+			return nil, fmt.Errorf("multipart upload init error: %w", err)
+		}
+		if err = mu.Upload(ctx); err != nil {
+			return nil, err
+		}
+		data, err := f.postUpload(mu.callbackRes)
+		if err != nil {
+			return nil, fmt.Errorf("multipart finalize error: %w", err)
+		}
+		return o, o.setMetaDataFromCallBack(data)
+	}
+
+	// single part
+	client := f.newOSSClient()
+	req := &oss.PutObjectRequest{
+		Bucket:      oss.Ptr(ui.Bucket),
+		Key:         oss.Ptr(ui.Object),
+		Body:        in,
+		Callback:    oss.Ptr(ui.GetCallback()),
+		CallbackVar: oss.Ptr(ui.GetCallbackVar()),
+	}
+	// Apply upload options
+	for _, option := range options {
+		key, value := option.Header()
+		switch strings.ToLower(key) {
+		case "cache-control":
+			req.CacheControl = oss.Ptr(value)
+		case "content-disposition":
+			req.ContentDisposition = oss.Ptr(value)
+		case "content-encoding":
+			req.ContentEncoding = oss.Ptr(value)
+		case "content-type":
+			req.ContentType = oss.Ptr(value)
+		}
+	}
+
+	res, err := client.PutObject(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("single-part putObject error: %w", err)
+	}
+	data, err := f.postUpload(res.CallbackResult)
+	if err != nil {
+		return nil, fmt.Errorf("single-part finalize error: %w", err)
+	}
+	return o, o.setMetaDataFromCallBack(data)
+}
+
+// doMultipartUpload is a smaller helper to unify chunked upload logic
+func (f *Fs) doMultipartUpload(
+	ctx context.Context,
+	in io.Reader,
+	src fs.ObjectInfo,
+	o *Object,
+	leaf, dirID string,
+	size int64,
+	options ...fs.OpenOption,
+) (fs.Object, error) {
+	fs.Debugf(o, "Performing chunked/multipart upload for size=%d", size)
+	ui, err := f.initUpload(ctx, size, leaf, dirID, "", "", "") // no hash check here
+	if err != nil {
+		return nil, fmt.Errorf("multipart init error: %w", err)
+	}
+	mu, err := f.newChunkWriter(ctx, remote(o), src, ui, in, options...)
+	if err != nil {
+		return nil, fmt.Errorf("multipart upload failed to initialise: %w", err)
+	}
+	if err = mu.Upload(ctx); err != nil {
+		return nil, err
+	}
+	data, err := f.postUpload(mu.callbackRes)
+	if err != nil {
+		return nil, fmt.Errorf("multipart finalize error: %w", err)
+	}
+	return o, o.setMetaDataFromCallBack(data)
+}
+
+// remote is just a helper to get the full path or object name if needed.
+func remote(o *Object) string {
+	return o.fs.root + o.remote
+}
+
 // upload uploads the object with or without using a temporary file name
 func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote string, options ...fs.OpenOption) (fs.Object, error) {
 	if f.isShare {
@@ -481,7 +658,7 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 		}
 	}
 
-	// If file exceeds the maximum upload size, bail out.
+	// If file exceeds the maximum upload size, bail out immediately (same as original).
 	if size > maxUploadSize {
 		return nil, fmt.Errorf("file size exceeds the upload limit: %d > %d", size, int64(maxUploadSize))
 	}
@@ -493,11 +670,14 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 	}
 
 	//----------------------------------------------------------------
-	// Handle OnlyStream option
+	// 1) If OnlyStream is set:
+	//
+	//    - If file size <= StreamUploadLimit => sample upload.
+	//    - If file size above => bail out.
 	//----------------------------------------------------------------
 	if f.opt.OnlyStream {
-		if size <= int64(f.opt.SimpleUploadCutoff) {
-			fs.Debugf(o, "Using simple sample upload mode for streaming upload")
+		if size <= int64(StreamUploadLimit) {
+			fs.Debugf(o, "OnlyStream: Using simple sample upload mode (<= StreamUploadLimit).")
 			initResp, err := f.sampleInitUpload(ctx, size, leaf, dirID)
 			if err != nil {
 				return o, fmt.Errorf("simple init upload error: %w", err)
@@ -506,18 +686,94 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 			if err != nil {
 				return o, fmt.Errorf("simple upload form error: %w", err)
 			}
-			// Set metadata from the 115 callback. This includes final pick_code and sha1 from server
+			// Set metadata from callback.
 			return o, o.setMetaDataFromCallBack(callbackData)
 		} else {
-			return nil, fmt.Errorf("OnlyStream is enabled but file size %d exceeds SimpleUploadCutoff %d", size, f.opt.SimpleUploadCutoff)
+			return nil, fmt.Errorf("OnlyStream is enabled but file size %d exceeds StreamUploadLimit %d",
+				size, StreamUploadLimit)
 		}
 	}
 
 	//----------------------------------------------------------------
-	// 1) Simple / sample upload if under SimpleUploadCutoff and not forcing SHA1
+	// 2) If FastUpload is set:
+	//
+	//    - If size <= nohash_size => use sample upload right away.
+	//    - If size > nohash_size => try hash-based upload:
+	//         * If initUpload or block check fails:
+	//              - if nohash_size < size < StreamUploadLimit => sample upload
+	//              - else if StreamUploadLimit <= size < maxUploadSize => do chunked/multipart upload
+	//              - else => bail out
 	//----------------------------------------------------------------
-	if size >= 0 && size < int64(f.opt.SimpleUploadCutoff) && !f.opt.UploadHashOnly {
-		fs.Debugf(o, "Using simple sample upload mode for small file (streaming, no local SHA1)")
+	if f.opt.FastUpload {
+		noHashSize := int64(f.opt.NohashSize) // define how/where you store this
+		if size <= noHashSize {
+			fs.Debugf(o, "FastUpload: size <= nohash_size => simple sample upload.")
+			initResp, err := f.sampleInitUpload(ctx, size, leaf, dirID)
+			if err != nil {
+				return o, fmt.Errorf("simple init upload error: %w", err)
+			}
+			callbackData, err := f.sampleUploadForm(ctx, in, initResp, leaf, size, options...)
+			if err != nil {
+				return o, fmt.Errorf("simple upload form error: %w", err)
+			}
+			return o, o.setMetaDataFromCallBack(callbackData)
+		}
+
+		// Otherwise, attempt hash-based logic below in a helper
+		hashUpErr := f.tryHashUpload(ctx, in, src, o, leaf, dirID, size, options...)
+		if hashUpErr == nil {
+			// Hash upload succeeded
+			return o, nil
+		}
+
+		// If the hash-based upload fails, fall back to sample/multipart if possible:
+		fs.Debugf(o, "FastUpload: hash-based upload failed => fallback logic.")
+		if size <= int64(StreamUploadLimit) && size > noHashSize {
+			// fallback to simple sample
+			fs.Debugf(o, "Fallback to sample upload: nohash_size < size <= StreamUploadLimit")
+			initResp, err := f.sampleInitUpload(ctx, size, leaf, dirID)
+			if err != nil {
+				return o, fmt.Errorf("sample init upload error: %w", err)
+			}
+			callbackData, err := f.sampleUploadForm(ctx, in, initResp, leaf, size, options...)
+			if err != nil {
+				return o, fmt.Errorf("sample upload form error: %w", err)
+			}
+			return o, o.setMetaDataFromCallBack(callbackData)
+		} else if size < maxUploadSize {
+			// chunked/multipart upload
+			fs.Debugf(o, "Fallback to multipart upload: size=%d < maxUploadSize", size)
+			return f.doMultipartUpload(ctx, in, src, o, leaf, dirID, size, options...)
+		} else {
+			return nil, fmt.Errorf("FastUpload fallback: file size %d exceeds maximum upload limit", size)
+		}
+	}
+
+	//----------------------------------------------------------------
+	// 3) If UploadHashOnly is set:
+	//
+	//    - Maintain original logic: if there's no precomputed SHA1 => skip.
+	//    - Otherwise do hash-based upload only, no sample fallback.
+	//----------------------------------------------------------------
+	if f.opt.UploadHashOnly {
+		fs.Debugf(o, "UploadHashOnly: Checking if src has a SHA1.")
+		hashStr, err := src.Hash(ctx, hash.SHA1)
+		if err != nil || hashStr == "" {
+			return nil, fserrors.NoRetryError(errors.New("UploadHashOnly: skipping as src has no SHA1"))
+		}
+		// If we do have the SHA1, run the existing hash-based upload.
+		fs.Debugf(o, "UploadHashOnly: src has SHA1=%s -> continuing hash-based upload", hashStr)
+		return f.doHashBasedUpload(ctx, in, src, o, leaf, dirID, size, hashStr, options...)
+	}
+
+	//----------------------------------------------------------------
+	// 4) If none of them are set (the original logic):
+	//
+	//    - "Simple / sample upload if under NohashSize and not forcing SHA1,
+	//       otherwise do the existing “hash-based” logic"
+	//----------------------------------------------------------------
+	if size >= 0 && size < int64(f.opt.NohashSize) && !f.opt.UploadHashOnly {
+		fs.Debugf(o, "Normal: Using simple sample upload mode for small file.")
 		initResp, err := f.sampleInitUpload(ctx, size, leaf, dirID)
 		if err != nil {
 			return o, fmt.Errorf("simple init upload error: %w", err)
@@ -526,123 +782,10 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 		if err != nil {
 			return o, fmt.Errorf("simple upload form error: %w", err)
 		}
-		// Set metadata from the 115 callback. This includes final pick_code and sha1 from server
 		return o, o.setMetaDataFromCallBack(callbackData)
 	}
 
-	//----------------------------------------------------------------
-	// 2) Otherwise, do the existing “hash-based” logic
-	//----------------------------------------------------------------
-
-	// Attempt to read an existing SHA1 from src
-	hashStr, err := src.Hash(ctx, hash.SHA1)
-	if err != nil || hashStr == "" {
-		if f.opt.UploadHashOnly {
-			return nil, fserrors.NoRetryError(errors.New("skipping as no SHA1 from src"))
-		}
-		fs.Debugf(o, "Buffering to calculate SHA1...")
-		var cleanup func()
-		hashStr, in, cleanup, err = bufferIOwithSHA1(in, size, int64(f.opt.HashMemoryThreshold))
-		defer cleanup()
-		if err != nil {
-			return nil, fmt.Errorf("failed to calculate SHA1: %w", err)
-		}
-	} else {
-		fs.Debugf(o, "Using SHA1 from src: %s", hashStr)
-	}
-
-	// set calculated sha1 hash
-	o.sha1sum = strings.ToLower(hashStr)
-
-	var ui *api.UploadInitInfo
-	signKey, signVal := "", ""
-	for retry := true; retry; {
-		ui, err = f.initUpload(ctx, size, leaf, dirID, hashStr, signKey, signVal)
-		if err != nil {
-			// In this case, the upload (perhaps via hash) could be successful,
-			// so let the subsequent process locate the uploaded object.
-			return o, fmt.Errorf("failed to init upload: %w", err)
-		}
-		retry = ui.Status == 7
-		switch ui.Status {
-		case 1:
-			if f.opt.UploadHashOnly {
-				return nil, fserrors.NoRetryError(errors.New("skipping as --115-upload-hash-only flag turned on"))
-			}
-			fs.Debugf(o, "Upload will begin shortly. Outgoing traffic will occur...")
-		case 2:
-			// ui gives valid pickcode in this case but not available when listing
-			fs.Debugf(o, "Upload finished early. No outgoing traffic will occur!")
-			if acc, ok := in.(*accounting.Account); ok && acc != nil {
-				// if `in io.Reader` is still in type of `*accounting.Account` (meaning that it is unused)
-				// it is considered as a server side copy as no incoming/outgoing traffic occur at all
-				acc.ServerSideTransferStart()
-				acc.ServerSideCopyEnd(size)
-			}
-			if info, err := f.getFile(ctx, "", ui.PickCode); err == nil {
-				return o, o.setMetaData(info)
-			}
-			return o, nil
-		case 7:
-			signKey = ui.SignKey
-			if signVal, err = calcBlockSHA1(ctx, in, src, ui.SignCheck); err != nil {
-				return nil, fmt.Errorf("failed to calculate block hash: %w", err)
-			}
-			fs.Debugf(o, "Retrying init upload: Status 7")
-		default:
-			return nil, fmt.Errorf("unexpected status: %#v", ui)
-		}
-	}
-
-	if size < 0 || size >= int64(o.fs.opt.UploadCutoff) {
-		mu, err := f.newChunkWriter(ctx, remote, src, ui, in, options...)
-		if err != nil {
-			return nil, fmt.Errorf("multipart upload failed to initialise: %w", err)
-		}
-		if err = mu.Upload(ctx); err != nil {
-			return nil, err
-		}
-		data, err := f.postUpload(mu.callbackRes)
-		if err != nil {
-			return nil, fmt.Errorf("multipart upload failed to finalize: %w", err)
-		}
-		return o, o.setMetaDataFromCallBack(data)
-	}
-
-	// upload singlepart
-	client := f.newOSSClient()
-	req := &oss.PutObjectRequest{
-		Bucket:      oss.Ptr(ui.Bucket),
-		Key:         oss.Ptr(ui.Object),
-		Body:        in,
-		Callback:    oss.Ptr(ui.GetCallback()),
-		CallbackVar: oss.Ptr(ui.GetCallbackVar()),
-	}
-	// Apply upload options
-	for _, option := range options {
-		key, value := option.Header()
-		lowerKey := strings.ToLower(key)
-		switch lowerKey {
-		case "":
-			// ignore
-		case "cache-control":
-			req.CacheControl = oss.Ptr(value)
-		case "content-disposition":
-			req.ContentDisposition = oss.Ptr(value)
-		case "content-encoding":
-			req.ContentEncoding = oss.Ptr(value)
-		case "content-type":
-			req.ContentType = oss.Ptr(value)
-		}
-	}
-
-	res, err := client.PutObject(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	data, err := f.postUpload(res.CallbackResult)
-	if err != nil {
-		return nil, fmt.Errorf("failed to finalize upload: %w", err)
-	}
-	return o, o.setMetaDataFromCallBack(data)
+	// Otherwise do the existing “hash-based” logic
+	fs.Debugf(o, "Normal: Doing existing hash-based logic (size >= nohash_size).")
+	return f.doHashBasedUpload(ctx, in, src, o, leaf, dirID, size, "", options...)
 }
