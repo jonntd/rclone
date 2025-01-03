@@ -940,6 +940,11 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 		// In this case, the upload (perhaps via hash) could be successful,
 		/// so let the subsequent process locate the uploaded object.
 	}
+
+	if newObj == nil {
+		return nil, fmt.Errorf("upload returned nil object without error")
+	}
+
 	o := newObj.(*Object)
 
 	if o.hasMetaData {

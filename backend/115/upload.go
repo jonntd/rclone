@@ -654,6 +654,9 @@ func (f *Fs) upload(
 		}
 		if gotIt {
 			// Fast upload successful
+			if o == nil {
+				return nil, fmt.Errorf("秒传 upload returned nil object without error")
+			}
 			return o, nil
 		}
 		// Fallback to uploadToOSS using the obtained UploadInitInfo
@@ -683,6 +686,9 @@ func (f *Fs) upload(
 			return nil, err
 		}
 		if gotIt {
+			if o == nil {
+				return nil, fmt.Errorf("秒传 upload returned nil object without error")
+			}
 			return o, nil
 		}
 		// No fallback for UploadHashOnly
@@ -704,6 +710,9 @@ func (f *Fs) upload(
 		return f.uploadToOSS(ctx, in, src, o, leaf, dirID, size, ui, options...)
 	}
 	if gotIt {
+		if o == nil {
+			return nil, fmt.Errorf("秒传 upload returned nil object without error")
+		}
 		// Fast upload successful
 		return o, nil
 	}
