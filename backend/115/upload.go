@@ -531,6 +531,10 @@ func (f *Fs) tryHashUpload(
 			}
 			ui, isSpecialError, err = f.initUpload(ctx, size, leaf, dirID, hashStr, signKey, signVal)
 			if err != nil {
+				if isSpecialError {
+					fs.Logf(o, "tryHashUpload: 秒传 re-init error but lz4 error is expected")
+					return true, ui, isSpecialError, nil
+				}
 				return false, nil, isSpecialError, fmt.Errorf("tryHashUpload: 秒传 re-init error: %w", err)
 			}
 			continue
@@ -727,15 +731,11 @@ func (f *Fs) upload(
 		}
 		// Attempt fast upload (秒传)
 		gotIt, ui, isSpecialError, err := f.tryHashUpload(ctx, in, src, o, leaf, dirID, size)
-		if isSpecialError {
-			return o, true, nil
-		}
 		if err != nil {
 			return nil, false, fmt.Errorf("FastUpload: 秒传 error: %w", err)
 		}
-
 		if gotIt {
-			return o, false, nil
+			return o, isSpecialError, nil
 		}
 		// Fallback to uploadToOSS using the obtained UploadInitInfo
 		if ui != nil {
@@ -776,14 +776,11 @@ func (f *Fs) upload(
 			return nil, false, fserrors.NoRetryError(errors.New("UploadHashOnly: skipping since no SHA1"))
 		}
 		gotIt, _, isSpecialError, err := f.tryHashUpload(ctx, in, src, o, leaf, dirID, size)
-		if isSpecialError {
-			return o, true, nil
-		}
 		if err != nil {
 			return nil, false, err
 		}
 		if gotIt {
-			return o, false, nil
+			return o, isSpecialError, nil
 		}
 		// No fallback for UploadHashOnly
 		return nil, false, fserrors.NoRetryError(errors.New("UploadHashOnly: server does not have file => skipping"))
@@ -803,9 +800,6 @@ func (f *Fs) upload(
 
 	// Attempt fast upload (秒传)
 	gotIt, ui, isSpecialError, err := f.tryHashUpload(ctx, in, src, o, leaf, dirID, size)
-	if isSpecialError {
-		return o, true, nil
-	}
 	if err != nil {
 		fs.Debugf(o, "normal: 秒传 error => fallback to uploadToOSS: %v", err)
 		obj, uploadErr := f.uploadToOSS(ctx, in, src, o, leaf, dirID, size, ui, options...)
@@ -816,7 +810,7 @@ func (f *Fs) upload(
 	}
 	if gotIt {
 		// Fast upload successful
-		return o, false, nil
+		return o, isSpecialError, nil
 	}
 	// Fallback to actual upload to OSS
 	obj, err := f.uploadToOSS(ctx, in, src, o, leaf, dirID, size, ui, options...)
