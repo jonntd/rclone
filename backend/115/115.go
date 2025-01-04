@@ -64,7 +64,7 @@ const (
 	minChunkSize        = 5 * fs.Mebi   // Part size should be in [100KB, 5GB]
 	defaultUploadCutoff = 200 * fs.Mebi
 	defaultNohashSize   = 100 * fs.Mebi
-	StreamUploadLimit   = 20 * fs.Gibi
+	StreamUploadLimit   = 5 * fs.Gibi
 )
 
 // Register with Fs
