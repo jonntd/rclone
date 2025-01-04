@@ -265,7 +265,7 @@ Use this flag with the "--115-download-cookie" option to bypass proxy settings f
 				encoder.EncodeLeftSpace |
 				encoder.EncodeCtl |
 				encoder.EncodeRightSpace |
-				encoder.EncodeInvalidUtf8), // 文件名不能包含以下任意字符之一""<>" (20003)
+				encoder.EncodeInvalidUtf8),
 		}},
 	})
 }
