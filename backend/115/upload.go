@@ -21,6 +21,7 @@ import (
 	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss"
 	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss/credentials"
 	"github.com/cenkalti/backoff/v4"
+	"github.com/pierrec/lz4/v4"
 	"github.com/rclone/rclone/backend/115/api"
 	"github.com/rclone/rclone/backend/115/cipher"
 	"github.com/rclone/rclone/fs"
@@ -130,7 +131,7 @@ func generateToken(userID, fileID, fileSize, signKey, signVal, timeStamp, appVer
 }
 
 // initUpload calls 115's initupload endpoint. This is used for both 秒传 checks and actual uploads.
-func (f *Fs) initUpload(ctx context.Context, size int64, name, dirID, sha1sum, signKey, signVal string) (*api.UploadInitInfo, error) {
+func (f *Fs) initUpload(ctx context.Context, size int64, name, dirID, sha1sum, signKey, signVal string) (*api.UploadInitInfo, bool, error) {
 	operation := func() (*api.UploadInitInfo, error) {
 		filename := f.opt.Enc.FromStandardName(name)
 		filesize := strconv.FormatInt(size, 10)
@@ -208,27 +209,34 @@ func (f *Fs) initUpload(ctx context.Context, size int64, name, dirID, sha1sum, s
 	}
 
 	var ui *api.UploadInitInfo
-	operationWithRetry := func() (*api.UploadInitInfo, error) {
+	var isSpecialError bool
+	var err error
+
+	operationWithRetry := func() (*api.UploadInitInfo, bool, error) {
 		expBackoff := backoff.NewExponentialBackOff()
 		expBackoff.MaxElapsedTime = 2 * time.Minute
 		err := backoff.RetryNotify(func() error {
-			var err error
 			ui, err = operation()
 			if err != nil {
-				return err
+				if errors.Is(err, lz4.ErrInvalidSourceShortBuffer) {
+					// Special handling: treat as success
+					isSpecialError = true
+					return backoff.Permanent(err) // Stop retrying
+				}
+				return err // Retry for other errors
 			}
 			return nil
 		}, expBackoff, func(err error, duration time.Duration) {
 			fs.Logf(nil, "initUpload failed: %v. Retrying in %v", err, duration)
 		})
-		return ui, err
+		return ui, isSpecialError, err
 	}
 
-	ui, err := operationWithRetry()
-	if err != nil {
-		return nil, err
+	ui, isSpecialError, err = operationWithRetry()
+	if err != nil && !isSpecialError {
+		return nil, false, err
 	}
-	return ui, nil
+	return ui, isSpecialError, nil
 }
 
 // postUpload processes the JSON callback after an upload to OSS or sample upload.
@@ -462,7 +470,7 @@ func (f *Fs) tryHashUpload(
 	o *Object,
 	leaf, dirID string,
 	size int64,
-) (bool, *api.UploadInitInfo, error) {
+) (bool, *api.UploadInitInfo, bool, error) {
 	fs.Debugf(o, "tryHashUpload: attempting 秒传...")
 
 	// 1) Get or compute the file's SHA-1
@@ -473,7 +481,7 @@ func (f *Fs) tryHashUpload(
 		hashStr, in, cleanup, err = bufferIOwithSHA1(in, size, int64(f.opt.HashMemoryThreshold))
 		defer cleanup()
 		if err != nil {
-			return false, nil, fmt.Errorf("failed to calculate SHA1: %w", err)
+			return false, nil, false, fmt.Errorf("failed to calculate SHA1: %w", err)
 		}
 	} else {
 		fs.Debugf(o, "tryHashUpload: using precomputed SHA1=%s", hashStr)
@@ -481,9 +489,14 @@ func (f *Fs) tryHashUpload(
 	o.sha1sum = strings.ToLower(hashStr)
 
 	// 2) Call initUpload with that SHA-1
-	ui, err := f.initUpload(ctx, size, leaf, dirID, hashStr, "", "")
+	ui, isSpecialError, err := f.initUpload(ctx, size, leaf, dirID, hashStr, "", "")
 	if err != nil {
-		return false, nil, fmt.Errorf("秒传 initUpload failed: %w", err)
+		if isSpecialError {
+			// Treat as success and proceed
+			fs.Logf(o, "initUpload encountered lz4.ErrInvalidSourceShortBuffer, treating as success")
+			return true, ui, isSpecialError, nil
+		}
+		return false, nil, isSpecialError, fmt.Errorf("秒传 initUpload failed: %w", err)
 	}
 
 	// 3) Handle different statuses
@@ -502,29 +515,29 @@ func (f *Fs) tryHashUpload(
 			if info, err2 := f.getFile(ctx, "", ui.PickCode); err2 == nil {
 				_ = o.setMetaData(info)
 			}
-			return true, ui, nil
+			return true, ui, false, nil
 
 		case 1:
 			// status=1 => server doesn't have file => need actual upload
 			fs.Debugf(o, "tryHashUpload: 秒传 not possible => server requires real upload.")
-			return false, ui, nil
+			return false, ui, false, nil
 
 		case 7:
 			// partial-block check
 			fs.Debugf(o, "tryHashUpload: 秒传 partial-block check => signCheck=%q", ui.SignCheck)
 			signKey = ui.SignKey
 			if signVal, err = calcBlockSHA1(ctx, in, src, ui.SignCheck); err != nil {
-				return false, nil, fmt.Errorf("calcBlockSHA1 error: %w", err)
+				return false, nil, false, fmt.Errorf("calcBlockSHA1 error: %w", err)
 			}
-			ui, err = f.initUpload(ctx, size, leaf, dirID, hashStr, signKey, signVal)
+			ui, isSpecialError, err = f.initUpload(ctx, size, leaf, dirID, hashStr, signKey, signVal)
 			if err != nil {
-				return false, nil, fmt.Errorf("tryHashUpload: 秒传 re-init error: %w", err)
+				return false, nil, isSpecialError, fmt.Errorf("tryHashUpload: 秒传 re-init error: %w", err)
 			}
 			continue
 
 		default:
 			// Unexpected status => treat as error
-			return false, nil, fmt.Errorf("tryHashUpload: 秒传 error: unexpected status=%d", ui.Status)
+			return false, nil, false, fmt.Errorf("tryHashUpload: 秒传 error: unexpected status=%d", ui.Status)
 		}
 	}
 }
@@ -659,29 +672,29 @@ func (f *Fs) upload(
 	src fs.ObjectInfo,
 	remote string,
 	options ...fs.OpenOption,
-) (fs.Object, error) {
+) (fs.Object, bool, error) {
 	if f.isShare {
-		return nil, errors.New("unsupported for shared filesystem")
+		return nil, false, errors.New("unsupported for shared filesystem")
 	}
 	size := src.Size()
 
 	// Ensure we have userID/userkey
 	if f.userkey == "" {
 		if err := f.getUploadBasicInfo(ctx); err != nil {
-			return nil, fmt.Errorf("failed to get upload basic info: %w", err)
+			return nil, false, fmt.Errorf("failed to get upload basic info: %w", err)
 		}
 		if f.userID == "" || f.userkey == "" {
-			return nil, fmt.Errorf("empty userid or userkey")
+			return nil, false, fmt.Errorf("empty userid or userkey")
 		}
 	}
 
 	if size > int64(maxUploadSize) {
-		return nil, fmt.Errorf("file size exceeds upload limit: %d > %d", size, maxUploadSize)
+		return nil, false, fmt.Errorf("file size exceeds upload limit: %d > %d", size, maxUploadSize)
 	}
 
 	o, leaf, dirID, err := f.createObject(ctx, remote, src.ModTime(ctx), size)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	//----------------------------------------------------------------
@@ -691,11 +704,11 @@ func (f *Fs) upload(
 		if size <= int64(StreamUploadLimit) {
 			obj, err := f.doSampleUpload(ctx, in, o, leaf, dirID, size, options...)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
-			return obj, nil
+			return obj, false, nil
 		}
-		return nil, fmt.Errorf("OnlyStream is enabled but file size %d exceeds StreamUploadLimit %d",
+		return nil, false, fmt.Errorf("OnlyStream is enabled but file size %d exceeds StreamUploadLimit %d",
 			size, StreamUploadLimit)
 	}
 
@@ -708,46 +721,50 @@ func (f *Fs) upload(
 			// Tiny files use sample upload
 			obj, err := f.doSampleUpload(ctx, in, o, leaf, dirID, size, options...)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
-			return obj, nil
+			return obj, false, nil
 		}
 		// Attempt fast upload (秒传)
-		gotIt, ui, err := f.tryHashUpload(ctx, in, src, o, leaf, dirID, size)
-		if err != nil {
-			return nil, fmt.Errorf("FastUpload: 秒传 error: %w", err)
+		gotIt, ui, isSpecialError, err := f.tryHashUpload(ctx, in, src, o, leaf, dirID, size)
+		if isSpecialError {
+			return o, true, nil
 		}
+		if err != nil {
+			return nil, false, fmt.Errorf("FastUpload: 秒传 error: %w", err)
+		}
+
 		if gotIt {
-			return o, nil
+			return o, false, nil
 		}
 		// Fallback to uploadToOSS using the obtained UploadInitInfo
 		if ui != nil {
 			if size <= int64(StreamUploadLimit) {
 				obj, err := f.doSampleUpload(ctx, in, o, leaf, dirID, size, options...)
 				if err != nil {
-					return nil, err
+					return nil, false, err
 				}
-				return obj, nil
+				return obj, false, nil
 			}
 			obj, err := f.uploadToOSS(ctx, in, src, o, leaf, dirID, size, ui, options...)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
-			return obj, nil
+			return obj, false, nil
 		}
 		// If ui is nil, fallback to standard upload
 		if size <= int64(StreamUploadLimit) {
 			obj, err := f.doSampleUpload(ctx, in, o, leaf, dirID, size, options...)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
-			return obj, nil
+			return obj, false, nil
 		}
 		obj, err := f.uploadToOSS(ctx, in, src, o, leaf, dirID, size, nil, options...)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
-		return obj, nil
+		return obj, false, nil
 	}
 
 	//----------------------------------------------------------------
@@ -756,17 +773,20 @@ func (f *Fs) upload(
 	if f.opt.UploadHashOnly {
 		hashStr, _ := src.Hash(ctx, hash.SHA1)
 		if hashStr == "" {
-			return nil, fserrors.NoRetryError(errors.New("UploadHashOnly: skipping since no SHA1"))
+			return nil, false, fserrors.NoRetryError(errors.New("UploadHashOnly: skipping since no SHA1"))
 		}
-		gotIt, _, err := f.tryHashUpload(ctx, in, src, o, leaf, dirID, size)
+		gotIt, _, isSpecialError, err := f.tryHashUpload(ctx, in, src, o, leaf, dirID, size)
+		if isSpecialError {
+			return o, true, nil
+		}
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if gotIt {
-			return o, nil
+			return o, false, nil
 		}
 		// No fallback for UploadHashOnly
-		return nil, fserrors.NoRetryError(errors.New("UploadHashOnly: server does not have file => skipping"))
+		return nil, false, fserrors.NoRetryError(errors.New("UploadHashOnly: server does not have file => skipping"))
 	}
 
 	//----------------------------------------------------------------
@@ -776,29 +796,32 @@ func (f *Fs) upload(
 		// Use sample upload for small files
 		obj, err := f.doSampleUpload(ctx, in, o, leaf, dirID, size, options...)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
-		return obj, nil
+		return obj, false, nil
 	}
 
 	// Attempt fast upload (秒传)
-	gotIt, ui, err := f.tryHashUpload(ctx, in, src, o, leaf, dirID, size)
+	gotIt, ui, isSpecialError, err := f.tryHashUpload(ctx, in, src, o, leaf, dirID, size)
+	if isSpecialError {
+		return o, true, nil
+	}
 	if err != nil {
 		fs.Debugf(o, "normal: 秒传 error => fallback to uploadToOSS: %v", err)
 		obj, uploadErr := f.uploadToOSS(ctx, in, src, o, leaf, dirID, size, ui, options...)
 		if uploadErr != nil {
-			return nil, uploadErr
+			return nil, false, uploadErr
 		}
-		return obj, nil
+		return obj, false, nil
 	}
 	if gotIt {
 		// Fast upload successful
-		return o, nil
+		return o, false, nil
 	}
 	// Fallback to actual upload to OSS
 	obj, err := f.uploadToOSS(ctx, in, src, o, leaf, dirID, size, ui, options...)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return obj, nil
+	return obj, false, nil
 }

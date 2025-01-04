@@ -31,7 +31,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pierrec/lz4/v4"
 	"github.com/rclone/rclone/backend/115/api"
 	"github.com/rclone/rclone/backend/115/dircache"
 	"github.com/rclone/rclone/fs"
@@ -928,13 +927,9 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 // checking to see if there is one already - use Put() for that.
 func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote string, options ...fs.OpenOption) (fs.Object, error) {
 	// upload src with the name of remote
-	newObj, err := f.upload(ctx, in, src, remote, options...)
+	newObj, isSpecialError, err := f.upload(ctx, in, src, remote, options...)
 	if err != nil {
-		if !errors.Is(err, lz4.ErrInvalidSourceShortBuffer) {
-			return nil, fmt.Errorf("failed to upload: %w", err)
-		}
-		// In this case, the upload (perhaps via hash) could be successful,
-		/// so let the subsequent process locate the uploaded object.
+		return nil, fmt.Errorf("failed to upload: %w", err)
 	}
 
 	if newObj == nil {
@@ -944,6 +939,9 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 	o := newObj.(*Object)
 
 	if o.hasMetaData {
+		if isSpecialError {
+			fs.Logf(o, "Upload successful with lz4.ErrInvalidSourceShortBuffer")
+		}
 		return o, nil
 	}
 
@@ -951,6 +949,9 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 	found, err := f.listAll(ctx, o.parent, f.opt.ListChunk, true, false, func(item *api.File) bool {
 		if strings.ToLower(item.Sha) == o.sha1sum {
 			info = item
+			if isSpecialError {
+				fs.Logf(o, "Upload successful with lz4.ErrInvalidSourceShortBuffer")
+			}
 			return true
 		}
 		return false
@@ -960,6 +961,9 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 	}
 	if !found {
 		return nil, fs.ErrorObjectNotFound
+	}
+	if isSpecialError {
+		fs.Logf(o, "Upload successful with lz4.ErrInvalidSourceShortBuffer")
 	}
 	return o, o.setMetaData(info)
 }
