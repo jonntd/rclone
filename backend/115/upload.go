@@ -595,6 +595,17 @@ func (f *Fs) uploadToOSS(
 			return fmt.Errorf("uploadToOSS: multipart init error: %w", err)
 		}
 		if err = mu.Upload(ctx); err != nil {
+			// Handle context cancellation
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return backoff.Permanent(err)
+			}
+
+			// Check if the error is PartAlreadyExist
+			var ossErr *oss.ServiceError
+			if errors.As(err, &ossErr) && ossErr.Code == "PartAlreadyExist" {
+				fs.Debugf(o, "uploadToOSS: part already exists, skipping upload")
+				return nil // Skip re-uploading this part
+			}
 			return fmt.Errorf("uploadToOSS: multipart upload error: %w", err)
 		}
 		data, err := f.postUpload(mu.callbackRes)
