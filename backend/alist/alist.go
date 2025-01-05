@@ -227,7 +227,10 @@ func (f *Fs) doRequest(req *http.Request) (*http.Response, error) {
 	// Read the entire response body
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		resp.Body.Close()
+		// Start of Selection
+		if err := resp.Body.Close(); err != nil {
+			fs.Errorf(ctx, "Failed to close response body: %v", err)
+		}
 		return nil, err
 	}
 	// Handle the error returned by resp.Body.Close()
