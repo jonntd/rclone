@@ -595,12 +595,26 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	}
 
 	// Download from raw URL
-	resp, err := http.Get(getResp.Data.RawURL)
+	resp, err := http.NewRequestWithContext(ctx, "GET", getResp.Data.RawURL, nil)
 	if err != nil {
 		return nil, err
 	}
-
-	return resp.Body, nil
+	fs.FixRangeOption(options, o.size)
+	fs.OpenOptionAddHTTPHeaders(resp.Header, options)
+	if o.size == 0 {
+		// Don't supply range requests for 0 length objects as they always fail
+		delete(resp.Header, "Range")
+	}
+	client := &http.Client{}
+	response, err := client.Do(resp)
+	if err != nil {
+		return nil, err
+	}
+	if response.StatusCode != 200 && response.StatusCode != 206 {
+		response.Body.Close()
+		return nil, fmt.Errorf("failed to open object: status code %d", response.StatusCode)
+	}
+	return response.Body, nil
 }
 
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
