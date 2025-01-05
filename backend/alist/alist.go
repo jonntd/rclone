@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +30,14 @@ const (
 	minSleep      = 10 * time.Millisecond
 	maxSleep      = 2 * time.Second
 	decayConstant = 2 // bigger for slower decay, exponential
+
+	// Define API endpoint constants
+	apiLogin  = "/api/auth/login/hash"
+	apiList   = "/api/fs/list"
+	apiPut    = "/api/fs/put"
+	apiMkdir  = "/api/fs/mkdir"
+	apiRemove = "/api/fs/remove"
+	apiGet    = "/api/fs/get"
 )
 
 func init() {
@@ -311,8 +320,11 @@ func (f *Fs) makeRequest(ctx context.Context, method, endpoint string, data inte
 	}
 
 	// Set common headers
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/plain, */*")
+	headers := map[string]string{
+		"Content-Type": "application/json",
+		"Accept":       "application/json, text/plain, */*",
+	}
+	f.setCommonHeaders(req, headers)
 
 	// Perform the request using doRequest
 	resp, err := f.doRequest(req)
@@ -337,23 +349,20 @@ func (f *Fs) makeRequest(ctx context.Context, method, endpoint string, data inte
 		return err
 	}
 
-	// Check the response code
-	switch respType := response.(type) {
-	case *loginResponse:
-		if respType.Code != 200 {
-			return fmt.Errorf("login failed: %s", respType.Message)
+	// Handle response codes
+	err = f.handleResponse(response)
+	if err != nil {
+		if err.Error() == "unauthorized access" {
+			// Renew token if unauthorized
+			f.tokenMu.Lock()
+			defer f.tokenMu.Unlock()
+			if err := f.login(ctx); err != nil {
+				return fmt.Errorf("token renewal failed: %w", err)
+			}
+			// Retry the request after renewing token
+			return f.makeRequest(ctx, method, endpoint, data, response)
 		}
-	case *listResponse:
-		if respType.Code != 200 {
-			return fmt.Errorf("list failed: %s", respType.Message)
-		}
-	case *requestResponse:
-		if respType.Code != 200 {
-			return fmt.Errorf("request failed: %s", respType.Message)
-		}
-	// Add more cases as needed for different response types
-	default:
-		// No action needed
+		return err
 	}
 
 	return nil
@@ -386,20 +395,15 @@ func (f *Fs) fileInfoToDirEntry(item fileInfo, dir string) fs.DirEntry {
 
 // List the objects and directories in dir into entries
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-	f.fileListCacheMu.Lock()
-	if cached, ok := f.fileListCache[dir]; ok {
-		f.fileListCacheMu.Unlock()
+	if cached, ok := f.getCachedList(dir); ok {
 		// Use cached data
 		for _, item := range cached.Data.Content {
 			entries = append(entries, f.fileInfoToDirEntry(item, dir))
 		}
 		return entries, nil
 	}
-	f.fileListCacheMu.Unlock()
 
 	// existing listing logic...
-	listURL := "/api/fs/list"
-
 	data := map[string]interface{}{
 		"path":     path.Join(f.root, dir),
 		"per_page": 1000,
@@ -409,15 +413,13 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	}
 
 	var listResp listResponse
-	err = f.makeRequest(ctx, "POST", listURL, data, &listResp)
+	err = f.makeRequest(ctx, "POST", apiList, data, &listResp)
 	if err != nil {
 		return nil, err
 	}
 
 	// Cache the list response
-	f.fileListCacheMu.Lock()
-	f.fileListCache[dir] = listResp
-	f.fileListCacheMu.Unlock()
+	f.setCachedList(dir, listResp)
 
 	for _, item := range listResp.Data.Content {
 		entries = append(entries, f.fileInfoToDirEntry(item, dir))
@@ -473,11 +475,9 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		return nil, fmt.Errorf("upload failed: %s", uploadResp.Message)
 	}
 
-	// Invalidate cache for the parent directory
+	// Invalidate cache for the parent directory using helper
 	parentDir := path.Dir(src.Remote())
-	f.fileListCacheMu.Lock()
-	delete(f.fileListCache, parentDir)
-	f.fileListCacheMu.Unlock()
+	f.invalidateCache(parentDir)
 
 	return &Object{
 		fs:      f,
@@ -607,6 +607,9 @@ func (o *Object) Remove(ctx context.Context) error {
 		return err
 	}
 
+	// Invalidate cache for the directory using helper
+	o.fs.invalidateCache(path.Dir(o.remote))
+
 	return nil
 }
 
@@ -667,4 +670,50 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 // String returns a descriptive string for the filesystem
 func (f *Fs) String() string {
 	return f.name
+}
+
+// Add a helper function to handle response codes
+func (f *Fs) handleResponse(response interface{}) error {
+	switch response.(type) {
+	case *loginResponse, *listResponse, *requestResponse:
+		v := reflect.ValueOf(response).Elem()
+		code := v.FieldByName("Code").Int()
+		message := v.FieldByName("Message").String()
+		if code != 200 {
+			if code == 401 {
+				return fmt.Errorf("unauthorized access")
+			}
+			return fmt.Errorf("request failed: %s", message)
+		}
+	default:
+		// No action needed for other types
+	}
+	return nil
+}
+
+// Add helper functions for cache access
+func (f *Fs) getCachedList(dir string) (listResponse, bool) {
+	f.fileListCacheMu.Lock()
+	defer f.fileListCacheMu.Unlock()
+	cached, ok := f.fileListCache[dir]
+	return cached, ok
+}
+
+func (f *Fs) setCachedList(dir string, resp listResponse) {
+	f.fileListCacheMu.Lock()
+	defer f.fileListCacheMu.Unlock()
+	f.fileListCache[dir] = resp
+}
+
+func (f *Fs) invalidateCache(dir string) {
+	f.fileListCacheMu.Lock()
+	defer f.fileListCacheMu.Unlock()
+	delete(f.fileListCache, dir)
+}
+
+// Add a helper function to set common headers
+func (f *Fs) setCommonHeaders(req *http.Request, headers map[string]string) {
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
 }
