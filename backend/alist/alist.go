@@ -93,10 +93,10 @@ type fileInfo struct {
 	Size     int64     `json:"size"`
 	IsDir    bool      `json:"is_dir"`
 	Modified time.Time `json:"modified"`
-	HashInfo struct {
-		MD5    string `json:"md5"`
-		SHA1   string `json:"sha1"`
-		SHA256 string `json:"sha256"`
+	HashInfo *struct {
+		MD5    string `json:"md5,omitempty"`
+		SHA1   string `json:"sha1,omitempty"`
+		SHA256 string `json:"sha256,omitempty"`
 	} `json:"hash_info"`
 	RawURL string `json:"raw_url"`
 }
@@ -117,11 +117,13 @@ type requestResponse struct {
 
 // Object describes an AList object
 type Object struct {
-	fs      *Fs
-	remote  string
-	size    int64
-	modTime time.Time
-	hash    map[hash.Type]string
+	fs        *Fs
+	remote    string
+	size      int64
+	modTime   time.Time
+	md5sum    string
+	sha1sum   string
+	sha256sum string
 }
 
 // Name of the remote (as passed into NewFs)
@@ -320,23 +322,21 @@ func (f *Fs) fileInfoToDirEntry(item fileInfo, dir string) fs.DirEntry {
 		return fs.NewDir(remote, item.Modified)
 	}
 
-	hashMap := make(map[hash.Type]string)
-	if item.HashInfo.MD5 != "" {
-		hashMap[hash.MD5] = item.HashInfo.MD5
-	}
-	if item.HashInfo.SHA1 != "" {
-		hashMap[hash.SHA1] = item.HashInfo.SHA1
-	}
-	if item.HashInfo.SHA256 != "" {
-		hashMap[hash.SHA256] = item.HashInfo.SHA256
+	var md5sum, sha1sum, sha256sum string
+	if item.HashInfo != nil {
+		md5sum = item.HashInfo.MD5
+		sha1sum = item.HashInfo.SHA1
+		sha256sum = item.HashInfo.SHA256
 	}
 
 	return &Object{
-		fs:      f,
-		remote:  remote,
-		size:    item.Size,
-		modTime: item.Modified,
-		hash:    hashMap,
+		fs:        f,
+		remote:    remote,
+		size:      item.Size,
+		modTime:   item.Modified,
+		md5sum:    md5sum,
+		sha1sum:   sha1sum,
+		sha256sum: sha256sum,
 	}
 }
 
@@ -506,8 +506,7 @@ func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
 }
 
 func (o *Object) Hashes() hash.Set {
-	hashSet := hash.NewHashSet(hash.SHA1, hash.MD5, hash.SHA256)
-	return hashSet
+	return hash.NewHashSet(hash.MD5, hash.SHA1, hash.SHA256)
 }
 
 func (o *Object) Storable() bool {
@@ -567,10 +566,16 @@ func (o *Object) Remove(ctx context.Context) error {
 
 // Hash returns the hash for the given type
 func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
-	if o.hash == nil {
-		return "", nil
+	switch ty {
+	case hash.MD5:
+		return o.md5sum, nil
+	case hash.SHA1:
+		return o.sha1sum, nil
+	case hash.SHA256:
+		return o.sha256sum, nil
+	default:
+		return "", hash.ErrUnsupported
 	}
-	return o.hash[ty], nil
 }
 
 // String returns a descriptive string for the object
