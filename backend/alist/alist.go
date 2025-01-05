@@ -21,6 +21,7 @@ import (
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/config/obscure"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/encoder"
@@ -244,17 +245,20 @@ func (f *Fs) login(ctx context.Context) error {
 		// Skip login for guest access
 		return nil
 	}
-
+	pw, err := obscure.Reveal(f.opt.Password)
+	if err != nil {
+		return fmt.Errorf("password decode failed - did you obscure it?: %w", err)
+	}
 	loginURL := "/api/auth/login/hash"
 
 	data := map[string]string{
 		"username": f.opt.Username,
-		"password": f.makePasswordHash(f.opt.Password),
+		"password": pw,
 		"otpcode":  f.opt.OTPCode,
 	}
 
 	var loginResp loginResponse
-	err := f.makeRequest(ctx, "POST", loginURL, data, &loginResp)
+	err = f.makeRequest(ctx, "POST", loginURL, data, &loginResp)
 	if err != nil {
 		return err
 	}
