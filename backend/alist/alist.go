@@ -67,6 +67,11 @@ func init() {
 			Required: false,
 			Default:  "/",
 		}, {
+			Name:     "cf_server",
+			Help:     "URL of the Cloudflare server",
+			Required: false,
+			Default:  "",
+		}, {
 			Name:     "otp_code",
 			Help:     "Two-factor authentication code",
 			Default:  "",
@@ -100,6 +105,7 @@ type Options struct {
 	MetaPass string `config:"meta_pass"`
 	// root_path specifies the root path within the AList server
 	RootPath string `config:"root_path"`
+	CfServer string `config:"cf_server"`
 }
 
 // Fs represents a remote AList server
@@ -114,6 +120,12 @@ type Fs struct {
 	pacer           *fs.Pacer
 	fileListCacheMu sync.Mutex
 	fileListCache   map[string]listResponse
+
+	// New fields for Cloudflare handling
+	cfCookie       *http.Cookie
+	cfCookieExpiry time.Time
+	cfUserAgent    string
+	cfMu           sync.Mutex
 }
 
 // API response structures
@@ -209,6 +221,17 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		pacer:           fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 		fileListCacheMu: sync.Mutex{},
 		fileListCache:   make(map[string]listResponse),
+		cfCookie:        nil,
+		cfCookieExpiry:  time.Time{},
+		cfUserAgent:     "",
+	}
+
+	// Fetch Cloudflare cookies and user agent if CfServer is set
+	if f.opt.CfServer != "" {
+		err = f.fetchCloudflare(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch Cloudflare cookies: %w", err)
+		}
 	}
 
 	// Login and get token only if username and password are provided
@@ -294,6 +317,21 @@ func (f *Fs) doRequest(req *http.Request) (*http.Response, error) {
 		fs.Errorf(ctx, "Failed to close response body: %v", err)
 	}
 
+	// Check for "Just a moment..." in HTML title
+	if resp.StatusCode == 403 && bytes.Contains(bodyBytes, []byte("<title>Just a moment...</title>")) {
+		if f.opt.CfServer != "" {
+			// Refresh Cloudflare cookies
+			f.cfMu.Lock()
+			err := f.fetchCloudflare(req.Context())
+			f.cfMu.Unlock()
+			if err != nil {
+				return nil, fmt.Errorf("failed to refresh Cloudflare cookies on 403: %w", err)
+			}
+			// Retry the request with refreshed cookies
+			return f.doRequest(req)
+		}
+	}
+
 	// Parse the response to check the Code
 	var respBody requestResponse
 	err = json.Unmarshal(bodyBytes, &respBody)
@@ -339,6 +377,25 @@ func (f *Fs) makeRequest(ctx context.Context, method, endpoint string, data inte
 		"Content-Type": "application/json",
 		"Accept":       "application/json, text/plain, */*",
 	}
+
+	// If CfServer is set, add cookies and user agent
+	if f.opt.CfServer != "" {
+		f.cfMu.Lock()
+		if time.Now().After(f.cfCookieExpiry.Add(-1 * time.Minute)) {
+			// Refresh Cloudflare cookies
+			err = f.fetchCloudflare(ctx)
+			if err != nil {
+				f.cfMu.Unlock()
+				return fmt.Errorf("failed to refresh Cloudflare cookies: %w", err)
+			}
+		}
+		if f.cfCookie != nil {
+			req.AddCookie(f.cfCookie)
+			headers["User-Agent"] = f.cfUserAgent
+		}
+		f.cfMu.Unlock()
+	}
+
 	f.setCommonHeaders(req, headers)
 
 	// Perform the request using doRequest
@@ -748,4 +805,50 @@ func (f *Fs) setCommonHeaders(req *http.Request, headers map[string]string) {
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}
+}
+
+// New method to fetch Cloudflare cookies and user agent
+func (f *Fs) fetchCloudflare(ctx context.Context) error {
+	f.cfMu.Lock()
+	defer f.cfMu.Unlock()
+
+	// Make request to cf_server to get cookies and user agent
+	resp, err := http.Get(fmt.Sprintf("%s/get-cookies?url=%s", f.opt.CfServer, url.QueryEscape(f.opt.URL)))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	var cookieData struct {
+		Cookies []struct {
+			Name    string  `json:"name"`
+			Value   string  `json:"value"`
+			Domain  string  `json:"domain"`
+			Path    string  `json:"path"`
+			Expires float64 `json:"expires"`
+			// other fields...
+		} `json:"cookies"`
+		UserAgent string `json:"userAgent"`
+	}
+
+	err = json.NewDecoder(resp.Body).Decode(&cookieData)
+	if err != nil {
+		return err
+	}
+
+	if len(cookieData.Cookies) == 0 {
+		return fmt.Errorf("no cookies received from cf_server")
+	}
+
+	// Assume the first cookie is cf_clearance
+	f.cfCookie = &http.Cookie{
+		Name:   cookieData.Cookies[0].Name,
+		Value:  cookieData.Cookies[0].Value,
+		Domain: cookieData.Cookies[0].Domain,
+		Path:   cookieData.Cookies[0].Path,
+	}
+	f.cfCookieExpiry = time.Unix(int64(cookieData.Cookies[0].Expires), 0)
+	f.cfUserAgent = cookieData.UserAgent
+
+	return nil
 }
