@@ -213,6 +213,8 @@ func (f *Fs) login(ctx context.Context) error {
 
 // doRequest performs an HTTP request, handles token renewal, and ensures the response body can be read by the caller.
 func (f *Fs) doRequest(req *http.Request) (*http.Response, error) {
+	ctx := req.Context()
+
 	if f.token != "" {
 		req.Header.Set("Authorization", f.token)
 	}
@@ -228,7 +230,10 @@ func (f *Fs) doRequest(req *http.Request) (*http.Response, error) {
 		resp.Body.Close()
 		return nil, err
 	}
-	resp.Body.Close()
+	// Handle the error returned by resp.Body.Close()
+	if err := resp.Body.Close(); err != nil {
+		fs.Errorf(ctx, "Failed to close response body: %v", err)
+	}
 
 	// Parse the response to check the Code
 	var respBody requestResponse
@@ -279,7 +284,11 @@ func (f *Fs) makeRequest(ctx context.Context, method, endpoint string, data inte
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			fs.Errorf(ctx, "Failed to close response body: %v", closeErr)
+		}
+	}()
 
 	// Read the response body
 	bodyBytes, err := io.ReadAll(resp.Body)
@@ -404,7 +413,11 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			fs.Errorf(ctx, "Failed to close response body: %v", closeErr)
+		}
+	}()
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -465,9 +478,6 @@ func (f *Fs) purgeDir(ctx context.Context, dir string, recursive bool) error {
 	removeURL := "/api/fs/remove"
 
 	names := []string{"."}
-	if recursive {
-		// Add logic for recursive deletion if needed
-	}
 
 	data := map[string]interface{}{
 		"dir":   path.Join(f.root, dir),
