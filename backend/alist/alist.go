@@ -50,6 +50,11 @@ func init() {
 			Required:   false,
 			IsPassword: true,
 		}, {
+			Name:     "root_path",
+			Help:     "Root path within the AList server",
+			Required: false,
+			Default:  "/",
+		}, {
 			Name:     "otp_code",
 			Help:     "Two-factor authentication code",
 			Default:  "",
@@ -72,6 +77,8 @@ type Options struct {
 	OTPCode  string `config:"otp_code"`
 	// meta_pass is used as a password parameter in listing
 	MetaPass string `config:"meta_pass"`
+	// root_path specifies the root path within the AList server
+	RootPath string `config:"root_path"`
 }
 
 // Fs represents a remote AList server
@@ -165,6 +172,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Ensure root starts with '/'
 	if !strings.HasPrefix(root, "/") {
 		root = "/" + root
+	}
+
+	// Incorporate root_path if provided
+	if opt.RootPath != "" && opt.RootPath != "/" {
+		root = path.Join(root, opt.RootPath)
 	}
 
 	client := fshttp.NewClient(ctx)
