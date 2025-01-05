@@ -611,7 +611,10 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		return nil, err
 	}
 	if response.StatusCode != 200 && response.StatusCode != 206 {
-		response.Body.Close()
+		err = response.Body.Close()
+		if err != nil {
+			fs.Errorf(ctx, "Failed to close response body: %v", err)
+		}
 		return nil, fmt.Errorf("failed to open object: status code %d", response.StatusCode)
 	}
 	return response.Body, nil
