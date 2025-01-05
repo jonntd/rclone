@@ -31,7 +31,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pierrec/lz4/v4"
+	"github.com/cenkalti/backoff/v4"
 	"github.com/rclone/rclone/backend/115/api"
 	"github.com/rclone/rclone/backend/115/dircache"
 	"github.com/rclone/rclone/fs"
@@ -927,41 +927,55 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 // This will create a duplicate if we upload a new file without
 // checking to see if there is one already - use Put() for that.
 func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote string, options ...fs.OpenOption) (fs.Object, error) {
-	// upload src with the name of remote
-	newObj, err := f.upload(ctx, in, src, remote, options...)
-	if err != nil {
-		if !errors.Is(err, lz4.ErrInvalidSourceShortBuffer) {
-			return nil, fmt.Errorf("failed to upload: %w", err)
+	var newObj fs.Object
+	var err error
+
+	operation := func() error {
+		newObj, err = f.upload(ctx, in, src, remote, options...)
+		if err != nil {
+			return err
 		}
-		// In this case, the upload (perhaps via hash) could be successful,
-		/// so let the subsequent process locate the uploaded object.
-	}
 
-	if newObj == nil {
-		return nil, fmt.Errorf("upload returned nil object without error")
-	}
-
-	o := newObj.(*Object)
-
-	if o.hasMetaData {
-		return o, nil
-	}
-
-	var info *api.File
-	found, err := f.listAll(ctx, o.parent, f.opt.ListChunk, true, false, func(item *api.File) bool {
-		if strings.ToLower(item.Sha) == o.sha1sum {
-			info = item
-			return true
+		if newObj == nil {
+			return backoff.Permanent(fmt.Errorf("upload returned nil object without error"))
 		}
-		return false
+
+		o := newObj.(*Object)
+
+		if o.hasMetaData {
+			return nil
+		}
+
+		var info *api.File
+		found, err := f.listAll(ctx, o.parent, f.opt.ListChunk, true, false, func(item *api.File) bool {
+			if strings.ToLower(item.Sha) == o.sha1sum {
+				info = item
+				return true
+			}
+			return false
+		})
+		if err != nil {
+			return backoff.Permanent(fmt.Errorf("failed to locate updated file: %w", err))
+		}
+		if !found {
+			return fs.ErrorObjectNotFound
+		}
+		return o.setMetaData(info)
+	}
+
+	// Configure backoff strategy
+	expBackoff := backoff.NewExponentialBackOff()
+	expBackoff.MaxElapsedTime = 2 * time.Minute // Adjust as needed
+
+	// Retry the operation with backoff
+	err = backoff.RetryNotify(operation, backoff.WithContext(expBackoff, ctx), func(err error, duration time.Duration) {
+		fs.Logf(nil, "upload failed: %v. Retrying in %v", err, duration)
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to locate updated file: %w", err)
+		return nil, err
 	}
-	if !found {
-		return nil, fs.ErrorObjectNotFound
-	}
-	return o, o.setMetaData(info)
+
+	return newObj, nil
 }
 
 // PutUnchecked uploads the object
