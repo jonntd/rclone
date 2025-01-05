@@ -43,17 +43,24 @@ func init() {
 		}, {
 			Name:     "username",
 			Help:     "Username for AList",
-			Required: true,
+			Required: false,
 		}, {
 			Name:       "password",
 			Help:       "Password for AList",
-			Required:   true,
+			Required:   false,
 			IsPassword: true,
 		}, {
-			Name:    "otp_code",
-			Help:    "Two-factor authentication code",
-			Default: "",
-		}},
+			Name:     "otp_code",
+			Help:     "Two-factor authentication code",
+			Default:  "",
+			Advanced: true,
+		}, {
+			Name:     "meta_pass",
+			Help:     "Meta password for listing",
+			Default:  "",
+			Advanced: true,
+		},
+		},
 	})
 }
 
@@ -63,6 +70,8 @@ type Options struct {
 	Username string `config:"username"`
 	Password string `config:"password"`
 	OTPCode  string `config:"otp_code"`
+	// meta_pass is used as a password parameter in listing
+	MetaPass string `config:"meta_pass"`
 }
 
 // Fs represents a remote AList server
@@ -168,10 +177,16 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		fileListCacheMu: sync.Mutex{},
 		fileListCache:   make(map[string]listResponse),
 	}
-	// Login and get token
-	err = f.login(ctx)
-	if err != nil {
-		return nil, err
+
+	// Login and get token only if username and password are provided
+	if f.opt.Username != "" && f.opt.Password != "" {
+		err = f.login(ctx)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// Proceed as guest
+		f.token = ""
 	}
 
 	// Set supported hash types
@@ -193,6 +208,11 @@ func (f *Fs) makePasswordHash(password string) string {
 
 // login performs authentication and stores the token
 func (f *Fs) login(ctx context.Context) error {
+	if f.opt.Username == "" || f.opt.Password == "" {
+		// Skip login for guest access
+		return nil
+	}
+
 	loginURL := "/api/auth/login/hash"
 
 	data := map[string]string{
@@ -373,6 +393,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		"per_page": 1000,
 		"page":     1,
 		"refresh":  true,
+		"password": f.opt.MetaPass,
 	}
 
 	var listResp listResponse
