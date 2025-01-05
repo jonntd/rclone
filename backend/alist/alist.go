@@ -253,7 +253,7 @@ func (f *Fs) login(ctx context.Context) error {
 
 	data := map[string]string{
 		"username": f.opt.Username,
-		"password": pw,
+		"password": f.makePasswordHash(pw),
 		"otpcode":  f.opt.OTPCode,
 	}
 
