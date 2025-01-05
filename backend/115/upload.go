@@ -490,13 +490,13 @@ func (f *Fs) tryHashUpload(
 
 	// 2) Call initUpload with that SHA-1
 	ui, isSpecialError, err := f.initUpload(ctx, size, leaf, dirID, hashStr, "", "")
-	// Check for nil ui before accessing its fields
-	if ui == nil && isSpecialError {
-		fs.Logf(o, "initUpload returned nil ui with lz4.ErrInvalidSourceShortBuffer, treating as success")
-		return true, nil, true, nil
-	}
-	if ui == nil {
-		return false, nil, false, fmt.Errorf("秒传 initUpload failed with no special error: %w", err)
+	if err != nil {
+		if isSpecialError {
+			// Treat as success and proceed
+			fs.Logf(o, "initUpload encountered lz4.ErrInvalidSourceShortBuffer, treating as success")
+			return true, ui, isSpecialError, nil
+		}
+		return false, nil, isSpecialError, fmt.Errorf("秒传 initUpload failed: %w", err)
 	}
 
 	// 3) Handle different statuses
@@ -531,15 +531,11 @@ func (f *Fs) tryHashUpload(
 			}
 			ui, isSpecialError, err = f.initUpload(ctx, size, leaf, dirID, hashStr, signKey, signVal)
 			if err != nil {
+				if isSpecialError {
+					fs.Logf(o, "tryHashUpload: 秒传 re-init error but lz4 error is expected")
+					return true, ui, isSpecialError, nil
+				}
 				return false, nil, isSpecialError, fmt.Errorf("tryHashUpload: 秒传 re-init error: %w", err)
-			}
-			// Check for nil ui again after re-init
-			if ui == nil && isSpecialError {
-				fs.Logf(o, "tryHashUpload: 秒传 re-init returned nil ui with lz4 error, treating as success")
-				return true, nil, true, nil
-			}
-			if ui == nil {
-				return false, nil, false, fmt.Errorf("tryHashUpload: 秒传 re-init failed with no special error: %w", err)
 			}
 			continue
 
