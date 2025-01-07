@@ -542,16 +542,7 @@ func (f *Fs) uploadToOSS(
 ) (fs.Object, error) {
 	// Check if ui is nil and retry fetching UploadInitInfo if necessary
 	if ui == nil {
-		// Attempt to re-request UploadInitInfo
-		fs.Debugf(o, "uploadToOSS: UploadInitInfo is nil, re-requesting...")
-		var err error
-		ui, err = f.initUpload(ctx, size, leaf, dirID, "", "", "")
-		if err != nil {
-			return nil, fmt.Errorf("uploadToOSS: failed to re-request UploadInitInfo: %w", err)
-		}
-		if ui == nil {
-			return nil, fmt.Errorf("uploadToOSS: re-requested UploadInitInfo is still nil")
-		}
+		return nil, fmt.Errorf("uploadToOSS: UploadInitInfo is nil")
 	}
 
 	// Define the upload operation
