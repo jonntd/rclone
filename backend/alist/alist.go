@@ -213,9 +213,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	// Ensure url does not end with '/'
-	if strings.HasSuffix(opt.URL, "/") {
-		opt.URL = opt.URL[:len(opt.URL)-1]
-	}
+	opt.URL = strings.TrimSuffix(opt.URL, "/")
 
 	// Ensure root starts with '/'
 	if !strings.HasPrefix(root, "/") {
