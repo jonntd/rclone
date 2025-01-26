@@ -41,6 +41,7 @@ const (
 	apiMkdir  = "/api/fs/mkdir"
 	apiRemove = "/api/fs/remove"
 	apiGet    = "/api/fs/get"
+	apiMe     = "/api/me"
 )
 
 func init() {
@@ -121,6 +122,7 @@ type Fs struct {
 	fileListCacheMu sync.Mutex
 	fileListCache   map[string]listResponse
 
+	userPermission int
 	// New fields for Cloudflare handling
 	cfCookie       *http.Cookie
 	cfCookieExpiry time.Time
@@ -134,6 +136,14 @@ type loginResponse struct {
 	Message string `json:"message"`
 	Data    struct {
 		Token string `json:"token"`
+	} `json:"data"`
+}
+
+type meResponse struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    struct {
+		Permission int `json:"permission"`
 	} `json:"data"`
 }
 
@@ -202,6 +212,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, err
 	}
 
+	// Ensure url does not end with '/'
+	if strings.HasSuffix(opt.URL, "/") {
+		opt.URL = opt.URL[:len(opt.URL)-1]
+	}
+
 	// Ensure root starts with '/'
 	if !strings.HasPrefix(root, "/") {
 		root = "/" + root
@@ -244,6 +259,14 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		// Proceed as guest
 		f.token = ""
 	}
+
+	// Get user permissions
+	var meResp meResponse
+	err = f.makeRequest(ctx, "GET", apiMe, nil, &meResp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve user permissions: %w", err)
+	}
+	f.userPermission = meResp.Data.Permission
 
 	// Set supported hash types
 	f.features = (&fs.Features{
@@ -480,8 +503,10 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		"path":     path.Join(f.root, dir),
 		"per_page": 1000,
 		"page":     1,
-		"refresh":  true,
 		"password": f.opt.MetaPass,
+	}
+	if f.userPermission == 2 {
+		data["refresh"] = true
 	}
 
 	var listResp listResponse
@@ -817,7 +842,11 @@ func (f *Fs) fetchCloudflare(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			fs.Errorf(ctx, "Failed to close response body: %v", err)
+		}
+	}()
 
 	var cookieData struct {
 		Cookies []struct {
