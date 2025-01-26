@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	mega "github.com/Sakura-Byte/go-mega"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
@@ -36,7 +37,6 @@ import (
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/readers"
-	mega "github.com/t3rm1n4l/go-mega"
 )
 
 const (
@@ -102,6 +102,11 @@ Enabling it will increase CPU usage and add network overhead.`,
 			// Encode invalid UTF-8 bytes as json doesn't handle them properly.
 			Default: (encoder.Base |
 				encoder.EncodeInvalidUtf8),
+		}, {
+			Name:     "use_ipv6",
+			Help:     `Use multiple IPv6 addresses to bypass bandwidth limits`,
+			Default:  false,
+			Advanced: true,
 		}},
 	})
 }
@@ -114,6 +119,7 @@ type Options struct {
 	HardDelete bool                 `config:"hard_delete"`
 	UseHTTPS   bool                 `config:"use_https"`
 	Enc        encoder.MultiEncoder `config:"encoding"`
+	UseIPv6    bool                 `config:"use_ipv6"`
 }
 
 // Fs represents a remote mega
@@ -216,6 +222,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	srv := megaCache[opt.User]
 	if srv == nil {
 		srv = mega.New().SetClient(fshttp.NewClient(ctx))
+		// Configure IPv6 if enabled
+		if opt.UseIPv6 {
+			if err := srv.AutoConfigureIPv6CIDR(); err != nil {
+				fs.Logf("mega", "IPv6 bypass unavailable: %v", err)
+			}
+		}
 		srv.SetRetries(ci.LowLevelRetries) // let mega do the low level retries
 		srv.SetHTTPS(opt.UseHTTPS)
 		srv.SetLogger(func(format string, v ...interface{}) {
