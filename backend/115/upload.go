@@ -542,7 +542,33 @@ func (f *Fs) uploadToOSS(
 ) (fs.Object, error) {
 	// Check if ui is nil and retry fetching UploadInitInfo if necessary
 	if ui == nil {
-		return nil, fmt.Errorf("uploadToOSS: UploadInitInfo is nil")
+		fs.Debugf(o, "uploadToOSS: UploadInitInfo is nil, attempting to reinitialize...")
+		var err error
+		expBackoff := backoff.NewExponentialBackOff()
+		expBackoff.InitialInterval = 1 * time.Second
+		expBackoff.MaxInterval = 5 * time.Second
+		expBackoff.MaxElapsedTime = 30 * time.Second
+
+		// Retry initializing the upload with minimal backoff
+		err = backoff.RetryNotify(func() error {
+			var initErr error
+			// Initialize without SHA1 for regular upload
+			ui, initErr = f.initUpload(ctx, size, leaf, dirID, "", "", "")
+			if initErr != nil {
+				return initErr
+			}
+			if ui == nil {
+				return errors.New("initUpload returned nil without error")
+			}
+			return nil
+		}, expBackoff, func(err error, d time.Duration) {
+			fs.Debugf(o, "uploadToOSS: initUpload retry error: %v, retrying in %v", err, d)
+		})
+
+		if err != nil {
+			return nil, fmt.Errorf("uploadToOSS: failed to initialize upload after retries: %w", err)
+		}
+		fs.Debugf(o, "uploadToOSS: successfully reinitialized UploadInitInfo")
 	}
 
 	// Define the upload operation
