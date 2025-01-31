@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -78,6 +79,15 @@ func (w *ossChunkWriter) Upload(ctx context.Context) (err error) {
 
 	// Do the accounting manually
 	in, acc := accounting.UnWrapAccounting(w.in)
+
+	// FIXED: Ensure temp file stays open during upload
+	if w.tempFile != nil {
+		defer func() {
+			if cerr := w.tempFile.Close(); cerr != nil && err == nil {
+				err = cerr
+			}
+		}()
+	}
 
 	for partNum := int64(0); !finished; partNum++ {
 		// Get a block of memory from the pool and token which limits concurrency.
@@ -155,10 +165,17 @@ type ossChunkWriter struct {
 	callbackVar   string
 	callbackRes   map[string]any
 	imur          *oss.InitiateMultipartUploadResult
+	tempFile      *os.File // NEW: 显式保存临时文件引用
 }
 
-func (f *Fs) newChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, ui *api.UploadInitInfo, in io.Reader, options ...fs.OpenOption) (w *ossChunkWriter, err error) {
-	// Temporary Object under construction
+func (f *Fs) newChunkWriter(
+	ctx context.Context,
+	remote string,
+	src fs.ObjectInfo,
+	ui *api.UploadInitInfo,
+	in io.Reader,
+	options ...fs.OpenOption,
+) (w *ossChunkWriter, err error) {
 	o := &Object{
 		fs:     f,
 		remote: remote,
@@ -167,19 +184,29 @@ func (f *Fs) newChunkWriter(ctx context.Context, remote string, src fs.ObjectInf
 	uploadParts := min(max(1, f.opt.MaxUploadParts), maxUploadParts)
 	size := src.Size()
 
-	// calculate size of parts
 	chunkSize := f.opt.ChunkSize
-
-	// size can be -1 here meaning we don't know the size of the incoming file. We use ChunkSize
-	// buffers here (default 5 MiB). With a maximum number of parts (10,000) this will be a file of
-	// 48 GiB which seems like a not too unreasonable limit.
-	if size == -1 {
-		warnStreamUpload.Do(func() {
-			fs.Logf(f, "Streaming uploads using chunk size %v will have maximum file size of %v",
-				f.opt.ChunkSize, fs.SizeSuffix(int64(chunkSize)*int64(uploadParts)))
-		})
-	} else {
+	if size != -1 {
 		chunkSize = chunksize.Calculator(src, size, uploadParts, chunkSize)
+	}
+
+	// FIXED: Handle file inputs properly
+	var tempFile *os.File
+	if file, ok := in.(*os.File); ok {
+		tempFile = file
+	} else if size > int64(f.opt.HashMemoryThreshold) {
+		// Buffer to temp file if needed
+		tempFile, err = os.CreateTemp("", cachePrefix)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create temp file: %w", err)
+		}
+		defer os.Remove(tempFile.Name())
+		if _, err = io.Copy(tempFile, in); err != nil {
+			return nil, fmt.Errorf("failed to buffer to temp file: %w", err)
+		}
+		if _, err = tempFile.Seek(0, io.SeekStart); err != nil {
+			return nil, fmt.Errorf("failed to seek temp file: %w", err)
+		}
+		in = tempFile
 	}
 
 	w = &ossChunkWriter{
@@ -190,6 +217,7 @@ func (f *Fs) newChunkWriter(ctx context.Context, remote string, src fs.ObjectInf
 		o:         o,
 		in:        in,
 		client:    f.newOSSClient(),
+		tempFile:  tempFile, // FIXED: Keep reference to temp file
 	}
 
 	req := &oss.InitiateMultipartUploadRequest{
@@ -200,13 +228,11 @@ func (f *Fs) newChunkWriter(ctx context.Context, remote string, src fs.ObjectInf
 	if w.con == 1 {
 		req.Parameters["sequential"] = ""
 	}
-	// Apply upload options
+
 	for _, option := range options {
 		key, value := option.Header()
 		lowerKey := strings.ToLower(key)
 		switch lowerKey {
-		case "":
-			// ignore
 		case "cache-control":
 			req.CacheControl = oss.Ptr(value)
 		case "content-disposition":
@@ -217,16 +243,18 @@ func (f *Fs) newChunkWriter(ctx context.Context, remote string, src fs.ObjectInf
 			req.ContentType = oss.Ptr(value)
 		}
 	}
-	err = w.f.pacer.Call(func() (bool, error) {
+
+	err = f.pacer.Call(func() (bool, error) {
 		w.imur, err = w.client.InitiateMultipartUpload(ctx, req)
 		return w.shouldRetry(ctx, err)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create multipart upload failed: %w", err)
 	}
+
 	w.callback, w.callbackVar = ui.GetCallback(), ui.GetCallbackVar()
 	fs.Debugf(w.o, "multipart upload: %q initiated", *w.imur.UploadId)
-	return
+	return w, nil
 }
 
 // shouldRetry returns a boolean as to whether this err

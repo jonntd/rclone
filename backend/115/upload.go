@@ -73,36 +73,37 @@ func (f *Fs) getUploadBasicInfo(ctx context.Context) error {
 func bufferIO(in io.Reader, size, threshold int64) (out io.Reader, cleanup func(), err error) {
 	cleanup = func() {}
 	if size > threshold {
-		tempFile, errF := os.CreateTemp("", cachePrefix)
-		if errF != nil {
-			return nil, cleanup, errF
+		tempFile, err := os.CreateTemp("", cachePrefix)
+		if err != nil {
+			return nil, cleanup, err
 		}
-		// Attempt to remove right away (on non-Windows).
-		_ = os.Remove(tempFile.Name())
-
+		// NEW: 不再立即删除，由 cleanup 处理
 		cleanup = func() {
 			_ = tempFile.Close()
 			_ = os.Remove(tempFile.Name())
 		}
-		if _, errC := io.Copy(tempFile, in); errC != nil {
-			return nil, cleanup, errC
+
+		if _, err := io.Copy(tempFile, in); err != nil {
+			cleanup()
+			return nil, func() {}, err
 		}
-		if _, errS := tempFile.Seek(0, io.SeekStart); errS != nil {
-			return nil, cleanup, errS
+		if _, err := tempFile.Seek(0, io.SeekStart); err != nil {
+			cleanup()
+			return nil, func() {}, err
 		}
-		out = tempFile
-	} else {
-		inData, errR := io.ReadAll(in)
-		if errR != nil {
-			return nil, cleanup, errR
-		}
-		out = bytes.NewReader(inData)
+		return tempFile, cleanup, nil
 	}
-	return out, cleanup, nil
+
+	inData, err := io.ReadAll(in)
+	if err != nil {
+		return nil, cleanup, err
+	}
+	return bytes.NewReader(inData), cleanup, nil
 }
 
 // bufferIOwithSHA1 buffers the input and calculates its SHA-1
 func bufferIOwithSHA1(in io.Reader, size, threshold int64) (sha1sum string, out io.Reader, cleanup func(), err error) {
+	cleanup = func() {} // 默认空清理函数
 	hashVal := sha1.New()
 	tee := io.TeeReader(in, hashVal)
 
@@ -462,18 +463,24 @@ func (f *Fs) tryHashUpload(
 	o *Object,
 	leaf, dirID string,
 	size int64,
-) (bool, *api.UploadInitInfo, io.Reader, error) {
+) (found bool, ui *api.UploadInitInfo, newIn io.Reader, cleanup func(), err error) {
+	cleanup = func() {} // 默认空清理函数
+	defer func() {
+		if err != nil && cleanup != nil {
+			cleanup() // 错误时立即清理
+		}
+	}()
 	fs.Debugf(o, "tryHashUpload: attempting 秒传...")
 
 	// 1) Get or compute the file's SHA-1
 	hashStr, err := src.Hash(ctx, hash.SHA1)
-	var cleanup func()
 	if err != nil || hashStr == "" {
 		fs.Debugf(o, "tryHashUpload: computing SHA1 locally...")
-		hashStr, in, cleanup, err = bufferIOwithSHA1(in, size, int64(f.opt.HashMemoryThreshold))
-		defer cleanup()
+		var localCleanup func()
+		hashStr, newIn, localCleanup, err = bufferIOwithSHA1(in, size, int64(f.opt.HashMemoryThreshold))
+		cleanup = localCleanup // NEW: 将 cleanup 传递给调用者
 		if err != nil {
-			return false, nil, nil, fmt.Errorf("failed to calculate SHA1: %w", err)
+			return false, nil, nil, cleanup, fmt.Errorf("计算 SHA1 失败: %w", err)
 		}
 	} else {
 		fs.Debugf(o, "tryHashUpload: using precomputed SHA1=%s", hashStr)
@@ -481,9 +488,9 @@ func (f *Fs) tryHashUpload(
 	o.sha1sum = strings.ToLower(hashStr)
 
 	// 2) Call initUpload with that SHA-1
-	ui, err := f.initUpload(ctx, size, leaf, dirID, hashStr, "", "")
+	ui, err = f.initUpload(ctx, size, leaf, dirID, hashStr, "", "")
 	if err != nil {
-		return false, nil, nil, fmt.Errorf("秒传 initUpload failed: %w", err)
+		return false, nil, newIn, cleanup, fmt.Errorf("秒传 initUpload 失败: %w", err)
 	}
 
 	// 3) Handle different statuses
@@ -502,29 +509,29 @@ func (f *Fs) tryHashUpload(
 			if info, err2 := f.getFile(ctx, "", ui.PickCode); err2 == nil {
 				_ = o.setMetaData(info)
 			}
-			return true, ui, in, nil
+			return false, ui, newIn, cleanup, nil
 
 		case 1:
 			// status=1 => server doesn't have file => need actual upload
 			fs.Debugf(o, "tryHashUpload: 秒传 not possible => server requires real upload.")
-			return false, ui, in, nil
+			return false, ui, in, cleanup, nil
 
 		case 7:
 			// partial-block check
 			fs.Debugf(o, "tryHashUpload: 秒传 partial-block check => signCheck=%q", ui.SignCheck)
 			signKey = ui.SignKey
 			if signVal, err = calcBlockSHA1(ctx, in, src, ui.SignCheck); err != nil {
-				return false, nil, nil, fmt.Errorf("calcBlockSHA1 error: %w", err)
+				return false, nil, newIn, cleanup, fmt.Errorf("calcBlockSHA1 error: %w", err)
 			}
 			ui, err = f.initUpload(ctx, size, leaf, dirID, hashStr, signKey, signVal)
 			if err != nil {
-				return false, nil, nil, fmt.Errorf("tryHashUpload: 秒传 re-init error: %w", err)
+				return false, nil, newIn, cleanup, fmt.Errorf("tryHashUpload: 秒传 re-init error: %w", err)
 			}
 			continue
 
 		default:
 			// Unexpected status => treat as error
-			return false, nil, nil, fmt.Errorf("tryHashUpload: 秒传 error: unexpected status=%d", ui.Status)
+			return false, nil, newIn, cleanup, fmt.Errorf("tryHashUpload: 秒传 error: unexpected status=%d", ui.Status)
 		}
 	}
 }
@@ -537,47 +544,36 @@ func (f *Fs) uploadToOSS(
 	o *Object,
 	leaf, dirID string,
 	size int64,
-	ui *api.UploadInitInfo, // Existing parameter
+	ui *api.UploadInitInfo,
 	options ...fs.OpenOption,
 ) (fs.Object, error) {
-	// Check if ui is nil and retry fetching UploadInitInfo if necessary
 	if ui == nil {
-		fs.Debugf(o, "uploadToOSS: UploadInitInfo is nil, attempting to reinitialize...")
-		var err error
 		expBackoff := backoff.NewExponentialBackOff()
 		expBackoff.InitialInterval = 1 * time.Second
-		expBackoff.MaxInterval = 5 * time.Second
 		expBackoff.MaxElapsedTime = 30 * time.Second
 
-		// Retry initializing the upload with minimal backoff
-		err = backoff.RetryNotify(func() error {
+		err := backoff.RetryNotify(func() error {
 			var initErr error
-			// Initialize without SHA1 for regular upload
 			ui, initErr = f.initUpload(ctx, size, leaf, dirID, "", "", "")
 			if initErr != nil {
 				return initErr
 			}
 			if ui == nil {
-				return errors.New("initUpload returned nil without error")
+				return errors.New("initUpload returned nil")
 			}
 			return nil
 		}, expBackoff, func(err error, d time.Duration) {
-			fs.Debugf(o, "uploadToOSS: initUpload retry error: %v, retrying in %v", err, d)
+			fs.Debugf(o, "initUpload retry error: %v", err)
 		})
 
 		if err != nil {
-			return nil, fmt.Errorf("uploadToOSS: failed to initialize upload after retries: %w", err)
+			return nil, fmt.Errorf("failed to initialize upload: %w", err)
 		}
-		fs.Debugf(o, "uploadToOSS: successfully reinitialized UploadInitInfo")
 	}
 
-	// Define the upload operation
 	operation := func() error {
-		// Decide between single-part and multipart uploads
 		cutoff := int64(o.fs.opt.UploadCutoff)
 		if size < cutoff {
-			// Single-part upload
-			fs.Debugf(o, "uploadToOSS: single-part => size=%d < cutoff=%d", size, cutoff)
 			client := f.newOSSClient()
 			req := &oss.PutObjectRequest{
 				Bucket:      oss.Ptr(ui.Bucket),
@@ -586,7 +582,7 @@ func (f *Fs) uploadToOSS(
 				Callback:    oss.Ptr(ui.GetCallback()),
 				CallbackVar: oss.Ptr(ui.GetCallbackVar()),
 			}
-			// Apply options
+
 			for _, opt := range options {
 				k, v := opt.Header()
 				switch strings.ToLower(k) {
@@ -600,60 +596,59 @@ func (f *Fs) uploadToOSS(
 					req.ContentType = oss.Ptr(v)
 				}
 			}
+
+			// FIXED: Reset read position before retries
+			if seeker, ok := in.(io.Seeker); ok {
+				_, _ = seeker.Seek(0, io.SeekStart)
+			}
+
 			res, err := client.PutObject(ctx, req)
 			if err != nil {
-				return fmt.Errorf("uploadToOSS: single-part putObject error: %w", err)
+				return fmt.Errorf("putObject error: %w", err)
 			}
+
 			data, err := f.postUpload(res.CallbackResult)
 			if err != nil {
-				return fmt.Errorf("uploadToOSS: single-part finalize error: %w", err)
+				return fmt.Errorf("finalize error: %w", err)
 			}
-			if err = o.setMetaDataFromCallBack(data); err != nil {
-				return fmt.Errorf("uploadToOSS: setting metadata error: %w", err)
-			}
-			return nil
+			return o.setMetaDataFromCallBack(data)
 		}
 
-		// Multipart upload
-		fs.Debugf(o, "uploadToOSS: starting multipart for size=%d >= cutoff=%d", size, cutoff)
+		// FIXED: Handle file inputs in chunk writer
 		mu, err := f.newChunkWriter(ctx, remote(o), src, ui, in, options...)
 		if err != nil {
-			return fmt.Errorf("uploadToOSS: multipart init error: %w", err)
+			return fmt.Errorf("multipart init error: %w", err)
 		}
+
 		if err = mu.Upload(ctx); err != nil {
-			// Handle context cancellation
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if errors.Is(err, context.Canceled) {
 				return backoff.Permanent(err)
 			}
 
-			// Check if the error is PartAlreadyExist
 			var ossErr *oss.ServiceError
 			if errors.As(err, &ossErr) && ossErr.Code == "PartAlreadyExist" {
-				fs.Debugf(o, "uploadToOSS: part already exists, skipping upload")
-				return nil // Skip re-uploading this part
+				fs.Debugf(o, "part already exists")
+				return nil
 			}
-			return fmt.Errorf("uploadToOSS: multipart upload error: %w", err)
+			return fmt.Errorf("upload error: %w", err)
 		}
+
 		data, err := f.postUpload(mu.callbackRes)
 		if err != nil {
-			return fmt.Errorf("uploadToOSS: multipart finalize error: %w", err)
+			return fmt.Errorf("finalize error: %w", err)
 		}
-		if err = o.setMetaDataFromCallBack(data); err != nil {
-			return fmt.Errorf("uploadToOSS: setting metadata error: %w", err)
-		}
-		return nil
+		return o.setMetaDataFromCallBack(data)
 	}
 
-	// Execute the upload operation with retries
 	expBackoff := backoff.NewExponentialBackOff()
 	expBackoff.MaxElapsedTime = 2 * time.Minute
-	err := backoff.RetryNotify(operation, expBackoff, func(err error, duration time.Duration) {
-		fs.Logf(o, "uploadToOSS failed: %v. Retrying in %v", err, duration)
+	err := backoff.RetryNotify(operation, expBackoff, func(err error, d time.Duration) {
+		fs.Logf(o, "upload error: %v, retrying", err)
 	})
-	if err != nil {
-		return nil, err
-	}
 
+	if err != nil {
+		return nil, fmt.Errorf("upload failed: %w", err)
+	}
 	return o, nil
 }
 
@@ -710,6 +705,13 @@ func (f *Fs) upload(
 		return nil, err
 	}
 
+	var cleanup func() // FIXED: Add cleanup handler
+	defer func() {
+		if cleanup != nil {
+			cleanup()
+		}
+	}()
+
 	//----------------------------------------------------------------
 	// 1) OnlyStream
 	//----------------------------------------------------------------
@@ -731,22 +733,28 @@ func (f *Fs) upload(
 	if f.opt.FastUpload {
 		noHashSize := int64(f.opt.NohashSize)
 		if size <= noHashSize {
-			// Tiny files use sample upload
 			obj, err := f.doSampleUpload(ctx, in, o, leaf, dirID, size, options...)
 			if err != nil {
 				return nil, err
 			}
 			return obj, nil
 		}
-		// Attempt fast upload (秒传)
-		gotIt, ui, newIn, err := f.tryHashUpload(ctx, in, src, o, leaf, dirID, size)
+
+		// FIXED: Get cleanup function from tryHashUpload
+		gotIt, ui, newIn, localCleanup, err := f.tryHashUpload(ctx, in, src, o, leaf, dirID, size)
+		cleanup = localCleanup
 		if err != nil {
 			return nil, fmt.Errorf("FastUpload: 秒传 error: %w", err)
 		}
 		if gotIt {
 			return o, nil
 		}
-		// Fallback to uploadToOSS using the obtained UploadInitInfo
+
+		// FIXED: Reset read position before upload
+		if seeker, ok := newIn.(io.Seeker); ok {
+			_, _ = seeker.Seek(0, io.SeekStart)
+		}
+
 		if ui != nil {
 			if size <= int64(StreamUploadLimit) {
 				obj, err := f.doSampleUpload(ctx, newIn, o, leaf, dirID, size, options...)
@@ -761,7 +769,7 @@ func (f *Fs) upload(
 			}
 			return obj, nil
 		}
-		// If ui is nil, fallback to standard upload
+
 		if size <= int64(StreamUploadLimit) {
 			obj, err := f.doSampleUpload(ctx, newIn, o, leaf, dirID, size, options...)
 			if err != nil {
@@ -784,22 +792,20 @@ func (f *Fs) upload(
 		if hashStr == "" {
 			return nil, fserrors.NoRetryError(errors.New("UploadHashOnly: skipping since no SHA1"))
 		}
-		gotIt, _, _, err := f.tryHashUpload(ctx, in, src, o, leaf, dirID, size)
+		gotIt, _, _, _, err := f.tryHashUpload(ctx, in, src, o, leaf, dirID, size)
 		if err != nil {
 			return nil, err
 		}
 		if gotIt {
 			return o, nil
 		}
-		// No fallback for UploadHashOnly
 		return nil, fserrors.NoRetryError(errors.New("UploadHashOnly: server does not have file => skipping"))
 	}
 
 	//----------------------------------------------------------------
-	// 4) Normal logic: if file < nohash_size => sample; else 秒传 => fallback to upload
+	// 4) Normal logic
 	//----------------------------------------------------------------
 	if size >= 0 && size < int64(f.opt.NohashSize) && !f.opt.UploadHashOnly {
-		// Use sample upload for small files
 		obj, err := f.doSampleUpload(ctx, in, o, leaf, dirID, size, options...)
 		if err != nil {
 			return nil, err
@@ -807,8 +813,9 @@ func (f *Fs) upload(
 		return obj, nil
 	}
 
-	// Attempt fast upload (秒传)
-	gotIt, ui, newIn, err := f.tryHashUpload(ctx, in, src, o, leaf, dirID, size)
+	// FIXED: Get cleanup function from tryHashUpload
+	gotIt, ui, newIn, localCleanup, err := f.tryHashUpload(ctx, in, src, o, leaf, dirID, size)
+	cleanup = localCleanup
 	if err != nil {
 		fs.Debugf(o, "normal: 秒传 error => fallback to uploadToOSS: %v", err)
 		obj, uploadErr := f.uploadToOSS(ctx, newIn, src, o, leaf, dirID, size, ui, options...)
@@ -818,10 +825,14 @@ func (f *Fs) upload(
 		return obj, nil
 	}
 	if gotIt {
-		// Fast upload successful
 		return o, nil
 	}
-	// Fallback to actual upload to OSS
+
+	// FIXED: Reset read position before upload
+	if seeker, ok := newIn.(io.Seeker); ok {
+		_, _ = seeker.Seek(0, io.SeekStart)
+	}
+
 	obj, err := f.uploadToOSS(ctx, newIn, src, o, leaf, dirID, size, ui, options...)
 	if err != nil {
 		return nil, err
