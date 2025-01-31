@@ -103,7 +103,6 @@ func bufferIO(in io.Reader, size, threshold int64) (out io.Reader, cleanup func(
 
 // bufferIOwithSHA1 buffers the input and calculates its SHA-1
 func bufferIOwithSHA1(in io.Reader, size, threshold int64) (sha1sum string, out io.Reader, cleanup func(), err error) {
-	cleanup = func() {} // 默认空清理函数
 	hashVal := sha1.New()
 	tee := io.TeeReader(in, hashVal)
 

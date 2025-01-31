@@ -185,7 +185,15 @@ func (f *Fs) newChunkWriter(
 	size := src.Size()
 
 	chunkSize := f.opt.ChunkSize
-	if size != -1 {
+	// size can be -1 here meaning we don't know the size of the incoming file. We use ChunkSize
+	// buffers here (default 5 MiB). With a maximum number of parts (10,000) this will be a file of
+	// 48 GiB which seems like a not too unreasonable limit.
+	if size == -1 {
+		warnStreamUpload.Do(func() {
+			fs.Logf(f, "Streaming uploads using chunk size %v will have maximum file size of %v",
+				f.opt.ChunkSize, fs.SizeSuffix(int64(chunkSize)*int64(uploadParts)))
+		})
+	} else {
 		chunkSize = chunksize.Calculator(src, size, uploadParts, chunkSize)
 	}
 
@@ -199,7 +207,11 @@ func (f *Fs) newChunkWriter(
 		if err != nil {
 			return nil, fmt.Errorf("failed to create temp file: %w", err)
 		}
-		defer os.Remove(tempFile.Name())
+		defer func() {
+			if err := os.Remove(tempFile.Name()); err != nil {
+				fs.Errorf(w.o, "failed to remove temp file: %v", err)
+			}
+		}()
 		if _, err = io.Copy(tempFile, in); err != nil {
 			return nil, fmt.Errorf("failed to buffer to temp file: %w", err)
 		}
