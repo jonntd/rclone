@@ -20,10 +20,12 @@ package _115
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path"
 	"reflect"
 	"regexp"
@@ -33,6 +35,7 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/rclone/rclone/backend/115/api"
+	"github.com/rclone/rclone/backend/115/crypto"
 	"github.com/rclone/rclone/backend/115/dircache"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
@@ -61,10 +64,13 @@ const (
 
 	maxUploadSize       = 115 * fs.Gibi // 115 GiB from https://proapi.115.com/app/uploadinfo
 	maxUploadParts      = 10000         // Part number must be an integer between 1 and 10000, inclusive.
-	minChunkSize        = 5 * fs.Mebi   // Part size should be in [100KB, 5GB]
+	defaultChunkSize    = 5 * fs.Mebi   // Part size should be in [100KB, 5GB]
+	minChunkSize        = 100 * fs.Kibi
+	maxChunkSize        = 100 * fs.Gibi
 	defaultUploadCutoff = 200 * fs.Mebi
 	defaultNohashSize   = 100 * fs.Mebi
 	StreamUploadLimit   = 5 * fs.Gibi
+	maxUploadCutoff     = 20 * fs.Gibi // maximum allowed size for singlepart uploads
 )
 
 // Register with Fs
@@ -216,7 +222,7 @@ it's buffered by the OSS SDK, when in fact it may still be uploading.
 A bigger chunk size means a bigger OSS SDK buffer and progress
 reporting more deviating from the truth.
 `,
-			Default:  minChunkSize,
+			Default:  defaultChunkSize,
 			Advanced: true,
 		}, {
 			Name: "max_upload_parts",
@@ -490,6 +496,40 @@ func (p *poolClient) CallJSON(ctx context.Context, opts *rest.Opts, request inte
 	return p.client().CallJSON(ctx, opts, request, response)
 }
 
+func (p *poolClient) CallDATA(ctx context.Context, opts *rest.Opts, request interface{}, response interface{}) (resp *http.Response, err error) {
+	// Encode request data
+	input, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+	key := crypto.GenerateKey()
+	opts.MultipartParams = url.Values{"data": {crypto.Encode(input, key)}}
+
+	// Perform API call
+	var info *api.Base
+	resp, err = p.client().CallJSON(ctx, opts, request, &info)
+	if err != nil {
+		return
+	}
+
+	// Handle API errors
+	if !info.State {
+		return nil, fmt.Errorf("API Error: %s (%d)", info.Error, info.Errno)
+	} else if info.Data.EncodedData == "" {
+		return nil, errors.New("no data")
+	}
+
+	// Decode and unmarshal response
+	output, err := crypto.Decode(info.Data.EncodedData, key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode data: %w", err)
+	}
+	if err := json.Unmarshal(output, response); err != nil {
+		return nil, fmt.Errorf("failed to json.Unmarshal %q", string(output))
+	}
+	return resp, nil
+}
+
 func (p *poolClient) Call(ctx context.Context, opts *rest.Opts) (resp *http.Response, err error) {
 	return p.client().Call(ctx, opts)
 }
@@ -610,7 +650,33 @@ func checkUploadChunkSize(cs fs.SizeSuffix) error {
 	if cs < minChunkSize {
 		return fmt.Errorf("%s is less than %s", cs, minChunkSize)
 	}
+	if cs > maxChunkSize {
+		return fmt.Errorf("%s is greater than %s", cs, maxChunkSize)
+	}
 	return nil
+}
+
+func (f *Fs) setUploadChunkSize(cs fs.SizeSuffix) (old fs.SizeSuffix, err error) {
+	err = checkUploadChunkSize(cs)
+	if err == nil {
+		old, f.opt.ChunkSize = f.opt.ChunkSize, cs
+	}
+	return
+}
+
+func checkUploadCutoff(cs fs.SizeSuffix) error {
+	if cs > maxUploadCutoff {
+		return fmt.Errorf("%s is greater than %s", cs, maxUploadCutoff)
+	}
+	return nil
+}
+
+func (f *Fs) setUploadCutoff(cs fs.SizeSuffix) (old fs.SizeSuffix, err error) {
+	err = checkUploadCutoff(cs)
+	if err == nil {
+		old, f.opt.UploadCutoff = f.opt.UploadCutoff, cs
+	}
+	return
 }
 
 // newFs partially constructs Fs from the path
@@ -640,6 +706,10 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 	if err != nil {
 		return nil, fmt.Errorf("115: chunk size: %w", err)
 	}
+	err = checkUploadCutoff(opt.UploadCutoff)
+	if err != nil {
+		return nil, fmt.Errorf("115: upload cutoff: %w", err)
+	}
 
 	// mod - override rootID from path remote:{ID}
 	if rootID, _, _ := parseRootID(path); rootID != "" {
@@ -658,7 +728,6 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 		DuplicateFiles:          false, // duplicatefiles are only possible via web
 		CanHaveEmptyDirectories: true,  // can have empty directories
 		NoMultiThreading:        true,  // set if can't have multiplethreads on one download open
-		ServerSideAcrossConfigs: true,  // Can copy from shared FS (this is checked in Copy/Move/DirMove)
 	}).Fill(ctx, f)
 
 	// setting appVer
@@ -721,6 +790,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	} else {
 		f.rootFolderID = "0" //根目录 = root directory
 	}
+
+	// Can copy from shared FS (this is checked in Copy/Move/DirMove)
+	f.features.ServerSideAcrossConfigs = f.isShare
 
 	// Set the root folder path if it is not on the absolute root
 	if f.rootFolderID != "" && f.rootFolderID != "0" {
@@ -1598,7 +1670,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		return nil, fmt.Errorf("can't download: %w", err)
 	}
 	if o.durl.URL == "" {
-		return nil, errors.New("can't download: no url")
+		return nil, fserrors.NoRetryError(errors.New("can't download: no url"))
 	}
 	return o.open(ctx, options...)
 }
