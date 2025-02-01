@@ -505,7 +505,9 @@ func (f *Fs) tryHashUpload(
 				acc.ServerSideTransferStart()
 				acc.ServerSideCopyEnd(size)
 			}
-			// Optionally fetch final info - Removed this line in this fix to simplify and avoid potential issues if getFile fails.
+			if info, err2 := f.getFile(ctx, "", ui.PickCode); err2 == nil {
+				_ = o.setMetaData(info)
+			}
 			return true, ui, newIn, cleanup, nil // Return true to indicate 秒传 success
 
 		case 1:
