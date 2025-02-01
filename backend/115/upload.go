@@ -519,7 +519,7 @@ func (f *Fs) tryHashUpload(
 			// partial-block check
 			fs.Debugf(o, "tryHashUpload: 秒传 partial-block check => signCheck=%q", ui.SignCheck)
 			signKey = ui.SignKey
-			if signVal, err = calcBlockSHA1(ctx, in, src, ui.SignCheck); err != nil {
+			if signVal, err = calcBlockSHA1(ctx, newIn, src, ui.SignCheck); err != nil {
 				return false, nil, newIn, cleanup, fmt.Errorf("calcBlockSHA1 error: %w", err)
 			}
 			ui, err = f.initUpload(ctx, size, leaf, dirID, hashStr, signKey, signVal)
