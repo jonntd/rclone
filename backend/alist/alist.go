@@ -761,13 +761,6 @@ func (f *Fs) invalidateCache(dir string) {
 	delete(f.fileListCache, dir)
 }
 
-// setCommonHeaders sets headers on an HTTP request.
-func (f *Fs) setCommonHeaders(req *http.Request, headers map[string]string) {
-	for key, value := range headers {
-		req.Header.Set(key, value)
-	}
-}
-
 // fetchCloudflare contacts the CF server to obtain cookies (and optionally a user agent)
 // for the given targetURL.
 func (f *Fs) fetchCloudflare(ctx context.Context, targetURL string) error {
@@ -776,7 +769,11 @@ func (f *Fs) fetchCloudflare(ctx context.Context, targetURL string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			fs.Errorf(ctx, "Failed to close response body in fetchCloudflare: %v", err)
+		}
+	}()
 
 	// Decode the JSON response into a map.
 	// For example, the response might be: {"cf_clearance": "cookie_value"}
@@ -834,7 +831,11 @@ func (f *Fs) fetchUserAgent(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			fs.Errorf(ctx, "Failed to close response body in fetchUserAgent: %v", err)
+		}
+	}()
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
