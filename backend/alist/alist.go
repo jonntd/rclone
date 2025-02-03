@@ -34,7 +34,7 @@ const (
 	maxSleep      = 2 * time.Second
 	decayConstant = 2 // bigger for slower decay, exponential
 
-	// Define API endpoint constants
+	// API endpoint constants.
 	apiLogin  = "/api/auth/login/hash"
 	apiList   = "/api/fs/list"
 	apiPut    = "/api/fs/put"
@@ -49,67 +49,81 @@ func init() {
 		Name:        "alist",
 		Description: "AList",
 		NewFs:       NewFs,
-		Options: []fs.Option{{
-			Name:     "url",
-			Help:     "URL of the AList server",
-			Required: true,
-		}, {
-			Name:     "username",
-			Help:     "Username for AList",
-			Required: false,
-		}, {
-			Name:       "password",
-			Help:       "Password for AList",
-			Required:   false,
-			IsPassword: true,
-		}, {
-			Name:     "root_path",
-			Help:     "Root path within the AList server",
-			Required: false,
-			Default:  "/",
-		}, {
-			Name:     "cf_server",
-			Help:     "URL of the Cloudflare server",
-			Required: false,
-			Default:  "",
-		}, {
-			Name:     "otp_code",
-			Help:     "Two-factor authentication code",
-			Default:  "",
-			Advanced: true,
-		}, {
-			Name:     "meta_pass",
-			Help:     "Meta password for listing",
-			Default:  "",
-			Advanced: true,
-		}, {
-			Name:     config.ConfigEncoding,
-			Help:     config.ConfigEncodingHelp,
-			Advanced: true,
-			Default: (encoder.EncodeLtGt |
-				encoder.EncodeLeftSpace |
-				encoder.EncodeCtl |
-				encoder.EncodeSlash |
-				encoder.EncodeRightSpace |
-				encoder.EncodeInvalidUtf8),
-		}},
+		Options: []fs.Option{
+			{
+				Name:     "url",
+				Help:     "URL of the AList server",
+				Required: true,
+			},
+			{
+				Name:     "username",
+				Help:     "Username for AList",
+				Required: false,
+			},
+			{
+				Name:       "password",
+				Help:       "Password for AList",
+				Required:   false,
+				IsPassword: true,
+			},
+			{
+				Name:     "root_path",
+				Help:     "Root path within the AList server",
+				Required: false,
+				Default:  "/",
+			},
+			{
+				Name:     "cf_server",
+				Help:     "URL of the Cloudflare server",
+				Required: false,
+				Default:  "",
+			},
+			{
+				Name:     "otp_code",
+				Help:     "Two-factor authentication code",
+				Default:  "",
+				Advanced: true,
+			},
+			{
+				Name:     "meta_pass",
+				Help:     "Meta password for listing",
+				Default:  "",
+				Advanced: true,
+			},
+			{
+				Name:     config.ConfigEncoding,
+				Help:     config.ConfigEncodingHelp,
+				Advanced: true,
+				Default: (encoder.EncodeLtGt |
+					encoder.EncodeLeftSpace |
+					encoder.EncodeCtl |
+					encoder.EncodeSlash |
+					encoder.EncodeRightSpace |
+					encoder.EncodeInvalidUtf8),
+			},
+			{
+				Name:     "user_agent",
+				Help:     "Custom User-Agent string to use (overridden by Cloudflare if cf_server is set)",
+				Advanced: true,
+				Default:  "",
+			},
+		},
 	})
 }
 
-// Options defines the configuration for this backend
+// Options defines the configuration for this backend.
 type Options struct {
-	URL      string `config:"url"`
-	Username string `config:"username"`
-	Password string `config:"password"`
-	OTPCode  string `config:"otp_code"`
-	// meta_pass is used as a password parameter in listing
-	MetaPass string `config:"meta_pass"`
-	// root_path specifies the root path within the AList server
-	RootPath string `config:"root_path"`
-	CfServer string `config:"cf_server"`
+	URL       string `config:"url"`
+	Username  string `config:"username"`
+	Password  string `config:"password"`
+	OTPCode   string `config:"otp_code"`
+	MetaPass  string `config:"meta_pass"`
+	RootPath  string `config:"root_path"`
+	CfServer  string `config:"cf_server"`
+	UserAgent string `config:"user_agent"`
 }
 
-// Fs represents a remote AList server
+// Fs represents a remote AList server.
 type Fs struct {
 	name            string
 	root            string
@@ -123,14 +137,17 @@ type Fs struct {
 	fileListCache   map[string]listResponse
 
 	userPermission int
-	// New fields for Cloudflare handling
-	cfCookie       *http.Cookie
-	cfCookieExpiry time.Time
+	// cfCookies and cfCookieExpiry store Cloudflare cookies per host.
+	cfCookies      map[string]*http.Cookie
+	cfCookieExpiry map[string]time.Time
 	cfUserAgent    string
 	cfMu           sync.Mutex
+
+	// The underlying HTTP client used to build rest.Client.
+	httpClient *http.Client
 }
 
-// API response structures
+// API response structures.
 type loginResponse struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
@@ -174,7 +191,7 @@ type requestResponse struct {
 	Message string `json:"message"`
 }
 
-// Object describes an AList object
+// Object describes an AList object.
 type Object struct {
 	fs        *Fs
 	remote    string
@@ -204,69 +221,81 @@ func (o *Object) Fs() fs.Info {
 	return o.fs
 }
 
-// NewFs constructs an Fs from the path, container:path
+// newClientWithPacer creates an HTTP client using fs.AddConfig to override the
+// User-Agent from Options.
+func newClientWithPacer(ctx context.Context, opt *Options) *http.Client {
+	newCtx, ci := fs.AddConfig(ctx)
+	ci.UserAgent = opt.UserAgent
+	return fshttp.NewClient(newCtx)
+}
+
+// NewFs constructs an Fs from the path, container:path.
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	opt := new(Options)
-	err := configstruct.Set(m, opt)
-	if err != nil {
+	if err := configstruct.Set(m, opt); err != nil {
 		return nil, err
 	}
 
-	// Ensure url does not end with '/'
+	// Ensure URL does not end with '/'
 	opt.URL = strings.TrimSuffix(opt.URL, "/")
-
 	// Ensure root starts with '/'
 	if !strings.HasPrefix(root, "/") {
 		root = "/" + root
 	}
-
-	// Incorporate root_path if provided
+	// Incorporate root_path if provided.
 	if opt.RootPath != "" && opt.RootPath != "/" {
 		root = path.Join(root, opt.RootPath)
 	}
 
-	client := fshttp.NewClient(ctx)
 	f := &Fs{
-		name:            name,
-		root:            root,
-		opt:             *opt,
-		srv:             rest.NewClient(client).SetRoot(opt.URL),
-		pacer:           fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
-		fileListCacheMu: sync.Mutex{},
-		fileListCache:   make(map[string]listResponse),
-		cfCookie:        nil,
-		cfCookieExpiry:  time.Time{},
-		cfUserAgent:     "",
+		name:           name,
+		root:           root,
+		opt:            *opt,
+		fileListCache:  make(map[string]listResponse),
+		cfCookies:      make(map[string]*http.Cookie),
+		cfCookieExpiry: make(map[string]time.Time),
 	}
 
-	// Fetch Cloudflare cookies and user agent if CfServer is set
+	// --- Early UA setting ---
+	// If a CF server is configured, attempt to update the user agent early
+	// by calling the /get-ua endpoint. If that fails, log a warning and proceed.
 	if f.opt.CfServer != "" {
-		err = f.fetchCloudflare(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch Cloudflare cookies: %w", err)
+		if err := f.fetchUserAgent(ctx); err != nil {
+			fs.Infof(ctx, "Warning: failed to fetch CF user agent: %v", err)
+		} else {
+			fs.Infof(ctx, "Using CF user agent: %s", f.cfUserAgent)
 		}
 	}
 
-	// Login and get token only if username and password are provided
+	client := newClientWithPacer(ctx, opt)
+	f.httpClient = client
+	f.srv = rest.NewClient(client).SetRoot(opt.URL)
+	f.pacer = fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))
+
+	// Login if credentials are provided.
 	if f.opt.Username != "" && f.opt.Password != "" {
-		err = f.login(ctx)
-		if err != nil {
+		if err := f.login(ctx); err != nil {
 			return nil, err
 		}
 	} else {
-		// Proceed as guest
 		f.token = ""
 	}
 
-	// Get user permissions
+	// Retrieve user permissions.
 	var meResp meResponse
-	err = f.makeRequest(ctx, "GET", apiMe, nil, &meResp)
+	err := f.doCFRequestMust(ctx, "GET", apiMe, nil, &meResp)
+	// If that fails and a CF server is set, try to fetch CF cookie and retry.
+	if err != nil && f.opt.CfServer != "" {
+		if fetchErr := f.fetchCloudflare(ctx, f.opt.URL); fetchErr == nil {
+			err = f.doCFRequestMust(ctx, "GET", apiMe, nil, &meResp)
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to retrieve user permissions: %w", err)
 	}
 	f.userPermission = meResp.Data.Permission
 
-	// Set supported hash types
+	// Set supported hash types.
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
 	}).Fill(ctx, f)
@@ -274,207 +303,195 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	return f, nil
 }
 
-// func make password to hash
+// makePasswordHash returns a sha256 hash of the password with a fixed suffix.
 func (f *Fs) makePasswordHash(password string) string {
-	// add -https://github.com/alist-org/alist at the end of the password
 	password += "-https://github.com/alist-org/alist"
-	// hash the password with sha256
 	hash := sha256.Sum256([]byte(password))
 	return hex.EncodeToString(hash[:])
 }
 
-// login performs authentication and stores the token
+// login performs authentication and stores the token.
 func (f *Fs) login(ctx context.Context) error {
 	if f.opt.Username == "" || f.opt.Password == "" {
-		// Skip login for guest access
 		return nil
 	}
 	pw, err := obscure.Reveal(f.opt.Password)
 	if err != nil {
 		return fmt.Errorf("password decode failed - did you obscure it?: %w", err)
 	}
-	loginURL := "/api/auth/login/hash"
-
 	data := map[string]string{
 		"username": f.opt.Username,
 		"password": f.makePasswordHash(pw),
 		"otpcode":  f.opt.OTPCode,
 	}
-
 	var loginResp loginResponse
-	err = f.makeRequest(ctx, "POST", loginURL, data, &loginResp)
-	if err != nil {
+	if err := f.doCFRequestMust(ctx, "POST", apiLogin, data, &loginResp); err != nil {
 		return err
 	}
-
 	f.token = loginResp.Data.Token
 	return nil
 }
 
-// doRequest performs an HTTP request, handles token renewal, and ensures the response body can be read by the caller.
-func (f *Fs) doRequest(req *http.Request) (*http.Response, error) {
-	ctx := req.Context()
-
-	if f.token != "" {
+// ----------------------------------------------------------------------------
+// doCFRequest is our single function for all HTTP requests. It:
+// - Adds an Authorization token if the request URL host matches the API host.
+// - Adds any available Cloudflare cookie for the request host.
+// - Chooses the proper client: if the target host equals the API host use f.srv, otherwise use f.httpClient.
+// - Checks for Cloudflare challenge responses and, if detected, refreshes the cookie and retries the request.
+// ----------------------------------------------------------------------------
+func (f *Fs) doCFRequest(req *http.Request) (*http.Response, error) {
+	// If the request URL host is the same as our API host, add the token (if available).
+	apiBase, err := url.Parse(f.opt.URL)
+	if err == nil && req.URL.Host == apiBase.Host && f.token != "" {
 		req.Header.Set("Authorization", f.token)
 	}
 
-	resp, err := f.srv.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	// Read the entire response body
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		// Start of Selection
-		if err := resp.Body.Close(); err != nil {
-			fs.Errorf(ctx, "Failed to close response body: %v", err)
-		}
-		return nil, err
-	}
-	// Handle the error returned by resp.Body.Close()
-	if err := resp.Body.Close(); err != nil {
-		fs.Errorf(ctx, "Failed to close response body: %v", err)
-	}
-
-	// Check for "Just a moment..." in HTML title
-	if resp.StatusCode == 403 && bytes.Contains(bodyBytes, []byte("<title>Just a moment...</title>")) {
-		if f.opt.CfServer != "" {
-			// Refresh Cloudflare cookies
-			f.cfMu.Lock()
-			err := f.fetchCloudflare(req.Context())
-			f.cfMu.Unlock()
-			if err != nil {
-				return nil, fmt.Errorf("failed to refresh Cloudflare cookies on 403: %w", err)
-			}
-			// Retry the request with refreshed cookies
-			return f.doRequest(req)
-		}
-	}
-
-	// Parse the response to check the Code
-	var respBody requestResponse
-	err = json.Unmarshal(bodyBytes, &respBody)
-	if err != nil {
-		return nil, err
-	}
-
-	if respBody.Code != 200 {
-		if respBody.Code == 401 {
-			// Renew token
-			f.tokenMu.Lock()
-			err = f.login(req.Context())
-			f.tokenMu.Unlock()
-			if err != nil {
-				return nil, fmt.Errorf("token renewal failed: %w", err)
-			}
-			return f.doRequest(req)
-		}
-		return nil, fmt.Errorf("request failed: %s", respBody.Message)
-	}
-
-	// Reconstruct the response body so the caller can read it
-	resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-	return resp, nil
-}
-
-// makeRequest is a helper method to create and process HTTP requests.
-func (f *Fs) makeRequest(ctx context.Context, method, endpoint string, data interface{}, response interface{}) error {
-	// Marshal the data to JSON
-	jsonData, err := json.Marshal(data)
-	if err != nil {
-		return err
-	}
-
-	// Create the HTTP request
-	req, err := http.NewRequestWithContext(ctx, method, f.opt.URL+endpoint, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return err
-	}
-
-	// Set common headers
-	headers := map[string]string{
-		"Content-Type": "application/json",
-		"Accept":       "application/json, text/plain, */*",
-	}
-
-	// If CfServer is set, add cookies and user agent
+	// Add Cloudflare cookie for this request's host if available.
 	if f.opt.CfServer != "" {
 		f.cfMu.Lock()
-		if time.Now().After(f.cfCookieExpiry.Add(-1 * time.Minute)) {
-			// Refresh Cloudflare cookies
-			err = f.fetchCloudflare(ctx)
-			if err != nil {
-				f.cfMu.Unlock()
-				return fmt.Errorf("failed to refresh Cloudflare cookies: %w", err)
+		host := req.URL.Host
+		if cookie, ok := f.cfCookies[host]; ok {
+			expiry := f.cfCookieExpiry[host]
+			if time.Now().After(expiry.Add(-1 * time.Minute)) {
+				if err := f.fetchCloudflare(req.Context(), req.URL.String()); err != nil {
+					f.cfMu.Unlock()
+					return nil, fmt.Errorf("failed to refresh CF cookies: %w", err)
+				}
+				cookie = f.cfCookies[host]
 			}
-		}
-		if f.cfCookie != nil {
-			req.AddCookie(f.cfCookie)
-			headers["User-Agent"] = f.cfUserAgent
+			req.AddCookie(cookie)
 		}
 		f.cfMu.Unlock()
 	}
 
-	f.setCommonHeaders(req, headers)
+	// Choose the appropriate HTTP client.
+	apiBase, err = url.Parse(f.opt.URL)
+	var clientFunc func(*http.Request) (*http.Response, error)
+	if err == nil && req.URL.Host == apiBase.Host {
+		clientFunc = f.srv.Do
+	} else {
+		clientFunc = f.httpClient.Do
+	}
 
-	// Perform the request using doRequest
-	resp, err := f.doRequest(req)
+	// Perform the request.
+	resp, err := clientFunc(req)
+	if err != nil {
+		return nil, err
+	}
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		_ = resp.Body.Close()
+		return nil, err
+	}
+	_ = resp.Body.Close()
+
+	// Check for a Cloudflare challenge page.
+	if resp.StatusCode == 403 {
+		if f.opt.CfServer != "" {
+			f.cfMu.Lock()
+			if err := f.fetchCloudflare(req.Context(), req.URL.String()); err != nil {
+				f.cfMu.Unlock()
+				return nil, fmt.Errorf("failed to refresh CF cookies on 403: %w", err)
+			}
+			f.cfMu.Unlock()
+			// Recreate the request (for GET requests no body is required).
+			newReq, err := http.NewRequestWithContext(req.Context(), req.Method, req.URL.String(), nil)
+			if err != nil {
+				return nil, err
+			}
+			// Copy headers.
+			for k, v := range req.Header {
+				newReq.Header[k] = v
+			}
+			return f.doCFRequest(newReq)
+		}
+	}
+
+	resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	return resp, nil
+}
+
+// doCFRequestMust is a helper that performs an HTTP request via doCFRequest and unmarshals the JSON response into "response".
+// It returns an error if the HTTP request or JSON unmarshalling fails or if the response indicates an error.
+func (f *Fs) doCFRequestMust(ctx context.Context, method, endpoint string, data interface{}, response interface{}) error {
+	var reqBody io.Reader
+	if data != nil {
+		jsonData, err := json.Marshal(data)
+		if err != nil {
+			return err
+		}
+		reqBody = bytes.NewBuffer(jsonData)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, f.opt.URL+endpoint, reqBody)
+	if err != nil {
+		return err
+	}
+	// Set common headers.
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	resp, err := f.doCFRequest(req)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		if closeErr := resp.Body.Close(); closeErr != nil {
-			fs.Errorf(ctx, "Failed to close response body: %v", closeErr)
+		if err := resp.Body.Close(); err != nil {
+			fs.Errorf(ctx, "Failed to close response body: %v", err)
 		}
 	}()
-
-	// Read the response body
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
-
-	// Unmarshal the response into the provided response interface
-	err = json.Unmarshal(bodyBytes, response)
-	if err != nil {
+	if err := json.Unmarshal(bodyBytes, response); err != nil {
 		return err
 	}
-
-	// Handle response codes
-	err = f.handleResponse(response)
-	if err != nil {
+	// Check for error codes in common response types.
+	if err := f.handleResponse(response); err != nil {
+		// If unauthorized, try to renew token and retry.
 		if err.Error() == "unauthorized access" {
-			// Renew token if unauthorized
 			f.tokenMu.Lock()
 			defer f.tokenMu.Unlock()
 			if err := f.login(ctx); err != nil {
 				return fmt.Errorf("token renewal failed: %w", err)
 			}
-			// Retry the request after renewing token
-			return f.makeRequest(ctx, method, endpoint, data, response)
+			return f.doCFRequestMust(ctx, method, endpoint, data, response)
 		}
 		return err
 	}
-
 	return nil
 }
 
-// fileInfoToDirEntry converts a fileInfo instance to a fs.DirEntry
+// handleResponse examines the API response for error codes.
+func (f *Fs) handleResponse(response interface{}) error {
+	switch response.(type) {
+	case *loginResponse, *listResponse, *requestResponse:
+		v := reflect.ValueOf(response).Elem()
+		code := v.FieldByName("Code").Int()
+		message := v.FieldByName("Message").String()
+		if code != 200 {
+			if code == 401 {
+				return fmt.Errorf("unauthorized access")
+			}
+			return fmt.Errorf("request failed: %s", message)
+		}
+	default:
+		// No action needed.
+	}
+	return nil
+}
+
+// fileInfoToDirEntry converts a fileInfo instance to a fs.DirEntry.
 func (f *Fs) fileInfoToDirEntry(item fileInfo, dir string) fs.DirEntry {
 	remote := path.Join(dir, item.Name)
 	if item.IsDir {
 		return fs.NewDir(remote, item.Modified)
 	}
-
 	var md5sum, sha1sum, sha256sum string
 	if item.HashInfo != nil {
 		md5sum = item.HashInfo.MD5
 		sha1sum = item.HashInfo.SHA1
 		sha256sum = item.HashInfo.SHA256
 	}
-
 	return &Object{
 		fs:        f,
 		remote:    remote,
@@ -486,17 +503,14 @@ func (f *Fs) fileInfoToDirEntry(item fileInfo, dir string) fs.DirEntry {
 	}
 }
 
-// List the objects and directories in dir into entries
+// List lists the objects and directories in dir.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
 	if cached, ok := f.getCachedList(dir); ok {
-		// Use cached data
 		for _, item := range cached.Data.Content {
 			entries = append(entries, f.fileInfoToDirEntry(item, dir))
 		}
 		return entries, nil
 	}
-
-	// existing listing logic...
 	data := map[string]interface{}{
 		"path":     path.Join(f.root, dir),
 		"per_page": 1000,
@@ -506,74 +520,58 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	if f.userPermission == 2 {
 		data["refresh"] = true
 	}
-
 	var listResp listResponse
-	err = f.makeRequest(ctx, "POST", apiList, data, &listResp)
-	if err != nil {
+	if err = f.doCFRequestMust(ctx, "POST", apiList, data, &listResp); err != nil {
 		return nil, err
 	}
-
-	// Cache the list response
 	f.setCachedList(dir, listResp)
-
 	for _, item := range listResp.Data.Content {
 		entries = append(entries, f.fileInfoToDirEntry(item, dir))
 	}
-
 	return entries, nil
 }
 
-// Put in to the remote path with the modTime given of the given size
+// Put uploads an object to the remote.
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	remote := src.Remote()
 	size := src.Size()
 	modTime := src.ModTime(ctx)
-
 	putURL := f.opt.URL + "/api/fs/put"
 	req, err := http.NewRequestWithContext(ctx, "PUT", putURL, in)
 	if err != nil {
 		return nil, err
 	}
-
 	encodedFilePath := url.PathEscape(path.Join(f.root, remote))
 	req.Header.Set("File-Path", encodedFilePath)
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Content-Length", fmt.Sprintf("%d", size))
 	req.Header.Set("last-modified", fmt.Sprintf("%d", modTime.UnixMilli()))
 	req.ContentLength = size
-
-	resp, err := f.doRequest(req)
+	resp, err := f.doCFRequest(req)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
-		if closeErr := resp.Body.Close(); closeErr != nil {
-			fs.Errorf(ctx, "Failed to close response body: %v", closeErr)
+		if err := resp.Body.Close(); err != nil {
+			fs.Errorf(ctx, "Failed to close response body: %v", err)
 		}
 	}()
-
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
-
 	var uploadResp struct {
 		Code    int    `json:"code"`
 		Message string `json:"message"`
 	}
-	err = json.Unmarshal(bodyBytes, &uploadResp)
-	if err != nil {
+	if err := json.Unmarshal(bodyBytes, &uploadResp); err != nil {
 		return nil, err
 	}
-
 	if uploadResp.Code != 200 {
 		return nil, fmt.Errorf("upload failed: %s", uploadResp.Message)
 	}
-
-	// Invalidate cache for the parent directory using helper
 	parentDir := path.Dir(src.Remote())
 	f.invalidateCache(parentDir)
-
 	return &Object{
 		fs:      f,
 		remote:  remote,
@@ -582,54 +580,41 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	}, nil
 }
 
-// Mkdir creates a directory if it doesn't exist
+// Mkdir creates a directory.
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	mkdirURL := "/api/fs/mkdir"
-
 	data := map[string]string{
 		"path": path.Join(f.root, dir),
 	}
-
 	var mkdirResp requestResponse
-	err := f.makeRequest(ctx, "POST", mkdirURL, data, &mkdirResp)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return f.doCFRequestMust(ctx, "POST", mkdirURL, data, &mkdirResp)
 }
 
-// Rmdir removes the directory if empty
+// Rmdir removes an empty directory.
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	return f.purgeDir(ctx, dir, false)
 }
 
-// purgeDir removes the directory and optionally all of its contents
+// purgeDir removes the directory.
 func (f *Fs) purgeDir(ctx context.Context, dir string, recursive bool) error {
 	removeURL := "/api/fs/remove"
-
 	names := []string{"."}
-
 	data := map[string]interface{}{
 		"dir":   path.Join(f.root, dir),
 		"names": names,
 	}
-
 	var removeResp requestResponse
-	err := f.makeRequest(ctx, "POST", removeURL, data, &removeResp)
-	if err != nil {
+	if err := f.doCFRequestMust(ctx, "POST", removeURL, data, &removeResp); err != nil {
 		return err
 	}
-
-	// Optionally, clear the file list cache for the directory
 	f.fileListCacheMu.Lock()
 	delete(f.fileListCache, dir)
 	f.fileListCacheMu.Unlock()
-
 	return nil
 }
 
-// Object implementation
+// Object methods.
+
 func (o *Object) Remote() string {
 	return o.remote
 }
@@ -654,13 +639,12 @@ func (o *Object) Storable() bool {
 	return true
 }
 
+// Open retrieves the raw download URL and uses doCFRequest to handle CF challenges.
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	getURL := "/api/fs/get"
-
 	data := map[string]string{
 		"path": path.Join(o.fs.root, o.remote),
 	}
-
 	var getResp struct {
 		Code    int    `json:"code"`
 		Message string `json:"message"`
@@ -668,33 +652,24 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 			RawURL string `json:"raw_url"`
 		} `json:"data"`
 	}
-
-	err := o.fs.makeRequest(ctx, "POST", getURL, data, &getResp)
-	if err != nil {
+	if err := o.fs.doCFRequestMust(ctx, "POST", getURL, data, &getResp); err != nil {
 		return nil, err
 	}
-
-	// Download from raw URL
-	resp, err := http.NewRequestWithContext(ctx, "GET", getResp.Data.RawURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", getResp.Data.RawURL, nil)
 	if err != nil {
 		return nil, err
 	}
 	fs.FixRangeOption(options, o.size)
-	fs.OpenOptionAddHTTPHeaders(resp.Header, options)
+	fs.OpenOptionAddHTTPHeaders(req.Header, options)
 	if o.size == 0 {
-		// Don't supply range requests for 0 length objects as they always fail
-		delete(resp.Header, "Range")
+		delete(req.Header, "Range")
 	}
-	client := &http.Client{}
-	response, err := client.Do(resp)
+	response, err := o.fs.doCFRequest(req)
 	if err != nil {
 		return nil, err
 	}
 	if response.StatusCode != 200 && response.StatusCode != 206 {
-		err = response.Body.Close()
-		if err != nil {
-			fs.Errorf(ctx, "Failed to close response body: %v", err)
-		}
+		_ = response.Body.Close()
 		return nil, fmt.Errorf("failed to open object: status code %d", response.StatusCode)
 	}
 	return response.Body, nil
@@ -707,25 +682,18 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 func (o *Object) Remove(ctx context.Context) error {
 	removeURL := "/api/fs/remove"
-
 	data := map[string]interface{}{
 		"dir":   path.Dir(path.Join(o.fs.root, o.remote)),
 		"names": []string{path.Base(o.remote)},
 	}
-
 	var removeResp requestResponse
-	err := o.fs.makeRequest(ctx, "POST", removeURL, data, &removeResp)
-	if err != nil {
+	if err := o.fs.doCFRequestMust(ctx, "POST", removeURL, data, &removeResp); err != nil {
 		return err
 	}
-
-	// Invalidate cache for the directory using helper
 	o.fs.invalidateCache(path.Dir(o.remote))
-
 	return nil
 }
 
-// Hash returns the hash for the given type
 func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
 	switch ty {
 	case hash.MD5:
@@ -739,71 +707,39 @@ func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
 	}
 }
 
-// String returns a descriptive string for the object
 func (o *Object) String() string {
 	return fmt.Sprintf("AList Object: %s", o.remote)
 }
 
-// Hashes returns the supported hash types
 func (f *Fs) Hashes() hash.Set {
 	return hash.NewHashSet(hash.MD5, hash.SHA1, hash.SHA256)
 }
 
-// Precision returns the precision of the filesystem
 func (f *Fs) Precision() time.Duration {
-	return time.Second // Adjust as needed
+	return time.Second
 }
 
-// NewObject creates a new Object
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	// Split the remote path into directory and file name
 	dir := path.Dir(remote)
-
-	// List the contents of the directory
 	entries, err := f.List(ctx, dir)
 	if err != nil {
 		return nil, err
 	}
-
-	// Iterate through the directory entries to find the specific object
 	for _, entry := range entries {
 		if entry.Remote() == remote {
-			obj, ok := entry.(*Object)
-			if ok {
+			if obj, ok := entry.(*Object); ok {
 				return obj, nil
 			}
 		}
 	}
-
-	// If the object is not found, return an appropriate error
 	return nil, fs.ErrorObjectNotFound
 }
 
-// String returns a descriptive string for the filesystem
 func (f *Fs) String() string {
 	return f.name
 }
 
-// Add a helper function to handle response codes
-func (f *Fs) handleResponse(response interface{}) error {
-	switch response.(type) {
-	case *loginResponse, *listResponse, *requestResponse:
-		v := reflect.ValueOf(response).Elem()
-		code := v.FieldByName("Code").Int()
-		message := v.FieldByName("Message").String()
-		if code != 200 {
-			if code == 401 {
-				return fmt.Errorf("unauthorized access")
-			}
-			return fmt.Errorf("request failed: %s", message)
-		}
-	default:
-		// No action needed for other types
-	}
-	return nil
-}
-
-// Add helper functions for cache access
+// getCachedList retrieves a cached directory listing.
 func (f *Fs) getCachedList(dir string) (listResponse, bool) {
 	f.fileListCacheMu.Lock()
 	defer f.fileListCacheMu.Unlock()
@@ -811,71 +747,109 @@ func (f *Fs) getCachedList(dir string) (listResponse, bool) {
 	return cached, ok
 }
 
+// setCachedList caches a directory listing.
 func (f *Fs) setCachedList(dir string, resp listResponse) {
 	f.fileListCacheMu.Lock()
 	defer f.fileListCacheMu.Unlock()
 	f.fileListCache[dir] = resp
 }
 
+// invalidateCache deletes the cached listing for a directory.
 func (f *Fs) invalidateCache(dir string) {
 	f.fileListCacheMu.Lock()
 	defer f.fileListCacheMu.Unlock()
 	delete(f.fileListCache, dir)
 }
 
-// Add a helper function to set common headers
+// setCommonHeaders sets headers on an HTTP request.
 func (f *Fs) setCommonHeaders(req *http.Request, headers map[string]string) {
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}
 }
 
-// New method to fetch Cloudflare cookies and user agent
-func (f *Fs) fetchCloudflare(ctx context.Context) error {
-	f.cfMu.Lock()
-	defer f.cfMu.Unlock()
-
-	// Make request to cf_server to get cookies and user agent
-	resp, err := http.Get(fmt.Sprintf("%s/get-cookies?url=%s", f.opt.CfServer, url.QueryEscape(f.opt.URL)))
+// fetchCloudflare contacts the CF server to obtain cookies (and optionally a user agent)
+// for the given targetURL.
+func (f *Fs) fetchCloudflare(ctx context.Context, targetURL string) error {
+	reqURL := fmt.Sprintf("%s/get-cookies?url=%s", f.opt.CfServer, url.QueryEscape(targetURL))
+	resp, err := http.Get(reqURL)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			fs.Errorf(ctx, "Failed to close response body: %v", err)
-		}
-	}()
+	defer resp.Body.Close()
 
-	var cookieData struct {
-		Cookies []struct {
-			Name    string  `json:"name"`
-			Value   string  `json:"value"`
-			Domain  string  `json:"domain"`
-			Path    string  `json:"path"`
-			Expires float64 `json:"expires"`
-			// other fields...
-		} `json:"cookies"`
-		UserAgent string `json:"userAgent"`
-	}
-
-	err = json.NewDecoder(resp.Body).Decode(&cookieData)
-	if err != nil {
+	// Decode the JSON response into a map.
+	// For example, the response might be: {"cf_clearance": "cookie_value"}
+	var cookieMap map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&cookieMap); err != nil {
 		return err
 	}
-
-	if len(cookieData.Cookies) == 0 {
+	if len(cookieMap) == 0 {
 		return fmt.Errorf("no cookies received from cf_server")
 	}
 
-	// Assume the first cookie is cf_clearance
-	f.cfCookie = &http.Cookie{
-		Name:   cookieData.Cookies[0].Name,
-		Value:  cookieData.Cookies[0].Value,
-		Domain: cookieData.Cookies[0].Domain,
-		Path:   cookieData.Cookies[0].Path,
+	// Retrieve the first (and presumably only) cookie from the map.
+	var cookieName, cookieValue string
+	for k, v := range cookieMap {
+		cookieName = k
+		cookieValue = v
+		break
 	}
-	f.cfCookieExpiry = time.Unix(int64(cookieData.Cookies[0].Expires), 0)
-	f.cfUserAgent = cookieData.UserAgent
 
+	// Parse the target URL to extract the host (for use as the cookie domain).
+	parsed, err := url.Parse(targetURL)
+	if err != nil {
+		return err
+	}
+	host := parsed.Host
+
+	// Set the cookie's expiry to 30 minutes from now.
+	expiry := time.Now().Add(30 * time.Minute)
+
+	// Create the cookie with default Domain (the host), Path "/", and the computed expiry.
+	cfCookie := &http.Cookie{
+		Name:    cookieName,
+		Value:   cookieValue,
+		Domain:  host,
+		Path:    "/",
+		Expires: expiry,
+	}
+
+	// Save the cookie and its expiry keyed by host.
+	f.cfCookies[host] = cfCookie
+	f.cfCookieExpiry[host] = expiry
+
+	return nil
+}
+
+// fetchUserAgent retrieves the user agent from the CF server's /get-ua endpoint.
+// It uses http.DefaultClient because this is a one-off call during initialization.
+func (f *Fs) fetchUserAgent(ctx context.Context) error {
+	reqURL := fmt.Sprintf("%s/get-ua", f.opt.CfServer)
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	var data struct {
+		UserAgent string `json:"user_agent"`
+		Error     string `json:"error"`
+	}
+	if err := json.Unmarshal(bodyBytes, &data); err != nil {
+		return err
+	}
+	if data.Error != "" {
+		return fmt.Errorf("cfserver error: %s", data.Error)
+	}
+	f.cfUserAgent = data.UserAgent
+	f.opt.UserAgent = data.UserAgent
 	return nil
 }
