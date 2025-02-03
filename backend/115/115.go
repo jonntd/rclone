@@ -263,6 +263,11 @@ This enables separate client instances dedicated to downloading files`,
 			
 Use this flag with the "--115-download-cookie" option to bypass proxy settings for downloads.`,
 		}, {
+			Name:     "no_check",
+			Default:  false,
+			Advanced: true,
+			Help:     "Disable post-upload directory listing check (f.listAll) in PutUnchecked",
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -303,6 +308,7 @@ type Options struct {
 	UploadConcurrency   int                  `config:"upload_concurrency"`
 	DownloadCookie      fs.CommaSepList      `config:"download_cookie"`
 	DownloadNoProxy     bool                 `config:"download_no_proxy"`
+	NoCheck             bool                 `config:"no_check"`
 	Enc                 encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -1015,6 +1021,10 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 		o := newObj.(*Object)
 
 		if o.hasMetaData {
+			return nil
+		}
+
+		if f.opt.NoCheck {
 			return nil
 		}
 
