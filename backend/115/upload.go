@@ -56,10 +56,10 @@ func (f *Fs) getUploadBasicInfo(ctx context.Context) error {
 		return shouldRetry(ctx, resp, info, err)
 	})
 	if err != nil {
-		return
+		return err
 	}
 	if err = info.Err(); err != nil {
-		return
+		return fmt.Errorf("API Error: %s (%d)", info.Error, info.Errno)
 	}
 	userID := info.UserID.String()
 	if userID == "0" {
@@ -67,7 +67,7 @@ func (f *Fs) getUploadBasicInfo(ctx context.Context) error {
 	}
 	f.userID = userID
 	f.userkey = info.Userkey
-	return
+	return nil
 }
 
 // bufferIO handles buffering of input streams based on size thresholds.
