@@ -50,6 +50,7 @@ import (
 	"golang.org/x/oauth2/google"
 	drive_v2 "google.golang.org/api/drive/v2"
 	drive "google.golang.org/api/drive/v3"
+	"google.golang.org/api/driveactivity/v2"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
@@ -206,7 +207,6 @@ func driveScopesContainsAppFolder(scopes []string) bool {
 		if scope == scopePrefix+"drive.appfolder" {
 			return true
 		}
-
 	}
 	return false
 }
@@ -545,6 +545,15 @@ date is used.`,
 			Default:  "default",
 			Help:     `api mode for custom google drive authentication server.`,
 			Advanced: true,
+		}, { // mod
+			Name:     "activity_targets",
+			Help:     `Comma-separated list of folder IDs to monitor for file/directory changes using Drive Activity API.`,
+			Advanced: true,
+		}, { // mod
+			Name:     "activity_sleep",
+			Default:  fs.Duration(1 * time.Second),
+			Help:     `Sleep duration between Drive Activity requests (per target).`,
+			Advanced: true,
 		}, {
 			Name:    "alternate_export",
 			Default: false,
@@ -860,6 +869,8 @@ type Options struct {
 	GdsApikey                 string               `config:"gds_apikey"`       // mod
 	GdsEndpoint               string               `config:"gds_endpoint"`     // mod
 	GdsMode                   string               `config:"gds_mode"`         // mod
+	ActivityTargets           fs.CommaSepList      `config:"activity_targets"` // mod
+	ActivitySleep             fs.Duration          `config:"activity_sleep"`   // mod
 	UploadCutoff              fs.SizeSuffix        `config:"upload_cutoff"`
 	ChunkSize                 fs.SizeSuffix        `config:"chunk_size"`
 	AcknowledgeAbuse          bool                 `config:"acknowledge_abuse"`
@@ -910,6 +921,7 @@ type Fs struct {
 	changeSAtime     time.Time                    // mod
 	fileObj          *fs.Object                   // mod
 	gdsSvc           *drive.Service               // mod
+	actSvc           *driveactivity.Service       // mod
 	dirResourceKeys  *sync.Map                    // map directory ID to resource key
 	permissionsMu    *sync.Mutex                  // protect the below
 	permissions      map[string]*drive.Permission // map permission IDs to Permissions
@@ -1290,6 +1302,7 @@ func fixMimeType(mimeTypeIn string) string {
 	}
 	return mimeTypeOut
 }
+
 func fixMimeTypeMap(in map[string][]string) (out map[string][]string) {
 	out = make(map[string][]string, len(in))
 	for k, v := range in {
@@ -1300,9 +1313,11 @@ func fixMimeTypeMap(in map[string][]string) (out map[string][]string) {
 	}
 	return out
 }
+
 func isInternalMimeType(mimeType string) bool {
 	return strings.HasPrefix(mimeType, "application/vnd.google-apps.")
 }
+
 func isLinkMimeType(mimeType string) bool {
 	return strings.HasPrefix(mimeType, "application/x-link-")
 }
@@ -1464,6 +1479,7 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 
 	// mod
 	var gdsSvc *drive.Service
+	var actSvc *driveactivity.Service
 	if gds, ok, err := newGdsClient(ctx, opt); err != nil {
 		return nil, err
 	} else if ok {
@@ -1479,6 +1495,12 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 			gdsSvc, err = drive.NewService(context.Background(), option.WithHTTPClient(cli))
 			if err != nil {
 				return nil, fmt.Errorf("gds: couldn't create Drive client: %w", err)
+			}
+			if len(opt.ActivityTargets) > 0 {
+				actSvc, err = driveactivity.NewService(context.Background(), option.WithHTTPClient(cli))
+				if err != nil {
+					return nil, fmt.Errorf("gds: couldn't create Drive Activity client: %w", err)
+				}
 			}
 		}
 		opt.Scope = gdsRemote.Scope
@@ -1539,12 +1561,19 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 		fs.Infof(nil, "Changing service account is enabled")
 	}
 	f.gdsSvc = gdsSvc
+	f.actSvc = actSvc
 
 	// Create a new authorized Drive client.
 	f.client = oAuthClient
 	f.svc, err = drive.NewService(context.Background(), option.WithHTTPClient(f.client))
 	if err != nil {
 		return nil, fmt.Errorf("couldn't create Drive client: %w", err)
+	}
+	if f.actSvc == nil && len(f.opt.ActivityTargets) > 0 { // mod
+		f.actSvc, err = driveactivity.NewService(context.Background(), option.WithHTTPClient(f.client))
+		if err != nil {
+			return nil, fmt.Errorf("couldn't create Drive Activity client: %w", err)
+		}
 	}
 
 	if f.opt.V2DownloadMinSize >= 0 {
@@ -1831,7 +1860,8 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *drive.F
 // When the drive.File cannot be represented as an fs.Object it will return (nil, nil).
 func (f *Fs) newObjectWithExportInfo(
 	ctx context.Context, remote string, info *drive.File,
-	extension, exportName, exportMimeType string, isDocument bool) (o fs.Object, err error) {
+	extension, exportName, exportMimeType string, isDocument bool,
+) (o fs.Object, err error) {
 	// Note that resolveShortcut will have been called already if
 	// we are being called from a listing. However the drive.Item
 	// will have been resolved so this will do nothing.
@@ -2027,6 +2057,7 @@ func linkTemplate(mt string) *template.Template {
 	})
 	return _linkTemplates[mt]
 }
+
 func (f *Fs) fetchFormats(ctx context.Context) {
 	fetchFormatsOnce.Do(func() {
 		var about *drive.About
@@ -2072,7 +2103,8 @@ func (f *Fs) importFormats(ctx context.Context) map[string][]string {
 // Look through the exportExtensions and find the first format that can be
 // converted.  If none found then return ("", "", false)
 func (f *Fs) findExportFormatByMimeType(ctx context.Context, itemMimeType string) (
-	extension, mimeType string, isDocument bool) {
+	extension, mimeType string, isDocument bool,
+) {
 	exportMimeTypes, isDocument := f.exportFormats(ctx)[itemMimeType]
 	if isDocument {
 		for _, _extension := range f.exportExtensions {
@@ -2868,7 +2900,7 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 	if shortcutID != "" {
 		return f.delete(ctx, shortcutID, f.opt.UseTrash)
 	}
-	var trashedFiles = false
+	trashedFiles := false
 	if check {
 		found, err := f.list(ctx, []string{directoryID}, "", false, false, f.opt.TrashedOnly, true, func(item *drive.File) bool {
 			if !item.Trashed {
@@ -3109,7 +3141,6 @@ func (f *Fs) CleanUp(ctx context.Context) error {
 		err := f.svc.Files.EmptyTrash().Context(ctx).Do()
 		return f.shouldRetry(ctx, err)
 	})
-
 	if err != nil {
 		return err
 	}
@@ -3328,6 +3359,9 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 //
 // Close the returned channel to stop being notified.
 func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryType), pollIntervalChan <-chan time.Duration) {
+	if f.actSvc != nil { // mod
+		f.activityNotify(ctx, notifyFunc, pollIntervalChan)
+	}
 	go func() {
 		// get the StartPageToken early so all changes from now on get processed
 		startPageToken, err := f.changeNotifyStartPageToken(ctx)
@@ -3370,6 +3404,7 @@ func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryT
 		}
 	}()
 }
+
 func (f *Fs) changeNotifyStartPageToken(ctx context.Context) (pageToken string, err error) {
 	var startPageToken *drive.StartPageToken
 	err = f.pacer.Call(func() (bool, error) {
@@ -4263,14 +4298,13 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 	case "query":
 		if len(arg) == 1 {
 			query := arg[0]
-			var results, err = f.query(ctx, query)
+			results, err := f.query(ctx, query)
 			if err != nil {
 				return nil, fmt.Errorf("failed to execute query: %q, error: %w", query, err)
 			}
 			return results, nil
-		} else {
-			return nil, errors.New("need a query argument")
 		}
+		return nil, errors.New("need a query argument")
 	case "rescue":
 		dirID := ""
 		_, delete := opt["delete"]
@@ -4330,6 +4364,7 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 	}
 	return "", hash.ErrUnsupported
 }
+
 func (o *baseObject) Hash(ctx context.Context, t hash.Type) (string, error) {
 	if t != hash.MD5 && t != hash.SHA1 && t != hash.SHA256 {
 		return "", hash.ErrUnsupported
@@ -4344,7 +4379,8 @@ func (o *baseObject) Size() int64 {
 
 // getRemoteInfoWithExport returns a drive.File and the export settings for the remote
 func (f *Fs) getRemoteInfoWithExport(ctx context.Context, remote string) (
-	info *drive.File, extension, exportName, exportMimeType string, isDocument bool, err error) {
+	info *drive.File, extension, exportName, exportMimeType string, isDocument bool, err error,
+) {
 	leaf, directoryID, err := f.dirCache.FindPath(ctx, remote, false)
 	if err != nil {
 		if err == fs.ErrorDirNotFound {
@@ -4557,12 +4593,13 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	}
 	return o.baseObject.open(ctx, o.url, options...)
 }
+
 func (o *documentObject) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
 	// Update the size with what we are reading as it can change from
 	// the HEAD in the listing to this GET. This stops rclone marking
 	// the transfer as corrupted.
 	var offset, end int64 = 0, -1
-	var newOptions = options[:0]
+	newOptions := options[:0]
 	for _, o := range options {
 		// Note that Range requests don't work on Google docs:
 		// https://developers.google.com/drive/v3/web/manage-downloads#partial_download
@@ -4589,9 +4626,10 @@ func (o *documentObject) Open(ctx context.Context, options ...fs.OpenOption) (in
 	}
 	return
 }
+
 func (o *linkObject) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
 	var offset, limit int64 = 0, -1
-	var data = o.content
+	data := o.content
 	for _, option := range options {
 		switch x := option.(type) {
 		case *fs.SeekOption:
@@ -4616,7 +4654,8 @@ func (o *linkObject) Open(ctx context.Context, options ...fs.OpenOption) (in io.
 }
 
 func (o *baseObject) update(ctx context.Context, updateInfo *drive.File, uploadMimeType string, in io.Reader,
-	src fs.ObjectInfo) (info *drive.File, err error) {
+	src fs.ObjectInfo,
+) (info *drive.File, err error) {
 	// Make the API request to upload metadata and file data.
 	size := src.Size()
 	if size >= 0 && size < int64(o.fs.opt.UploadCutoff) {
@@ -4694,6 +4733,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 	return nil
 }
+
 func (o *documentObject) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	srcMimeType := fs.MimeType(ctx, src)
 	importMimeType := ""
@@ -4789,6 +4829,7 @@ func (o *baseObject) Metadata(ctx context.Context) (metadata fs.Metadata, err er
 func (o *documentObject) ext() string {
 	return o.baseObject.remote[len(o.baseObject.remote)-o.extLen:]
 }
+
 func (o *linkObject) ext() string {
 	return o.baseObject.remote[len(o.baseObject.remote)-o.extLen:]
 }
