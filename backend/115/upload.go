@@ -21,6 +21,7 @@ import (
 	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss"
 	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss/credentials"
 	"github.com/cenkalti/backoff/v4"
+	"github.com/pierrec/lz4/v4"
 	"github.com/rclone/rclone/backend/115/api"
 	"github.com/rclone/rclone/backend/115/cipher"
 	"github.com/rclone/rclone/fs"
@@ -131,11 +132,12 @@ func generateToken(userID, fileID, fileSize, signKey, signVal, timeStamp, appVer
 
 // initUpload calls 115's initupload endpoint. This is used for both 秒传 checks and actual uploads.
 func (f *Fs) initUpload(ctx context.Context, size int64, name, dirID, sha1sum, signKey, signVal string) (*api.UploadInitInfo, error) {
+	// 1) The core operation which calls initupload.php
 	operation := func() (*api.UploadInitInfo, error) {
 		filename := f.opt.Enc.FromStandardName(name)
 		filesize := strconv.FormatInt(size, 10)
 		fileID := strings.ToUpper(sha1sum) // if sha1 not known, pass ""
-		target := "U_1_" + dirID           // 115 style
+		target := "U_1_" + dirID           // 115-style directory reference
 		ts := time.Now().UnixMilli()
 		t := strconv.FormatInt(ts, 10)
 
@@ -183,10 +185,8 @@ func (f *Fs) initUpload(ctx context.Context, size int64, name, dirID, sha1sum, s
 		if err != nil {
 			return nil, err
 		}
-
-		// Ensure resp is not nil before proceeding
 		if resp == nil {
-			return nil, errors.New("initUpload: received nil response without error")
+			return nil, errors.New("initUpload: received nil HTTP response without error")
 		}
 
 		body, err := rest.ReadBody(resp)
@@ -198,7 +198,7 @@ func (f *Fs) initUpload(ctx context.Context, size int64, name, dirID, sha1sum, s
 			return nil, err
 		}
 		var info api.UploadInitInfo
-		if err = json.Unmarshal(decrypted, &info); err != nil {
+		if err := json.Unmarshal(decrypted, &info); err != nil {
 			return nil, err
 		}
 		if info.ErrorCode != 0 && info.ErrorCode != 701 {
@@ -207,15 +207,45 @@ func (f *Fs) initUpload(ctx context.Context, size int64, name, dirID, sha1sum, s
 		return &info, nil
 	}
 
-	var ui *api.UploadInitInfo
+	// 2) Wrap the operation with retries/backoff
 	operationWithRetry := func() (*api.UploadInitInfo, error) {
 		expBackoff := backoff.NewExponentialBackOff()
 		expBackoff.MaxElapsedTime = 2 * time.Minute
+
+		var ui *api.UploadInitInfo
 		err := backoff.RetryNotify(func() error {
-			var err error
-			ui, err = operation()
-			if err != nil {
-				return err
+			var e error
+			ui, e = operation()
+			if e != nil {
+				// Catch lz4.ErrInvalidSourceShortBuffer here
+				if errors.Is(e, lz4.ErrInvalidSourceShortBuffer) {
+					fs.Debugf(nil, "initUpload encountered lz4.ErrInvalidSourceShortBuffer => listing dir %q to see if file is present", dirID)
+					var matched *api.File
+					found, listErr := f.listAll(ctx, dirID, f.opt.ListChunk, true /*filesOnly*/, false /*dirsOnly*/, func(item *api.File) bool {
+						// Compare by SHA-1, size, or name as needed:
+						if strings.EqualFold(item.Sha, sha1sum) && item.Size == api.Int64(size) {
+							matched = item
+							return true
+						}
+						return false
+					})
+					if listErr != nil {
+						fs.Debugf(nil, "Directory listing failed after lz4 error: %v => will keep retrying", listErr)
+						return listErr
+					}
+					if found && matched != nil {
+						fs.Debugf(nil, "Found file %q in dir => returning pickcode=%q as if server matched", matched.Name, matched.PickCode)
+						ui = &api.UploadInitInfo{
+							Status:    2, // treat as server found a match
+							ErrorCode: 0,
+							PickCode:  matched.PickCode,
+						}
+						return nil
+					}
+					fs.Debugf(nil, "No matching file found => rethrowing the lz4 error to trigger next backoff retry")
+					return e // rethrow so the backoff can retry
+				}
+				return e // normal error
 			}
 			return nil
 		}, expBackoff, func(err error, duration time.Duration) {
@@ -224,6 +254,7 @@ func (f *Fs) initUpload(ctx context.Context, size int64, name, dirID, sha1sum, s
 		return ui, err
 	}
 
+	// 3) Execute the operationWithRetry, returning ui or error
 	ui, err := operationWithRetry()
 	if err != nil {
 		return nil, err
