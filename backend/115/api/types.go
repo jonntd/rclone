@@ -62,6 +62,18 @@ func (e *Int64) UnmarshalJSON(in []byte) (err error) {
 	return
 }
 
+// String ensures JSON unmarshals to a string, handling both quoted and unquoted inputs.
+// Unquoted inputs are treated as raw bytes and converted directly to a string.
+type String string
+
+func (s *String) UnmarshalJSON(in []byte) error {
+	if n := len(in); n > 1 && in[0] == '"' && in[n-1] == '"' {
+		return json.Unmarshal(in, (*string)(s))
+	}
+	*s = String(in)
+	return nil
+}
+
 type Error struct {
 	Status    int    `json:"status,omitempty"`
 	Message   string `json:"message,omitempty"`
@@ -145,6 +157,7 @@ type File struct {
 	CheckMsg  string      `json:"check_msg,omitempty"`
 	Score     int         `json:"score,omitempty"`
 	PlayLong  float64     `json:"play_long,omitempty"` // playback secs if media
+	Censored  int         `json:"c,omitempty"`
 }
 
 func (f *File) IsDir() bool {
@@ -270,7 +283,7 @@ type FileStats struct {
 
 type StringInfo struct {
 	Base
-	Data string `json:"data,omitempty"`
+	Data String `json:"data,omitempty"`
 }
 
 type IndexInfo struct {

@@ -310,6 +310,7 @@ func (f *Fs) newOSSClient() *oss.Client {
 		WithCredentialsProvider(provider).
 		WithRegion(OSSRegion).
 		WithUserAgent(OSSUserAgent).
+		WithUseDualStackEndpoint(f.opt.DualStack).
 		WithUseInternalEndpoint(f.opt.Internal)
 
 	return oss.NewClient(cfg)

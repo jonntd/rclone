@@ -85,10 +85,14 @@ OUTER:
 			continue // retry with same offset
 		}
 		for _, item := range info.Files {
-			if filesOnly && item.IsDir() {
+			isDir := item.IsDir()
+			if filesOnly && isDir {
 				continue
 			}
-			if dirsOnly && !item.IsDir() {
+			if dirsOnly && !isDir {
+				continue
+			}
+			if !isDir && f.opt.CensoredOnly && item.Censored == 0 {
 				continue
 			}
 			item.Name = f.opt.Enc.ToStandardName(item.Name)
@@ -283,7 +287,7 @@ func (f *Fs) indexInfo(ctx context.Context) (data *api.IndexData, err error) {
 	return
 }
 
-func (f *Fs) _getDownloadURL(ctx context.Context, request interface{}, response interface{}) (resp *http.Response, err error) {
+func (f *Fs) _getDownloadURL(ctx context.Context, request any, response any) (resp *http.Response, err error) {
 	rootURL := "https://proapi.115.com/app/chrome/downurl"
 	if f.isShare {
 		rootURL = "https://proapi.115.com/app/share/downurl"

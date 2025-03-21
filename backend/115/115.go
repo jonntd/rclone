@@ -148,6 +148,11 @@ Fill in for rclone to use a non root folder as its starting point.
 			Help:     "Size of listing chunk.",
 			Advanced: true,
 		}, {
+			Name:     "censored_only",
+			Default:  false,
+			Help:     "Only show files that are censored.",
+			Advanced: true,
+		}, {
 			Name:     "pacer_min_sleep",
 			Default:  defaultMinSleep,
 			Help:     "Minimum time to sleep between API calls.",
@@ -255,6 +260,11 @@ this may help to speed up the transfers.`,
 			Default:  false,
 			Advanced: true,
 		}, {
+			Name:     "dual_stack",
+			Help:     `Upload using a dual-stack endpoint, allowing connections via both IPv4 and IPv6.`,
+			Default:  false,
+			Advanced: true,
+		}, {
 			Name:      "download_cookie",
 			Sensitive: true,
 			Advanced:  true,
@@ -300,6 +310,7 @@ type Options struct {
 	UserAgent           string               `config:"user_agent"`
 	RootFolderID        string               `config:"root_folder_id"`
 	ListChunk           int                  `config:"list_chunk"`
+	CensoredOnly        bool                 `config:"censored_only"`
 	PacerMinSleep       fs.Duration          `config:"pacer_min_sleep"`
 	ConTimeout          fs.Duration          `config:"contimeout"`
 	Timeout             fs.Duration          `config:"timeout"`
@@ -313,6 +324,7 @@ type Options struct {
 	MaxUploadParts      int                  `config:"max_upload_parts"`
 	UploadConcurrency   int                  `config:"upload_concurrency"`
 	Internal            bool                 `config:"internal"`
+	DualStack           bool                 `config:"dual_stack"`
 	DownloadCookie      fs.CommaSepList      `config:"download_cookie"`
 	DownloadNoProxy     bool                 `config:"download_no_proxy"`
 	NoCheck             bool                 `config:"no_check"`
@@ -365,7 +377,7 @@ var retryErrorCodes = []int{
 
 // shouldRetry returns a boolean as to whether this resp and err
 // deserve to be retried.  It returns the err as a convenience
-func shouldRetry(ctx context.Context, resp *http.Response, info interface{}, err error) (bool, error) {
+func shouldRetry(ctx context.Context, resp *http.Response, info any, err error) (bool, error) {
 	if fserrors.ContextError(ctx, &err) {
 		return false, err
 	}
@@ -379,6 +391,10 @@ func shouldRetry(ctx context.Context, resp *http.Response, info interface{}, err
 			}
 		case *api.StringInfo:
 			if apiInfo.ErrCode() == 50038 {
+				if apiInfo.ErrMsg() != "" {
+					// 下载失败，含违规内容
+					return false, fserrors.NoRetryError(apiInfo.Err())
+				}
 				// can't download: API Error:  (50038)
 				return true, fserrors.RetryError(apiInfo.Err())
 			}
@@ -503,7 +519,7 @@ func (p *poolClient) client() *rest.Client {
 	return p.clients[index%uint32(len(p.clients))]
 }
 
-func (p *poolClient) CallJSON(ctx context.Context, opts *rest.Opts, request interface{}, response interface{}) (resp *http.Response, err error) {
+func (p *poolClient) CallJSON(ctx context.Context, opts *rest.Opts, request any, response any) (resp *http.Response, err error) {
 	return p.client().CallJSON(ctx, opts, request, response)
 }
 
@@ -521,7 +537,7 @@ func (p *poolClient) CallBASE(ctx context.Context, opts *rest.Opts) (err error) 
 	return info.Err()
 }
 
-func (p *poolClient) CallDATA(ctx context.Context, opts *rest.Opts, request interface{}, response interface{}) (resp *http.Response, err error) {
+func (p *poolClient) CallDATA(ctx context.Context, opts *rest.Opts, request any, response any) (resp *http.Response, err error) {
 	// Encode request data
 	input, err := json.Marshal(request)
 	if err != nil {
@@ -549,7 +565,7 @@ func (p *poolClient) CallDATA(ctx context.Context, opts *rest.Opts, request inte
 	}
 
 	// Decode and unmarshal response
-	output, err := crypto.Decode(info.Data, key)
+	output, err := crypto.Decode(string(info.Data), key)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode data: %w", err)
 	}
@@ -1562,7 +1578,7 @@ If the path doesn't exist, rclone will create it for you.
 // The result should be capable of being JSON encoded
 // If it is a string or a []string it will be shown to the user
 // otherwise it will be JSON encoded and shown to the user like that
-func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (out interface{}, err error) {
+func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (out any, err error) {
 	if f.isShare {
 		return nil, errors.New("unsupported for shared filesystem")
 	}
