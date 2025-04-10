@@ -454,7 +454,7 @@ func (f *Fs) doCFRequestStream(req *http.Request) (*http.Response, error) {
 	// If we get a Cloudflare challenge (HTTP 403), force a refresh.
 	if resp.StatusCode == 403 {
 		// Read the body (since it's expected to be a challenge page and is small)
-		bodyBytes, err := io.ReadAll(resp.Body)
+		_, err := io.ReadAll(resp.Body)
 		if err != nil {
 			_ = resp.Body.Close()
 			return nil, err
