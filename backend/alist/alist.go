@@ -411,6 +411,81 @@ func (f *Fs) doCFRequest(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
+// doCFRequestStream works like doCFRequest but streams the response body without loading it all into memory.
+// It still handles Cloudflare challenge responses by checking for a 403 status code.
+func (f *Fs) doCFRequestStream(req *http.Request) (*http.Response, error) {
+	// Add the Authorization token if the request is to our API host.
+	apiBase, err := url.Parse(f.opt.URL)
+	if err == nil && req.URL.Host == apiBase.Host && f.token != "" {
+		req.Header.Set("Authorization", f.token)
+	}
+	// Add Cloudflare cookie if available.
+	if f.opt.CfServer != "" {
+		f.cfMu.Lock()
+		host := req.URL.Host
+		if cookie, ok := f.cfCookies[host]; ok {
+			expiry := f.cfCookieExpiry[host]
+			if time.Now().After(expiry.Add(-1 * time.Minute)) {
+				if err := f.fetchCloudflare(req.Context(), req.URL.String()); err != nil {
+					f.cfMu.Unlock()
+					return nil, fmt.Errorf("failed to refresh CF cookies: %w", err)
+				}
+				cookie = f.cfCookies[host]
+			}
+			req.AddCookie(cookie)
+		}
+		f.cfMu.Unlock()
+	}
+	// Choose the appropriate HTTP client.
+	var clientFunc func(*http.Request) (*http.Response, error)
+	apiBase, err = url.Parse(f.opt.URL)
+	if err == nil && req.URL.Host == apiBase.Host {
+		clientFunc = f.srv.Do
+	} else {
+		clientFunc = f.httpClient.Do
+	}
+
+	// Issue the request.
+	resp, err := clientFunc(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// If we get a Cloudflare challenge (HTTP 403), force a refresh.
+	if resp.StatusCode == 403 {
+		// Read the body (since it's expected to be a challenge page and is small)
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			_ = resp.Body.Close()
+			return nil, err
+		}
+		_ = resp.Body.Close()
+		// Refresh CF cookies.
+		if f.opt.CfServer != "" {
+			f.cfMu.Lock()
+			if err := f.fetchCloudflare(req.Context(), req.URL.String()); err != nil {
+				f.cfMu.Unlock()
+				return nil, fmt.Errorf("failed to refresh CF cookies on 403: %w", err)
+			}
+			f.cfMu.Unlock()
+		}
+		// Recreate the request.
+		newReq, err := http.NewRequestWithContext(req.Context(), req.Method, req.URL.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		// Copy headers.
+		for k, v := range req.Header {
+			newReq.Header[k] = v
+		}
+		// Retry using streaming.
+		return f.doCFRequestStream(newReq)
+	}
+
+	// No buffering: return the response as-is so that the caller can stream the body.
+	return resp, nil
+}
+
 // doCFRequestMust is a helper that performs an HTTP request via doCFRequest and unmarshals the JSON response into "response".
 // It returns an error if the HTTP request or JSON unmarshalling fails or if the response indicates an error.
 func (f *Fs) doCFRequestMust(ctx context.Context, method, endpoint string, data interface{}, response interface{}) error {
@@ -664,10 +739,12 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	if o.size == 0 {
 		delete(req.Header, "Range")
 	}
-	response, err := o.fs.doCFRequest(req)
+	// Use the streaming helper rather than the buffering doCFRequest.
+	response, err := o.fs.doCFRequestStream(req)
 	if err != nil {
 		return nil, err
 	}
+	// Check the status code.
 	if response.StatusCode != 200 && response.StatusCode != 206 {
 		_ = response.Body.Close()
 		return nil, fmt.Errorf("failed to open object: status code %d", response.StatusCode)
