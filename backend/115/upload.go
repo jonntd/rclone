@@ -2,8 +2,7 @@ package _115
 
 import (
 	"bytes"
-	"context"
-	"crypto/md5" // Keep for traditional token generation
+	"context" // Keep for traditional token generation
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
@@ -24,8 +23,7 @@ import (
 	"github.com/cenkalti/backoff/v4"
 
 	// "github.com/pierrec/lz4/v4" // Keep commented out unless lz4 errors reappear
-	"github.com/rclone/rclone/backend/115/api"
-	"github.com/rclone/rclone/backend/115/cipher" // Keep for traditional initUpload
+	"github.com/rclone/rclone/backend/115/api" // Keep for traditional initUpload
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/chunksize"
@@ -156,115 +154,6 @@ func bufferIOwithSHA1(in io.Reader, size, threshold int64) (sha1sum string, out 
 	return sha1sum, out, cleanup, nil
 }
 
-// generateSignature for traditional 115 initupload.php
-func generateSignature(userID, fileID, target, userKey string) string {
-	sum1 := sha1.Sum([]byte(userID + fileID + target + "0"))
-	sigStr := userKey + hex.EncodeToString(sum1[:]) + "000000"
-	sum2 := sha1.Sum([]byte(sigStr))
-	return strings.ToUpper(hex.EncodeToString(sum2[:]))
-}
-
-// generateToken for traditional 115 initupload.php
-func generateToken(userID, fileID, fileSize, signKey, signVal, timeStamp, appVer string) string {
-	userIDMd5 := md5.Sum([]byte(userID))
-	tokenMd5 := md5.Sum([]byte(md5Salt + fileID + fileSize + signKey + signVal + userID + timeStamp + hex.EncodeToString(userIDMd5[:]) + appVer))
-	return hex.EncodeToString(tokenMd5[:])
-}
-
-// initUploadTraditional calls the traditional initupload.php endpoint.
-// This is kept for compatibility if needed, or potentially for hash checks if OpenAPI fails.
-func (f *Fs) initUploadTraditional(ctx context.Context, size int64, name, dirID, sha1sum, signKey, signVal string) (*api.UploadInitInfo, error) {
-	// Ensure userkey is available
-	if f.userkey == "" {
-		if err := f.getUploadBasicInfo(ctx); err != nil {
-			return nil, fmt.Errorf("userkey required for traditional initUpload but failed to get it: %w", err)
-		}
-	}
-
-	filename := f.opt.Enc.FromStandardName(name)
-	filesize := strconv.FormatInt(size, 10)
-	fileID := strings.ToUpper(sha1sum) // if sha1 not known, pass ""
-	target := "U_1_" + dirID
-	ts := time.Now().UnixMilli()
-	t := strconv.FormatInt(ts, 10)
-
-	ecdhCipher, err := cipher.NewEcdhCipher()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create ECDH cipher: %w", err)
-	}
-	encodedToken, err := ecdhCipher.EncodeToken(ts)
-	if err != nil {
-		return nil, fmt.Errorf("failed to encode ECDH token: %w", err)
-	}
-
-	form := url.Values{}
-	form.Set("appid", "0") // Traditional appid?
-	form.Set("appversion", f.appVer)
-	form.Set("userid", f.userID)
-	form.Set("filename", filename)
-	form.Set("filesize", filesize)
-	form.Set("fileid", fileID)
-	form.Set("target", target)
-	form.Set("sig", generateSignature(f.userID, fileID, target, f.userkey))
-	form.Set("t", t)
-	form.Set("token", generateToken(f.userID, fileID, filesize, signKey, signVal, t, f.appVer))
-	if signKey != "" && signVal != "" {
-		form.Set("sign_key", signKey)
-		form.Set("sign_val", signVal)
-	}
-	encryptedBody, err := ecdhCipher.Encrypt([]byte(form.Encode()))
-	if err != nil {
-		return nil, fmt.Errorf("failed to encrypt traditional initUpload body: %w", err)
-	}
-
-	opts := rest.Opts{
-		Method:      "POST",
-		RootURL:     "https://uplb.115.com/4.0/initupload.php", // Traditional endpoint
-		ContentType: "application/x-www-form-urlencoded",
-		Parameters:  url.Values{"k_ec": {encodedToken}},
-		Body:        bytes.NewReader(encryptedBody),
-	}
-
-	var info api.UploadInitInfo // Reuse struct, but expect traditional fields
-	// Use traditional API call (requires cookie, handles encryption internally via body)
-	err = f.CallTraditionalAPI(ctx, &opts, nil, &info, true) // Skip explicit encryption here as body is already encrypted
-	if err != nil {
-		// Check for lz4 error specifically if it occurs
-		// if errors.Is(err, lz4.ErrInvalidSourceShortBuffer) { ... }
-		return nil, fmt.Errorf("traditional initUpload call failed: %w", err)
-	}
-
-	// Decrypt response (CallTraditionalAPI doesn't handle response decryption)
-	// This part needs adjustment. CallTraditionalAPI expects StringInfo for encrypted responses.
-	// Let's assume the response from initupload.php needs decryption similar to request.
-	// This requires modifying CallTraditionalAPI or handling decryption here.
-	// For now, assume CallTraditionalAPI handles it or the response isn't encrypted.
-	// Revisit this if traditional initUpload is actually used and fails.
-
-	// Check traditional error codes
-	if info.ErrorCode != 0 && info.ErrorCode != 701 { // 701 might be auth related?
-		return nil, fmt.Errorf("traditional initUpload API error: %s (%d)", info.ErrorMsg, info.ErrorCode)
-	}
-
-	// Map traditional fields to OpenAPI fields if necessary for consistency downstream
-	if info.Data == nil {
-		info.Data = &api.UploadInitData{
-			PickCode:  info.PickCode,
-			Status:    info.Status,
-			SignKey:   info.SignKey,
-			SignCheck: info.SignCheck,
-			FileID:    info.FileIDStr, // Assuming FileIDStr holds the ID on 秒传
-			Target:    info.Target,
-			Bucket:    info.Bucket,
-			Object:    info.Object,
-			Callback:  info.Callback, // Copy nested struct
-			Version:   info.Version,
-		}
-	}
-
-	return &info, nil
-}
-
 // initUploadOpenAPI calls the OpenAPI /open/upload/init endpoint.
 func (f *Fs) initUploadOpenAPI(ctx context.Context, size int64, name, dirID, sha1sum, preSha1, pickCode, signKey, signVal string) (*api.UploadInitInfo, error) {
 	form := url.Values{}
@@ -370,24 +259,72 @@ func (f *Fs) postUpload(callbackResult map[string]any) (*api.CallbackData, error
 		}
 	}
 
-	// Assume the callback result map directly matches the CallbackData structure
+	// Check for OpenAPI format (with state/code/message/data structure)
+	var cbData *api.CallbackData
+
+	// First, check if this is an OpenAPI format response
+	if _, ok := callbackResult["state"]; ok {
+		// This could be an OpenAPI format response
+		if dataVal, ok := callbackResult["data"]; ok {
+			if dataMap, ok := dataVal.(map[string]any); ok {
+				// Try to extract file_id and pick_code from the data field
+				fileID, fileIDExists := dataMap["file_id"].(string)
+				pickCode, pickCodeExists := dataMap["pick_code"].(string)
+
+				if fileIDExists && pickCodeExists {
+					// Create a CallbackData from the nested data map
+					cbData = &api.CallbackData{
+						FileID:   fileID,
+						PickCode: pickCode,
+					}
+
+					// Copy other fields if they exist
+					if fileName, ok := dataMap["file_name"].(string); ok {
+						cbData.FileName = fileName
+					}
+					if fileSize, ok := dataMap["file_size"].(string); ok {
+						if size, err := strconv.ParseInt(fileSize, 10, 64); err == nil {
+							cbData.FileSize = api.Int64(size)
+						}
+					}
+					if sha1, ok := dataMap["sha1"].(string); ok {
+						cbData.Sha = sha1
+					}
+
+					// Log the values for debugging
+					fs.Debugf(f, "OpenAPI callback data parsed: file_id=%q, pick_code=%q", cbData.FileID, cbData.PickCode)
+
+					// Early return if we successfully extracted data
+					if cbData.FileID != "" && cbData.PickCode != "" {
+						return cbData, nil
+					}
+				}
+			}
+		}
+	}
+
+	// If we couldn't extract from OpenAPI format, try traditional format
 	// Need to marshal it back to JSON and then unmarshal to CallbackData for validation/typing
 	callbackJSON, err := json.Marshal(callbackResult)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal OSS callback result: %w", err)
 	}
 
-	var cbData api.CallbackData
-	if err := json.Unmarshal(callbackJSON, &cbData); err != nil {
+	cbData = &api.CallbackData{}
+	if err := json.Unmarshal(callbackJSON, cbData); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal OSS callback result into CallbackData: %w. JSON: %s", err, string(callbackJSON))
 	}
 
 	// Basic validation
 	if cbData.FileID == "" || cbData.PickCode == "" {
+		// Debugging information
+		fs.Debugf(f, "Callback data missing required fields: file_id=%q, pick_code=%q, raw JSON: %s",
+			cbData.FileID, cbData.PickCode, string(callbackJSON))
 		return nil, fmt.Errorf("OSS callback data missing required fields (file_id or pick_code). JSON: %s", string(callbackJSON))
 	}
 
-	return &cbData, nil
+	fs.Debugf(f, "Traditional callback data parsed: file_id=%q, pick_code=%q", cbData.FileID, cbData.PickCode)
+	return cbData, nil
 }
 
 // getOSSToken fetches OSS credentials using the OpenAPI.
@@ -404,12 +341,7 @@ func (f *Fs) getOSSToken(ctx context.Context) (*api.OSSToken, error) {
 	if info.Data == nil {
 		return nil, errors.New("OpenAPI get_token returned no data")
 	}
-	// Correct potential typo in API response field name
-	if info.Data.AccessKeySecret == "" {
-		// If AccessKeySecrett (with typo) exists, use it
-		// This requires adding the field with typo to the struct temporarily or using reflection/mapstructure
-		// Let's assume the typo is fixed or handle it defensively if needed later.
-	}
+
 	if info.Data.AccessKeyID == "" || info.Data.AccessKeySecret == "" || info.Data.SecurityToken == "" {
 		return nil, errors.New("OpenAPI get_token response missing essential credential fields")
 	}
@@ -979,6 +911,13 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 	if f.isShare {
 		return nil, errors.New("upload unsupported for shared filesystem")
 	}
+
+	// Start the token renewer if we have a valid one
+	if f.tokenRenewer != nil {
+		f.tokenRenewer.Start()
+		defer f.tokenRenewer.Stop()
+	}
+
 	size := src.Size()
 
 	// Ensure userID is available (needed for traditional sample upload)

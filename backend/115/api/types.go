@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -251,13 +252,13 @@ type RefreshTokenResp struct {
 // Uses tags for both traditional and OpenAPI field names
 type File struct {
 	// Common fields (adapt names if needed)
-	Name     string `json:"n,omitempty"`         // Traditional: n, OpenAPI: fn or file_name
-	FileName string `json:"fn,omitempty"`        // OpenAPI: fn (in list), file_name (in details)
-	Size     Int64  `json:"s,omitempty"`         // Traditional: s, OpenAPI: file_size
-	FileSize Int64  `json:"file_size,omitempty"` // OpenAPI: file_size
-	PickCode string `json:"pc,omitempty"`        // Traditional: pc, OpenAPI: pick_code
-	Sha      string `json:"sha,omitempty"`       // Traditional: sha, OpenAPI: sha1
-	Sha1     string `json:"sha1,omitempty"`      // OpenAPI: sha1
+	Name     string `json:"n,omitempty"`    // Traditional: n, OpenAPI: fn or file_name
+	FileName string `json:"fn,omitempty"`   // OpenAPI: fn (in list), file_name (in details)
+	Size     Int64  `json:"size,omitempty"` // Traditional: s, OpenAPI: file_size
+	FileSize Int64  `json:"fs,omitempty"`   // OpenAPI: file_size
+	PickCode string `json:"pc,omitempty"`   // Traditional: pc, OpenAPI: pick_code
+	Sha      string `json:"sha,omitempty"`  // Traditional: sha, OpenAPI: sha1
+	Sha1     string `json:"sha1,omitempty"` // OpenAPI: sha1
 
 	// Identifiers
 	FID string `json:"fid,omitempty"` // Traditional: fid (file), OpenAPI: fid (file), file_id (folder/file details)
@@ -275,10 +276,9 @@ type File struct {
 	Ppt Time   `json:"uppt,omitempty"` // OpenAPI: uppt (upload time)
 
 	// Type/Category
-	IsFolder Int    `json:"fc,omitempty"`            // OpenAPI: fc (0 folder, 1 file)
-	FileType Int    `json:"file_category,omitempty"` // OpenAPI: file_category (0 folder, 1 file) - in folder details
-	Ico      string `json:"ico,omitempty"`           // Traditional icon
-	Class    string `json:"class,omitempty"`         // Traditional class
+	IsFolder Int    `json:"fc,omitempty"`    // OpenAPI: fc (0 folder, 1 file)
+	Ico      string `json:"ico,omitempty"`   // Traditional icon
+	Class    string `json:"class,omitempty"` // Traditional class
 
 	// Status/Attributes
 	IsMarked Int `json:"ism,omitempty"`  // OpenAPI: ism (starred, 1=yes)
@@ -307,7 +307,7 @@ type File struct {
 func (f *File) IsDir() bool {
 	// OpenAPI uses fc=0 for folder, file_category="0" in details
 	// Traditional uses fid="" for folder
-	return f.IsFolder == 0 || f.FileType == 0 || (f.FID == "" && f.CID != "")
+	return f.IsFolder == 0 || (f.FID == "" && f.CID != "")
 }
 
 // ID returns the best identifier (File ID or Category ID)
@@ -660,12 +660,9 @@ type UploadInitInfo struct {
 	Version  string `json:"version,omitempty"`  // Both?
 
 	// OSS upload fields (Traditional top-level, OpenAPI in 'data')
-	Bucket   string `json:"bucket,omitempty"` // Both
-	Object   string `json:"object,omitempty"` // Both
-	Callback struct {
-		Callback    string `json:"callback"`
-		CallbackVar string `json:"callback_var"`
-	} `json:"callback,omitempty"` // Both (structure might differ slightly)
+	Bucket   string          `json:"bucket,omitempty"`   // Both
+	Object   string          `json:"object,omitempty"`   // Both
+	Callback json.RawMessage `json:"callback,omitempty"` // Both (structure might differ)
 
 	// Useless fields (Traditional)
 	FileID   int    `json:"fileid,omitempty"`
@@ -679,47 +676,130 @@ type UploadInitInfo struct {
 
 // UploadInitData holds the nested data part of the OpenAPI upload init/resume response
 type UploadInitData struct {
-	PickCode  string `json:"pick_code"`  // Upload task ID
-	Status    Int    `json:"status"`     // 1: non-秒传, 2: 秒传, 6/7/8: auth needed
-	SignKey   string `json:"sign_key"`   // SHA1 ID for secondary auth
-	SignCheck string `json:"sign_check"` // SHA1 range for secondary auth
-	FileID    string `json:"file_id"`    // File ID if 秒传 success (status=2)
-	Target    string `json:"target"`     // Upload target string
-	Bucket    string `json:"bucket"`     // OSS Bucket
-	Object    string `json:"object"`     // OSS Object ID
-	Callback  struct {
-		Callback    string `json:"callback"`     // Base64 encoded callback URL + body
-		CallbackVar string `json:"callback_var"` // Base64 encoded callback variables
-	} `json:"callback"`
-	Version string `json:"version,omitempty"` // Optional version info
+	PickCode  string          `json:"pick_code"`         // Upload task ID
+	Status    Int             `json:"status"`            // 1: non-秒传, 2: 秒传, 6/7/8: auth needed
+	SignKey   string          `json:"sign_key"`          // SHA1 ID for secondary auth
+	SignCheck string          `json:"sign_check"`        // SHA1 range for secondary auth
+	FileID    string          `json:"file_id"`           // File ID if 秒传 success (status=2)
+	Target    string          `json:"target"`            // Upload target string
+	Bucket    string          `json:"bucket"`            // OSS Bucket
+	Object    string          `json:"object"`            // OSS Object ID
+	Callback  json.RawMessage `json:"callback"`          // Can be either struct or array
+	Version   string          `json:"version,omitempty"` // Optional version info
 }
 
 // GetCallback decodes and returns the callback string
 func (ui *UploadInitInfo) GetCallback() string {
+	// Get the raw callback data first
+	var rawCallback string
 	data := ui.Data
 	if data == nil {
 		// Fallback to traditional structure
-		// b, _ := base64.StdEncoding.DecodeString(ui.Callback.Callback) // Assume already decoded if traditional? Check crypto.Encode
-		// return string(b)
-		return ui.Callback.Callback // Traditional might not be base64? Needs verification. Let's assume it is for now.
-		// return base64.StdEncoding.EncodeToString([]byte(ui.Callback.Callback)) // Re-encode if needed? Unlikely.
+		// Try to unmarshal as object first
+		var callbackStruct struct {
+			Callback    string `json:"callback"`
+			CallbackVar string `json:"callback_var"`
+		}
+
+		if err := json.Unmarshal(ui.Callback, &callbackStruct); err == nil && callbackStruct.Callback != "" {
+			rawCallback = callbackStruct.Callback
+		} else {
+			// Try to unmarshal as array if object failed
+			var callbackArray []string
+			if err := json.Unmarshal(ui.Callback, &callbackArray); err == nil && len(callbackArray) > 0 {
+				rawCallback = callbackArray[0]
+			} else {
+				// Fall back to string representation if both fail
+				rawCallback = string(ui.Callback)
+			}
+		}
+	} else {
+		// Try to unmarshal as object first
+		var callbackStruct struct {
+			Callback    string `json:"callback"`
+			CallbackVar string `json:"callback_var"`
+		}
+
+		if err := json.Unmarshal(data.Callback, &callbackStruct); err == nil && callbackStruct.Callback != "" {
+			rawCallback = callbackStruct.Callback
+		} else {
+			// Try to unmarshal as array if object failed
+			var callbackArray []string
+			if err := json.Unmarshal(data.Callback, &callbackArray); err == nil && len(callbackArray) > 0 {
+				rawCallback = callbackArray[0]
+			} else {
+				// Fall back to string representation if both fail
+				rawCallback = string(data.Callback)
+			}
+		}
 	}
-	// OpenAPI callback is already base64 encoded string in JSON
-	return data.Callback.Callback
+
+	// Check if the callback data is already base64 encoded
+	if _, err := base64.StdEncoding.DecodeString(rawCallback); err != nil {
+		// Not valid base64, so encode it
+		return base64.StdEncoding.EncodeToString([]byte(rawCallback))
+	}
+
+	// Already base64 encoded, return as is
+	return rawCallback
 }
 
 // GetCallbackVar decodes and returns the callback variables string
 func (ui *UploadInitInfo) GetCallbackVar() string {
+	// Get the raw callback var data first
+	var rawCallbackVar string
 	data := ui.Data
 	if data == nil {
 		// Fallback to traditional structure
-		// b, _ := base64.StdEncoding.DecodeString(ui.Callback.CallbackVar)
-		// return string(b)
-		return ui.Callback.CallbackVar // Assume base64 like OpenAPI
-		// return base64.StdEncoding.EncodeToString([]byte(ui.Callback.CallbackVar))
+		// Try to unmarshal as object first
+		var callbackStruct struct {
+			Callback    string `json:"callback"`
+			CallbackVar string `json:"callback_var"`
+		}
+
+		if err := json.Unmarshal(ui.Callback, &callbackStruct); err == nil && callbackStruct.CallbackVar != "" {
+			rawCallbackVar = callbackStruct.CallbackVar
+		} else {
+			// Try to unmarshal as array if object failed
+			var callbackArray []string
+			if err := json.Unmarshal(ui.Callback, &callbackArray); err == nil && len(callbackArray) > 1 {
+				rawCallbackVar = callbackArray[1]
+			} else {
+				// No callback var found
+				return ""
+			}
+		}
+	} else {
+		// Try to unmarshal as object first
+		var callbackStruct struct {
+			Callback    string `json:"callback"`
+			CallbackVar string `json:"callback_var"`
+		}
+
+		if err := json.Unmarshal(data.Callback, &callbackStruct); err == nil && callbackStruct.CallbackVar != "" {
+			rawCallbackVar = callbackStruct.CallbackVar
+		} else {
+			// Try to unmarshal as array if object failed
+			var callbackArray []string
+			if err := json.Unmarshal(data.Callback, &callbackArray); err == nil && len(callbackArray) > 1 {
+				rawCallbackVar = callbackArray[1]
+			} else {
+				// No callback var found
+				return ""
+			}
+		}
 	}
-	// OpenAPI callback_var is already base64 encoded string in JSON
-	return data.Callback.CallbackVar
+
+	// If we have callback var data, check if it's already base64 encoded
+	if rawCallbackVar != "" {
+		if _, err := base64.StdEncoding.DecodeString(rawCallbackVar); err != nil {
+			// Not valid base64, so encode it
+			return base64.StdEncoding.EncodeToString([]byte(rawCallbackVar))
+		}
+	}
+
+	// Already base64 encoded or empty, return as is
+	return rawCallbackVar
 }
 
 // GetPickCode returns the pick code from the appropriate field
@@ -799,11 +879,11 @@ type CallbackData struct {
 
 // OSSToken represents the structure for OSS credentials (adaptable)
 type OSSToken struct {
-	AccessKeyID     string `json:"AccessKeyId"`      // OpenAPI uses AccessKeyId
-	AccessKeySecret string `json:"AccessKeySecrett"` // OpenAPI uses AccessKeySecrett (typo in docs?) -> Corrected to AccessKeySecret based on common usage
-	Expiration      Time   `json:"Expiration"`       // OpenAPI uses Expiration (RFC3339 format)
-	SecurityToken   string `json:"SecurityToken"`    // OpenAPI uses SecurityToken
-	Endpoint        string `json:"endpoint"`         // OpenAPI provides endpoint
+	AccessKeyID     string `json:"AccessKeyId"`     // OpenAPI uses AccessKeyId
+	AccessKeySecret string `json:"AccessKeySecret"` // OpenAPI uses AccessKeySecrett (typo in docs?) -> Corrected to AccessKeySecret based on common usage
+	Expiration      Time   `json:"Expiration"`      // OpenAPI uses Expiration (RFC3339 format)
+	SecurityToken   string `json:"SecurityToken"`   // OpenAPI uses SecurityToken
+	Endpoint        string `json:"endpoint"`        // OpenAPI provides endpoint
 
 	// Traditional fields (might be redundant)
 	StatusCode   string `json:"StatusCode,omitempty"`

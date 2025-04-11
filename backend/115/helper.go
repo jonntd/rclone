@@ -20,28 +20,6 @@ import (
 	"github.com/rclone/rclone/lib/rest"
 )
 
-// listOrder sets the order for directory listing (Traditional API).
-// OpenAPI list doesn't seem to support setting order persistently, only via query params.
-func (f *Fs) listOrder(ctx context.Context, cid, order, asc string) (err error) {
-	if f.isShare {
-		return errors.New("listOrder unsupported for shared filesystem")
-	}
-	form := url.Values{}
-	form.Set("file_id", cid)
-	form.Set("user_order", order)
-	form.Set("user_asc", asc)
-	form.Set("fc_mix", "0") // Keep this? Meaning unclear.
-
-	opts := rest.Opts{
-		Method:          "POST",
-		Path:            "/files/order", // Traditional endpoint
-		MultipartParams: form,
-	}
-	// Use traditional API call (requires cookie, encryption)
-	var baseResp api.TraditionalBase
-	return f.CallTraditionalAPI(ctx, &opts, nil, &baseResp, false) // Not skipping encryption
-}
-
 // listAll retrieves directory listings, using OpenAPI if possible.
 // User function fn should return true to stop processing.
 type listAllFn func(*api.File) bool
@@ -62,22 +40,6 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly, di
 	// Sorting (OpenAPI uses query params)
 	params.Set("o", "user_utime") // Default sort: update time
 	params.Set("asc", "0")        // Default sort: descending
-
-	// Filtering (OpenAPI query params)
-	if filesOnly && dirsOnly {
-		// Cannot filter for both, return error or ignore? Ignore for now.
-	} else if filesOnly {
-		params.Set("fc", "1") // fc=1 for files? Check docs. Assume 1=file, 0=folder.
-		// Need to confirm if fc param exists. Docs mention 'type' and 'stdir'.
-		// Let's use stdir=0 to hide directories when filtering files.
-		params.Set("stdir", "0")
-	} else if dirsOnly {
-		params.Set("fc", "0") // fc=0 for folders?
-		// Or maybe just filter client-side if fc doesn't work reliably.
-		// Let's try setting show_dir=1 and filtering client-side for dirsOnly.
-	}
-
-	// TODO: Add other filters like star, type, suffix if needed via OpenAPI params
 
 	offset := 0
 	for {
@@ -119,16 +81,14 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly, di
 			}
 		}
 
-		// Check if we have fetched all items based on total count if available
-		// OpenAPI response structure for total count needs confirmation. Assume 'count' field for now.
+		// Check if we have fetched all items based on total count from response
 		currentOffset, _ := strconv.Atoi(params.Get("offset"))
 		offset = currentOffset + len(info.Files)
-		// Need total count from response to break early. Let's assume info.Count holds it.
-		// If info.Count is not reliable, we loop until an empty page is returned.
-		// if info.Count > 0 && offset >= info.Count {
-		// 	break
-		// }
-		// Loop until empty page is safer if count is unreliable.
+
+		// Stop listing when we've reached the total count
+		if info.Count > 0 && offset >= info.Count {
+			break // We've reached or exceeded the total count
+		}
 	}
 	return found, nil
 }

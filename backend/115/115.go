@@ -31,8 +31,10 @@ import (
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
+	"golang.org/x/oauth2"
 )
 
 // Constants
@@ -44,7 +46,8 @@ const (
 	qrCodeAPIRootURL   = "https://qrcodeapi.115.com"
 	hnQrCodeAPIRootURL = "https://hnqrcodeapi.115.com"     // For confirm step
 	appID              = "100195993"                       // Provided App ID
-	defaultUserAgent   = "Mozilla/5.0 115Browser/27.0.7.5" // Keep for traditional login mimicry?
+	tradUserAgent      = "Mozilla/5.0 115Browser/27.0.7.5" // Keep for traditional login mimicry?
+	defaultUserAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
 
 	defaultGlobalMinSleep = fs.Duration(200 * time.Millisecond)  // 5 QPS default for global
 	traditionalMinSleep   = fs.Duration(1112 * time.Millisecond) // ~0.9 QPS for traditional
@@ -290,6 +293,7 @@ type Fs struct {
 	refreshToken string
 	tokenExpiry  time.Time
 	codeVerifier string // For PKCE
+	tokenRenewer *oauthutil.Renew
 }
 
 // Object describes a 115 object
@@ -419,6 +423,22 @@ func getHTTPClient(ctx context.Context, opt *Options) *http.Client {
 	}
 }
 
+// getTradHTTPClient creates an HTTP client with traditional UserAgent
+func getTradHTTPClient(ctx context.Context, opt *Options) *http.Client {
+	// Create a new context with the traditional UserAgent
+	newCtx, ci := fs.AddConfig(ctx)
+	ci.UserAgent = tradUserAgent
+	return getHTTPClient(newCtx, opt)
+}
+
+// getOpenAPIHTTPClient creates an HTTP client with default UserAgent
+func getOpenAPIHTTPClient(ctx context.Context, opt *Options) *http.Client {
+	// Create a new context with the default UserAgent
+	newCtx, ci := fs.AddConfig(ctx)
+	ci.UserAgent = defaultUserAgent
+	return getHTTPClient(newCtx, opt)
+}
+
 // errorHandler parses a non 2xx error response into an error (Generic, might need adjustment per API)
 func errorHandler(resp *http.Response) error {
 	// Attempt to decode as OpenAPI error first
@@ -483,25 +503,19 @@ func (f *Fs) login(ctx context.Context) error {
 	f.userID = cred.UserID() // Set userID early
 
 	// 2. Setup clients (needed for the login calls)
-	// --- Create a new context with the UserAgent configured ---
-	newCtx, ci := fs.AddConfig(ctx)
-	ci.UserAgent = f.opt.UserAgent // Set the User-Agent from options
-
-	// --- Create HTTP client base using the new context ---
-	// getHTTPClient will now use the User-Agent from newCtx
-	httpClient := getHTTPClient(newCtx, &f.opt)
+	// Create separate clients for each API type with different User-Agents
+	tradHTTPClient := getTradHTTPClient(ctx, &f.opt)
+	openAPIHTTPClient := getOpenAPIHTTPClient(ctx, &f.opt)
 
 	// Traditional client (uses cookie)
-	f.tradClient = rest.NewClient(httpClient). // Pass the configured httpClient
-							SetRoot(traditionalRootURL).
-		// SetUserAgent removed - handled by httpClient
+	f.tradClient = rest.NewClient(tradHTTPClient).
+		SetRoot(traditionalRootURL).
 		SetCookie(cred.Cookie()...).
 		SetErrorHandler(errorHandler)
 
 	// OpenAPI client (will have token set later)
-	f.openAPIClient = rest.NewClient(httpClient). // Pass the configured httpClient
-							SetRoot(openAPIRootURL).
-		// SetUserAgent removed - handled by httpClient
+	f.openAPIClient = rest.NewClient(openAPIHTTPClient).
+		SetRoot(openAPIRootURL).
 		SetErrorHandler(errorHandler)
 
 	fs.Debugf(f, "Starting login process for user %s", f.userID)
@@ -627,24 +641,44 @@ func (f *Fs) login(ctx context.Context) error {
 	return nil
 }
 
-// refreshTokenIfNecessary checks token expiry and refreshes if needed. Must be called with tokenMu locked.
+// refreshTokenIfNecessary checks token expiry and refreshes if needed.
+// This function handles its own locking.
 func (f *Fs) refreshTokenIfNecessary(ctx context.Context) error {
+	f.tokenMu.Lock()
+
+	// Common check for token validity
 	if f.accessToken == "" || f.refreshToken == "" {
 		fs.Debugf(f, "No token found, attempting initial login.")
 		// Drop lock before calling login, as login acquires the lock
 		f.tokenMu.Unlock()
 		err := f.login(ctx)
-		f.tokenMu.Lock() // Reacquire lock
-		return err
+		return err // login handles its own locking
 	}
 
 	if time.Now().Before(f.tokenExpiry.Add(-tokenRefreshWindow)) {
-		return nil // Token is still valid
+		f.tokenMu.Unlock() // Unlock before returning since token is valid
+		return nil         // Token is still valid
 	}
 
+	// Prepare for token refresh
 	fs.Debugf(f, "Access token expired or nearing expiry, attempting refresh.")
+	refreshToken := f.refreshToken // Store locally before unlocking
+	f.tokenMu.Unlock()             // Unlock before making API call
+
+	// Check if openAPIClient is initialized
+	if f.openAPIClient == nil {
+		// Setup client if it doesn't exist
+		newCtx, ci := fs.AddConfig(ctx)
+		ci.UserAgent = f.opt.UserAgent
+		httpClient := getHTTPClient(newCtx, &f.opt)
+		f.openAPIClient = rest.NewClient(httpClient).
+			SetRoot(openAPIRootURL).
+			SetErrorHandler(errorHandler)
+	}
+
+	// Set up refresh request
 	refreshData := url.Values{
-		"refresh_token": {f.refreshToken},
+		"refresh_token": {refreshToken},
 	}
 	opts := rest.Opts{
 		Method:       "POST",
@@ -654,21 +688,18 @@ func (f *Fs) refreshTokenIfNecessary(ctx context.Context) error {
 		ExtraHeaders: map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
 	}
 
+	// Make API call without the lock
 	var refreshResp api.RefreshTokenResp
-	// Refresh call uses the OpenAPI client but doesn't need the access token itself
-	// It still needs global pacing.
-	err := f.CallOpenAPI(ctx, &opts, nil, &refreshResp, true) // skipToken=true
+	_, err := f.openAPIClient.CallJSON(ctx, &opts, nil, &refreshResp)
 
+	// Handle the response
 	if err != nil {
 		fs.Errorf(f, "Refresh token failed: %v", err)
 		// Check if the error indicates the refresh token itself is expired
 		var tokenErr *api.TokenError
-		if errors.As(err, &tokenErr) && tokenErr.IsRefreshTokenExpired || strings.Contains(err.Error(), "refresh token expired") { // Heuristic check
+		if errors.As(err, &tokenErr) && tokenErr.IsRefreshTokenExpired || strings.Contains(err.Error(), "refresh token expired") {
 			fs.Debugf(f, "Refresh token seems expired, attempting full re-login.")
-			// Drop lock before calling login
-			f.tokenMu.Unlock()
-			loginErr := f.login(ctx)
-			f.tokenMu.Lock() // Reacquire lock
+			loginErr := f.login(ctx) // login handles its own locking
 			if loginErr != nil {
 				return fmt.Errorf("re-login failed after refresh token expired: %w", loginErr)
 			}
@@ -681,10 +712,7 @@ func (f *Fs) refreshTokenIfNecessary(ctx context.Context) error {
 
 	if refreshResp.Data == nil || refreshResp.Data.AccessToken == "" {
 		fs.Errorf(f, "Refresh token response empty, attempting re-login.")
-		// Drop lock before calling login
-		f.tokenMu.Unlock()
-		loginErr := f.login(ctx)
-		f.tokenMu.Lock() // Reacquire lock
+		loginErr := f.login(ctx) // login handles its own locking
 		if loginErr != nil {
 			return fmt.Errorf("re-login failed after empty refresh response: %w", loginErr)
 		}
@@ -703,6 +731,129 @@ func (f *Fs) refreshTokenIfNecessary(ctx context.Context) error {
 	return nil
 }
 
+// saveToken saves the current token to the config
+func (f *Fs) saveToken(ctx context.Context, m configmap.Mapper) {
+	f.tokenMu.Lock()
+	defer f.tokenMu.Unlock()
+
+	if f.accessToken == "" || f.refreshToken == "" || f.tokenExpiry.IsZero() {
+		fs.Debugf(f, "Not saving tokens - incomplete token information")
+		return
+	}
+
+	// Create the token structure
+	token := map[string]string{
+		"access_token":  f.accessToken,
+		"token_type":    "Bearer",
+		"refresh_token": f.refreshToken,
+		"expiry":        f.tokenExpiry.Format(time.RFC3339Nano),
+	}
+
+	// Convert to JSON
+	tokenBytes, err := json.Marshal(token)
+	if err != nil {
+		fs.Errorf(f, "Failed to marshal token: %v", err)
+		return
+	}
+	tokenString := string(tokenBytes)
+
+	// Save to config
+	err = config.SetValueAndSave(f.name, "token", tokenString)
+	if err != nil {
+		fs.Errorf(f, "Failed to save token to config: %v", err)
+		return
+	}
+
+	fs.Debugf(f, "Saved token to config file")
+}
+
+// setupTokenRenewer initializes the token renewer to automatically refresh tokens
+func (f *Fs) setupTokenRenewer(ctx context.Context, m configmap.Mapper) {
+	// Only set up renewer if we have valid tokens
+	if f.accessToken == "" || f.refreshToken == "" || f.tokenExpiry.IsZero() {
+		return
+	}
+
+	// Create a renewal transaction function
+	transaction := func() error {
+		f.tokenMu.Lock()
+		defer f.tokenMu.Unlock()
+
+		// Check if token needs refresh
+		if time.Now().Before(f.tokenExpiry.Add(-tokenRefreshWindow)) {
+			return nil // Token is still valid
+		}
+
+		// Perform refresh without lock to avoid deadlock
+		f.tokenMu.Unlock()
+		// Use the direct method to refresh instead of calling refreshTokenIfNecessary to avoid deadlocks
+		refreshData := url.Values{
+			"refresh_token": {f.refreshToken},
+		}
+		opts := rest.Opts{
+			Method:       "POST",
+			RootURL:      passportRootURL,
+			Path:         "/open/refreshToken",
+			Body:         strings.NewReader(refreshData.Encode()),
+			ExtraHeaders: map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
+		}
+
+		var refreshResp api.RefreshTokenResp
+		_, err := f.openAPIClient.CallJSON(ctx, &opts, nil, &refreshResp)
+
+		// Reacquire lock
+		f.tokenMu.Lock()
+
+		if err == nil && refreshResp.Data != nil && refreshResp.Data.AccessToken != "" {
+			// Update tokens
+			f.accessToken = refreshResp.Data.AccessToken
+			if refreshResp.Data.RefreshToken != "" {
+				f.refreshToken = refreshResp.Data.RefreshToken
+			}
+			f.tokenExpiry = time.Now().Add(time.Duration(refreshResp.Data.ExpiresIn) * time.Second)
+			fs.Debugf(f, "Token refreshed successfully via renewer, new expiry: %v", f.tokenExpiry)
+
+			// Save the refreshed token back to config
+			f.saveToken(ctx, m)
+		} else if err != nil {
+			fs.Errorf(f, "Failed to refresh token in renewer: %v", err)
+		}
+
+		return err
+	}
+
+	// Create actual OAuth2 token from our fields
+	token := &oauth2.Token{
+		AccessToken:  f.accessToken,
+		RefreshToken: f.refreshToken,
+		Expiry:       f.tokenExpiry,
+		TokenType:    "Bearer",
+	}
+
+	// Save token to config so it can be accessed by TokenSource
+	err := oauthutil.PutToken(f.name, m, token, false)
+	if err != nil {
+		fs.Logf(f, "Failed to save token for renewer: %v", err)
+		return
+	}
+
+	// Create a minimal config for token handling
+	config := &oauthutil.Config{
+		TokenURL: "https://115.com/oauth/token", // The actual URL doesn't matter for refresh operation
+	}
+
+	// Create a client with the token source
+	_, ts, err := oauthutil.NewClientWithBaseClient(ctx, f.name, m, config, fshttp.NewClient(ctx))
+	if err != nil {
+		fs.Logf(f, "Failed to create token source for renewer: %v", err)
+		return
+	}
+
+	// Create token renewer that will trigger when the token is about to expire
+	f.tokenRenewer = oauthutil.NewRenew(f.String(), ts, transaction)
+	fs.Debugf(f, "Token renewer initialized")
+}
+
 // CallOpenAPI performs a call to the OpenAPI endpoint.
 // It handles token refresh and sets the Authorization header.
 // If skipToken is true, it skips adding the Authorization header (used for refresh itself).
@@ -714,24 +865,26 @@ func (f *Fs) CallOpenAPI(ctx context.Context, opts *rest.Opts, request any, resp
 
 	// Wrap the entire attempt sequence with the global pacer, returning proper retry signals
 	err := f.globalPacer.Call(func() (shouldRetryGlobal bool, errGlobal error) {
-		f.tokenMu.Lock()
-		tokErr := f.refreshTokenIfNecessary(ctx)
-		if tokErr != nil {
-			f.tokenMu.Unlock()
-			fs.Debugf(f, "Token refresh check failed: %v", tokErr)
-			return false, backoff.Permanent(fmt.Errorf("token refresh check failed: %w", tokErr))
-		}
-		// Keep lock until request is prepared
-
-		// Prepare request
+		// Check if we need to refresh the token first
 		if !skipToken {
+			// Token refresh is needed - refreshTokenIfNecessary handles its own locking
+			refreshErr := f.refreshTokenIfNecessary(ctx)
+			if refreshErr != nil {
+				fs.Debugf(f, "Token refresh check failed: %v", refreshErr)
+				return false, backoff.Permanent(fmt.Errorf("token refresh check failed: %w", refreshErr))
+			}
+
+			// Get the current token
+			f.tokenMu.Lock()
+			token := f.accessToken
+			f.tokenMu.Unlock()
+
+			// Set the Authorization header
 			if opts.ExtraHeaders == nil {
 				opts.ExtraHeaders = make(map[string]string)
 			}
-			opts.ExtraHeaders["Authorization"] = "Bearer " + f.accessToken
+			opts.ExtraHeaders["Authorization"] = "Bearer " + token
 		}
-		// Unlock before making the actual call
-		f.tokenMu.Unlock()
 
 		// Make the call using the OpenAPI client
 		var resp *http.Response
@@ -743,8 +896,7 @@ func (f *Fs) CallOpenAPI(ctx context.Context, opts *rest.Opts, request any, resp
 			// Assume GET request with JSON response
 			resp, apiErr = f.openAPIClient.CallJSON(ctx, opts, nil, response)
 		} else {
-			// Assume call without specific request/response body (e.g., simple POST/DELETE)
-			// We still need to parse the base response for errors
+			// Assume call without specific request/response body
 			var baseResp api.OpenAPIBase
 			resp, apiErr = f.openAPIClient.CallJSON(ctx, opts, nil, &baseResp)
 			if apiErr == nil {
@@ -1078,10 +1230,81 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.globalPacer = fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(time.Duration(opt.PacerMinSleep)), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))
 	f.tradPacer = fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(traditionalMinSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))
 
-	// Perform initial login to get tokens and setup clients
-	if err = f.login(ctx); err != nil {
-		return nil, fmt.Errorf("initial login failed: %w", err)
+	// Check if we have saved token in config file
+	tokenString, found := m.Get("token")
+	if found && tokenString != "" {
+		// Parse the token
+		token := make(map[string]interface{})
+		err = json.Unmarshal([]byte(tokenString), &token)
+		if err == nil {
+			// Extract token components
+			if accessToken, ok := token["access_token"].(string); ok {
+				f.accessToken = accessToken
+			}
+			if refreshToken, ok := token["refresh_token"].(string); ok {
+				f.refreshToken = refreshToken
+			}
+			if expiryStr, ok := token["expiry"].(string); ok {
+				f.tokenExpiry, _ = time.Parse(time.RFC3339Nano, expiryStr)
+			}
+
+			fs.Debugf(f, "Loaded token from config file, expires at %v", f.tokenExpiry)
+
+			// Only attempt to validate/refresh if we have both tokens
+			if f.accessToken != "" && f.refreshToken != "" {
+				// Check if the token needs refreshing now
+				if time.Now().After(f.tokenExpiry.Add(-tokenRefreshWindow)) {
+					fs.Debugf(f, "Token expired or will expire soon, refreshing now")
+					// refreshTokenIfNecessary handles its own locking
+					err = f.refreshTokenIfNecessary(ctx)
+					if err != nil {
+						fs.Logf(f, "Failed to refresh token from config: %v", err)
+						// Continue with login below
+					} else {
+						// Token refreshed successfully, save it back to config
+						f.saveToken(ctx, m)
+					}
+				}
+			}
+		} else {
+			fs.Logf(f, "Failed to parse token from config: %v", err)
+		}
 	}
+
+	// Perform initial login if needed (no token or token refresh failed)
+	if f.accessToken == "" || f.refreshToken == "" {
+		if err = f.login(ctx); err != nil {
+			return nil, fmt.Errorf("initial login failed: %w", err)
+		}
+		// Save token to config after successful login
+		f.saveToken(ctx, m)
+	}
+
+	// Setup clients (needed in case login above didn't initialize them)
+	if f.tradClient == nil || f.openAPIClient == nil {
+		// Create separate clients for each API type with different User-Agents
+		tradHTTPClient := getTradHTTPClient(ctx, &f.opt)
+		openAPIHTTPClient := getOpenAPIHTTPClient(ctx, &f.opt)
+
+		// Traditional client (uses cookie)
+		if f.tradClient == nil {
+			cred := (&Credential{}).FromCookie(f.opt.Cookie)
+			f.tradClient = rest.NewClient(tradHTTPClient).
+				SetRoot(traditionalRootURL).
+				SetCookie(cred.Cookie()...).
+				SetErrorHandler(errorHandler)
+		}
+
+		// OpenAPI client
+		if f.openAPIClient == nil {
+			f.openAPIClient = rest.NewClient(openAPIHTTPClient).
+				SetRoot(openAPIRootURL).
+				SetErrorHandler(errorHandler)
+		}
+	}
+
+	// Setup token renewer
+	f.setupTokenRenewer(ctx, m)
 
 	// --- Root Folder Logic ---
 	// mod - parse object id from path remote:{ID}
@@ -1679,6 +1902,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		fs.Debugf(src, "Can't copy - source and destination directory are the same (%q)", srcParentID)
 		return nil, fs.ErrorCantCopy
 	}
+
 	// Perform the copy using OpenAPI
 	fs.Debugf(srcObj, "Copying %q to %q", srcObj.id, dstParentID)
 	err = f.copyFiles(ctx, []string{srcObj.id}, dstParentID)
@@ -1805,6 +2029,15 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 	}
 
 	return usage, nil
+}
+
+// Shutdown shuts down the fs, closing any background tasks
+func (f *Fs) Shutdown(ctx context.Context) error {
+	if f.tokenRenewer != nil {
+		f.tokenRenewer.Shutdown()
+		f.tokenRenewer = nil
+	}
+	return nil
 }
 
 // itemToDirEntry converts an api.File to an fs.DirEntry
@@ -2095,19 +2328,17 @@ func (o *Object) open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	if !o.durl.Valid() {
 		return nil, errors.New("download URL is invalid or expired")
 	}
-
-	// Use a standard HTTP client for the download itself, applying global pacer
-	var resp *http.Response
-	var err error
-	err = o.fs.globalPacer.Call(func() (bool, error) { // Pace the download request itself
-		req, err := http.NewRequestWithContext(ctx, "GET", o.durl.URL, nil)
-		if err != nil {
-			return false, err
-		}
-		resp, err = o.fs.openAPIClient.Do(req)
-		return shouldRetry(ctx, resp, err)
-	})
-
+	req, err := http.NewRequestWithContext(ctx, "GET", o.durl.URL, nil)
+	if err != nil {
+		return nil, err
+	}
+	fs.FixRangeOption(options, o.size)
+	fs.OpenOptionAddHTTPHeaders(req.Header, options)
+	if o.size == 0 {
+		// Don't supply range requests for 0 length objects as they always fail
+		delete(req.Header, "Range")
+	}
+	resp, err := o.fs.openAPIClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -2156,6 +2387,12 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 	if src.Size() < 0 {
 		return errors.New("refusing to update with unknown size")
+	}
+
+	// Start the token renewer if we have a valid one
+	if o.fs.tokenRenewer != nil {
+		o.fs.tokenRenewer.Start()
+		defer o.fs.tokenRenewer.Stop()
 	}
 
 	// Ensure metadata is read for the existing object
@@ -2334,4 +2571,5 @@ var (
 	_ fs.ObjectInfo      = (*Object)(nil)
 	_ fs.IDer            = (*Object)(nil)
 	_ fs.ParentIDer      = (*Object)(nil)
+	_ fs.Shutdowner      = (*Fs)(nil)
 )
