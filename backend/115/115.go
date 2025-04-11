@@ -1389,13 +1389,37 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 				}
 				// If leaf is not an object, maybe it's a non-existent path?
 				if errors.Is(errFile, fs.ErrorObjectNotFound) {
-					return f, fmt.Errorf("path not found: %s", f.root) // Return original error: path not found
+					// Instead of returning an error, create the missing directory if it's not a share
+					if !f.isShare {
+						fs.Debugf(f, "Directory %q not found, creating it", f.root)
+						// Recreate the dirCache with create=true to auto-create parent directories
+						f.dirCache = dircache.New(f.root, f.rootFolderID, f)
+						err = f.dirCache.FindRoot(ctx, true)
+						if err != nil {
+							return nil, fmt.Errorf("failed to create directory %q: %w", f.root, err)
+						}
+						return f, nil
+					}
+					return f, fmt.Errorf("path not found: %s", f.root) // Return original error for shares
 				}
 				// Return other errors from NewObject
 				return nil, errFile
 			}
 		}
-		// If FindRoot failed for other reasons, or it was the actual root ""
+
+		// If root is not a file path, check if we should create the directory
+		if !f.isShare && errors.Is(err, fs.ErrorDirNotFound) {
+			fs.Debugf(f, "Root directory %q not found, creating it", f.root)
+			// Recreate dirCache with create=true to auto-create the directory structure
+			f.dirCache = dircache.New(f.root, f.rootFolderID, f)
+			err = f.dirCache.FindRoot(ctx, true)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create root directory %q: %w", f.root, err)
+			}
+			return f, nil
+		}
+
+		// If FindRoot failed for other reasons, or it was a share that doesn't exist
 		return f, err // Return the original error from FindRoot
 	}
 
