@@ -1539,10 +1539,10 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 	if err != nil {
 		return "", err
 	}
-	if info.FileID == "" {
+	if info.Data == nil || info.Data.FileID == "" {
 		return "", errors.New("Mkdir response did not contain a file ID")
 	}
-	return info.FileID, nil
+	return info.Data.FileID, nil
 }
 
 // Put uploads the object.
