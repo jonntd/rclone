@@ -332,6 +332,48 @@ func (f *Fs) login(ctx context.Context) error {
 	return nil
 }
 
+// domainMatch checks if a host matches a cookie domain according to RFC 6265
+// A domain matches if it is equal to or a subdomain of the cookie domain
+func (f *Fs) domainMatch(host, cookieDomain string) bool {
+	// If domain is empty, it only matches the exact host
+	if cookieDomain == "" {
+		return host == cookieDomain
+	}
+
+	// Remove leading dot from cookie domain if present
+	if strings.HasPrefix(cookieDomain, ".") {
+		cookieDomain = cookieDomain[1:]
+	}
+
+	// Check for exact match
+	if host == cookieDomain {
+		return true
+	}
+
+	// Check if host is a subdomain of cookieDomain
+	return strings.HasSuffix(host, "."+cookieDomain)
+}
+
+// findCookiesForHost returns all matching cookies for the given host
+func (f *Fs) findCookiesForHost(host string) []*http.Cookie {
+	var cookies []*http.Cookie
+	now := time.Now()
+
+	for domain, cookie := range f.cfCookies {
+		// Check if cookie is expired
+		expiry, ok := f.cfCookieExpiry[domain]
+		if !ok || now.After(expiry) {
+			continue
+		}
+
+		// Check domain match
+		if f.domainMatch(host, domain) {
+			cookies = append(cookies, cookie)
+		}
+	}
+	return cookies
+}
+
 // ----------------------------------------------------------------------------
 // doCFRequest is our single function for all HTTP requests. It:
 // - Adds an Authorization token if the request URL host matches the API host.
@@ -350,15 +392,19 @@ func (f *Fs) doCFRequest(req *http.Request) (*http.Response, error) {
 	if f.opt.CfServer != "" {
 		f.cfMu.Lock()
 		host := req.URL.Host
-		if cookie, ok := f.cfCookies[host]; ok {
-			expiry := f.cfCookieExpiry[host]
-			if time.Now().After(expiry.Add(-1 * time.Minute)) {
-				if err := f.fetchCloudflare(req.Context(), req.URL.String()); err != nil {
-					f.cfMu.Unlock()
-					return nil, fmt.Errorf("failed to refresh CF cookies: %w", err)
-				}
-				cookie = f.cfCookies[host]
+		matchingCookies := f.findCookiesForHost(host)
+
+		// If no matching cookies or the first one is about to expire, refresh
+		if len(matchingCookies) == 0 || time.Now().After(f.cfCookieExpiry[matchingCookies[0].Domain].Add(-1*time.Minute)) {
+			if err := f.fetchCloudflare(req.Context(), req.URL.String()); err != nil {
+				f.cfMu.Unlock()
+				return nil, fmt.Errorf("failed to refresh CF cookies: %w", err)
 			}
+			matchingCookies = f.findCookiesForHost(host)
+		}
+
+		// Add all matching cookies to the request
+		for _, cookie := range matchingCookies {
 			req.AddCookie(cookie)
 		}
 		f.cfMu.Unlock()
@@ -373,11 +419,17 @@ func (f *Fs) doCFRequest(req *http.Request) (*http.Response, error) {
 		clientFunc = f.httpClient.Do
 	}
 
-	// Perform the request.
-	resp, err := clientFunc(req)
+	// Perform the request with pacer
+	var resp *http.Response
+	err = f.pacer.Call(func() (bool, error) {
+		var err error
+		resp, err = clientFunc(req)
+		return shouldRetry(resp, err)
+	})
 	if err != nil {
 		return nil, err
 	}
+
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		_ = resp.Body.Close()
@@ -411,6 +463,17 @@ func (f *Fs) doCFRequest(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
+// shouldRetry returns true if err != nil or the HTTP status code is 429 or 5xx.
+func shouldRetry(resp *http.Response, err error) (bool, error) {
+	if err != nil {
+		return true, err
+	}
+	if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+		return true, fmt.Errorf("got status code %d", resp.StatusCode)
+	}
+	return false, nil
+}
+
 // doCFRequestStream works like doCFRequest but streams the response body without loading it all into memory.
 // It still handles Cloudflare challenge responses by checking for a 403 status code.
 func (f *Fs) doCFRequestStream(req *http.Request) (*http.Response, error) {
@@ -423,15 +486,20 @@ func (f *Fs) doCFRequestStream(req *http.Request) (*http.Response, error) {
 	if f.opt.CfServer != "" {
 		f.cfMu.Lock()
 		host := req.URL.Host
-		if cookie, ok := f.cfCookies[host]; ok {
-			expiry := f.cfCookieExpiry[host]
-			if time.Now().After(expiry.Add(-1 * time.Minute)) {
-				if err := f.fetchCloudflare(req.Context(), req.URL.String()); err != nil {
-					f.cfMu.Unlock()
-					return nil, fmt.Errorf("failed to refresh CF cookies: %w", err)
-				}
-				cookie = f.cfCookies[host]
+		matchingCookies := f.findCookiesForHost(host)
+
+		// If no matching cookies or the first one is about to expire, refresh
+		if len(matchingCookies) == 0 || (len(matchingCookies) > 0 &&
+			time.Now().After(f.cfCookieExpiry[matchingCookies[0].Domain].Add(-1*time.Minute))) {
+			if err := f.fetchCloudflare(req.Context(), req.URL.String()); err != nil {
+				f.cfMu.Unlock()
+				return nil, fmt.Errorf("failed to refresh CF cookies: %w", err)
 			}
+			matchingCookies = f.findCookiesForHost(host)
+		}
+
+		// Add all matching cookies to the request
+		for _, cookie := range matchingCookies {
 			req.AddCookie(cookie)
 		}
 		f.cfMu.Unlock()
@@ -445,8 +513,13 @@ func (f *Fs) doCFRequestStream(req *http.Request) (*http.Response, error) {
 		clientFunc = f.httpClient.Do
 	}
 
-	// Issue the request.
-	resp, err := clientFunc(req)
+	// Issue the request using pacer.
+	var resp *http.Response
+	err = f.pacer.Call(func() (bool, error) {
+		var err error
+		resp, err = clientFunc(req)
+		return shouldRetry(resp, err)
+	})
 	if err != nil {
 		return nil, err
 	}
