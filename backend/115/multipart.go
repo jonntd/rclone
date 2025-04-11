@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"sort"
 	"sync"
 	"time"
@@ -62,8 +61,7 @@ type ossChunkWriter struct {
 	callbackVar   string           // Base64 encoded callback vars
 	callbackRes   map[string]any   // Result from CompleteMultipartUpload callback
 	imur          *oss.InitiateMultipartUploadResult
-	tempFile      *os.File // Reference to temp file if disk buffering is used
-	cleanup       func()   // Cleanup function for temp file or buffer
+	cleanup       func() // Cleanup function for temp file or buffer
 }
 
 // Upload performs the multipart upload.

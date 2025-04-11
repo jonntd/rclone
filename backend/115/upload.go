@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -40,14 +39,6 @@ const (
 	OSSRegion    = "cn-shenzhen"              // Default OSS region
 	OSSUserAgent = "aliyun-sdk-android/2.9.1" // Keep or update as needed
 )
-
-// remote gets the full remote path for logging/debugging.
-func remote(o *Object) string {
-	// Construct path relative to the Fs root
-	fullPath := path.Join(o.fs.root, o.remote)
-	// Add the Fs name prefix
-	return o.fs.name + ":" + fullPath
-}
 
 // getUploadBasicInfo retrieves userkey using the traditional API (needed for traditional initUpload signature).
 func (f *Fs) getUploadBasicInfo(ctx context.Context) error {
@@ -201,38 +192,6 @@ func (f *Fs) initUploadOpenAPI(ctx context.Context, size int64, name, dirID, sha
 		// If state is false, CallOpenAPI should have returned an error.
 		return nil, errors.New("internal error: OpenAPI initUpload failed but CallOpenAPI returned no error")
 
-	}
-
-	return &info, nil
-}
-
-// resumeUploadOpenAPI calls the OpenAPI /open/upload/resume endpoint.
-func (f *Fs) resumeUploadOpenAPI(ctx context.Context, size int64, dirID, sha1sum, pickCode string) (*api.UploadInitInfo, error) {
-	form := url.Values{}
-	form.Set("file_size", strconv.FormatInt(size, 10))
-	form.Set("target", "U_1_"+dirID)
-	form.Set("fileid", strings.ToUpper(sha1sum))
-	form.Set("pick_code", pickCode) // Mandatory for resume
-
-	opts := rest.Opts{
-		Method: "POST",
-		Path:   "/open/upload/resume",
-		Body:   strings.NewReader(form.Encode()),
-		ExtraHeaders: map[string]string{
-			"Content-Type": "application/x-www-form-urlencoded",
-		},
-	}
-
-	var info api.UploadInitInfo
-	err := f.CallOpenAPI(ctx, &opts, nil, &info, false)
-	if err != nil {
-		return nil, fmt.Errorf("OpenAPI resumeUpload failed: %w", err)
-	}
-	if info.Data == nil {
-		if info.State {
-			return nil, errors.New("OpenAPI resumeUpload returned success state but no data")
-		}
-		return nil, errors.New("internal error: OpenAPI resumeUpload failed but CallOpenAPI returned no error")
 	}
 
 	return &info, nil

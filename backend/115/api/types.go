@@ -400,8 +400,6 @@ type FilePath struct {
 type FileList struct {
 	// Use OpenAPIBase for state/code/message
 	OpenAPIBase
-	// Traditional fields (might be redundant)
-	TraditionalBase
 
 	// Data payload
 	Files []*File `json:"data,omitempty"` // OpenAPI uses 'data', Traditional uses 'data'
