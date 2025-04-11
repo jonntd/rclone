@@ -174,8 +174,10 @@ func (f *Fs) makeDir(ctx context.Context, pid, name string) (info *api.NewDir, e
 				// Return info for the existing directory
 				return &api.NewDir{
 					OpenAPIBase: api.OpenAPIBase{State: true}, // Mark as success
-					FileID:      existingID,
-					FileName:    name,
+					Data: &api.NewDirData{
+						FileID:   existingID,
+						FileName: name,
+					},
 				}, fs.ErrorDirExists // Return specific error
 			}
 			// If finding fails, return the original Mkdir error
@@ -184,7 +186,7 @@ func (f *Fs) makeDir(ctx context.Context, pid, name string) (info *api.NewDir, e
 		return nil, fmt.Errorf("OpenAPI makeDir failed: %w", err)
 	}
 	// Ensure FileID is populated
-	if info.FileID == "" {
+	if info.Data == nil || info.Data.FileID == "" {
 		return nil, errors.New("OpenAPI makeDir response missing file_id")
 	}
 	return info, nil

@@ -444,17 +444,15 @@ type FileInfo struct {
 	TraditionalBase
 	Data []*File `json:"data,omitempty"`
 }
+type NewDirData struct {
+	FileName string `json:"file_name,omitempty"`
+	FileID   string `json:"file_id,omitempty"`
+}
 
 // NewDir represents the response for creating a directory
 type NewDir struct {
 	OpenAPIBase
-	// Traditional fields (might be redundant)
-	AID   json.Number `json:"aid,omitempty"`
-	CID   json.Number `json:"cid,omitempty"` // Traditional uses CID
-	Cname string      `json:"cname,omitempty"`
-	// OpenAPI fields
-	FileName string `json:"file_name,omitempty"` // OpenAPI uses file_name
-	FileID   string `json:"file_id,omitempty"`   // OpenAPI uses file_id
+	Data *NewDirData `json:"data,omitempty"`
 }
 
 // DirID represents the response for getting a directory ID by path (Traditional)

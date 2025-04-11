@@ -1217,13 +1217,13 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	// Setting appVer (might only be needed for traditional calls)
 	re := regexp.MustCompile(`\d+\.\d+\.\d+(\.\d+)?$`)
-	if m := re.FindStringSubmatch(opt.UserAgent); m == nil {
+	if m := re.FindStringSubmatch(tradUserAgent); m == nil {
 		// Don't fail, just use a default or log a warning if UserAgent is critical
-		fs.Logf(f, "Could not parse app version from User-Agent %q. Using default.", opt.UserAgent)
+		fs.Logf(f, "Could not parse app version from User-Agent %q. Using default.", tradUserAgent)
 		f.appVer = "27.0.7.5" // Default fallback
 	} else {
 		f.appVer = m[0]
-		fs.Debugf(f, "Using App Version %q from User-Agent %q", f.appVer, opt.UserAgent)
+		fs.Debugf(f, "Using App Version %q from User-Agent %q", f.appVer, tradUserAgent)
 	}
 
 	// Initialize pacers
