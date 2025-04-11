@@ -30,10 +30,9 @@ import (
 )
 
 const (
-	minSleep      = 10 * time.Millisecond
-	maxSleep      = 2 * time.Second
-	decayConstant = 2 // bigger for slower decay, exponential
-
+	defaultPacerMinSleep = fs.Duration(50 * time.Millisecond)
+	maxSleep             = fs.Duration(2 * time.Second)
+	decayConstant        = 2 // bigger for slower decay, exponential
 	// API endpoint constants.
 	apiLogin  = "/api/auth/login/hash"
 	apiList   = "/api/fs/list"
@@ -79,6 +78,12 @@ func init() {
 				Default:  "",
 			},
 			{
+				Name:     "pacer_min_sleep",
+				Help:     "Minimum sleep time between API requests",
+				Advanced: true,
+				Default:  defaultPacerMinSleep,
+			},
+			{
 				Name:     "otp_code",
 				Help:     "Two-factor authentication code",
 				Default:  "",
@@ -113,14 +118,15 @@ func init() {
 
 // Options defines the configuration for this backend.
 type Options struct {
-	URL       string `config:"url"`
-	Username  string `config:"username"`
-	Password  string `config:"password"`
-	OTPCode   string `config:"otp_code"`
-	MetaPass  string `config:"meta_pass"`
-	RootPath  string `config:"root_path"`
-	CfServer  string `config:"cf_server"`
-	UserAgent string `config:"user_agent"`
+	URL           string      `config:"url"`
+	Username      string      `config:"username"`
+	Password      string      `config:"password"`
+	PacerMinSleep fs.Duration `config:"pacer_min_sleep"`
+	OTPCode       string      `config:"otp_code"`
+	MetaPass      string      `config:"meta_pass"`
+	RootPath      string      `config:"root_path"`
+	CfServer      string      `config:"cf_server"`
+	UserAgent     string      `config:"user_agent"`
 }
 
 // Fs represents a remote AList server.
@@ -270,7 +276,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	client := newClientWithPacer(ctx, opt)
 	f.httpClient = client
 	f.srv = rest.NewClient(client).SetRoot(opt.URL)
-	f.pacer = fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))
+	f.pacer = fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(opt.PacerMinSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))
 
 	// Login if credentials are provided.
 	if f.opt.Username != "" && f.opt.Password != "" {
