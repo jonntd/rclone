@@ -34,7 +34,6 @@ import (
 	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
-	"github.com/spf13/pflag"
 	"golang.org/x/oauth2"
 )
 
@@ -70,17 +69,6 @@ const (
 
 	tokenRefreshWindow = 10 * time.Minute // Refresh token 10 minutes before expiry
 	pkceVerifierLength = 64               // Length for PKCE code verifier
-)
-
-// Feature flags
-var (
-	// Feature flags
-	_ = pflag.Bool("115-user", false, "Set to use username instead of a full login URL")
-	_ = pflag.String("115-pass", "", "115.com password")
-	_ = pflag.String("115-encoding", "", "Encoding for 115 backend ('Slash', 'LtGt', 'None')")
-
-	// Global Mutex for login operations to prevent concurrent logins
-	loginMu sync.Mutex
 )
 
 // TraditionalRequest is the standard 115.com request structure for traditional API
@@ -310,6 +298,8 @@ type Fs struct {
 	tokenExpiry  time.Time
 	codeVerifier string // For PKCE
 	tokenRenewer *oauthutil.Renew
+
+	loginMu sync.Mutex
 }
 
 // Object describes a 115 object
@@ -510,8 +500,8 @@ func generatePKCE() (verifier, challenge string, err error) {
 func (f *Fs) login(ctx context.Context) error {
 	// Use a global mutex for login to prevent multiple concurrent login attempts
 	// which could overwhelm the API and cause authentication failures
-	loginMu.Lock()
-	defer loginMu.Unlock()
+	f.loginMu.Lock()
+	defer f.loginMu.Unlock()
 
 	f.tokenMu.Lock()
 	// Check if another thread has successfully logged in while we were waiting
