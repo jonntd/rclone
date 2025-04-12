@@ -1332,7 +1332,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	// Store the original name before any modifications for config operations
+	// Extract the base name without the config override suffix {xxxx}
 	originalName := name
+	if idx := strings.IndexRune(name, '{'); idx > 0 {
+		originalName = name[:idx]
+	}
 
 	// Parse root ID from path if present
 	if rootID, _, _ := parseRootID(root); rootID != "" {
