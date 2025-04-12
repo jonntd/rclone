@@ -199,6 +199,11 @@ Minimum is 100 KiB, maximum is 5 GiB.`,
 			Advanced: true,
 			Help:     "Disable post-upload check (avoids extra API call but reduces certainty).",
 		}, {
+			Name:     "no_buffer",
+			Default:  false,
+			Advanced: true,
+			Help:     "Skip disk buffering for uploads.",
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -268,6 +273,7 @@ type Options struct {
 	Internal            bool                 `config:"internal"`
 	DualStack           bool                 `config:"dual_stack"`
 	NoCheck             bool                 `config:"no_check"`
+	NoBuffer            bool                 `config:"no_buffer"` // Skip disk buffering for uploads
 	Enc                 encoder.MultiEncoder `config:"encoding"`
 }
 

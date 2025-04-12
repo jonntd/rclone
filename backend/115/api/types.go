@@ -685,6 +685,63 @@ type UploadInitInfo struct {
 	SignKey   string `json:"sign_key,omitempty"`   // Both
 	SignCheck string `json:"sign_check,omitempty"` // Both
 	FileIDStr string `json:"file_id,omitempty"`    // OpenAPI: file_id (for 秒传 success)
+
+	// Raw data for custom UnmarshalJSON
+	rawData json.RawMessage
+}
+
+// UnmarshalJSON handles custom unmarshaling for UploadInitInfo
+func (ui *UploadInitInfo) UnmarshalJSON(data []byte) error {
+	// Define an alias type to avoid infinite recursion
+	type Alias UploadInitInfo
+	aux := &struct {
+		Data json.RawMessage `json:"data"`
+		*Alias
+	}{
+		Alias: (*Alias)(ui),
+	}
+
+	// Unmarshal into the auxiliary struct
+	if err := json.Unmarshal(data, aux); err != nil {
+		return err
+	}
+
+	// Store raw data for later processing
+	ui.rawData = aux.Data
+
+	// Handle different formats for the data field
+	if len(aux.Data) > 0 {
+		// Try to unmarshal as an object first
+		var objData UploadInitData
+		if err := json.Unmarshal(aux.Data, &objData); err != nil {
+			// If that fails, try as an array
+			var arrData []map[string]interface{}
+			if err := json.Unmarshal(aux.Data, &arrData); err != nil {
+				return fmt.Errorf("data field is neither a valid object nor an array: %w", err)
+			}
+
+			// If it's an array and has at least one element, use the first element
+			if len(arrData) > 0 {
+				// Convert the first array element back to JSON
+				firstElem, err := json.Marshal(arrData[0])
+				if err != nil {
+					return fmt.Errorf("failed to marshal first array element: %w", err)
+				}
+
+				// Then unmarshal it into the objData
+				if err := json.Unmarshal(firstElem, &objData); err != nil {
+					return fmt.Errorf("failed to unmarshal first array element: %w", err)
+				}
+
+				ui.Data = &objData
+			}
+		} else {
+			// It was a valid object
+			ui.Data = &objData
+		}
+	}
+
+	return nil
 }
 
 // UploadInitData holds the nested data part of the OpenAPI upload init/resume response
