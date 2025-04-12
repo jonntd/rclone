@@ -176,11 +176,28 @@ func (b *OpenAPIBase) Err() error {
 	if msg := b.ErrMsg(); msg != "" {
 		out += fmt.Sprintf(": %q", msg)
 	}
-	// Specific error codes to check
-	// Example: Refresh token expired (needs re-login) - Assuming code 401 or a specific message
-	// if b.ErrCode() == 401 || strings.Contains(b.ErrMsg(), "refresh token expired") {
-	// 	return &TokenError{msg: out, IsRefreshTokenExpired: true}
-	// }
+
+	// Specific error codes to check based on API documentation
+	code := b.ErrCode()
+	switch code {
+	// Codes that require re-login
+	case 40140116: // refresh_token invalid (authorization revoked)
+		return NewTokenError(out, true)
+	case 40140117: // access_token refreshed too frequently
+		return NewTokenError(out, true)
+	case 40140119: // refresh_token expired
+		return NewTokenError(out, true)
+	case 40140120: // refresh_token verification failed (anti-tampering)
+		// Check if local refresh token is updated; if not, re-login
+		return NewTokenError(out, true)
+	case 40140121: // access_token refresh failed
+		// This should allow a retry of the refresh token operation
+		return NewTokenError(out, false)
+	case 40140125: // access_token invalid (expired or authorization revoked)
+		// Try refreshing token first
+		return NewTokenError(out, false)
+	}
+
 	return errors.New(out)
 }
 

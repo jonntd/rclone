@@ -644,27 +644,35 @@ func (f *Fs) login(ctx context.Context) error {
 
 // refreshTokenIfNecessary checks token expiry and refreshes if needed.
 // This function handles its own locking.
-func (f *Fs) refreshTokenIfNecessary(ctx context.Context) error {
+func (f *Fs) refreshTokenIfNecessary(ctx context.Context, refreshTokenExpired bool, forceRefresh bool) error {
 	f.tokenMu.Lock()
+
+	// Check if we should skip directly to re-login
+	if refreshTokenExpired {
+		fs.Debugf(f, "Token refresh skipped, going directly to re-login due to expired refresh token")
+		f.tokenMu.Unlock()
+		err := f.login(ctx) // login handles its own locking
+		return err
+	}
 
 	// Common check for token validity
 	if f.accessToken == "" || f.refreshToken == "" {
-		fs.Debugf(f, "No token found, attempting initial login.")
-		// Drop lock before calling login, as login acquires the lock
+		fs.Debugf(f, "No token found, attempting login.")
 		f.tokenMu.Unlock()
-		err := f.login(ctx)
-		return err // login handles its own locking
+		err := f.login(ctx) // login handles its own locking
+		return err
 	}
 
-	if time.Now().Before(f.tokenExpiry.Add(-tokenRefreshWindow)) {
+	// Check if token is valid OR if refresh is not forced
+	if !forceRefresh && time.Now().Before(f.tokenExpiry.Add(-tokenRefreshWindow)) {
 		f.tokenMu.Unlock() // Unlock before returning since token is valid
-		return nil         // Token is still valid
+		return nil         // Token is still valid or refresh not forced
 	}
 
 	// Prepare for token refresh
-	fs.Debugf(f, "Access token expired or nearing expiry, attempting refresh.")
-	refreshToken := f.refreshToken // Store locally before unlocking
-	f.tokenMu.Unlock()             // Unlock before making API call
+	fs.Debugf(f, "Access token expired, nearing expiry, or refresh forced. Attempting refresh.")
+	refreshTokenToUse := f.refreshToken // Store locally before unlocking
+	f.tokenMu.Unlock()                  // Unlock before making API call
 
 	// Check if openAPIClient is initialized
 	if f.openAPIClient == nil {
@@ -679,7 +687,7 @@ func (f *Fs) refreshTokenIfNecessary(ctx context.Context) error {
 
 	// Set up refresh request
 	refreshData := url.Values{
-		"refresh_token": {refreshToken},
+		"refresh_token": {refreshTokenToUse},
 	}
 	opts := rest.Opts{
 		Method:       "POST",
@@ -722,6 +730,9 @@ func (f *Fs) refreshTokenIfNecessary(ctx context.Context) error {
 	}
 
 	// Update tokens
+	f.tokenMu.Lock()
+	defer f.tokenMu.Unlock()
+
 	f.accessToken = refreshResp.Data.AccessToken
 	// OpenAPI spec says refresh_token might be updated, so store the new one
 	if refreshResp.Data.RefreshToken != "" {
@@ -869,7 +880,7 @@ func (f *Fs) CallOpenAPI(ctx context.Context, opts *rest.Opts, request any, resp
 		// Check if we need to refresh the token first
 		if !skipToken {
 			// Token refresh is needed - refreshTokenIfNecessary handles its own locking
-			refreshErr := f.refreshTokenIfNecessary(ctx)
+			refreshErr := f.refreshTokenIfNecessary(ctx, false, false)
 			if refreshErr != nil {
 				fs.Debugf(f, "Token refresh check failed: %v", refreshErr)
 				return false, backoff.Permanent(fmt.Errorf("token refresh check failed: %w", refreshErr))
@@ -914,12 +925,28 @@ func (f *Fs) CallOpenAPI(ctx context.Context, opts *rest.Opts, request any, resp
 
 		// If error occurred and it's not retryable according to shouldRetry
 		if apiErr != nil {
-			// Check if it's a token error that might need re-login
+			// Check if it's a token error that might need refresh or re-login
 			var tokenErr *api.TokenError
-			if errors.As(apiErr, &tokenErr) && tokenErr.IsRefreshTokenExpired {
-				// Signal that re-login is needed by returning the specific error
-				fs.Debugf(f, "Token error detected, needs re-login: %v", tokenErr)
-				return false, tokenErr // Special case handled outside the pacer
+			if errors.As(apiErr, &tokenErr) {
+				fs.Debugf(f, "Token error detected: %v (relogin needed: %v)", tokenErr, tokenErr.IsRefreshTokenExpired)
+				// Handle token refresh/re-login using the enhanced refreshTokenIfNecessary
+				refreshErr := f.refreshTokenIfNecessary(ctx, tokenErr.IsRefreshTokenExpired, !tokenErr.IsRefreshTokenExpired)
+				if refreshErr != nil {
+					fs.Debugf(f, "Token refresh/relogin failed: %v", refreshErr)
+					return false, backoff.Permanent(fmt.Errorf("token refresh/relogin failed: %w (original: %v)", refreshErr, apiErr))
+				}
+
+				// Token was successfully refreshed or re-login succeeded, retry the API call
+				fs.Debugf(f, "Token refresh/relogin succeeded, retrying API call")
+
+				// Update the Authorization header with the new token
+				if !skipToken {
+					f.tokenMu.Lock()
+					opts.ExtraHeaders["Authorization"] = "Bearer " + f.accessToken
+					f.tokenMu.Unlock()
+				}
+
+				return true, nil // Signal retry with the refreshed token
 			}
 
 			// Non-retryable error
@@ -939,9 +966,26 @@ func (f *Fs) CallOpenAPI(ctx context.Context, opts *rest.Opts, request any, resp
 						apiErr = result[0].Interface().(error)
 						// Check if this specific API error is a token error
 						var tokenErr *api.TokenError
-						if errors.As(apiErr, &tokenErr) && tokenErr.IsRefreshTokenExpired {
-							fs.Debugf(f, "Token error detected in API response, needs re-login: %v", tokenErr)
-							return false, tokenErr
+						if errors.As(apiErr, &tokenErr) {
+							fs.Debugf(f, "Token error detected in API response: %v (relogin needed: %v)", tokenErr, tokenErr.IsRefreshTokenExpired)
+							// Handle token refresh/re-login using the enhanced refreshTokenIfNecessary
+							refreshErr := f.refreshTokenIfNecessary(ctx, tokenErr.IsRefreshTokenExpired, !tokenErr.IsRefreshTokenExpired)
+							if refreshErr != nil {
+								fs.Debugf(f, "Token refresh/relogin failed after API response error: %v", refreshErr)
+								return false, backoff.Permanent(fmt.Errorf("token refresh/relogin failed: %w (original: %v)", refreshErr, apiErr))
+							}
+
+							// Token was successfully refreshed or re-login succeeded, retry the API call
+							fs.Debugf(f, "Token refresh/relogin succeeded after API response error, retrying API call")
+
+							// Update the Authorization header with the new token
+							if !skipToken {
+								f.tokenMu.Lock()
+								opts.ExtraHeaders["Authorization"] = "Bearer " + f.accessToken
+								f.tokenMu.Unlock()
+							}
+
+							return true, nil // Signal retry with the refreshed token
 						}
 						fs.Debugf(f, "pacer: permanent API error encountered in API response: %v", apiErr)
 						return false, backoff.Permanent(apiErr) // Treat API error as permanent
@@ -953,80 +997,6 @@ func (f *Fs) CallOpenAPI(ctx context.Context, opts *rest.Opts, request any, resp
 		fs.Debugf(f, "pacer: OpenAPI call successful")
 		return false, nil // Success, don't retry
 	})
-
-	// The re-login logic is handled outside the pacer.Call like before
-	var tokenErr *api.TokenError
-	if errors.As(err, &tokenErr) && tokenErr.IsRefreshTokenExpired {
-		fs.Debugf(f, "Token error detected after API call, attempting re-login.")
-		f.tokenMu.Lock()
-		loginErr := f.login(ctx) // Attempt re-login
-		f.tokenMu.Unlock()
-		if loginErr != nil {
-			return fmt.Errorf("re-login failed after token error: %w (original error: %s)", loginErr, err)
-		}
-		// Re-login successful, retry the original call *once*
-		fs.Debugf(f, "Re-login successful, retrying original OpenAPI call.")
-
-		// Retry once with the same pacer pattern
-		err = f.globalPacer.Call(func() (shouldRetryGlobal bool, errGlobal error) {
-			// Prepare request again
-			if !skipToken {
-				if opts.ExtraHeaders == nil {
-					opts.ExtraHeaders = make(map[string]string)
-				}
-				// Use the newly acquired token from re-login
-				f.tokenMu.Lock()
-				opts.ExtraHeaders["Authorization"] = "Bearer " + f.accessToken
-				f.tokenMu.Unlock()
-			}
-
-			// Make the call using the OpenAPI client
-			var resp *http.Response
-			var apiErr error
-			if request != nil && response != nil {
-				resp, apiErr = f.openAPIClient.CallJSON(ctx, opts, request, response)
-			} else if response != nil {
-				resp, apiErr = f.openAPIClient.CallJSON(ctx, opts, nil, response)
-			} else {
-				var baseResp api.OpenAPIBase
-				resp, apiErr = f.openAPIClient.CallJSON(ctx, opts, nil, &baseResp)
-				if apiErr == nil {
-					apiErr = baseResp.Err()
-				}
-			}
-
-			// Check for retryable errors
-			retryNeeded, retryErr := shouldRetry(ctx, resp, apiErr)
-			if retryNeeded {
-				fs.Debugf(f, "pacer: low level retry required for OpenAPI call after re-login (error: %v)", retryErr)
-				return true, retryErr // Signal globalPacer to retry
-			}
-
-			if apiErr != nil {
-				fs.Debugf(f, "pacer: permanent error encountered in OpenAPI call after re-login: %v", apiErr)
-				return false, backoff.Permanent(apiErr)
-			}
-
-			// Check API response errors like before
-			if response != nil {
-				val := reflect.ValueOf(response)
-				if val.Kind() == reflect.Ptr && !val.IsNil() {
-					method := val.MethodByName("Err")
-					if method.IsValid() && method.Type().NumIn() == 0 && method.Type().NumOut() == 1 && method.Type().Out(0).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
-						result := method.Call(nil)
-						if !result[0].IsNil() {
-							apiErr = result[0].Interface().(error)
-							fs.Debugf(f, "pacer: permanent API error encountered in API response after re-login: %v", apiErr)
-							return false, backoff.Permanent(apiErr)
-						}
-					}
-				}
-			}
-
-			fs.Debugf(f, "pacer: OpenAPI call successful after re-login")
-			return false, nil // Success after re-login
-		})
-	}
 
 	return err
 }
@@ -1261,7 +1231,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 				if time.Now().After(f.tokenExpiry.Add(-tokenRefreshWindow)) {
 					fs.Debugf(f, "Token expired or will expire soon, refreshing now")
 					// refreshTokenIfNecessary handles its own locking
-					err = f.refreshTokenIfNecessary(ctx)
+					err = f.refreshTokenIfNecessary(ctx, false, false)
 					if err != nil {
 						fs.Logf(f, "Failed to refresh token from config: %v", err)
 						// Continue with login below
