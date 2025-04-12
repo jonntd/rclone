@@ -271,6 +271,7 @@ type Options struct {
 // Fs represents a remote 115 drive
 type Fs struct {
 	name          string
+	originalName  string // Original config name without modifications
 	root          string
 	opt           Options
 	features      *fs.Features
@@ -757,14 +758,14 @@ func (f *Fs) saveToken(ctx context.Context, m configmap.Mapper) {
 	}
 	tokenString := string(tokenBytes)
 
-	// Save to config
-	err = config.SetValueAndSave(f.name, "token", tokenString)
+	// Save to config using the original config name
+	err = config.SetValueAndSave(f.originalName, "token", tokenString)
 	if err != nil {
 		fs.Errorf(f, "Failed to save token to config: %v", err)
 		return
 	}
 
-	fs.Debugf(f, "Saved token to config file")
+	fs.Debugf(f, "Saved token to config file using original name %q", f.originalName)
 }
 
 // setupTokenRenewer initializes the token renewer to automatically refresh tokens
@@ -830,8 +831,8 @@ func (f *Fs) setupTokenRenewer(ctx context.Context, m configmap.Mapper) {
 		TokenType:    "Bearer",
 	}
 
-	// Save token to config so it can be accessed by TokenSource
-	err := oauthutil.PutToken(f.name, m, token, false)
+	// Save token to config so it can be accessed by TokenSource, using the original name
+	err := oauthutil.PutToken(f.originalName, m, token, false)
 	if err != nil {
 		fs.Logf(f, "Failed to save token for renewer: %v", err)
 		return
@@ -843,15 +844,15 @@ func (f *Fs) setupTokenRenewer(ctx context.Context, m configmap.Mapper) {
 	}
 
 	// Create a client with the token source
-	_, ts, err := oauthutil.NewClientWithBaseClient(ctx, f.name, m, config, fshttp.NewClient(ctx))
+	_, ts, err := oauthutil.NewClientWithBaseClient(ctx, f.originalName, m, config, fshttp.NewClient(ctx))
 	if err != nil {
 		fs.Logf(f, "Failed to create token source for renewer: %v", err)
 		return
 	}
 
 	// Create token renewer that will trigger when the token is about to expire
-	f.tokenRenewer = oauthutil.NewRenew(f.String(), ts, transaction)
-	fs.Debugf(f, "Token renewer initialized")
+	f.tokenRenewer = oauthutil.NewRenew(f.originalName, ts, transaction)
+	fs.Debugf(f, "Token renewer initialized with original name %q", f.originalName)
 }
 
 // CallOpenAPI performs a call to the OpenAPI endpoint.
@@ -1196,6 +1197,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		opt.NohashSize = StreamUploadLimit
 	}
 
+	// Store the original name before any modifications for config operations
+	originalName := name
+
 	// Parse root ID from path if present
 	if rootID, _, _ := parseRootID(root); rootID != "" {
 		name += rootID // Append ID to name for uniqueness?
@@ -1205,9 +1209,10 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	root = strings.Trim(root, "/")
 
 	f := &Fs{
-		name: name,
-		root: root,
-		opt:  *opt,
+		name:         name,
+		originalName: originalName,
+		root:         root,
+		opt:          *opt,
 	}
 	f.features = (&fs.Features{
 		DuplicateFiles:          false,
