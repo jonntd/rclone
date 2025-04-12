@@ -46,15 +46,36 @@ type RereadableObject struct {
 	ctx        context.Context
 	currReader io.Reader
 	options    []fs.OpenOption
+	size       int64               // Track the source size for accounting
+	acc        *accounting.Account // Store the accounting object
+	fsInfo     fs.Info             // Source filesystem info
 }
 
 // NewRereadableObject creates a wrapper that supports re-opening the source
 func NewRereadableObject(ctx context.Context, src fs.ObjectInfo, options ...fs.OpenOption) (*RereadableObject, error) {
+	// Try to extract the filesystem info from the source
+	var fsInfo fs.Info
+
+	// Try different ways of getting the filesystem info
+	if o, ok := src.(fs.Object); ok {
+		// If it's a direct Object
+		fsInfo = o.Fs()
+	} else if o, ok := fs.UnWrapObjectInfo(src).(fs.Object); ok {
+		// Try to unwrap it first
+		fsInfo = o.Fs()
+	} else if i, ok := src.(interface{ Fs() fs.Info }); ok {
+		// If it has an Fs() method that returns fs.Info
+		fsInfo = i.Fs()
+	}
+
 	r := &RereadableObject{
 		src:     src,
 		ctx:     ctx,
 		options: options,
+		size:    src.Size(), // Remember the size for accounting
+		fsInfo:  fsInfo,     // Store the filesystem info
 	}
+
 	// Open it once to make sure it works and assign to currReader
 	reader, err := r.Open()
 	if err != nil {
@@ -81,8 +102,48 @@ func (r *RereadableObject) Open() (io.Reader, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to reopen source object: %w", err)
 		}
-		r.currReader = rc
-		return rc, nil
+
+		// Check if we already have an accounting wrapper
+		// If this is a fresh Open, extract the existing accounting if any
+		if r.acc == nil {
+			// Get the underlying accounting.Account if there is one
+			// The accounting system might wrap our reader with its own accounting
+			// We need to preserve this for speed tracking to work
+			_, acc := accounting.UnWrapAccounting(rc)
+			if acc != nil {
+				r.acc = acc
+				fs.Debugf(nil, "Preserved existing accounting wrapper for RereadableObject")
+			}
+		}
+
+		// Always wrap with accounting, even if we found an existing one
+		// The accounting system will handle this properly
+		stats := accounting.Stats(r.ctx)
+		if stats == nil {
+			fs.Debugf(nil, "No Stats found - accounting may not work correctly")
+			r.currReader = rc
+			return rc, nil
+		}
+
+		name := ""
+		if obj != nil {
+			name = obj.Remote()
+		} else if r.src != nil {
+			name = r.src.String()
+		}
+
+		// Try to get real Fs objects if available by downcasting fs.Info to fs.Fs
+		var srcFs, dstFs fs.Fs
+		if r.fsInfo != nil {
+			if f, ok := r.fsInfo.(fs.Fs); ok {
+				srcFs = f
+			}
+		}
+
+		// Create an accounting transfer with the best filesystem info we have
+		transfer := stats.NewTransferRemoteSize(name, r.size, srcFs, dstFs)
+		r.currReader = transfer.Account(r.ctx, rc).WithBuffer()
+		return r.currReader, nil
 	}
 
 	return nil, errors.New("source doesn't support reopening")
