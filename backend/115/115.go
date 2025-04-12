@@ -34,6 +34,7 @@ import (
 	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
+	"github.com/spf13/pflag"
 	"golang.org/x/oauth2"
 )
 
@@ -70,6 +71,20 @@ const (
 	tokenRefreshWindow = 10 * time.Minute // Refresh token 10 minutes before expiry
 	pkceVerifierLength = 64               // Length for PKCE code verifier
 )
+
+// Feature flags
+var (
+	// Feature flags
+	_ = pflag.Bool("115-user", false, "Set to use username instead of a full login URL")
+	_ = pflag.String("115-pass", "", "115.com password")
+	_ = pflag.String("115-encoding", "", "Encoding for 115 backend ('Slash', 'LtGt', 'None')")
+
+	// Global Mutex for login operations to prevent concurrent logins
+	loginMu sync.Mutex
+)
+
+// TraditionalRequest is the standard 115.com request structure for traditional API
+// ... existing code ...
 
 // Register with Fs
 func init() {
@@ -493,7 +508,18 @@ func generatePKCE() (verifier, challenge string, err error) {
 
 // login performs the initial authentication flow to get tokens
 func (f *Fs) login(ctx context.Context) error {
+	// Use a global mutex for login to prevent multiple concurrent login attempts
+	// which could overwhelm the API and cause authentication failures
+	loginMu.Lock()
+	defer loginMu.Unlock()
+
 	f.tokenMu.Lock()
+	// Check if another thread has successfully logged in while we were waiting
+	if f.accessToken != "" && time.Now().Before(f.tokenExpiry) {
+		fs.Debugf(f, "Token is already valid after waiting for login mutex, skipping login")
+		f.tokenMu.Unlock()
+		return nil
+	}
 	defer f.tokenMu.Unlock()
 
 	// Parse cookie and setup clients
@@ -693,6 +719,14 @@ func (f *Fs) exchangeDeviceCodeForToken(ctx context.Context, loginUID string) er
 func (f *Fs) refreshTokenIfNecessary(ctx context.Context, refreshTokenExpired bool, forceRefresh bool) error {
 	f.tokenMu.Lock()
 
+	// Check if token is already valid when we acquire the lock
+	// This handles the case where another thread just refreshed the token
+	if !refreshTokenExpired && !forceRefresh && isTokenStillValid(f) {
+		fs.Debugf(f, "Token is still valid after acquiring lock, skipping refresh")
+		f.tokenMu.Unlock()
+		return nil
+	}
+
 	// Check if we need to perform a full login instead of a refresh
 	if shouldPerformFullLogin(f, refreshTokenExpired) {
 		f.tokenMu.Unlock()
@@ -706,7 +740,8 @@ func (f *Fs) refreshTokenIfNecessary(ctx context.Context, refreshTokenExpired bo
 	}
 
 	// Prepare for token refresh
-	refreshToken := f.prepareForRefresh()
+	refreshToken := f.refreshToken // Make a local copy of the refresh token
+	f.tokenMu.Unlock()             // Unlock before making API call
 
 	// Perform the actual token refresh
 	result, err := f.performTokenRefresh(ctx, refreshToken)
@@ -765,7 +800,24 @@ func (f *Fs) performTokenRefresh(ctx context.Context, refreshToken string) (*api
 
 	// Validate the response
 	if refreshResp.Data == nil || refreshResp.Data.AccessToken == "" {
+		// Log detailed information about the empty response
+		fs.Errorf(f, "Refresh token response empty or invalid. Full response: %#v", refreshResp)
+		// Log OpenAPI base information (state, code, message)
+		fs.Errorf(f, "Response state: %v, code: %d, message: %q",
+			refreshResp.State, refreshResp.Code, refreshResp.Message)
+
 		fs.Errorf(f, "Refresh token response empty, attempting re-login.")
+
+		// Re-lock before checking token again to avoid race condition
+		f.tokenMu.Lock()
+		// Check if another thread has already refreshed the token
+		if f.accessToken != "" && time.Now().Before(f.tokenExpiry) {
+			fs.Debugf(f, "Token was refreshed by another thread while waiting")
+			f.tokenMu.Unlock()
+			return nil, nil
+		}
+		f.tokenMu.Unlock()
+
 		loginErr := f.login(ctx)
 		if loginErr != nil {
 			return nil, fmt.Errorf("re-login failed after empty refresh response: %w", loginErr)
@@ -808,8 +860,30 @@ func (f *Fs) callRefreshTokenAPI(ctx context.Context, refreshToken string) (*api
 	}
 
 	var refreshResp api.RefreshTokenResp
-	_, err := f.openAPIClient.CallJSON(ctx, &opts, nil, &refreshResp)
-	return &refreshResp, err
+	resp, err := f.openAPIClient.Call(ctx, &opts)
+	if err != nil {
+		return nil, err
+	}
+
+	// Read the raw response for logging
+	defer fs.CheckClose(resp.Body, &err)
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		fs.Errorf(f, "Failed to read refresh token response body: %v", readErr)
+		return nil, readErr
+	}
+
+	// Log the raw response
+	fs.Debugf(f, "Raw refresh token response: %s", string(body))
+
+	// Create a new reader for the JSON unmarshal
+	err = json.Unmarshal(body, &refreshResp)
+	if err != nil {
+		fs.Errorf(f, "Failed to parse refresh token response: %v", err)
+		return nil, err
+	}
+
+	return &refreshResp, nil
 }
 
 // handleRefreshError handles errors from the refresh token API call
@@ -1029,14 +1103,25 @@ func (f *Fs) CallOpenAPI(ctx context.Context, opts *rest.Opts, request any, resp
 
 // prepareTokenForRequest ensures a valid token is available and sets it in the request headers
 func (f *Fs) prepareTokenForRequest(ctx context.Context, opts *rest.Opts) error {
-	// Token refresh is needed - refreshTokenIfNecessary handles its own locking
-	refreshErr := f.refreshTokenIfNecessary(ctx, false, false)
-	if refreshErr != nil {
-		fs.Debugf(f, "Token refresh check failed: %v", refreshErr)
-		return fmt.Errorf("token refresh check failed: %w", refreshErr)
+	// First check if we need to refresh the token
+	refreshNeeded := false
+
+	f.tokenMu.Lock()
+	if !isTokenStillValid(f) {
+		refreshNeeded = true
+	}
+	f.tokenMu.Unlock()
+
+	// If refresh is needed, do it outside the lock
+	if refreshNeeded {
+		refreshErr := f.refreshTokenIfNecessary(ctx, false, false)
+		if refreshErr != nil {
+			fs.Debugf(f, "Token refresh check failed: %v", refreshErr)
+			return fmt.Errorf("token refresh check failed: %w", refreshErr)
+		}
 	}
 
-	// Get the current token and set the Authorization header
+	// Always get the freshest token right before using it
 	f.tokenMu.Lock()
 	token := f.accessToken
 	f.tokenMu.Unlock()
@@ -1084,9 +1169,15 @@ func (f *Fs) handleTokenError(ctx context.Context, opts *rest.Opts, apiErr error
 
 		// Update the Authorization header with the new token
 		if !skipToken {
+			// Always get the freshest token right before using it
 			f.tokenMu.Lock()
-			opts.ExtraHeaders["Authorization"] = "Bearer " + f.accessToken
+			token := f.accessToken
 			f.tokenMu.Unlock()
+
+			if opts.ExtraHeaders == nil {
+				opts.ExtraHeaders = make(map[string]string)
+			}
+			opts.ExtraHeaders["Authorization"] = "Bearer " + token
 		}
 		return true, nil // Signal retry with the refreshed token
 	}
