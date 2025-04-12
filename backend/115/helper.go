@@ -2,20 +2,17 @@ package _115
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"path"
-	"reflect"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/rclone/rclone/backend/115/api"
-	"github.com/rclone/rclone/backend/115/crypto"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/lib/rest"
 )
@@ -663,66 +660,26 @@ func (f *Fs) CallTraditionalAPIWithResp(ctx context.Context, opts *rest.Opts, re
 
 	var httpResp *http.Response
 	err := f.globalPacer.Call(func() (shouldRetryGlobal bool, errGlobal error) {
-		// --- Enforce traditional pacer delay ---
-		// Use tradPacer.Call with a dummy function that always succeeds immediately
-		// and doesn't retry. This effectively just waits for the pacer's internal timer.
-		tradPaceErr := f.tradPacer.Call(func() (bool, error) {
-			return false, nil // Dummy call: Success, don't retry this dummy op.
-		})
-		if tradPaceErr != nil {
-			// If waiting for tradPacer was interrupted (e.g., context cancelled)
-			fs.Debugf(f, "Context cancelled or error while waiting for traditional pacer: %v", tradPaceErr)
-			// Treat this as a permanent failure for the global pacer's attempt.
-			return false, backoff.Permanent(tradPaceErr)
+		// Wait for traditional pacer
+		if err := f.enforceTraditionalPacerDelay(); err != nil {
+			return false, backoff.Permanent(err)
 		}
-		// --- End of traditional pacer delay enforcement ---
 
-		// Prepare and make the actual API call using the traditional client
+		// Make the API call (with or without encryption)
 		var apiErr error
-		if skipEncrypt {
-			httpResp, apiErr = f.tradClient.CallJSON(ctx, opts, request, response)
-		} else {
-			// Encrypted call logic
-			input, marshalErr := json.Marshal(request)
-			if marshalErr != nil {
-				return false, backoff.Permanent(fmt.Errorf("failed to marshal traditional request: %w", marshalErr))
-			}
-			key := crypto.GenerateKey()
-			if opts.MultipartParams == nil {
-				opts.MultipartParams = url.Values{}
-			}
-			opts.MultipartParams.Set("data", crypto.Encode(input, key))
-			opts.Body = nil
+		httpResp, apiErr = f.executeTraditionalAPICall(ctx, opts, request, response, skipEncrypt)
 
-			var info api.StringInfo
-			httpResp, apiErr = f.tradClient.CallJSON(ctx, opts, nil, &info)
-			if apiErr == nil {
-				if apiErr = info.Err(); apiErr != nil {
-					// API level error before decryption
-				} else if info.Data == "" {
-					apiErr = errors.New("no data received in traditional response")
-				} else {
-					output, decodeErr := crypto.Decode(string(info.Data), key)
-					if decodeErr != nil {
-						apiErr = fmt.Errorf("failed to decode traditional data: %w", decodeErr)
-					} else if unmarshalErr := json.Unmarshal(output, response); unmarshalErr != nil {
-						apiErr = fmt.Errorf("failed to unmarshal traditional response %q: %w", string(output), unmarshalErr)
-					}
-				}
-			}
-		}
-
-		// Check the result of the actual API call for retryability by the *global* pacer
+		// Check for retryable errors
 		retryNeeded, retryErr := shouldRetry(ctx, httpResp, apiErr)
 		if retryNeeded {
 			fs.Debugf(f, "pacer: low level retry required for traditional call with response (error: %v)", retryErr)
 			return true, retryErr // Signal globalPacer to retry
 		}
 
+		// Handle non-retryable errors
 		if apiErr != nil {
-			// Error occurred, but shouldRetry decided it's permanent
 			fs.Debugf(f, "pacer: permanent error encountered in traditional call with response: %v", apiErr)
-			// Ensure the error returned to globalPacer is marked permanent if it isn't already.
+			// Ensure the error is marked as permanent
 			var permanentErr *backoff.PermanentError
 			if !errors.As(apiErr, &permanentErr) {
 				return false, backoff.Permanent(apiErr)
@@ -731,19 +688,9 @@ func (f *Fs) CallTraditionalAPIWithResp(ctx context.Context, opts *rest.Opts, re
 		}
 
 		// Check API-level errors in response struct
-		if response != nil {
-			val := reflect.ValueOf(response)
-			if val.Kind() == reflect.Ptr && !val.IsNil() {
-				method := val.MethodByName("Err")
-				if method.IsValid() && method.Type().NumIn() == 0 && method.Type().NumOut() == 1 && method.Type().Out(0).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
-					result := method.Call(nil)
-					if !result[0].IsNil() {
-						apiErr = result[0].Interface().(error)
-						fs.Debugf(f, "pacer: permanent API error encountered in traditional call with response: %v", apiErr)
-						return false, backoff.Permanent(apiErr)
-					}
-				}
-			}
+		if errResp := f.checkResponseForAPIErrors(response, false, nil); errResp != nil {
+			fs.Debugf(f, "pacer: permanent API error encountered in traditional call with response: %v", errResp)
+			return false, backoff.Permanent(errResp)
 		}
 
 		fs.Debugf(f, "pacer: traditional call with response successful")

@@ -496,14 +496,62 @@ func (f *Fs) login(ctx context.Context) error {
 	f.tokenMu.Lock()
 	defer f.tokenMu.Unlock()
 
-	// 1. Parse cookie
+	// Parse cookie and setup clients
+	if err := f.setupLoginEnvironment(ctx); err != nil {
+		return err
+	}
+
+	fs.Debugf(f, "Starting login process for user %s", f.userID)
+
+	// Generate PKCE
+	var challenge string
+	var err error
+	if f.codeVerifier, challenge, err = generatePKCE(); err != nil {
+		return fmt.Errorf("failed to generate PKCE codes: %w", err)
+	}
+	fs.Debugf(f, "Generated PKCE challenge")
+
+	// Request device code
+	loginUID, err := f.getAuthDeviceCode(ctx, challenge)
+	if err != nil {
+		return err
+	}
+
+	// Mimic QR scan confirmation
+	if err := f.simulateQRCodeScan(ctx, loginUID); err != nil {
+		// Only log errors from these steps, don't fail
+		fs.Logf(f, "QR code scan simulation steps had errors (continuing anyway): %v", err)
+	}
+
+	// Exchange device code for access token
+	if err := f.exchangeDeviceCodeForToken(ctx, loginUID); err != nil {
+		return err
+	}
+
+	// Get userkey for traditional uploads if needed
+	if f.userkey == "" {
+		fs.Debugf(f, "Fetching userkey using traditional API...")
+		if err := f.getUploadBasicInfo(ctx); err != nil {
+			// Log error but don't fail login, userkey is only for traditional upload init
+			fs.Logf(f, "Failed to get userkey (needed for some traditional uploads): %v", err)
+		} else {
+			fs.Debugf(f, "Successfully fetched userkey.")
+		}
+	}
+
+	return nil
+}
+
+// setupLoginEnvironment parses cookies and sets up HTTP clients
+func (f *Fs) setupLoginEnvironment(ctx context.Context) error {
+	// Parse cookie
 	cred := (&Credential{}).FromCookie(f.opt.Cookie)
 	if err := cred.Valid(); err != nil {
 		return fmt.Errorf("invalid cookie provided: %w", err)
 	}
 	f.userID = cred.UserID() // Set userID early
 
-	// 2. Setup clients (needed for the login calls)
+	// Setup clients (needed for the login calls)
 	// Create separate clients for each API type with different User-Agents
 	tradHTTPClient := getTradHTTPClient(ctx, &f.opt)
 	openAPIHTTPClient := getOpenAPIHTTPClient(ctx, &f.opt)
@@ -519,18 +567,11 @@ func (f *Fs) login(ctx context.Context) error {
 		SetRoot(openAPIRootURL).
 		SetErrorHandler(errorHandler)
 
-	fs.Debugf(f, "Starting login process for user %s", f.userID)
+	return nil
+}
 
-	// 3. Generate PKCE
-	var challenge string
-	var err error
-	f.codeVerifier, challenge, err = generatePKCE()
-	if err != nil {
-		return fmt.Errorf("failed to generate PKCE codes: %w", err)
-	}
-	fs.Debugf(f, "Generated PKCE challenge")
-
-	// 4. Call open/authDeviceCode (using traditional client)
+// getAuthDeviceCode calls the authDeviceCode API to start the login process
+func (f *Fs) getAuthDeviceCode(ctx context.Context, challenge string) (string, error) {
 	authData := url.Values{
 		"client_id":             {appID},
 		"code_challenge":        {challenge},
@@ -547,19 +588,38 @@ func (f *Fs) login(ctx context.Context) error {
 	var authResp api.AuthDeviceCodeResp
 	// This initial call uses the traditional client *but doesn't need encryption*
 	// It still needs the cookie and pacing.
-	err = f.CallTraditionalAPI(ctx, &authOpts, nil, &authResp, true) // Pass skipEncrypt=true
+	err := f.CallTraditionalAPI(ctx, &authOpts, nil, &authResp, true) // Pass skipEncrypt=true
 	if err != nil {
-		return fmt.Errorf("authDeviceCode failed: %w", err)
+		return "", fmt.Errorf("authDeviceCode failed: %w", err)
 	}
 	if authResp.Data == nil || authResp.Data.UID == "" {
-		return fmt.Errorf("authDeviceCode returned empty data: %v", authResp)
+		return "", fmt.Errorf("authDeviceCode returned empty data: %v", authResp)
 	}
 	loginUID := authResp.Data.UID
 	fs.Debugf(f, "authDeviceCode successful, login UID: %s", loginUID)
+	return loginUID, nil
+}
 
-	// 5. Mimic QR Scan/Confirm (using traditional client and endpoints)
-	// These calls seem necessary based on user request, even if OpenAPI docs differ.
-	// They use the *old* QR API endpoints and require the cookie.
+// simulateQRCodeScan mimics the QR code scan and confirm process
+func (f *Fs) simulateQRCodeScan(ctx context.Context, loginUID string) error {
+	// Call QR scan API
+	scanErr := f.callQRScanAPI(ctx, loginUID)
+
+	// Call QR confirm API - still proceed if scan had an error
+	confirmErr := f.callQRConfirmAPI(ctx, loginUID)
+
+	// Add a small delay after mimic steps, just in case
+	time.Sleep(1 * time.Second)
+
+	// Return an error if both steps failed, otherwise continue
+	if scanErr != nil && confirmErr != nil {
+		return fmt.Errorf("both scan and confirm steps failed: scan: %v, confirm: %v", scanErr, confirmErr)
+	}
+	return nil
+}
+
+// callQRScanAPI calls the QR scan API
+func (f *Fs) callQRScanAPI(ctx context.Context, loginUID string) error {
 	scanPayload := map[string]string{"uid": loginUID}
 	scanOpts := rest.Opts{
 		Method:     "GET",
@@ -569,15 +629,16 @@ func (f *Fs) login(ctx context.Context) error {
 	}
 	var scanResp api.TraditionalBase // Use base struct, don't care about response data much
 	fs.Debugf(f, "Calling login_qrcode_scan...")
-	err = f.CallTraditionalAPI(ctx, &scanOpts, scanPayload, &scanResp, true) // Needs encryption? Assume yes for old API.
+	err := f.CallTraditionalAPI(ctx, &scanOpts, scanPayload, &scanResp, true)
 	if err != nil {
-		// Log error but continue, maybe it's not strictly required?
-		fs.Logf(f, "login_qrcode_scan failed (continuing anyway): %v", err)
-		// return fmt.Errorf("login_qrcode_scan failed: %w", err)
-	} else {
-		fs.Debugf(f, "login_qrcode_scan call successful (State: %v)", scanResp.State)
+		return fmt.Errorf("login_qrcode_scan failed: %w", err)
 	}
+	fs.Debugf(f, "login_qrcode_scan call successful (State: %v)", scanResp.State)
+	return nil
+}
 
+// callQRConfirmAPI calls the QR confirm API
+func (f *Fs) callQRConfirmAPI(ctx context.Context, loginUID string) error {
 	confirmPayload := map[string]string{"uid": loginUID, "key": loginUID, "client": "0"} // Key seems to be same as uid?
 	confirmOpts := rest.Opts{
 		Method:     "GET",
@@ -587,19 +648,16 @@ func (f *Fs) login(ctx context.Context) error {
 	}
 	var confirmResp api.TraditionalBase
 	fs.Debugf(f, "Calling login_qrcode_scan_confirm...")
-	err = f.CallTraditionalAPI(ctx, &confirmOpts, confirmPayload, &confirmResp, true) // Needs encryption? Assume yes.
+	err := f.CallTraditionalAPI(ctx, &confirmOpts, confirmPayload, &confirmResp, true) // Needs encryption? Assume yes.
 	if err != nil {
-		// Log error but continue
-		fs.Logf(f, "login_qrcode_scan_confirm failed (continuing anyway): %v", err)
-		// return fmt.Errorf("login_qrcode_scan_confirm failed: %w", err)
-	} else {
-		fs.Debugf(f, "login_qrcode_scan_confirm call successful (State: %v)", confirmResp.State)
+		return fmt.Errorf("login_qrcode_scan_confirm failed: %w", err)
 	}
+	fs.Debugf(f, "login_qrcode_scan_confirm call successful (State: %v)", confirmResp.State)
+	return nil
+}
 
-	// Add a small delay after mimic steps, just in case
-	time.Sleep(1 * time.Second)
-
-	// 6. Call open/deviceCodeToToken (using traditional client)
+// exchangeDeviceCodeForToken gets the access token using the device code
+func (f *Fs) exchangeDeviceCodeForToken(ctx context.Context, loginUID string) error {
 	tokenData := url.Values{
 		"uid":           {loginUID},
 		"code_verifier": {f.codeVerifier},
@@ -613,7 +671,7 @@ func (f *Fs) login(ctx context.Context) error {
 	}
 	var tokenResp api.DeviceCodeTokenResp
 	// This call also uses traditional client but no encryption needed.
-	err = f.CallTraditionalAPI(ctx, &tokenOpts, nil, &tokenResp, true) // skipEncrypt=true
+	err := f.CallTraditionalAPI(ctx, &tokenOpts, nil, &tokenResp, true) // skipEncrypt=true
 	if err != nil {
 		return fmt.Errorf("deviceCodeToToken failed: %w", err)
 	}
@@ -621,23 +679,11 @@ func (f *Fs) login(ctx context.Context) error {
 		return fmt.Errorf("deviceCodeToToken returned empty data: %v", tokenResp)
 	}
 
-	// 7. Store tokens
+	// Store tokens
 	f.accessToken = tokenResp.Data.AccessToken
 	f.refreshToken = tokenResp.Data.RefreshToken
 	f.tokenExpiry = time.Now().Add(time.Duration(tokenResp.Data.ExpiresIn) * time.Second)
 	fs.Debugf(f, "Successfully obtained access token, expires at %v", f.tokenExpiry)
-
-	// 8. Get userkey (needed for traditional upload init signature)
-	// This uses the old /app/uploadinfo endpoint with the cookie.
-	if f.userkey == "" {
-		fs.Debugf(f, "Fetching userkey using traditional API...")
-		if err := f.getUploadBasicInfo(ctx); err != nil {
-			// Log error but don't fail login, userkey is only for traditional upload init
-			fs.Logf(f, "Failed to get userkey (needed for some traditional uploads): %v", err)
-		} else {
-			fs.Debugf(f, "Successfully fetched userkey.")
-		}
-	}
 
 	return nil
 }
@@ -647,47 +693,111 @@ func (f *Fs) login(ctx context.Context) error {
 func (f *Fs) refreshTokenIfNecessary(ctx context.Context, refreshTokenExpired bool, forceRefresh bool) error {
 	f.tokenMu.Lock()
 
-	// Check if we should skip directly to re-login
-	if refreshTokenExpired {
-		fs.Debugf(f, "Token refresh skipped, going directly to re-login due to expired refresh token")
+	// Check if we need to perform a full login instead of a refresh
+	if shouldPerformFullLogin(f, refreshTokenExpired) {
 		f.tokenMu.Unlock()
-		err := f.login(ctx) // login handles its own locking
-		return err
+		return f.login(ctx) // login handles its own locking
 	}
 
-	// Common check for token validity
-	if f.accessToken == "" || f.refreshToken == "" {
-		fs.Debugf(f, "No token found, attempting login.")
+	// Check if token is still valid and refresh not forced
+	if !forceRefresh && isTokenStillValid(f) {
 		f.tokenMu.Unlock()
-		err := f.login(ctx) // login handles its own locking
-		return err
-	}
-
-	// Check if token is valid OR if refresh is not forced
-	if !forceRefresh && time.Now().Before(f.tokenExpiry.Add(-tokenRefreshWindow)) {
-		f.tokenMu.Unlock() // Unlock before returning since token is valid
-		return nil         // Token is still valid or refresh not forced
+		return nil
 	}
 
 	// Prepare for token refresh
-	fs.Debugf(f, "Access token expired, nearing expiry, or refresh forced. Attempting refresh.")
-	refreshTokenToUse := f.refreshToken // Store locally before unlocking
-	f.tokenMu.Unlock()                  // Unlock before making API call
+	refreshToken := f.prepareForRefresh()
 
-	// Check if openAPIClient is initialized
-	if f.openAPIClient == nil {
-		// Setup client if it doesn't exist
-		newCtx, ci := fs.AddConfig(ctx)
-		ci.UserAgent = f.opt.UserAgent
-		httpClient := getHTTPClient(newCtx, &f.opt)
-		f.openAPIClient = rest.NewClient(httpClient).
-			SetRoot(openAPIRootURL).
-			SetErrorHandler(errorHandler)
+	// Perform the actual token refresh
+	result, err := f.performTokenRefresh(ctx, refreshToken)
+	if err != nil {
+		return err // Error already formatted with context
 	}
 
-	// Set up refresh request
+	// Update the tokens with new values
+	f.updateTokens(result)
+
+	return nil
+}
+
+// shouldPerformFullLogin determines if we should skip refresh and do a full login
+func shouldPerformFullLogin(f *Fs, refreshTokenExpired bool) bool {
+	// Skip directly to re-login if refresh token expired
+	if refreshTokenExpired {
+		fs.Debugf(f, "Token refresh skipped, going directly to re-login due to expired refresh token")
+		return true
+	}
+
+	// Re-login if no tokens available
+	if f.accessToken == "" || f.refreshToken == "" {
+		fs.Debugf(f, "No token found, attempting login.")
+		return true
+	}
+
+	return false
+}
+
+// isTokenStillValid checks if the current token is still valid
+func isTokenStillValid(f *Fs) bool {
+	return time.Now().Before(f.tokenExpiry.Add(-tokenRefreshWindow))
+}
+
+// prepareForRefresh gets the refresh token and unlocks the mutex
+func (f *Fs) prepareForRefresh() string {
+	fs.Debugf(f, "Access token expired, nearing expiry, or refresh forced. Attempting refresh.")
+	refreshTokenToUse := f.refreshToken
+	f.tokenMu.Unlock() // Unlock before making API call
+	return refreshTokenToUse
+}
+
+// performTokenRefresh handles the actual API call to refresh the token
+func (f *Fs) performTokenRefresh(ctx context.Context, refreshToken string) (*api.RefreshTokenResp, error) {
+	// Ensure client exists
+	if err := f.ensureOpenAPIClient(ctx); err != nil {
+		return nil, err
+	}
+
+	// Set up and make the refresh request
+	refreshResp, err := f.callRefreshTokenAPI(ctx, refreshToken)
+	if err != nil {
+		return handleRefreshError(f, ctx, err)
+	}
+
+	// Validate the response
+	if refreshResp.Data == nil || refreshResp.Data.AccessToken == "" {
+		fs.Errorf(f, "Refresh token response empty, attempting re-login.")
+		loginErr := f.login(ctx)
+		if loginErr != nil {
+			return nil, fmt.Errorf("re-login failed after empty refresh response: %w", loginErr)
+		}
+		fs.Debugf(f, "Re-login successful after empty refresh response.")
+		return nil, nil // Re-login successful, no need to update tokens
+	}
+
+	return refreshResp, nil
+}
+
+// ensureOpenAPIClient ensures the OpenAPI client is initialized
+func (f *Fs) ensureOpenAPIClient(ctx context.Context) error {
+	if f.openAPIClient != nil {
+		return nil
+	}
+
+	// Setup client if it doesn't exist
+	newCtx, ci := fs.AddConfig(ctx)
+	ci.UserAgent = f.opt.UserAgent
+	httpClient := getHTTPClient(newCtx, &f.opt)
+	f.openAPIClient = rest.NewClient(httpClient).
+		SetRoot(openAPIRootURL).
+		SetErrorHandler(errorHandler)
+
+	return nil
+}
+
+// callRefreshTokenAPI makes the actual API call to refresh the token
+func (f *Fs) callRefreshTokenAPI(ctx context.Context, refreshToken string) (*api.RefreshTokenResp, error) {
 	refreshData := url.Values{
-		"refresh_token": {refreshTokenToUse},
+		"refresh_token": {refreshToken},
 	}
 	opts := rest.Opts{
 		Method:       "POST",
@@ -697,39 +807,39 @@ func (f *Fs) refreshTokenIfNecessary(ctx context.Context, refreshTokenExpired bo
 		ExtraHeaders: map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
 	}
 
-	// Make API call without the lock
 	var refreshResp api.RefreshTokenResp
 	_, err := f.openAPIClient.CallJSON(ctx, &opts, nil, &refreshResp)
+	return &refreshResp, err
+}
 
-	// Handle the response
-	if err != nil {
-		fs.Errorf(f, "Refresh token failed: %v", err)
-		// Check if the error indicates the refresh token itself is expired
-		var tokenErr *api.TokenError
-		if errors.As(err, &tokenErr) && tokenErr.IsRefreshTokenExpired || strings.Contains(err.Error(), "refresh token expired") {
-			fs.Debugf(f, "Refresh token seems expired, attempting full re-login.")
-			loginErr := f.login(ctx) // login handles its own locking
-			if loginErr != nil {
-				return fmt.Errorf("re-login failed after refresh token expired: %w", loginErr)
-			}
-			fs.Debugf(f, "Re-login successful after refresh token expiry.")
-			return nil // Re-login successful
-		}
-		// Return the original refresh error if it wasn't an expiry issue or re-login failed
-		return fmt.Errorf("token refresh failed: %w", err)
-	}
+// handleRefreshError handles errors from the refresh token API call
+func handleRefreshError(f *Fs, ctx context.Context, err error) (*api.RefreshTokenResp, error) {
+	fs.Errorf(f, "Refresh token failed: %v", err)
 
-	if refreshResp.Data == nil || refreshResp.Data.AccessToken == "" {
-		fs.Errorf(f, "Refresh token response empty, attempting re-login.")
+	// Check if the error indicates the refresh token itself is expired
+	var tokenErr *api.TokenError
+	if errors.As(err, &tokenErr) && tokenErr.IsRefreshTokenExpired ||
+		strings.Contains(err.Error(), "refresh token expired") {
+		fs.Debugf(f, "Refresh token seems expired, attempting full re-login.")
 		loginErr := f.login(ctx) // login handles its own locking
 		if loginErr != nil {
-			return fmt.Errorf("re-login failed after empty refresh response: %w", loginErr)
+			return nil, fmt.Errorf("re-login failed after refresh token expired: %w", loginErr)
 		}
-		fs.Debugf(f, "Re-login successful after empty refresh response.")
-		return nil // Re-login successful
+		fs.Debugf(f, "Re-login successful after refresh token expiry.")
+		return nil, nil // Re-login successful
 	}
 
-	// Update tokens
+	// Return the original refresh error if it wasn't an expiry issue
+	return nil, fmt.Errorf("token refresh failed: %w", err)
+}
+
+// updateTokens updates the token values with new values from a refresh response
+func (f *Fs) updateTokens(refreshResp *api.RefreshTokenResp) {
+	// If we got a nil response, it means we did a re-login instead of a refresh
+	if refreshResp == nil {
+		return
+	}
+
 	f.tokenMu.Lock()
 	defer f.tokenMu.Unlock()
 
@@ -740,7 +850,6 @@ func (f *Fs) refreshTokenIfNecessary(ctx context.Context, refreshTokenExpired bo
 	}
 	f.tokenExpiry = time.Now().Add(time.Duration(refreshResp.Data.ExpiresIn) * time.Second)
 	fs.Debugf(f, "Token refreshed successfully, new expiry: %v", f.tokenExpiry)
-	return nil
 }
 
 // saveToken saves the current token to the config
@@ -876,129 +985,133 @@ func (f *Fs) CallOpenAPI(ctx context.Context, opts *rest.Opts, request any, resp
 	}
 
 	// Wrap the entire attempt sequence with the global pacer, returning proper retry signals
-	err := f.globalPacer.Call(func() (shouldRetryGlobal bool, errGlobal error) {
-		// Check if we need to refresh the token first
+	return f.globalPacer.Call(func() (shouldRetryGlobal bool, errGlobal error) {
+		// Ensure token is available and current
 		if !skipToken {
-			// Token refresh is needed - refreshTokenIfNecessary handles its own locking
-			refreshErr := f.refreshTokenIfNecessary(ctx, false, false)
-			if refreshErr != nil {
-				fs.Debugf(f, "Token refresh check failed: %v", refreshErr)
-				return false, backoff.Permanent(fmt.Errorf("token refresh check failed: %w", refreshErr))
-			}
-
-			// Get the current token
-			f.tokenMu.Lock()
-			token := f.accessToken
-			f.tokenMu.Unlock()
-
-			// Set the Authorization header
-			if opts.ExtraHeaders == nil {
-				opts.ExtraHeaders = make(map[string]string)
-			}
-			opts.ExtraHeaders["Authorization"] = "Bearer " + token
-		}
-
-		// Make the call using the OpenAPI client
-		var resp *http.Response
-		var apiErr error
-		if request != nil && response != nil {
-			// Assume standard JSON request/response
-			resp, apiErr = f.openAPIClient.CallJSON(ctx, opts, request, response)
-		} else if response != nil {
-			// Assume GET request with JSON response
-			resp, apiErr = f.openAPIClient.CallJSON(ctx, opts, nil, response)
-		} else {
-			// Assume call without specific request/response body
-			var baseResp api.OpenAPIBase
-			resp, apiErr = f.openAPIClient.CallJSON(ctx, opts, nil, &baseResp)
-			if apiErr == nil {
-				apiErr = baseResp.Err() // Check for API-level errors
+			if err := f.prepareTokenForRequest(ctx, opts); err != nil {
+				return false, backoff.Permanent(err)
 			}
 		}
 
-		// Check for retryable errors
-		retryNeeded, retryErr := shouldRetry(ctx, resp, apiErr)
-		if retryNeeded {
+		// Make the API call
+		resp, apiErr := f.executeOpenAPICall(ctx, opts, request, response)
+
+		// Handle retries for network/server errors
+		if retryNeeded, retryErr := shouldRetry(ctx, resp, apiErr); retryNeeded {
 			fs.Debugf(f, "pacer: low level retry required for OpenAPI call (error: %v)", retryErr)
 			return true, retryErr // Signal globalPacer to retry
 		}
 
-		// If error occurred and it's not retryable according to shouldRetry
+		// Handle token errors
 		if apiErr != nil {
-			// Check if it's a token error that might need refresh or re-login
-			var tokenErr *api.TokenError
-			if errors.As(apiErr, &tokenErr) {
-				fs.Debugf(f, "Token error detected: %v (relogin needed: %v)", tokenErr, tokenErr.IsRefreshTokenExpired)
-				// Handle token refresh/re-login using the enhanced refreshTokenIfNecessary
-				refreshErr := f.refreshTokenIfNecessary(ctx, tokenErr.IsRefreshTokenExpired, !tokenErr.IsRefreshTokenExpired)
-				if refreshErr != nil {
-					fs.Debugf(f, "Token refresh/relogin failed: %v", refreshErr)
-					return false, backoff.Permanent(fmt.Errorf("token refresh/relogin failed: %w (original: %v)", refreshErr, apiErr))
-				}
-
-				// Token was successfully refreshed or re-login succeeded, retry the API call
-				fs.Debugf(f, "Token refresh/relogin succeeded, retrying API call")
-
-				// Update the Authorization header with the new token
-				if !skipToken {
-					f.tokenMu.Lock()
-					opts.ExtraHeaders["Authorization"] = "Bearer " + f.accessToken
-					f.tokenMu.Unlock()
-				}
-
-				return true, nil // Signal retry with the refreshed token
+			if retryAfterTokenRefresh, err := f.handleTokenError(ctx, opts, apiErr, skipToken); retryAfterTokenRefresh {
+				return true, nil // Retry with refreshed token
+			} else if err != nil {
+				return false, backoff.Permanent(err)
 			}
-
-			// Non-retryable error
-			fs.Debugf(f, "pacer: permanent error encountered in OpenAPI call: %v", apiErr)
-			return false, backoff.Permanent(apiErr)
+			return false, backoff.Permanent(apiErr) // Non-token error, don't retry
 		}
 
-		// Check for API-level errors in the response struct if applicable
-		if response != nil {
-			// Use reflection to check for and call an Err() method
-			val := reflect.ValueOf(response)
-			if val.Kind() == reflect.Ptr && !val.IsNil() {
-				method := val.MethodByName("Err")
-				if method.IsValid() && method.Type().NumIn() == 0 && method.Type().NumOut() == 1 && method.Type().Out(0).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
-					result := method.Call(nil)
-					if !result[0].IsNil() {
-						apiErr = result[0].Interface().(error)
-						// Check if this specific API error is a token error
-						var tokenErr *api.TokenError
-						if errors.As(apiErr, &tokenErr) {
-							fs.Debugf(f, "Token error detected in API response: %v (relogin needed: %v)", tokenErr, tokenErr.IsRefreshTokenExpired)
-							// Handle token refresh/re-login using the enhanced refreshTokenIfNecessary
-							refreshErr := f.refreshTokenIfNecessary(ctx, tokenErr.IsRefreshTokenExpired, !tokenErr.IsRefreshTokenExpired)
-							if refreshErr != nil {
-								fs.Debugf(f, "Token refresh/relogin failed after API response error: %v", refreshErr)
-								return false, backoff.Permanent(fmt.Errorf("token refresh/relogin failed: %w (original: %v)", refreshErr, apiErr))
-							}
-
-							// Token was successfully refreshed or re-login succeeded, retry the API call
-							fs.Debugf(f, "Token refresh/relogin succeeded after API response error, retrying API call")
-
-							// Update the Authorization header with the new token
-							if !skipToken {
-								f.tokenMu.Lock()
-								opts.ExtraHeaders["Authorization"] = "Bearer " + f.accessToken
-								f.tokenMu.Unlock()
-							}
-
-							return true, nil // Signal retry with the refreshed token
-						}
-						fs.Debugf(f, "pacer: permanent API error encountered in API response: %v", apiErr)
-						return false, backoff.Permanent(apiErr) // Treat API error as permanent
-					}
-				}
+		// Check for API-level errors in the response
+		if apiErr = f.checkResponseForAPIErrors(response, skipToken, opts); apiErr != nil {
+			if tokenRefreshed, err := f.handleTokenError(ctx, opts, apiErr, skipToken); tokenRefreshed {
+				return true, nil // Retry with refreshed token
+			} else if err != nil {
+				return false, backoff.Permanent(err)
 			}
+			return false, backoff.Permanent(apiErr) // Other API error, don't retry
 		}
 
 		fs.Debugf(f, "pacer: OpenAPI call successful")
 		return false, nil // Success, don't retry
 	})
+}
 
-	return err
+// prepareTokenForRequest ensures a valid token is available and sets it in the request headers
+func (f *Fs) prepareTokenForRequest(ctx context.Context, opts *rest.Opts) error {
+	// Token refresh is needed - refreshTokenIfNecessary handles its own locking
+	refreshErr := f.refreshTokenIfNecessary(ctx, false, false)
+	if refreshErr != nil {
+		fs.Debugf(f, "Token refresh check failed: %v", refreshErr)
+		return fmt.Errorf("token refresh check failed: %w", refreshErr)
+	}
+
+	// Get the current token and set the Authorization header
+	f.tokenMu.Lock()
+	token := f.accessToken
+	f.tokenMu.Unlock()
+
+	if opts.ExtraHeaders == nil {
+		opts.ExtraHeaders = make(map[string]string)
+	}
+	opts.ExtraHeaders["Authorization"] = "Bearer " + token
+	return nil
+}
+
+// executeOpenAPICall makes the actual API call with the provided parameters
+func (f *Fs) executeOpenAPICall(ctx context.Context, opts *rest.Opts, request any, response any) (*http.Response, error) {
+	if request != nil && response != nil {
+		// Assume standard JSON request/response
+		return f.openAPIClient.CallJSON(ctx, opts, request, response)
+	} else if response != nil {
+		// Assume GET request with JSON response
+		return f.openAPIClient.CallJSON(ctx, opts, nil, response)
+	} else {
+		// Assume call without specific request/response body
+		var baseResp api.OpenAPIBase
+		resp, err := f.openAPIClient.CallJSON(ctx, opts, nil, &baseResp)
+		if err == nil {
+			err = baseResp.Err() // Check for API-level errors
+		}
+		return resp, err
+	}
+}
+
+// handleTokenError processes token-related errors and attempts to refresh or re-login
+func (f *Fs) handleTokenError(ctx context.Context, opts *rest.Opts, apiErr error, skipToken bool) (bool, error) {
+	var tokenErr *api.TokenError
+	if errors.As(apiErr, &tokenErr) {
+		fs.Debugf(f, "Token error detected: %v (relogin needed: %v)", tokenErr, tokenErr.IsRefreshTokenExpired)
+		// Handle token refresh/re-login using refreshTokenIfNecessary
+		refreshErr := f.refreshTokenIfNecessary(ctx, tokenErr.IsRefreshTokenExpired, !tokenErr.IsRefreshTokenExpired)
+		if refreshErr != nil {
+			fs.Debugf(f, "Token refresh/relogin failed: %v", refreshErr)
+			return false, fmt.Errorf("token refresh/relogin failed: %w (original: %v)", refreshErr, apiErr)
+		}
+
+		// Token was successfully refreshed or re-login succeeded, retry the API call
+		fs.Debugf(f, "Token refresh/relogin succeeded, retrying API call")
+
+		// Update the Authorization header with the new token
+		if !skipToken {
+			f.tokenMu.Lock()
+			opts.ExtraHeaders["Authorization"] = "Bearer " + f.accessToken
+			f.tokenMu.Unlock()
+		}
+		return true, nil // Signal retry with the refreshed token
+	}
+	return false, nil // Not a token error
+}
+
+// checkResponseForAPIErrors examines the response for API-level errors using reflection
+func (f *Fs) checkResponseForAPIErrors(response any, skipToken bool, opts *rest.Opts) error {
+	if response == nil {
+		return nil
+	}
+
+	// Use reflection to check for and call an Err() method
+	val := reflect.ValueOf(response)
+	if val.Kind() == reflect.Ptr && !val.IsNil() {
+		method := val.MethodByName("Err")
+		if method.IsValid() && method.Type().NumIn() == 0 && method.Type().NumOut() == 1 &&
+			method.Type().Out(0).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
+			result := method.Call(nil)
+			if !result[0].IsNil() {
+				return result[0].Interface().(error)
+			}
+		}
+	}
+	return nil
 }
 
 // CallTraditionalAPI performs a call to the traditional (cookie, encrypted) API.
@@ -1012,125 +1125,176 @@ func (f *Fs) CallTraditionalAPI(ctx context.Context, opts *rest.Opts, request an
 
 	// Wrap the entire attempt sequence with the global pacer
 	return f.globalPacer.Call(func() (shouldRetryGlobal bool, errGlobal error) {
-
-		// --- Enforce traditional pacer delay ---
-		// Use tradPacer.Call with a dummy function that always succeeds immediately
-		// and doesn't retry. This effectively just waits for the pacer's internal timer.
-		tradPaceErr := f.tradPacer.Call(func() (bool, error) {
-			return false, nil // Dummy call: Success, don't retry this dummy op.
-		})
-		if tradPaceErr != nil {
-			// If waiting for tradPacer was interrupted (e.g., context cancelled)
-			fs.Debugf(f, "Context cancelled or error while waiting for traditional pacer: %v", tradPaceErr)
-			// Treat this as a permanent failure for the global pacer's attempt.
-			return false, backoff.Permanent(tradPaceErr)
-		}
-		// --- End of traditional pacer delay enforcement ---
-
-		// Prepare and make the actual API call using the traditional client
-		var resp *http.Response
-		var apiErr error // Renamed from 'err' to avoid shadowing tradPaceErr
-		if skipEncrypt {
-			// Call without encryption (used for some login steps)
-			if request != nil && response != nil {
-				resp, apiErr = f.tradClient.CallJSON(ctx, opts, request, response)
-			} else if response != nil {
-				resp, apiErr = f.tradClient.CallJSON(ctx, opts, nil, response)
-			} else {
-				var baseResp api.TraditionalBase
-				resp, apiErr = f.tradClient.CallJSON(ctx, opts, nil, &baseResp)
-				if apiErr == nil {
-					apiErr = baseResp.Err()
-				}
-			}
-		} else {
-			// Call with standard encryption
-			if request != nil && response != nil {
-				// Encode request data
-				input, marshalErr := json.Marshal(request)
-				if marshalErr != nil {
-					// Permanent error on marshal failure
-					return false, backoff.Permanent(fmt.Errorf("failed to marshal traditional request: %w", marshalErr))
-				}
-				key := crypto.GenerateKey()
-				// Check if opts.MultipartParams exists, if not create it
-				if opts.MultipartParams == nil {
-					opts.MultipartParams = url.Values{}
-				}
-				opts.MultipartParams.Set("data", crypto.Encode(input, key))
-				opts.Body = nil // Clear body if using multipart params
-
-				var info api.StringInfo // Expect encrypted string response
-				resp, apiErr = f.tradClient.CallJSON(ctx, opts, nil, &info)
-				if apiErr == nil {
-					if apiErr = info.Err(); apiErr != nil {
-						// API level error before decryption
-					} else if info.Data == "" {
-						apiErr = errors.New("no data received in traditional response")
-					} else {
-						// Decode and unmarshal response
-						key := crypto.GenerateKey()
-						output, decodeErr := crypto.Decode(string(info.Data), key)
-						if decodeErr != nil {
-							apiErr = fmt.Errorf("failed to decode traditional data: %w", decodeErr)
-						} else if unmarshalErr := json.Unmarshal(output, response); unmarshalErr != nil {
-							apiErr = fmt.Errorf("failed to unmarshal traditional response %q: %w", string(output), unmarshalErr)
-						}
-					}
-				}
-			} else if response != nil {
-				// Call expecting encrypted response, no request body needed (e.g., GET)
-				var info api.StringInfo
-				resp, apiErr = f.tradClient.CallJSON(ctx, opts, nil, &info)
-				if apiErr == nil {
-					if apiErr = info.Err(); apiErr != nil {
-						// API level error before decryption
-					} else if info.Data == "" {
-						apiErr = errors.New("no data received in traditional response")
-					} else {
-						key := crypto.GenerateKey()
-						output, decodeErr := crypto.Decode(string(info.Data), key)
-						if decodeErr != nil {
-							apiErr = fmt.Errorf("failed to decode traditional data: %w", decodeErr)
-						} else if unmarshalErr := json.Unmarshal(output, response); unmarshalErr != nil {
-							apiErr = fmt.Errorf("failed to unmarshal traditional response %q: %w", string(output), unmarshalErr)
-						}
-					}
-				}
-			} else {
-				// Call expecting simple base response (e.g., delete, move)
-				var baseResp api.TraditionalBase
-				resp, apiErr = f.tradClient.CallJSON(ctx, opts, nil, &baseResp)
-				if apiErr == nil {
-					apiErr = baseResp.Err()
-				}
-			}
+		// Wait for traditional pacer
+		if err := f.enforceTraditionalPacerDelay(); err != nil {
+			return false, backoff.Permanent(err)
 		}
 
-		// Check the result of the actual API call for retryability by the *global* pacer
-		retryNeeded, retryErr := shouldRetry(ctx, resp, apiErr)
-		if retryNeeded {
-			fs.Debugf(f, "pacer: low level retry required for traditional call (error: %v)", retryErr)
-		} else if apiErr != nil {
-			// Error occurred, but shouldRetry decided it's permanent
-			fs.Debugf(f, "pacer: permanent error encountered in traditional call: %v", apiErr)
-			// Ensure the error returned to globalPacer is marked permanent if it isn't already.
-			var permanentErr *backoff.PermanentError
-			if !errors.As(apiErr, &permanentErr) {
-				retryErr = backoff.Permanent(apiErr)
-			} else {
-				retryErr = apiErr // Already permanent
-			}
-		} else {
-			// Success
-			fs.Debugf(f, "pacer: traditional call successful")
-			retryErr = nil
+		// Make the API call (with or without encryption)
+		resp, apiErr := f.executeTraditionalAPICall(ctx, opts, request, response, skipEncrypt)
+
+		// Process the result
+		return f.processTraditionalAPIResult(ctx, resp, apiErr)
+	})
+}
+
+// enforceTraditionalPacerDelay ensures we respect the traditional API pacer limits
+func (f *Fs) enforceTraditionalPacerDelay() error {
+	// Use tradPacer.Call with a dummy function that always succeeds immediately
+	// and doesn't retry. This effectively just waits for the pacer's internal timer.
+	tradPaceErr := f.tradPacer.Call(func() (bool, error) {
+		return false, nil // Dummy call: Success, don't retry this dummy op.
+	})
+	if tradPaceErr != nil {
+		// If waiting for tradPacer was interrupted (e.g., context cancelled)
+		fs.Debugf(f, "Context cancelled or error while waiting for traditional pacer: %v", tradPaceErr)
+		return tradPaceErr
+	}
+	return nil
+}
+
+// executeTraditionalAPICall makes the actual API call with proper handling of encryption
+func (f *Fs) executeTraditionalAPICall(ctx context.Context, opts *rest.Opts, request any, response any, skipEncrypt bool) (*http.Response, error) {
+	if skipEncrypt {
+		return f.executeUnencryptedCall(ctx, opts, request, response)
+	} else {
+		return f.executeEncryptedCall(ctx, opts, request, response)
+	}
+}
+
+// executeUnencryptedCall makes a traditional API call without encryption
+func (f *Fs) executeUnencryptedCall(ctx context.Context, opts *rest.Opts, request any, response any) (*http.Response, error) {
+	var resp *http.Response
+	var apiErr error
+
+	// Choose the right call pattern based on request/response
+	if request != nil && response != nil {
+		resp, apiErr = f.tradClient.CallJSON(ctx, opts, request, response)
+	} else if response != nil {
+		resp, apiErr = f.tradClient.CallJSON(ctx, opts, nil, response)
+	} else {
+		var baseResp api.TraditionalBase
+		resp, apiErr = f.tradClient.CallJSON(ctx, opts, nil, &baseResp)
+		if apiErr == nil {
+			apiErr = baseResp.Err()
 		}
+	}
 
-		// Return the retry status and error to the *global* pacer
-		return retryNeeded, retryErr
+	return resp, apiErr
+}
 
-	}) // End of globalPacer.Call
+// executeEncryptedCall makes a traditional API call with encryption
+func (f *Fs) executeEncryptedCall(ctx context.Context, opts *rest.Opts, request any, response any) (*http.Response, error) {
+	var resp *http.Response
+	var apiErr error
+
+	if request != nil && response != nil {
+		// Handle request+response case with encryption
+		apiErr = f.executeEncryptedRequestResponse(ctx, opts, request, response, &resp)
+	} else if response != nil {
+		// Handle response-only case with encryption
+		apiErr = f.executeEncryptedResponseOnly(ctx, opts, response, &resp)
+	} else {
+		// Simple base response case
+		var baseResp api.TraditionalBase
+		resp, apiErr = f.tradClient.CallJSON(ctx, opts, nil, &baseResp)
+		if apiErr == nil {
+			apiErr = baseResp.Err()
+		}
+	}
+
+	return resp, apiErr
+}
+
+// executeEncryptedRequestResponse handles the case where both request and response need encryption
+func (f *Fs) executeEncryptedRequestResponse(ctx context.Context, opts *rest.Opts, request any, response any, resp **http.Response) error {
+	// Encode request data
+	input, marshalErr := json.Marshal(request)
+	if marshalErr != nil {
+		return fmt.Errorf("failed to marshal traditional request: %w", marshalErr)
+	}
+
+	key := crypto.GenerateKey()
+	// Prepare multipart parameters
+	if opts.MultipartParams == nil {
+		opts.MultipartParams = url.Values{}
+	}
+	opts.MultipartParams.Set("data", crypto.Encode(input, key))
+	opts.Body = nil // Clear body if using multipart params
+
+	// Execute call expecting encrypted response
+	var info api.StringInfo
+	var err error
+	*resp, err = f.tradClient.CallJSON(ctx, opts, nil, &info)
+	if err != nil {
+		return err
+	}
+
+	// Process the encrypted response
+	return f.processEncryptedResponse(&info, response)
+}
+
+// executeEncryptedResponseOnly handles the case where only the response is encrypted
+func (f *Fs) executeEncryptedResponseOnly(ctx context.Context, opts *rest.Opts, response any, resp **http.Response) error {
+	// Call expecting encrypted response, no request body needed (e.g., GET)
+	var info api.StringInfo
+	var err error
+	*resp, err = f.tradClient.CallJSON(ctx, opts, nil, &info)
+	if err != nil {
+		return err
+	}
+
+	// Process the encrypted response
+	return f.processEncryptedResponse(&info, response)
+}
+
+// processEncryptedResponse decodes and unmarshals an encrypted response
+func (f *Fs) processEncryptedResponse(info *api.StringInfo, response any) error {
+	if err := info.Err(); err != nil {
+		return err // API level error before decryption
+	}
+
+	if info.Data == "" {
+		return errors.New("no data received in traditional response")
+	}
+
+	// Decode and unmarshal response
+	key := crypto.GenerateKey()
+	output, decodeErr := crypto.Decode(string(info.Data), key)
+	if decodeErr != nil {
+		return fmt.Errorf("failed to decode traditional data: %w", decodeErr)
+	}
+
+	if unmarshalErr := json.Unmarshal(output, response); unmarshalErr != nil {
+		return fmt.Errorf("failed to unmarshal traditional response %q: %w", string(output), unmarshalErr)
+	}
+
+	return nil
+}
+
+// processTraditionalAPIResult handles the result of a traditional API call
+func (f *Fs) processTraditionalAPIResult(ctx context.Context, resp *http.Response, apiErr error) (bool, error) {
+	// Check for retryable errors
+	retryNeeded, retryErr := shouldRetry(ctx, resp, apiErr)
+	if retryNeeded {
+		fs.Debugf(f, "pacer: low level retry required for traditional call (error: %v)", retryErr)
+		return true, retryErr
+	}
+
+	// Handle non-retryable errors
+	if apiErr != nil {
+		fs.Debugf(f, "pacer: permanent error encountered in traditional call: %v", apiErr)
+		// Ensure the error is marked as permanent
+		var permanentErr *backoff.PermanentError
+		if !errors.As(apiErr, &permanentErr) {
+			return false, backoff.Permanent(apiErr)
+		}
+		return false, apiErr // Already permanent
+	}
+
+	// Success
+	fs.Debugf(f, "pacer: traditional call successful")
+	return false, nil
 }
 
 // newFs constructs an Fs from the path, container:path
@@ -1172,7 +1336,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	// Parse root ID from path if present
 	if rootID, _, _ := parseRootID(root); rootID != "" {
-		name += rootID // Append ID to name for uniqueness?
+		name += rootID // Append ID to name for uniqueness
 		root = root[strings.Index(root, "}")+1:]
 	}
 
@@ -1184,16 +1348,17 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		root:         root,
 		opt:          *opt,
 	}
+
+	// Initialize features
 	f.features = (&fs.Features{
 		DuplicateFiles:          false,
 		CanHaveEmptyDirectories: true,
-		NoMultiThreading:        true, // Keep true as downloads might still use traditional API? Or set based on API used? Let's keep it for now.
+		NoMultiThreading:        true, // Keep true as downloads might still use traditional API
 	}).Fill(ctx, f)
 
-	// Setting appVer (might only be needed for traditional calls)
+	// Setting appVer (needed for traditional calls)
 	re := regexp.MustCompile(`\d+\.\d+\.\d+(\.\d+)?$`)
 	if m := re.FindStringSubmatch(tradUserAgent); m == nil {
-		// Don't fail, just use a default or log a warning if UserAgent is critical
 		fs.Logf(f, "Could not parse app version from User-Agent %q. Using default.", tradUserAgent)
 		f.appVer = "27.0.7.5" // Default fallback
 	} else {
@@ -1202,47 +1367,30 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	// Initialize pacers
-	f.globalPacer = fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(time.Duration(opt.PacerMinSleep)), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))
-	f.tradPacer = fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(traditionalMinSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))
+	f.globalPacer = fs.NewPacer(ctx, pacer.NewDefault(
+		pacer.MinSleep(time.Duration(opt.PacerMinSleep)),
+		pacer.MaxSleep(maxSleep),
+		pacer.DecayConstant(decayConstant)))
+
+	f.tradPacer = fs.NewPacer(ctx, pacer.NewDefault(
+		pacer.MinSleep(traditionalMinSleep),
+		pacer.MaxSleep(maxSleep),
+		pacer.DecayConstant(decayConstant)))
 
 	// Check if we have saved token in config file
-	tokenString, found := m.Get("token")
-	if found && tokenString != "" {
-		// Parse the token
-		token := make(map[string]interface{})
-		err = json.Unmarshal([]byte(tokenString), &token)
-		if err == nil {
-			// Extract token components
-			if accessToken, ok := token["access_token"].(string); ok {
-				f.accessToken = accessToken
-			}
-			if refreshToken, ok := token["refresh_token"].(string); ok {
-				f.refreshToken = refreshToken
-			}
-			if expiryStr, ok := token["expiry"].(string); ok {
-				f.tokenExpiry, _ = time.Parse(time.RFC3339Nano, expiryStr)
-			}
+	tokenLoaded := loadTokenFromConfig(f, m)
 
-			fs.Debugf(f, "Loaded token from config file, expires at %v", f.tokenExpiry)
-
-			// Only attempt to validate/refresh if we have both tokens
-			if f.accessToken != "" && f.refreshToken != "" {
-				// Check if the token needs refreshing now
-				if time.Now().After(f.tokenExpiry.Add(-tokenRefreshWindow)) {
-					fs.Debugf(f, "Token expired or will expire soon, refreshing now")
-					// refreshTokenIfNecessary handles its own locking
-					err = f.refreshTokenIfNecessary(ctx, false, false)
-					if err != nil {
-						fs.Logf(f, "Failed to refresh token from config: %v", err)
-						// Continue with login below
-					} else {
-						// Token refreshed successfully, save it back to config
-						f.saveToken(ctx, m)
-					}
-				}
-			}
+	// Authenticate if needed
+	if tokenLoaded && time.Now().After(f.tokenExpiry.Add(-tokenRefreshWindow)) {
+		fs.Debugf(f, "Token expired or will expire soon, refreshing now")
+		// refreshTokenIfNecessary handles its own locking
+		err = f.refreshTokenIfNecessary(ctx, false, false)
+		if err != nil {
+			fs.Logf(f, "Failed to refresh token from config: %v", err)
+			// Fall through to login
 		} else {
-			fs.Logf(f, "Failed to parse token from config: %v", err)
+			// Token refreshed successfully, save it back to config
+			f.saveToken(ctx, m)
 		}
 	}
 
@@ -1281,121 +1429,51 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Setup token renewer
 	f.setupTokenRenewer(ctx, m)
 
-	// --- Root Folder Logic ---
-	// mod - parse object id from path remote:{ID}
-	if rootID, receiveCode, _ := parseRootID(f.root); len(rootID) == 19 { // Check if root looks like a file/folder ID
-		info, err := f.getFile(ctx, rootID, "") // Use getFile which now uses OpenAPI
-		if err != nil {
-			// Check if it's a directory not found error vs file not found
-			if errors.Is(err, fs.ErrorDirNotFound) || errors.Is(err, fs.ErrorObjectNotFound) {
-				return nil, fmt.Errorf("root ID %s not found: %w", rootID, err)
-			}
-			return nil, fmt.Errorf("failed to get info for root ID %s: %w", rootID, err)
-		}
-		if !info.IsDir() {
-			// Root is a file
-			f.dirCache = dircache.New("", info.ParentID(), f)
-			_ = f.dirCache.FindRoot(ctx, false) // Populate parent info
-			obj, _ := f.newObjectWithInfo(ctx, info.FileNameBest(), info)
-			f.root = "isFile:" + info.FileNameBest() // Mark root as special case
-			f.fileObj = &obj
-			return f, fs.ErrorIsFile
-		}
-		// Root is a directory ID
-		f.opt.RootFolderID = rootID
-		f.root = "" // Reset root path as we are using RootFolderID
-	} else if len(rootID) == 11 { // Check if root looks like a share code
-		f.opt.ShareCode = rootID
-		f.opt.ReceiveCode = receiveCode
-		f.root = "" // Reset root path for shares
-	}
-
-	// Mark if it's a share based on options (needed for traditional share API)
-	f.isShare = f.opt.ShareCode != "" && f.opt.ReceiveCode != ""
-
-	// Set the root folder ID
-	if f.isShare {
-		// Shares use traditional API, root ID determined during listing/copying
-		f.rootFolderID = ""
-	} else if f.opt.RootFolderID != "" {
+	// Set the root folder ID based on config
+	if f.opt.RootFolderID != "" {
+		// Use configured root folder ID
 		f.rootFolderID = f.opt.RootFolderID
 	} else {
-		f.rootFolderID = "0" // Default root
+		// Use default root folder ID
+		f.rootFolderID = "0"
 	}
 
-	// Features related to sharing (only possible via traditional API)
-	f.features.ServerSideAcrossConfigs = f.isShare
-
-	// Set the root folder path if it is not the absolute root "0"
-	if f.rootFolderID != "" && f.rootFolderID != "0" {
-		// Use getDirPath which now uses OpenAPI
-		f.rootFolder, err = f.getDirPath(ctx, f.rootFolderID)
-		if err != nil {
-			// Check if the error is dir not found
-			if errors.Is(err, fs.ErrorDirNotFound) {
-				return nil, fmt.Errorf("configured root folder ID %q not found: %w", f.rootFolderID, err)
-			}
-			return nil, fmt.Errorf("failed to get path for root folder ID %q: %w", f.rootFolderID, err)
-		}
-	}
-
+	// Initialize directory cache
 	f.dirCache = dircache.New(f.root, f.rootFolderID, f)
 
-	// Find the current root directory in the cache
-	err = f.dirCache.FindRoot(ctx, false)
-	if err != nil {
-		// If root is not found, check if it's a file path
-		newRoot, remote := dircache.SplitPath(f.root)
-		if remote != "" { // Only check if there's a leaf part
-			tempF := *f // Create a temporary Fs pointing to the parent
+	// Find the current working directory
+	if f.root != "" {
+		// Find directory specified by the root path
+		err := f.dirCache.FindRoot(ctx, false)
+		if err != nil {
+			// Assume it is a file or doesn't exist
+			newRoot, remote := dircache.SplitPath(f.root)
+			tempF := *f
 			tempF.dirCache = dircache.New(newRoot, f.rootFolderID, &tempF)
 			tempF.root = newRoot
-			// Don't fill cache, FindRoot needs to run on the parent
-			errRoot := tempF.dirCache.FindRoot(ctx, false)
-			if errRoot == nil {
-				// Parent exists, try to find the leaf as an object
-				_, errFile := tempF.NewObject(ctx, remote)
-				if errFile == nil {
-					// It's a file! Update the original Fs instance
-					f.dirCache = tempF.dirCache
-					f.root = tempF.root
-					f.features.Fill(ctx, &tempF) // Fill features based on the parent Fs
-					return f, fs.ErrorIsFile
-				}
-				// If leaf is not an object, maybe it's a non-existent path?
-				if errors.Is(errFile, fs.ErrorObjectNotFound) {
-					// Instead of returning an error, create the missing directory if it's not a share
-					if !f.isShare {
-						fs.Debugf(f, "Directory %q not found, creating it", f.root)
-						// Recreate the dirCache with create=true to auto-create parent directories
-						f.dirCache = dircache.New(f.root, f.rootFolderID, f)
-						err = f.dirCache.FindRoot(ctx, true)
-						if err != nil {
-							return nil, fmt.Errorf("failed to create directory %q: %w", f.root, err)
-						}
-						return f, nil
-					}
-					return f, fmt.Errorf("path not found: %s", f.root) // Return original error for shares
-				}
-				// Return other errors from NewObject
-				return nil, errFile
-			}
-		}
-
-		// If root is not a file path, check if we should create the directory
-		if !f.isShare && errors.Is(err, fs.ErrorDirNotFound) {
-			fs.Debugf(f, "Root directory %q not found, creating it", f.root)
-			// Recreate dirCache with create=true to auto-create the directory structure
-			f.dirCache = dircache.New(f.root, f.rootFolderID, f)
-			err = f.dirCache.FindRoot(ctx, true)
+			// Make new Fs which is the parent
+			err = tempF.dirCache.FindRoot(ctx, false)
 			if err != nil {
-				return nil, fmt.Errorf("failed to create root directory %q: %w", f.root, err)
+				// No root so return old f
+				return f, nil
 			}
-			return f, nil
+			// Check if it's a file
+			_, err := tempF.newObjectWithInfo(ctx, remote, nil)
+			if err != nil {
+				if err == fs.ErrorObjectNotFound {
+					// File doesn't exist so return old f
+					return f, nil
+				}
+				return nil, err
+			}
+			// Copy the features
+			f.features.Fill(ctx, &tempF)
+			// Update the dir cache in the old f
+			f.dirCache = tempF.dirCache
+			f.root = tempF.root
+			// Return an error with an fs which points to the parent
+			return f, fs.ErrorIsFile
 		}
-
-		// If FindRoot failed for other reasons, or it was a share that doesn't exist
-		return f, err // Return the original error from FindRoot
 	}
 
 	return f, nil
@@ -2572,3 +2650,38 @@ var (
 	_ fs.ParentIDer      = (*Object)(nil)
 	_ fs.Shutdowner      = (*Fs)(nil)
 )
+
+// loadTokenFromConfig attempts to load and parse tokens from the config file
+func loadTokenFromConfig(f *Fs, m configmap.Mapper) bool {
+	tokenString, found := m.Get("token")
+	if !found || tokenString == "" {
+		return false
+	}
+
+	// Parse the token
+	token := make(map[string]interface{})
+	err := json.Unmarshal([]byte(tokenString), &token)
+	if err != nil {
+		fs.Logf(f, "Failed to parse token from config: %v", err)
+		return false
+	}
+
+	// Extract token components
+	if accessToken, ok := token["access_token"].(string); ok {
+		f.accessToken = accessToken
+	}
+	if refreshToken, ok := token["refresh_token"].(string); ok {
+		f.refreshToken = refreshToken
+	}
+	if expiryStr, ok := token["expiry"].(string); ok {
+		f.tokenExpiry, _ = time.Parse(time.RFC3339Nano, expiryStr)
+	}
+
+	// Check if we got valid token data
+	if f.accessToken == "" || f.refreshToken == "" {
+		return false
+	}
+
+	fs.Debugf(f, "Loaded token from config file, expires at %v", f.tokenExpiry)
+	return true
+}

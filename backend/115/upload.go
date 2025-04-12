@@ -701,82 +701,135 @@ func (f *Fs) uploadToOSS(
 ) (fs.Object, error) {
 	fs.Debugf(o, "Starting OSS multipart upload...")
 
-	// 1. Get UploadInitInfo if not provided (e.g., direct multipart without hash check)
-	if ui == nil {
-		var initErr error
-		// Call init without SHA1, expect status 1
-		ui, initErr = f.initUploadOpenAPI(ctx, size, leaf, dirID, "", "", "", "", "")
-		if initErr != nil {
-			return nil, fmt.Errorf("failed to initialize multipart upload: %w", initErr)
-		}
-		if ui.GetStatus() != 1 {
-			// Should not happen unless it's a very small file that gets 秒传'd even without hash? Unlikely.
-			// Or maybe an error occurred.
-			if ui.GetStatus() == 2 { // Unexpected 秒传
-				fs.Logf(o, "Warning: initUpload without hash resulted in 秒传 (status 2), handling...")
-				o.id = ui.GetFileID()
-				o.pickCode = ui.GetPickCode()
-				o.hasMetaData = true
-				return o, nil
-			}
-			return nil, fmt.Errorf("expected status 1 from initUpload for multipart, got %d: %s", ui.GetStatus(), ui.ErrMsg())
-		}
-	}
-
-	// 2. Create OSS client (fetches token internally)
-	ossClient, err := f.newOSSClient()
+	// Initialize upload and get upload info if not provided
+	uploadInfo, err := f.getUploadInfo(ctx, ui, leaf, dirID, size, o)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create OSS client: %w", err)
+		return nil, err
+	}
+	// Handle case where initUpload resulted in instant upload
+	if ui.GetStatus() == 2 {
+		return o, nil
 	}
 
-	// 3. Initiate OSS Multipart Upload
-	imur, err := f.initiateOSSMultipart(ctx, ossClient, ui, options...)
+	// Create OSS client and initiate multipart upload
+	ossClient, imur, err := f.prepareOSSMultipart(ctx, uploadInfo, options...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to initiate OSS multipart upload: %w", err)
+		return nil, err
 	}
 
-	// 4. Create and run the chunk writer
-	chunkWriter := &ossChunkWriter{
-		f:             f,
-		o:             o,
-		size:          size,
-		in:            in, // Pass the potentially buffered reader
-		client:        ossClient,
-		imur:          imur,
-		callback:      ui.GetCallback(),
-		callbackVar:   ui.GetCallbackVar(),
-		chunkSize:     int64(f.opt.ChunkSize), // Use configured chunk size initially
-		con:           1,                      // Hardcoded concurrency = 1
-		uploadedParts: make([]oss.UploadPart, 0, int(size/int64(f.opt.ChunkSize))+1),
-	}
-
-	// Adjust chunk size if necessary
-	uploadParts := min(max(1, f.opt.MaxUploadParts), maxUploadParts)
-	chunkWriter.chunkSize = int64(chunksize.Calculator(src, size, uploadParts, fs.SizeSuffix(chunkWriter.chunkSize)))
-	fs.Debugf(o, "Using OSS multipart chunk size %v", fs.SizeSuffix(chunkWriter.chunkSize))
-
-	// Perform the upload
-	err = chunkWriter.Upload(ctx)
+	// Configure and perform the upload
+	callbackData, err := f.performOSSUpload(ctx, ossClient, imur, in, src, o, size, uploadInfo)
 	if err != nil {
-		// Abort is handled by Upload's defer
-		return nil, fmt.Errorf("OSS multipart upload failed: %w", err)
+		return nil, err
 	}
 
-	// 5. Finalize (Close calls CompleteMultipartUpload)
-	// Close already called by Upload on success. Get callback result.
-	callbackData, err := f.postUpload(chunkWriter.callbackRes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to process OSS upload callback: %w", err)
-	}
-
-	// 6. Update object metadata
-	err = o.setMetaDataFromCallBack(callbackData)
-	if err != nil {
+	// Update object metadata
+	if err = o.setMetaDataFromCallBack(callbackData); err != nil {
 		return nil, fmt.Errorf("failed to set metadata from callback: %w", err)
 	}
 
 	fs.Debugf(o, "OSS multipart upload successful.")
 	return o, nil
+}
+
+// getUploadInfo gets or validates upload information
+func (f *Fs) getUploadInfo(
+	ctx context.Context,
+	ui *api.UploadInitInfo,
+	leaf, dirID string,
+	size int64,
+	o *Object,
+) (*api.UploadInitInfo, error) {
+	// If upload info is already provided, use it
+	if ui != nil {
+		return ui, nil
+	}
+
+	// Initialize upload without SHA1
+	ui, err := f.initUploadOpenAPI(ctx, size, leaf, dirID, "", "", "", "", "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize multipart upload: %w", err)
+	}
+
+	// Handle unexpected status
+	if ui.GetStatus() != 1 {
+		if ui.GetStatus() == 2 { // Instant upload success (秒传)
+			fs.Logf(o, "Warning: initUpload without hash resulted in 秒传 (status 2), handling...")
+			o.id = ui.GetFileID()
+			o.pickCode = ui.GetPickCode()
+			o.hasMetaData = true
+		} else {
+			return nil, fmt.Errorf("expected status 1 from initUpload for multipart, got %d: %s", ui.GetStatus(), ui.ErrMsg())
+		}
+	}
+
+	return ui, nil
+}
+
+// prepareOSSMultipart sets up the OSS client and initiates the multipart upload
+func (f *Fs) prepareOSSMultipart(
+	ctx context.Context,
+	ui *api.UploadInitInfo,
+	options ...fs.OpenOption,
+) (*oss.Client, *oss.InitiateMultipartUploadResult, error) {
+	// Create OSS client
+	ossClient, err := f.newOSSClient()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create OSS client: %w", err)
+	}
+
+	// Initiate multipart upload
+	imur, err := f.initiateOSSMultipart(ctx, ossClient, ui, options...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to initiate OSS multipart upload: %w", err)
+	}
+
+	return ossClient, imur, nil
+}
+
+// performOSSUpload handles the actual upload process
+func (f *Fs) performOSSUpload(
+	ctx context.Context,
+	client *oss.Client,
+	imur *oss.InitiateMultipartUploadResult,
+	in io.Reader,
+	src fs.ObjectInfo,
+	o *Object,
+	size int64,
+	ui *api.UploadInitInfo,
+) (*api.CallbackData, error) {
+	// Create the chunk writer
+	chunkWriter := &ossChunkWriter{
+		f:             f,
+		o:             o,
+		size:          size,
+		in:            in,
+		client:        client,
+		imur:          imur,
+		callback:      ui.GetCallback(),
+		callbackVar:   ui.GetCallbackVar(),
+		chunkSize:     int64(f.opt.ChunkSize),
+		con:           1, // Hardcoded concurrency = 1
+		uploadedParts: make([]oss.UploadPart, 0, int(size/int64(f.opt.ChunkSize))+1),
+	}
+
+	// Adjust chunk size based on file size and max parts
+	uploadParts := min(max(1, f.opt.MaxUploadParts), maxUploadParts)
+	chunkWriter.chunkSize = int64(chunksize.Calculator(src, size, uploadParts, fs.SizeSuffix(chunkWriter.chunkSize)))
+	fs.Debugf(o, "Using OSS multipart chunk size %v", fs.SizeSuffix(chunkWriter.chunkSize))
+
+	// Perform the upload
+	if err := chunkWriter.Upload(ctx); err != nil {
+		return nil, fmt.Errorf("OSS multipart upload failed: %w", err)
+	}
+
+	// Process upload callback
+	callbackData, err := f.postUpload(chunkWriter.callbackRes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to process OSS upload callback: %w", err)
+	}
+
+	return callbackData, nil
 }
 
 // initiateOSSMultipart starts the multipart upload with OSS.
