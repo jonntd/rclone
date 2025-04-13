@@ -1261,10 +1261,35 @@ func (f *Fs) tryHashUpload(
 			}
 			fs.Debugf(o, "Calculated range SHA1: %s for range %s", signVal, signCheckRange)
 
-			// Retry initUpload with sign_key and sign_val
-			ui, err = f.initUploadOpenAPI(ctx, size, leaf, dirID, hashStr, "", "", signKey, signVal)
-			if err != nil {
-				return false, nil, newIn, cleanup, fmt.Errorf("OpenAPI initUpload retry with signature failed: %w", err)
+			// Retry initUpload with sign_key and sign_val with exponential backoff for network errors
+			var retryErr error
+			// Define retry parameters
+			maxRetries := 12
+			initialDelay := 1 * time.Second
+			maxDelay := 60 * time.Second
+			maxElapsedTime := 10 * time.Minute
+
+			// Define the operation to be retried
+			initUploadOperation := func() error {
+				var initErr error
+				ui, initErr = f.initUploadOpenAPI(ctx, size, leaf, dirID, hashStr, "", "", signKey, signVal)
+				return initErr
+			}
+
+			// Execute with exponential backoff
+			retryErr = retryWithExponentialBackoff(
+				ctx,
+				"OpenAPI initUpload with signature",
+				o,
+				initUploadOperation,
+				maxRetries,
+				initialDelay,
+				maxDelay,
+				maxElapsedTime,
+			)
+
+			if retryErr != nil {
+				return false, nil, newIn, cleanup, fmt.Errorf("OpenAPI initUpload retry with signature failed after multiple attempts: %w", retryErr)
 			}
 			continue // Re-evaluate the new status
 
