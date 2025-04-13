@@ -99,7 +99,38 @@ func (r *RereadableObject) Open() (io.Reader, error) {
 	// This is for supporting direct methods like RangeSeek later
 	obj := unWrapObjectInfo(r.src)
 	if obj != nil {
-		rc, err := obj.Open(r.ctx, r.options...)
+		var rc io.ReadCloser
+		var err error
+
+		// First try to get the pacer from the Fs
+		var pacer *fs.Pacer
+		if fsObj, ok := obj.Fs().(*Fs); ok {
+			pacer = fsObj.globalPacer
+		}
+
+		// Use pacer if available, otherwise direct call
+		if pacer != nil {
+			// Apply pacer to handle rate limiting (429 errors)
+			fs.Debugf(nil, "Using pacer for reopening object to handle rate limits")
+			err = pacer.Call(func() (bool, error) {
+				var openErr error
+				rc, openErr = obj.Open(r.ctx, r.options...)
+				if openErr != nil {
+					// Check for 429 rate limit error by extracting HTTP response
+					// Use shouldRetry helper which already handles all HTTP errors
+					retry, _ := shouldRetry(r.ctx, nil, openErr)
+					if retry {
+						fs.Debugf(obj, "Retrying Open after error: %v", openErr)
+						return true, openErr
+					}
+				}
+				return false, openErr
+			})
+		} else {
+			// Fall back to direct open if we can't use pacer
+			rc, err = obj.Open(r.ctx, r.options...)
+		}
+
 		if err != nil {
 			return nil, fmt.Errorf("failed to reopen source object: %w", err)
 		}
@@ -340,8 +371,32 @@ func bufferIOwithSHA1(f *Fs, in io.Reader, src fs.ObjectInfo, size, threshold in
 			return "", in, cleanup, fmt.Errorf("failed to calculate SHA1 without buffering: %w", hashErr)
 		}
 
-		// Reopen the source for the actual upload
-		newReader, reopenErr := rereadable.Open()
+		// Reopen the source for the actual upload with retry logic
+		var newReader io.Reader
+		var reopenErr error
+
+		// Try a few times with increasing backoff in case of rate limiting
+		for retry := 0; retry < 5; retry++ {
+			if retry > 0 {
+				// Add exponential backoff delay between retries
+				delay := time.Duration(100*retry*retry) * time.Millisecond
+				fs.Debugf(f, "Waiting %v before retrying reopen after SHA1 calculation (attempt %d/5)", delay, retry+1)
+				time.Sleep(delay)
+			}
+
+			newReader, reopenErr = rereadable.Open()
+			if reopenErr == nil {
+				break // Success
+			}
+
+			fs.Debugf(f, "Error reopening source after SHA1 calculation (attempt %d/5): %v", retry+1, reopenErr)
+
+			// Break early for errors that shouldn't be retried
+			if !fserrors.ShouldRetry(reopenErr) {
+				break
+			}
+		}
+
 		if reopenErr != nil {
 			return "", in, cleanup, fmt.Errorf("failed to reopen source after SHA1 calculation: %w", reopenErr)
 		}
@@ -597,8 +652,32 @@ func calcBlockSHA1(ctx context.Context, in io.Reader, src fs.ObjectInfo, rangeSp
 
 	// Check if input is a RereadableObject first
 	if ro, ok := in.(*RereadableObject); ok {
-		// Open a new reader for the range check
-		reader, err := ro.Open()
+		// Try to open a new reader with retries for rate limiting
+		var reader io.Reader
+		var err error
+
+		// Try a few times with increasing backoff
+		for retry := 0; retry < 5; retry++ {
+			if retry > 0 {
+				// Add exponential backoff delay between retries
+				delay := time.Duration(100*retry*retry) * time.Millisecond
+				fs.Debugf(nil, "Waiting %v before retrying reopen for range SHA1 (attempt %d/5)", delay, retry+1)
+				time.Sleep(delay)
+			}
+
+			reader, err = ro.Open()
+			if err == nil {
+				break // Success
+			}
+
+			fs.Debugf(nil, "Error reopening source for range SHA1 (attempt %d/5): %v", retry+1, err)
+
+			// Break early for errors that shouldn't be retried
+			if !fserrors.ShouldRetry(err) {
+				break
+			}
+		}
+
 		if err != nil {
 			return "", fmt.Errorf("failed to open new reader for range SHA1: %w", err)
 		}
@@ -643,10 +722,37 @@ func calcBlockSHA1(ctx context.Context, in io.Reader, src fs.ObjectInfo, rangeSp
 		srcObj := unWrapObjectInfo(src)
 		if srcObj != nil {
 			fs.Debugf(src, "Input reader not seekable for SHA1 range, opening source object directly.")
-			rc, err := srcObj.Open(ctx, &fs.RangeOption{Start: start, End: end})
+
+			// Try to open with retries for rate limiting
+			var rc io.ReadCloser
+			var err error
+
+			// Try a few times with increasing backoff
+			for retry := 0; retry < 5; retry++ {
+				if retry > 0 {
+					// Add exponential backoff delay between retries
+					delay := time.Duration(100*retry*retry) * time.Millisecond
+					fs.Debugf(nil, "Waiting %v before retrying direct object open for range SHA1 (attempt %d/5)", delay, retry+1)
+					time.Sleep(delay)
+				}
+
+				rc, err = srcObj.Open(ctx, &fs.RangeOption{Start: start, End: end})
+				if err == nil {
+					break // Success
+				}
+
+				fs.Debugf(srcObj, "Error opening source object for range SHA1 (attempt %d/5): %v", retry+1, err)
+
+				// Break early for errors that shouldn't be retried
+				if !fserrors.ShouldRetry(err) {
+					break
+				}
+			}
+
 			if err != nil {
 				return "", fmt.Errorf("failed to open source object for SHA1 range %q: %w", rangeSpec, err)
 			}
+
 			defer fs.CheckClose(rc, &err) // Ensure closure
 			sectionReader = rc
 		} else {
@@ -1342,16 +1448,27 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 						cleanup = nil // Mark as cleaned up
 					}
 				} else {
-					// With no_buffer, newIn should already be a rereadable object
-					// that can be reused, or the original input if wrapping failed
-					fs.Debugf(o, "Using no_buffer mode, continuing with rereadable source")
+					// With no_buffer, we need to explicitly reopen the RereadableObject
+					// to ensure we're at the beginning of the stream for the next upload attempt
+					if ro, ok := newIn.(*RereadableObject); ok {
+						fs.Debugf(o, "Reopening RereadableObject after failed hash calculation")
+						_, reopenErr := ro.Open()
+						if reopenErr != nil {
+							return nil, fmt.Errorf("failed to reopen source after hash upload failure: %w", reopenErr)
+						}
+						// No need to reassign newIn, the Open() method resets the internal state of the RereadableObject
+						fs.Debugf(o, "Successfully reopened RereadableObject for upload attempt")
+					} else {
+						// If not a RereadableObject, fall back to original input as a last resort
+						fs.Logf(o, "Warning: Expected RereadableObject in no_buffer mode but got %T, reverting to original input", newIn)
+						newIn = in
+					}
 				}
 			}
 			if gotIt {
 				return o, nil // Hash upload successful
 			}
 		} else {
-			// Unknown size, cannot do hash upload
 			fs.Debugf(o, "FastUpload: Skipping hash upload for unknown size.")
 		}
 
@@ -1416,9 +1533,21 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 					cleanup = nil // Mark as cleaned up
 				}
 			} else {
-				// With no_buffer, newIn should already be a rereadable object
-				// that can be reused, or the original input if wrapping failed
-				fs.Debugf(o, "Using no_buffer mode, continuing with rereadable source")
+				// With no_buffer, we need to explicitly reopen the RereadableObject
+				// to ensure we're at the beginning of the stream for the next upload attempt
+				if ro, ok := newIn.(*RereadableObject); ok {
+					fs.Debugf(o, "Reopening RereadableObject after failed hash calculation")
+					_, reopenErr := ro.Open()
+					if reopenErr != nil {
+						return nil, fmt.Errorf("failed to reopen source after hash upload failure: %w", reopenErr)
+					}
+					// No need to reassign newIn, the Open() method resets the internal state of the RereadableObject
+					fs.Debugf(o, "Successfully reopened RereadableObject for upload attempt")
+				} else {
+					// If not a RereadableObject, fall back to original input as a last resort
+					fs.Logf(o, "Warning: Expected RereadableObject in no_buffer mode but got %T, reverting to original input", newIn)
+					newIn = in
+				}
 			}
 		}
 		if gotIt {
