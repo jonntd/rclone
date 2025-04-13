@@ -86,6 +86,90 @@ func NewRereadableObject(ctx context.Context, src fs.ObjectInfo, options ...fs.O
 	return r, nil
 }
 
+// retryWithExponentialBackoff provides a standard implementation of sophisticated retry logic
+// with exponential backoff for handling rate limiting issues.
+func retryWithExponentialBackoff(
+	ctx context.Context,
+	description string, // Description of the operation being retried (for logging)
+	loggingObj interface{}, // Object to log against
+	operation func() error, // Operation to execute and retry
+	maxRetries int, // Maximum number of retries
+	initialDelay time.Duration, // Initial delay between retries
+	maxDelay time.Duration, // Maximum delay between retries
+	maxElapsedTime time.Duration, // Maximum total retry time
+) error {
+	// Set up exponential backoff
+	var retryCount int
+	expBackoff := backoff.NewExponentialBackOff()
+	expBackoff.InitialInterval = initialDelay
+	expBackoff.MaxInterval = maxDelay
+	expBackoff.MaxElapsedTime = maxElapsedTime
+	expBackoff.Multiplier = 2.5          // More aggressive multiplier
+	expBackoff.RandomizationFactor = 0.5 // Add jitter to prevent thundering herd
+
+	// Create retry context with timeout
+	retryCtx, cancelRetry := context.WithTimeout(ctx, maxElapsedTime*3/2) // Extra margin
+	defer cancelRetry()
+
+	// Define the retry wrapper
+	retryOperation := func() error {
+		if retryCount > 0 {
+			nextDelay := expBackoff.NextBackOff()
+			if nextDelay == backoff.Stop {
+				return fmt.Errorf("exceeded maximum retry duration")
+			}
+
+			// Use more visible logging for retries
+			fs.Logf(loggingObj, "Rate limited when %s. Waiting %v before retry %d/%d",
+				description, nextDelay, retryCount+1, maxRetries)
+			time.Sleep(nextDelay)
+		}
+		retryCount++
+
+		// Execute the actual operation
+		err := operation()
+
+		// On success, return nil to break the retry loop
+		if err == nil {
+			return nil
+		}
+
+		// Check if this is a rate limit error that we should retry
+		shouldRetryErr, _ := shouldRetry(ctx, nil, err)
+		if !shouldRetryErr {
+			// Non-retryable error
+			fs.Debugf(loggingObj, "Non-retryable error when %s: %v", description, err)
+			return backoff.Permanent(err)
+		}
+
+		// Additional logging for rate limit errors
+		if strings.Contains(err.Error(), "429") ||
+			strings.Contains(err.Error(), "Too Many Requests") ||
+			strings.Contains(err.Error(), "rate limit") {
+			fs.Logf(loggingObj, "Hit rate limit (429) when %s. Will retry with increasing backoff.", description)
+		}
+
+		// Check if we've hit max retries
+		if retryCount >= maxRetries {
+			fs.Logf(loggingObj, "Giving up %s after %d retries: %v",
+				description, maxRetries, err)
+			return backoff.Permanent(err)
+		}
+
+		return err // Return error to trigger retry
+	}
+
+	// Define notify function for logging retries
+	notify := func(err error, delay time.Duration) {
+		if err != nil {
+			fs.Debugf(loggingObj, "Retrying %s after error: %v. Next delay: %v", description, err, delay)
+		}
+	}
+
+	// Execute the retry logic
+	return backoff.RetryNotify(retryOperation, backoff.WithContext(expBackoff, retryCtx), notify)
+}
+
 // Open (re)opens the source file
 func (r *RereadableObject) Open() (io.Reader, error) {
 	// Close existing reader if it's a ReadCloser
@@ -108,28 +192,17 @@ func (r *RereadableObject) Open() (io.Reader, error) {
 			pacer = fsObj.globalPacer
 		}
 
-		// Define maximum retries and use exponential backoff
-		maxRetries := 8                                       // Increased from 5 to 8
-		var retryDelay time.Duration = 500 * time.Millisecond // Start with 500ms
+		// Set retry parameters
+		maxRetries := 15
+		initialDelay := 1 * time.Second
+		maxDelay := 300 * time.Second
+		maxElapsedTime := 30 * time.Minute
 
-		// Try multiple times with exponential backoff for rate limiting
-		for retry := 0; retry < maxRetries; retry++ {
-			if retry > 0 {
-				// Use larger initial backoff and stronger exponential growth
-				delayMs := retryDelay.Milliseconds() * int64(1<<uint(retry-1)) // Exponential backoff
-				delay := time.Duration(delayMs) * time.Millisecond
-				// Cap maximum delay at 30 seconds
-				if delay > 30*time.Second {
-					delay = 30 * time.Second
-				}
-				fs.Debugf(obj, "Rate limited when reopening object. Waiting %v before retry %d/%d", delay, retry+1, maxRetries)
-				time.Sleep(delay)
-			}
-
-			// Use pacer if available, otherwise direct call
+		// Define the operation to retry
+		openOperation := func() error {
+			var openErr error
 			if pacer != nil {
 				// Apply pacer to handle rate limiting (429 errors)
-				var openErr error
 				err = pacer.Call(func() (bool, error) {
 					rc, openErr = obj.Open(r.ctx, r.options...)
 					if openErr != nil {
@@ -146,28 +219,20 @@ func (r *RereadableObject) Open() (io.Reader, error) {
 				// Fall back to direct open if we can't use pacer
 				rc, err = obj.Open(r.ctx, r.options...)
 			}
-
-			// Check if successful or if it's a non-retryable error
-			if err == nil {
-				// Success!
-				break
-			}
-
-			// Check if this is a rate limit error that we should retry
-			if shouldRetryErr, _ := shouldRetry(r.ctx, nil, err); !shouldRetryErr {
-				// Non-retryable error, break early
-				fs.Debugf(obj, "Non-retryable error when reopening object: %v", err)
-				break
-			}
-
-			// Log the error and continue to next retry
-			fs.Debugf(obj, "Retryable error when reopening object (retry %d/%d): %v", retry+1, maxRetries, err)
-
-			// For the last retry, just give up
-			if retry == maxRetries-1 {
-				fs.Logf(obj, "Giving up reopening object after %d retries: %v", maxRetries, err)
-			}
+			return err
 		}
+
+		// Retry with exponential backoff
+		err = retryWithExponentialBackoff(
+			r.ctx,
+			"reopening object",
+			obj,
+			openOperation,
+			maxRetries,
+			initialDelay,
+			maxDelay,
+			maxElapsedTime,
+		)
 
 		if err != nil {
 			return nil, fmt.Errorf("failed to reopen source object: %w", err)
@@ -409,48 +474,34 @@ func bufferIOwithSHA1(f *Fs, in io.Reader, src fs.ObjectInfo, size, threshold in
 			return "", in, cleanup, fmt.Errorf("failed to calculate SHA1 without buffering: %w", hashErr)
 		}
 
-		// Reopen the source for the actual upload with retry logic
+		// Reopen the source for the actual upload
 		var newReader io.Reader
 		var reopenErr error
 
-		// Define maximum retries and use exponential backoff
-		maxRetries := 8                                       // Increased max retries
-		var retryDelay time.Duration = 500 * time.Millisecond // Start with 500ms
+		// Set retry parameters for reopening
+		maxRetries := 12
+		initialDelay := 1 * time.Second
+		maxDelay := 180 * time.Second
+		maxElapsedTime := 20 * time.Minute
 
-		// Try multiple times with exponential backoff
-		for retry := 0; retry < maxRetries; retry++ {
-			if retry > 0 {
-				// Use larger initial backoff and stronger exponential growth
-				delayMs := retryDelay.Milliseconds() * int64(1<<uint(retry-1)) // Exponential backoff
-				delay := time.Duration(delayMs) * time.Millisecond
-				// Cap maximum delay at 30 seconds
-				if delay > 30*time.Second {
-					delay = 30 * time.Second
-				}
-				fs.Debugf(f, "Rate limited when reopening after SHA1. Waiting %v before retry %d/%d", delay, retry+1, maxRetries)
-				time.Sleep(delay)
-			}
-
-			newReader, reopenErr = rereadable.Open()
-			if reopenErr == nil {
-				break // Success
-			}
-
-			fs.Debugf(f, "Error reopening source after SHA1 calculation (attempt %d/%d): %v", retry+1, maxRetries, reopenErr)
-
-			// Check if this is a rate limit error that we should retry
-			shouldRetryErr, _ := shouldRetry(ctx, nil, reopenErr)
-			if !shouldRetryErr {
-				// Non-retryable error, break early
-				fs.Debugf(f, "Non-retryable error when reopening after SHA1: %v", reopenErr)
-				break
-			}
-
-			// For the last retry, just give up
-			if retry == maxRetries-1 {
-				fs.Logf(f, "Giving up reopening after SHA1 calculation after %d retries: %v", maxRetries, reopenErr)
-			}
+		// Define the reopening operation
+		reopenOperation := func() error {
+			var openErr error
+			newReader, openErr = rereadable.Open()
+			return openErr
 		}
+
+		// Retry with exponential backoff
+		reopenErr = retryWithExponentialBackoff(
+			ctx,
+			"reopening after SHA1",
+			f,
+			reopenOperation,
+			maxRetries,
+			initialDelay,
+			maxDelay,
+			maxElapsedTime,
+		)
 
 		if reopenErr != nil {
 			return "", in, cleanup, fmt.Errorf("failed to reopen source after SHA1 calculation: %w", reopenErr)
@@ -498,6 +549,11 @@ func (f *Fs) initUploadOpenAPI(ctx context.Context, size int64, name, dirID, sha
 	}
 	// topupload parameter seems related to folder uploads, skip for single files
 
+	// Log parameters for debugging, but mask sensitive values
+	fs.Debugf(f, "Initializing upload for file_name=%q, size=%d, target=U_1_%s, has_fileid=%v, has_preid=%v, has_pickcode=%v, has_sign=%v",
+		name, size, dirID, sha1sum != "", preSha1 != "", pickCode != "", signKey != "")
+
+	// Create request options
 	opts := rest.Opts{
 		Method: "POST",
 		Path:   "/open/upload/init",
@@ -510,21 +566,56 @@ func (f *Fs) initUploadOpenAPI(ctx context.Context, size int64, name, dirID, sha
 	var info api.UploadInitInfo // Response structure includes nested Data for OpenAPI
 	err := f.CallOpenAPI(ctx, &opts, nil, &info, false)
 	if err != nil {
+		// Try to extract more specific error information
+		var apiErr error
+		if errors.As(err, &apiErr) {
+			// If it's a parameter error (code 1001), provide more context
+			if strings.Contains(err.Error(), "参数错误") || strings.Contains(err.Error(), "1001") {
+				return nil, fmt.Errorf("OpenAPI initUpload failed with parameter error: %w (file_name=%q, size=%d, dirID=%s)",
+					err, name, size, dirID)
+			}
+
+			// If it's a rate limit error, provide advice
+			if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "Too Many Requests") {
+				return nil, fmt.Errorf("OpenAPI initUpload failed due to rate limiting: %w. Consider using --low-level-retries flag to increase retries",
+					err)
+			}
+		}
+
+		// General error handling
 		return nil, fmt.Errorf("OpenAPI initUpload failed: %w", err)
 	}
+
 	// Error checking is handled by CallOpenAPI using info.Err()
 	if info.Data == nil {
 		// If Data is nil but call succeeded, maybe it's a 秒传 response where fields are top-level?
-		// Let's assume error handling in CallOpenAPI covers this. If not, add checks here.
-		// Or maybe the response structure needs adjustment.
-		// If state is true but data is nil, it's an issue.
 		if info.State {
-			return nil, errors.New("OpenAPI initUpload returned success state but no data")
+			if info.GetFileID() != "" && info.GetPickCode() != "" {
+				// This is likely a successful 秒传 response with top-level fields
+				fs.Debugf(f, "Detected direct 秒传 success response with top-level fields")
+				return &info, nil
+			}
+			return nil, fmt.Errorf("OpenAPI initUpload returned success state but no data and insufficient top-level fields (file_id=%q, pick_code=%q)",
+				info.GetFileID(), info.GetPickCode())
 		}
-		// If state is false, CallOpenAPI should have returned an error.
-		return nil, errors.New("internal error: OpenAPI initUpload failed but CallOpenAPI returned no error")
 
+		// If state is false, CallOpenAPI should have returned an error, but let's add an extra check
+		errMsg := info.ErrMsg()
+		if info.ErrCode() != 0 || errMsg != "" {
+			return nil, fmt.Errorf("OpenAPI initUpload failed with error code %d: %s",
+				info.ErrCode(), errMsg)
+		}
+
+		return nil, errors.New("internal error: OpenAPI initUpload failed but CallOpenAPI returned no error")
 	}
+
+	// Log successful initialization
+	statusMsg := "normal upload"
+	if info.GetStatus() == 2 {
+		statusMsg = "秒传 success"
+	}
+	fs.Debugf(f, "Upload initialized: status=%d (%s), bucket=%q, object=%q",
+		info.GetStatus(), statusMsg, info.GetBucket(), info.GetObject())
 
 	return &info, nil
 }
@@ -1541,11 +1632,12 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 					// to ensure we're at the beginning of the stream for the next upload attempt
 					if ro, ok := newIn.(*RereadableObject); ok {
 						fs.Debugf(o, "Reopening RereadableObject after failed hash calculation")
-						_, reopenErr := ro.Open()
+						reopenedReader, reopenErr := ro.Open()
 						if reopenErr != nil {
 							return nil, fmt.Errorf("failed to reopen source after hash upload failure: %w", reopenErr)
 						}
-						// No need to reassign newIn, the Open() method resets the internal state of the RereadableObject
+						// IMPORTANT: Actually use the returned reader instead of assuming internal state is reset
+						newIn = reopenedReader
 						fs.Debugf(o, "Successfully reopened RereadableObject for upload attempt")
 					} else {
 						// If not a RereadableObject, fall back to original input as a last resort
@@ -1626,11 +1718,12 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 				// to ensure we're at the beginning of the stream for the next upload attempt
 				if ro, ok := newIn.(*RereadableObject); ok {
 					fs.Debugf(o, "Reopening RereadableObject after failed hash calculation")
-					_, reopenErr := ro.Open()
+					reopenedReader, reopenErr := ro.Open()
 					if reopenErr != nil {
 						return nil, fmt.Errorf("failed to reopen source after hash upload failure: %w", reopenErr)
 					}
-					// No need to reassign newIn, the Open() method resets the internal state of the RereadableObject
+					// IMPORTANT: Actually use the returned reader instead of assuming internal state is reset
+					newIn = reopenedReader
 					fs.Debugf(o, "Successfully reopened RereadableObject for upload attempt")
 				} else {
 					// If not a RereadableObject, fall back to original input as a last resort
