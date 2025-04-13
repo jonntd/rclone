@@ -1448,17 +1448,6 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 		}
 	}
 
-	// Ensure userID is available (needed for traditional sample upload)
-	if f.userID == "" {
-		// Try to get userID if not already set (e.g., during initial login)
-		if f.userID == "" {
-			// Get userID from uploadinfo API
-			if err := f.getUploadBasicInfo(ctx); err != nil {
-				return nil, fmt.Errorf("failed to get userID: %w", err)
-			}
-		}
-	}
-
 	// Check size limits
 	if size > int64(maxUploadSize) {
 		return nil, fmt.Errorf("file size %v exceeds upload limit %v", fs.SizeSuffix(size), fs.SizeSuffix(maxUploadSize))
