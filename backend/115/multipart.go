@@ -193,8 +193,8 @@ func (f *Fs) newChunkWriter(ctx context.Context, src fs.ObjectInfo, ui *api.Uplo
 	w.client = client
 
 	req := &oss.InitiateMultipartUploadRequest{
-		Bucket: oss.Ptr(ui.Bucket),
-		Key:    oss.Ptr(ui.Object),
+		Bucket: oss.Ptr(ui.GetBucket()),
+		Key:    oss.Ptr(ui.GetObject()),
 	}
 	req.Parameters = map[string]string{"x-oss-enable-sha1": ""}
 	if w.con == 1 {
@@ -289,8 +289,8 @@ func (w *ossChunkWriter) WriteChunk(ctx context.Context, chunkNumber int32, read
 			return false, err
 		}
 		res, err = w.client.UploadPart(ctx, &oss.UploadPartRequest{
-			Bucket:     w.imur.Bucket,
-			Key:        w.imur.Key,
+			Bucket:     oss.Ptr(*w.imur.Bucket),
+			Key:        oss.Ptr(*w.imur.Key),
 			UploadId:   w.imur.UploadId,
 			PartNumber: ossPartNumber,
 			Body:       reader,
@@ -322,8 +322,8 @@ func (w *ossChunkWriter) Abort(ctx context.Context) (err error) {
 	// Abort the upload session
 	err = w.f.globalPacer.Call(func() (bool, error) {
 		_, err = w.client.AbortMultipartUpload(ctx, &oss.AbortMultipartUploadRequest{
-			Bucket:   w.imur.Bucket,
-			Key:      w.imur.Key,
+			Bucket:   oss.Ptr(*w.imur.Bucket),
+			Key:      oss.Ptr(*w.imur.Key),
 			UploadId: w.imur.UploadId,
 		})
 		return w.shouldRetry(ctx, err)
@@ -341,8 +341,8 @@ func (w *ossChunkWriter) Close(ctx context.Context) (err error) {
 	// Finalise the upload session
 	var res *oss.CompleteMultipartUploadResult
 	req := &oss.CompleteMultipartUploadRequest{
-		Bucket:   w.imur.Bucket,
-		Key:      w.imur.Key,
+		Bucket:   oss.Ptr(*w.imur.Bucket),
+		Key:      oss.Ptr(*w.imur.Key),
 		UploadId: w.imur.UploadId,
 		CompleteMultipartUpload: &oss.CompleteMultipartUpload{
 			Parts: w.uploadedParts,
