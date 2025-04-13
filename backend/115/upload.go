@@ -1435,7 +1435,7 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 
 	// If NoBuffer option is enabled, try to wrap the input in a RereadableObject early
 	if f.opt.NoBuffer && size >= 0 {
-		fs.Logf(src, "Using no_buffer option: file will be read multiple times instead of buffered to disk")
+		fs.Debugf(src, "Using no_buffer option: file will be read multiple times instead of buffered to disk")
 		if _, ok := in.(*RereadableObject); !ok {
 			// Create a rereadable wrapper if not already wrapped
 			ro, roErr := NewRereadableObject(ctx, src, options...)
