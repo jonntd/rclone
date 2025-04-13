@@ -46,9 +46,10 @@ type RereadableObject struct {
 	ctx        context.Context
 	currReader io.Reader
 	options    []fs.OpenOption
-	size       int64               // Track the source size for accounting
-	acc        *accounting.Account // Store the accounting object
-	fsInfo     fs.Info             // Source filesystem info
+	size       int64                // Track the source size for accounting
+	acc        *accounting.Account  // Store the accounting object
+	fsInfo     fs.Info              // Source filesystem info
+	transfer   *accounting.Transfer // Keep track of the transfer object
 }
 
 // NewRereadableObject creates a wrapper that supports re-opening the source
@@ -140,9 +141,19 @@ func (r *RereadableObject) Open() (io.Reader, error) {
 			}
 		}
 
-		// Create an accounting transfer with the best filesystem info we have
-		transfer := stats.NewTransferRemoteSize(name, r.size, srcFs, dstFs)
-		r.currReader = transfer.Account(r.ctx, rc).WithBuffer()
+		// Create a new transfer or reuse existing one
+		if r.transfer == nil {
+			// Create an accounting transfer with the best filesystem info we have
+			r.transfer = stats.NewTransferRemoteSize(name, r.size, srcFs, dstFs)
+		}
+
+		// Create a new accounting wrapper using the transfer
+		accReader := r.transfer.Account(r.ctx, rc).WithBuffer()
+		r.currReader = accReader
+
+		// Extract the accounting object for later use
+		_, r.acc = accounting.UnWrapAccounting(accReader)
+
 		return r.currReader, nil
 	}
 
@@ -157,16 +168,32 @@ func (r *RereadableObject) Read(p []byte) (n int, err error) {
 	return r.currReader.Read(p)
 }
 
+// MarkComplete marks the transfer as complete with success
+func (r *RereadableObject) MarkComplete(ctx context.Context) {
+	if r.transfer != nil {
+		// Mark the transfer as successful and done
+		r.transfer.Done(ctx, nil)
+		r.transfer = nil // Clear to avoid double completion
+	}
+}
+
 // Close closes the current reader if it's a ReadCloser
 func (r *RereadableObject) Close() error {
+	var err error
+
+	// Close the current reader
 	if r.currReader != nil {
 		if rc, ok := r.currReader.(io.ReadCloser); ok {
-			err := rc.Close()
-			r.currReader = nil
-			return err
+			err = rc.Close()
 		}
+		r.currReader = nil
 	}
-	return nil
+
+	// Don't finalize the transfer here - this is just closing a read
+	// The transfer should be finalized by the caller when the operation is complete
+	// via MarkComplete() or by creating a new transfer
+
+	return err
 }
 
 // getUploadBasicInfo retrieves userkey using the traditional API (needed for traditional initUpload signature).
@@ -900,6 +927,13 @@ func (f *Fs) tryHashUpload(
 			o.id = ui.GetFileID()
 			o.pickCode = ui.GetPickCode() // Get pick code too
 			o.hasMetaData = true          // Mark as having basic metadata
+
+			// Mark complete on RereadableObject if applicable
+			if ro, ok := newIn.(*RereadableObject); ok {
+				ro.MarkComplete(ctx)
+				fs.Debugf(o, "Marked RereadableObject transfer as complete after hash upload")
+			}
+
 			// Optionally, call getFile to get full metadata, but might be slow/costly
 			// info, getErr := f.getFile(ctx, o.id, "")
 			// if getErr == nil { o.setMetaData(info) }
@@ -979,6 +1013,12 @@ func (f *Fs) uploadToOSS(
 	// Update object metadata
 	if err = o.setMetaDataFromCallBack(callbackData); err != nil {
 		return nil, fmt.Errorf("failed to set metadata from callback: %w", err)
+	}
+
+	// 7. Mark complete on RereadableObject if applicable
+	if ro, ok := in.(*RereadableObject); ok {
+		ro.MarkComplete(ctx)
+		fs.Debugf(o, "Marked RereadableObject transfer as complete")
 	}
 
 	fs.Debugf(o, "OSS multipart upload successful.")
@@ -1082,6 +1122,12 @@ func (f *Fs) performOSSUpload(
 		return nil, fmt.Errorf("failed to process OSS upload callback: %w", err)
 	}
 
+	// Mark complete on RereadableObject if applicable
+	if ro, ok := in.(*RereadableObject); ok {
+		ro.MarkComplete(ctx)
+		fs.Debugf(o, "Marked RereadableObject transfer as complete")
+	}
+
 	return callbackData, nil
 }
 
@@ -1165,6 +1211,12 @@ func (f *Fs) doSampleUpload(
 	err = o.setMetaDataFromCallBack(callbackData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to set metadata from sample upload callback: %w", err)
+	}
+
+	// 4. Mark complete on RereadableObject if applicable
+	if ro, ok := in.(*RereadableObject); ok {
+		ro.MarkComplete(ctx)
+		fs.Debugf(o, "Marked RereadableObject transfer as complete after sample upload")
 	}
 
 	fs.Debugf(o, "Traditional sample upload successful.")
@@ -1486,6 +1538,12 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 	err = o.setMetaDataFromCallBack(callbackData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to set metadata from PutObject callback: %w", err)
+	}
+
+	// 7. Mark complete on RereadableObject if applicable
+	if ro, ok := newIn.(*RereadableObject); ok {
+		ro.MarkComplete(ctx)
+		fs.Debugf(o, "Marked RereadableObject transfer as complete after PutObject upload")
 	}
 
 	fs.Debugf(o, "OSS PutObject successful.")
