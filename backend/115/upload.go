@@ -106,24 +106,48 @@ func retryWithExponentialBackoff(
 	expBackoff.Multiplier = 2.5          // More aggressive multiplier
 	expBackoff.RandomizationFactor = 0.5 // Add jitter to prevent thundering herd
 
-	// Create retry context with timeout
-	retryCtx, cancelRetry := context.WithTimeout(ctx, maxElapsedTime*3/2) // Extra margin
+	// Create retry context with timeout based on maxElapsedTime
+	// Give some buffer beyond MaxElapsedTime for the final attempt + operation time
+	retryCtx, cancelRetry := context.WithTimeout(ctx, maxElapsedTime+maxDelay+10*time.Second)
 	defer cancelRetry()
 
 	// Define the retry wrapper
 	retryOperation := func() error {
+		// Check context cancellation before proceeding
+		if err := retryCtx.Err(); err != nil {
+			fs.Debugf(loggingObj, "Retry context cancelled for '%s': %v", description, err)
+			return backoff.Permanent(fmt.Errorf("retry cancelled for '%s': %w", description, err))
+		}
+
 		if retryCount > 0 {
+			// Check context cancellation again before sleeping
+			if err := retryCtx.Err(); err != nil {
+				fs.Debugf(loggingObj, "Retry context cancelled before delay for '%s': %v", description, err)
+				return backoff.Permanent(fmt.Errorf("retry cancelled before delay for '%s': %w", description, err))
+			}
+
 			nextDelay := expBackoff.NextBackOff()
 			if nextDelay == backoff.Stop {
-				return fmt.Errorf("exceeded maximum retry duration")
+				// This condition might be reached if MaxElapsedTime is exceeded by the time calculation
+				// or if the backoff itself decides to stop for other reasons.
+				fs.Logf(loggingObj, "Exceeded max retry duration or backoff stopped for '%s'", description)
+				return backoff.Permanent(fmt.Errorf("exceeded maximum retry duration or backoff stopped for '%s'", description))
 			}
 
 			// Use more visible logging for retries
-			fs.Logf(loggingObj, "Rate limited when %s. Waiting %v before retry %d/%d",
+			fs.Logf(loggingObj, "Retrying '%s': Waiting %v before retry %d/%d",
 				description, nextDelay, retryCount+1, maxRetries)
-			time.Sleep(nextDelay)
+
+			// Wait for the delay, but honor context cancellation
+			select {
+			case <-time.After(nextDelay):
+				// Continue after delay
+			case <-retryCtx.Done():
+				fs.Logf(loggingObj, "Retry context cancelled while waiting for delay in '%s': %v", description, retryCtx.Err())
+				return backoff.Permanent(fmt.Errorf("retry cancelled while waiting for delay in '%s': %w", description, retryCtx.Err()))
+			}
 		}
-		retryCount++
+		retryCount++ // Increment retry count *after* the first attempt (retryCount=0)
 
 		// Execute the actual operation
 		err := operation()
@@ -133,40 +157,37 @@ func retryWithExponentialBackoff(
 			return nil
 		}
 
-		// Check if this is a rate limit error that we should retry
-		shouldRetryErr, _ := shouldRetry(ctx, nil, err)
+		// Check if we've hit max retries (retryCount is now 1 for the first attempt, so compare with >= maxRetries)
+		if retryCount >= maxRetries {
+			fs.Logf(loggingObj, "Giving up '%s' after %d attempts: %v",
+				description, retryCount, err)
+			return backoff.Permanent(fmt.Errorf("giving up '%s' after %d attempts: %w", description, retryCount, err))
+		}
+
+		// Check if this is a rate limit error or other error that we should retry
+		shouldRetryErr, classification := shouldRetry(retryCtx, nil, err) // Pass retryCtx
 		if !shouldRetryErr {
 			// Non-retryable error
-			fs.Debugf(loggingObj, "Non-retryable error when %s: %v", description, err)
-			return backoff.Permanent(err)
+			fs.Debugf(loggingObj, "Non-retryable error (%s) when '%s': %v", classification, description, err)
+			return backoff.Permanent(err) // Wrap in Permanent to stop retries
 		}
 
-		// Additional logging for rate limit errors
-		if strings.Contains(err.Error(), "429") ||
-			strings.Contains(err.Error(), "Too Many Requests") ||
-			strings.Contains(err.Error(), "rate limit") {
-			fs.Logf(loggingObj, "Hit rate limit (429) when %s. Will retry with increasing backoff.", description)
-		}
+		// Log retryable errors
+		fs.Debugf(loggingObj, "Retryable error (%s) on attempt %d for '%s', will retry: %v", classification, retryCount, description, err)
 
-		// Check if we've hit max retries
-		if retryCount >= maxRetries {
-			fs.Logf(loggingObj, "Giving up %s after %d retries: %v",
-				description, maxRetries, err)
-			return backoff.Permanent(err)
-		}
-
-		return err // Return error to trigger retry
+		return err // Return the retryable error to trigger the next retry
 	}
 
-	// Define notify function for logging retries
-	notify := func(err error, delay time.Duration) {
-		if err != nil {
-			fs.Debugf(loggingObj, "Retrying %s after error: %v. Next delay: %v", description, err, delay)
-		}
-	}
+	// Define notify function for logging retry attempts (optional, handled within retryOperation now)
+	// notify := func(err error, delay time.Duration) {
+	// 	if err != nil {
+	// 		fs.Debugf(loggingObj, "Error during '%s': %v. Retrying in %v...", description, err, delay)
+	// 	}
+	// }
 
-	// Execute the retry logic
-	return backoff.RetryNotify(retryOperation, backoff.WithContext(expBackoff, retryCtx), notify)
+	// Execute the retry logic using the context-aware wrapper
+	// No explicit notify needed if logging is done within retryOperation
+	return backoff.Retry(retryOperation, backoff.WithContext(expBackoff, retryCtx))
 }
 
 // Open (re)opens the source file
@@ -234,7 +255,7 @@ func (r *RereadableObject) Open() (io.Reader, error) {
 		)
 
 		if err != nil {
-			return nil, fmt.Errorf("failed to reopen source object: %w", err)
+			return nil, fmt.Errorf("failed to reopen source object after retries: %w", err)
 		}
 
 		// Check if we already have an accounting wrapper
@@ -797,64 +818,72 @@ func calcBlockSHA1(ctx context.Context, in io.Reader, src fs.ObjectInfo, rangeSp
 
 	// Check if input is a RereadableObject first
 	if ro, ok := in.(*RereadableObject); ok {
-		// Try to open a new reader with retries for rate limiting
-		var reader io.Reader
+		// Try to open a new reader with robust retries for rate limiting
+		var reader io.Reader // Holds the successfully opened reader
 		var err error
 
-		// Define maximum retries and use exponential backoff
-		maxRetries := 8                                       // Increased max retries
-		var retryDelay time.Duration = 500 * time.Millisecond // Start with 500ms
+		// Set retry parameters for reopening within calcBlockSHA1
+		maxRetries := 10                       // Max retries for opening range
+		initialDelay := 500 * time.Millisecond // Start with 500ms
+		maxDelay := 60 * time.Second           // Max delay 1 minute
+		maxElapsedTime := 5 * time.Minute      // Max total time
 
-		// Try multiple times with exponential backoff
-		for retry := 0; retry < maxRetries; retry++ {
-			if retry > 0 {
-				// Use larger initial backoff and stronger exponential growth
-				delayMs := retryDelay.Milliseconds() * int64(1<<uint(retry-1)) // Exponential backoff
-				delay := time.Duration(delayMs) * time.Millisecond
-				// Cap maximum delay at 30 seconds
-				if delay > 30*time.Second {
-					delay = 30 * time.Second
-				}
-				fs.Debugf(nil, "Rate limited when opening range for SHA1. Waiting %v before retry %d/%d", delay, retry+1, maxRetries)
-				time.Sleep(delay)
+		// Define the reopening operation
+		reopenOperation := func() error {
+			var openErr error
+			reader, openErr = ro.Open() // Attempt to open
+			if openErr != nil {
+				fs.Debugf(src, "Open attempt failed in calcBlockSHA1: %v", openErr)
 			}
-
-			reader, err = ro.Open()
-			if err == nil {
-				break // Success
-			}
-
-			// Check if this is a rate limit error that we should retry
-			shouldRetryErr, _ := shouldRetry(ctx, nil, err)
-			if !shouldRetryErr {
-				// Non-retryable error, break early
-				fs.Debugf(nil, "Non-retryable error when opening for range SHA1: %v", err)
-				break
-			}
-
-			fs.Debugf(nil, "Retryable error opening source for range SHA1 (attempt %d/%d): %v", retry+1, maxRetries, err)
-
-			// For the last retry, just give up
-			if retry == maxRetries-1 {
-				fs.Logf(nil, "Giving up opening for range SHA1 after %d retries: %v", maxRetries, err)
-			}
+			return openErr // Return error for retry logic
 		}
+
+		// Retry with exponential backoff
+		err = retryWithExponentialBackoff(
+			ctx,
+			"opening object for range SHA1",
+			src, // Log against the source object info
+			reopenOperation,
+			maxRetries,
+			initialDelay,
+			maxDelay,
+			maxElapsedTime,
+		)
 
 		if err != nil {
-			return "", fmt.Errorf("failed to open new reader for range SHA1: %w", err)
+			return "", fmt.Errorf("failed to open RereadableObject reader for range SHA1 after retries: %w", err)
 		}
 
-		// Skip to the start position
+		// If the obtained reader is an io.ReadCloser, ensure it's closed when calcBlockSHA1 finishes.
+		// This does NOT close the parent RereadableObject 'ro'.
+		closeReader := func() {} // No-op default
+		if rc, ok := reader.(io.ReadCloser); ok {
+			closeReader = func() { _ = rc.Close() }
+		}
+		defer closeReader() // Close the specific reader obtained for this SHA1 calc
+
+		// Skip to the start position using the successfully opened 'reader'
 		if seeker, ok := reader.(io.Seeker); ok {
 			if _, err := seeker.Seek(start, io.SeekStart); err != nil {
-				return "", fmt.Errorf("failed to seek RereadableObject to %d: %w", start, err)
+				// Attempt to close the reader before returning error
+				closeReader()
+				return "", fmt.Errorf("failed to seek RereadableObject reader to %d: %w", start, err)
 			}
 			sectionReader = io.LimitReader(reader, length)
 		} else {
 			// If not seekable, try skipping bytes
 			if start > 0 {
-				if _, err := io.CopyN(io.Discard, reader, start); err != nil {
-					return "", fmt.Errorf("failed to skip %d bytes in RereadableObject: %w", start, err)
+				// Use io.CopyN for skipping
+				skipped, err := io.CopyN(io.Discard, reader, start)
+				if err != nil {
+					// Attempt to close the reader before returning error
+					closeReader()
+					return "", fmt.Errorf("failed to skip %d bytes in RereadableObject reader (skipped %d): %w", start, skipped, err)
+				}
+				if skipped != start {
+					// Attempt to close the reader before returning error
+					closeReader()
+					return "", fmt.Errorf("failed to skip requested %d bytes in RereadableObject reader, only skipped %d", start, skipped)
 				}
 			}
 			sectionReader = io.LimitReader(reader, length)
@@ -890,49 +919,39 @@ func calcBlockSHA1(ctx context.Context, in io.Reader, src fs.ObjectInfo, rangeSp
 			var err error
 
 			// Define maximum retries and use exponential backoff
-			maxRetries := 8                                       // Increased max retries
-			var retryDelay time.Duration = 500 * time.Millisecond // Start with 500ms
+			maxRetries := 10                       // Max retries
+			initialDelay := 500 * time.Millisecond // Start delay
+			maxDelay := 60 * time.Second           // Max delay
+			maxElapsedTime := 5 * time.Minute      // Max total time
 
-			// Try multiple times with exponential backoff
-			for retry := 0; retry < maxRetries; retry++ {
-				if retry > 0 {
-					// Use larger initial backoff and stronger exponential growth
-					delayMs := retryDelay.Milliseconds() * int64(1<<uint(retry-1)) // Exponential backoff
-					delay := time.Duration(delayMs) * time.Millisecond
-					// Cap maximum delay at 30 seconds
-					if delay > 30*time.Second {
-						delay = 30 * time.Second
-					}
-					fs.Debugf(srcObj, "Rate limited when opening range. Waiting %v before retry %d/%d", delay, retry+1, maxRetries)
-					time.Sleep(delay)
+			// Define the operation
+			openRangeOperation := func() error {
+				var openErr error
+				// Use RangeOption for efficiency if supported
+				rc, openErr = srcObj.Open(ctx, &fs.RangeOption{Start: start, End: end})
+				if openErr != nil {
+					fs.Debugf(srcObj, "Open range attempt failed: %v", openErr)
 				}
-
-				rc, err = srcObj.Open(ctx, &fs.RangeOption{Start: start, End: end})
-				if err == nil {
-					break // Success
-				}
-
-				// Check if this is a rate limit error that we should retry
-				shouldRetryErr, _ := shouldRetry(ctx, nil, err)
-				if !shouldRetryErr {
-					// Non-retryable error, break early
-					fs.Debugf(srcObj, "Non-retryable error when opening range directly: %v", err)
-					break
-				}
-
-				fs.Debugf(srcObj, "Retryable error opening source object for range SHA1 (attempt %d/%d): %v", retry+1, maxRetries, err)
-
-				// For the last retry, just give up
-				if retry == maxRetries-1 {
-					fs.Logf(srcObj, "Giving up opening range directly after %d retries: %v", maxRetries, err)
-				}
+				return openErr
 			}
+
+			// Retry with exponential backoff
+			err = retryWithExponentialBackoff(
+				ctx,
+				"opening source object range directly",
+				srcObj,
+				openRangeOperation,
+				maxRetries,
+				initialDelay,
+				maxDelay,
+				maxElapsedTime,
+			)
 
 			if err != nil {
-				return "", fmt.Errorf("failed to open source object for SHA1 range %q: %w", rangeSpec, err)
+				return "", fmt.Errorf("failed to open source object for SHA1 range %q after retries: %w", rangeSpec, err)
 			}
-
-			defer fs.CheckClose(rc, &err) // Ensure closure
+			// Defer closing the reader obtained specifically for this operation
+			defer fs.CheckClose(rc, &err)
 			sectionReader = rc
 		} else {
 			return "", fmt.Errorf("cannot calculate SHA1 for range %q: input reader not seekable and source object unavailable", rangeSpec)
