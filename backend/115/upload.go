@@ -25,7 +25,6 @@ import (
 	"github.com/rclone/rclone/backend/115/api" // Keep for traditional initUpload
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
-	"github.com/rclone/rclone/fs/chunksize"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
@@ -1284,14 +1283,14 @@ func (f *Fs) uploadToOSS(
 		return o, nil
 	}
 
-	// Create OSS client and initiate multipart upload
-	ossClient, imur, err := f.prepareOSSMultipart(ctx, uploadInfo, options...)
+	// Create OSS client
+	ossClient, err := f.newOSSClient()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create OSS client: %w", err)
 	}
 
 	// Configure and perform the upload
-	callbackData, err := f.performOSSUpload(ctx, ossClient, imur, in, src, o, size, uploadInfo)
+	callbackData, err := f.performOSSUpload(ctx, ossClient, in, src, o, size, uploadInfo, options...)
 	if err != nil {
 		return nil, err
 	}
@@ -1345,57 +1344,22 @@ func (f *Fs) getUploadInfo(
 	return ui, nil
 }
 
-// prepareOSSMultipart sets up the OSS client and initiates the multipart upload
-func (f *Fs) prepareOSSMultipart(
-	ctx context.Context,
-	ui *api.UploadInitInfo,
-	options ...fs.OpenOption,
-) (*oss.Client, *oss.InitiateMultipartUploadResult, error) {
-	// Create OSS client
-	ossClient, err := f.newOSSClient()
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create OSS client: %w", err)
-	}
-
-	// Initiate multipart upload
-	imur, err := f.initiateOSSMultipart(ctx, ossClient, ui, options...)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to initiate OSS multipart upload: %w", err)
-	}
-
-	return ossClient, imur, nil
-}
-
 // performOSSUpload handles the actual upload process
 func (f *Fs) performOSSUpload(
 	ctx context.Context,
 	client *oss.Client,
-	imur *oss.InitiateMultipartUploadResult,
 	in io.Reader,
 	src fs.ObjectInfo,
 	o *Object,
 	size int64,
 	ui *api.UploadInitInfo,
+	options ...fs.OpenOption,
 ) (*api.CallbackData, error) {
 	// Create the chunk writer
-	chunkWriter := &ossChunkWriter{
-		f:             f,
-		o:             o,
-		size:          size,
-		in:            in,
-		client:        client,
-		imur:          imur,
-		callback:      ui.GetCallback(),
-		callbackVar:   ui.GetCallbackVar(),
-		chunkSize:     int64(f.opt.ChunkSize),
-		con:           1, // Hardcoded concurrency = 1
-		uploadedParts: make([]oss.UploadPart, 0, int(size/int64(f.opt.ChunkSize))+1),
+	chunkWriter, err := f.newChunkWriter(ctx, src, ui, in, o, options...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create chunk writer: %w", err)
 	}
-
-	// Adjust chunk size based on file size and max parts
-	uploadParts := min(max(1, f.opt.MaxUploadParts), maxUploadParts)
-	chunkWriter.chunkSize = int64(chunksize.Calculator(src, size, uploadParts, fs.SizeSuffix(chunkWriter.chunkSize)))
-	fs.Debugf(o, "Using OSS multipart chunk size %v", fs.SizeSuffix(chunkWriter.chunkSize))
 
 	// Perform the upload
 	if err := chunkWriter.Upload(ctx); err != nil {
@@ -1415,60 +1379,6 @@ func (f *Fs) performOSSUpload(
 	}
 
 	return callbackData, nil
-}
-
-// initiateOSSMultipart starts the multipart upload with OSS.
-func (f *Fs) initiateOSSMultipart(ctx context.Context, client *oss.Client, ui *api.UploadInitInfo, options ...fs.OpenOption) (*oss.InitiateMultipartUploadResult, error) {
-	req := &oss.InitiateMultipartUploadRequest{
-		Bucket: oss.Ptr(ui.GetBucket()),
-		Key:    oss.Ptr(ui.GetObject()),
-		// Add options like ContentType, CacheControl etc. from fs.OpenOption
-	}
-	// Apply headers from options
-	for _, option := range options {
-		key, value := option.Header()
-		lowerKey := strings.ToLower(key)
-		switch lowerKey {
-		case "cache-control":
-			req.CacheControl = oss.Ptr(value)
-		case "content-disposition":
-			req.ContentDisposition = oss.Ptr(value)
-		case "content-encoding":
-			req.ContentEncoding = oss.Ptr(value)
-		case "content-type":
-			req.ContentType = oss.Ptr(value)
-			// Add other relevant OSS headers if needed (e.g., x-oss-server-side-encryption)
-		}
-	}
-
-	var imur *oss.InitiateMultipartUploadResult
-	var err error
-	// Retry initiation if needed
-	err = f.globalPacer.Call(func() (bool, error) { // Use global pacer for OSS calls too
-		var initiateErr error
-		imur, initiateErr = client.InitiateMultipartUpload(ctx, req)
-		// Use shouldRetry for OSS errors? Need specific OSS error checking.
-		// For now, rely on standard fserrors retry logic.
-		retry, retryErr := shouldRetry(ctx, nil, initiateErr) // Pass nil response for non-HTTP errors
-		if retry {
-			fs.Debugf(f, "Retrying InitiateMultipartUpload: %v", retryErr)
-			return true, retryErr
-		}
-		if initiateErr != nil {
-			return false, backoff.Permanent(initiateErr) // Don't retry non-standard errors
-		}
-		return false, nil // Success
-	})
-
-	if err != nil {
-		return nil, err // Return error after retries
-	}
-	if imur == nil || imur.UploadId == nil || *imur.UploadId == "" {
-		return nil, errors.New("OSS InitiateMultipartUpload succeeded but returned invalid UploadId")
-	}
-
-	fs.Debugf(f, "Initiated OSS multipart upload with ID: %s", *imur.UploadId)
-	return imur, nil
 }
 
 // doSampleUpload performs the traditional streamed upload.

@@ -157,13 +157,7 @@ type ossChunkWriter struct {
 	imur          *oss.InitiateMultipartUploadResult
 }
 
-func (f *Fs) newChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, ui *api.UploadInitInfo, in io.Reader, options ...fs.OpenOption) (w *ossChunkWriter, err error) {
-	// Temporary Object under construction
-	o := &Object{
-		fs:     f,
-		remote: remote,
-	}
-
+func (f *Fs) newChunkWriter(ctx context.Context, src fs.ObjectInfo, ui *api.UploadInitInfo, in io.Reader, o *Object, options ...fs.OpenOption) (w *ossChunkWriter, err error) {
 	uploadParts := min(max(1, f.opt.MaxUploadParts), maxUploadParts)
 	size := src.Size()
 
@@ -346,17 +340,19 @@ func (w *ossChunkWriter) Abort(ctx context.Context) (err error) {
 func (w *ossChunkWriter) Close(ctx context.Context) (err error) {
 	// Finalise the upload session
 	var res *oss.CompleteMultipartUploadResult
+	req := &oss.CompleteMultipartUploadRequest{
+		Bucket:   w.imur.Bucket,
+		Key:      w.imur.Key,
+		UploadId: w.imur.UploadId,
+		CompleteMultipartUpload: &oss.CompleteMultipartUpload{
+			Parts: w.uploadedParts,
+		},
+		Callback:    oss.Ptr(w.callback),
+		CallbackVar: oss.Ptr(w.callbackVar),
+	}
+	req.Headers = map[string]string{"x-oss-hash-sha1": w.o.sha1sum}
 	err = w.f.globalPacer.Call(func() (bool, error) {
-		res, err = w.client.CompleteMultipartUpload(ctx, &oss.CompleteMultipartUploadRequest{
-			Bucket:   w.imur.Bucket,
-			Key:      w.imur.Key,
-			UploadId: w.imur.UploadId,
-			CompleteMultipartUpload: &oss.CompleteMultipartUpload{
-				Parts: w.uploadedParts,
-			},
-			Callback:    oss.Ptr(w.callback),
-			CallbackVar: oss.Ptr(w.callbackVar),
-		})
+		res, err = w.client.CompleteMultipartUpload(ctx, req)
 		return w.shouldRetry(ctx, err)
 	})
 	if err != nil {
