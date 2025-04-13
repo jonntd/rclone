@@ -108,27 +108,65 @@ func (r *RereadableObject) Open() (io.Reader, error) {
 			pacer = fsObj.globalPacer
 		}
 
-		// Use pacer if available, otherwise direct call
-		if pacer != nil {
-			// Apply pacer to handle rate limiting (429 errors)
-			fs.Debugf(nil, "Using pacer for reopening object to handle rate limits")
-			err = pacer.Call(func() (bool, error) {
-				var openErr error
-				rc, openErr = obj.Open(r.ctx, r.options...)
-				if openErr != nil {
-					// Check for 429 rate limit error by extracting HTTP response
-					// Use shouldRetry helper which already handles all HTTP errors
-					retry, _ := shouldRetry(r.ctx, nil, openErr)
-					if retry {
-						fs.Debugf(obj, "Retrying Open after error: %v", openErr)
-						return true, openErr
-					}
+		// Define maximum retries and use exponential backoff
+		maxRetries := 8                                       // Increased from 5 to 8
+		var retryDelay time.Duration = 500 * time.Millisecond // Start with 500ms
+
+		// Try multiple times with exponential backoff for rate limiting
+		for retry := 0; retry < maxRetries; retry++ {
+			if retry > 0 {
+				// Use larger initial backoff and stronger exponential growth
+				delayMs := retryDelay.Milliseconds() * int64(1<<uint(retry-1)) // Exponential backoff
+				delay := time.Duration(delayMs) * time.Millisecond
+				// Cap maximum delay at 30 seconds
+				if delay > 30*time.Second {
+					delay = 30 * time.Second
 				}
-				return false, openErr
-			})
-		} else {
-			// Fall back to direct open if we can't use pacer
-			rc, err = obj.Open(r.ctx, r.options...)
+				fs.Debugf(obj, "Rate limited when reopening object. Waiting %v before retry %d/%d", delay, retry+1, maxRetries)
+				time.Sleep(delay)
+			}
+
+			// Use pacer if available, otherwise direct call
+			if pacer != nil {
+				// Apply pacer to handle rate limiting (429 errors)
+				var openErr error
+				err = pacer.Call(func() (bool, error) {
+					rc, openErr = obj.Open(r.ctx, r.options...)
+					if openErr != nil {
+						// Check for 429 rate limit error
+						retry, _ := shouldRetry(r.ctx, nil, openErr)
+						if retry {
+							fs.Debugf(obj, "Pacer: Retrying Open after rate limit error: %v", openErr)
+							return true, openErr // Let pacer handle retry timing
+						}
+					}
+					return false, openErr
+				})
+			} else {
+				// Fall back to direct open if we can't use pacer
+				rc, err = obj.Open(r.ctx, r.options...)
+			}
+
+			// Check if successful or if it's a non-retryable error
+			if err == nil {
+				// Success!
+				break
+			}
+
+			// Check if this is a rate limit error that we should retry
+			if shouldRetryErr, _ := shouldRetry(r.ctx, nil, err); !shouldRetryErr {
+				// Non-retryable error, break early
+				fs.Debugf(obj, "Non-retryable error when reopening object: %v", err)
+				break
+			}
+
+			// Log the error and continue to next retry
+			fs.Debugf(obj, "Retryable error when reopening object (retry %d/%d): %v", retry+1, maxRetries, err)
+
+			// For the last retry, just give up
+			if retry == maxRetries-1 {
+				fs.Logf(obj, "Giving up reopening object after %d retries: %v", maxRetries, err)
+			}
 		}
 
 		if err != nil {
@@ -375,12 +413,21 @@ func bufferIOwithSHA1(f *Fs, in io.Reader, src fs.ObjectInfo, size, threshold in
 		var newReader io.Reader
 		var reopenErr error
 
-		// Try a few times with increasing backoff in case of rate limiting
-		for retry := 0; retry < 5; retry++ {
+		// Define maximum retries and use exponential backoff
+		maxRetries := 8                                       // Increased max retries
+		var retryDelay time.Duration = 500 * time.Millisecond // Start with 500ms
+
+		// Try multiple times with exponential backoff
+		for retry := 0; retry < maxRetries; retry++ {
 			if retry > 0 {
-				// Add exponential backoff delay between retries
-				delay := time.Duration(100*retry*retry) * time.Millisecond
-				fs.Debugf(f, "Waiting %v before retrying reopen after SHA1 calculation (attempt %d/5)", delay, retry+1)
+				// Use larger initial backoff and stronger exponential growth
+				delayMs := retryDelay.Milliseconds() * int64(1<<uint(retry-1)) // Exponential backoff
+				delay := time.Duration(delayMs) * time.Millisecond
+				// Cap maximum delay at 30 seconds
+				if delay > 30*time.Second {
+					delay = 30 * time.Second
+				}
+				fs.Debugf(f, "Rate limited when reopening after SHA1. Waiting %v before retry %d/%d", delay, retry+1, maxRetries)
 				time.Sleep(delay)
 			}
 
@@ -389,11 +436,19 @@ func bufferIOwithSHA1(f *Fs, in io.Reader, src fs.ObjectInfo, size, threshold in
 				break // Success
 			}
 
-			fs.Debugf(f, "Error reopening source after SHA1 calculation (attempt %d/5): %v", retry+1, reopenErr)
+			fs.Debugf(f, "Error reopening source after SHA1 calculation (attempt %d/%d): %v", retry+1, maxRetries, reopenErr)
 
-			// Break early for errors that shouldn't be retried
-			if !fserrors.ShouldRetry(reopenErr) {
+			// Check if this is a rate limit error that we should retry
+			shouldRetryErr, _ := shouldRetry(ctx, nil, reopenErr)
+			if !shouldRetryErr {
+				// Non-retryable error, break early
+				fs.Debugf(f, "Non-retryable error when reopening after SHA1: %v", reopenErr)
 				break
+			}
+
+			// For the last retry, just give up
+			if retry == maxRetries-1 {
+				fs.Logf(f, "Giving up reopening after SHA1 calculation after %d retries: %v", maxRetries, reopenErr)
 			}
 		}
 
@@ -656,12 +711,21 @@ func calcBlockSHA1(ctx context.Context, in io.Reader, src fs.ObjectInfo, rangeSp
 		var reader io.Reader
 		var err error
 
-		// Try a few times with increasing backoff
-		for retry := 0; retry < 5; retry++ {
+		// Define maximum retries and use exponential backoff
+		maxRetries := 8                                       // Increased max retries
+		var retryDelay time.Duration = 500 * time.Millisecond // Start with 500ms
+
+		// Try multiple times with exponential backoff
+		for retry := 0; retry < maxRetries; retry++ {
 			if retry > 0 {
-				// Add exponential backoff delay between retries
-				delay := time.Duration(100*retry*retry) * time.Millisecond
-				fs.Debugf(nil, "Waiting %v before retrying reopen for range SHA1 (attempt %d/5)", delay, retry+1)
+				// Use larger initial backoff and stronger exponential growth
+				delayMs := retryDelay.Milliseconds() * int64(1<<uint(retry-1)) // Exponential backoff
+				delay := time.Duration(delayMs) * time.Millisecond
+				// Cap maximum delay at 30 seconds
+				if delay > 30*time.Second {
+					delay = 30 * time.Second
+				}
+				fs.Debugf(nil, "Rate limited when opening range for SHA1. Waiting %v before retry %d/%d", delay, retry+1, maxRetries)
 				time.Sleep(delay)
 			}
 
@@ -670,11 +734,19 @@ func calcBlockSHA1(ctx context.Context, in io.Reader, src fs.ObjectInfo, rangeSp
 				break // Success
 			}
 
-			fs.Debugf(nil, "Error reopening source for range SHA1 (attempt %d/5): %v", retry+1, err)
-
-			// Break early for errors that shouldn't be retried
-			if !fserrors.ShouldRetry(err) {
+			// Check if this is a rate limit error that we should retry
+			shouldRetryErr, _ := shouldRetry(ctx, nil, err)
+			if !shouldRetryErr {
+				// Non-retryable error, break early
+				fs.Debugf(nil, "Non-retryable error when opening for range SHA1: %v", err)
 				break
+			}
+
+			fs.Debugf(nil, "Retryable error opening source for range SHA1 (attempt %d/%d): %v", retry+1, maxRetries, err)
+
+			// For the last retry, just give up
+			if retry == maxRetries-1 {
+				fs.Logf(nil, "Giving up opening for range SHA1 after %d retries: %v", maxRetries, err)
 			}
 		}
 
@@ -727,12 +799,21 @@ func calcBlockSHA1(ctx context.Context, in io.Reader, src fs.ObjectInfo, rangeSp
 			var rc io.ReadCloser
 			var err error
 
-			// Try a few times with increasing backoff
-			for retry := 0; retry < 5; retry++ {
+			// Define maximum retries and use exponential backoff
+			maxRetries := 8                                       // Increased max retries
+			var retryDelay time.Duration = 500 * time.Millisecond // Start with 500ms
+
+			// Try multiple times with exponential backoff
+			for retry := 0; retry < maxRetries; retry++ {
 				if retry > 0 {
-					// Add exponential backoff delay between retries
-					delay := time.Duration(100*retry*retry) * time.Millisecond
-					fs.Debugf(nil, "Waiting %v before retrying direct object open for range SHA1 (attempt %d/5)", delay, retry+1)
+					// Use larger initial backoff and stronger exponential growth
+					delayMs := retryDelay.Milliseconds() * int64(1<<uint(retry-1)) // Exponential backoff
+					delay := time.Duration(delayMs) * time.Millisecond
+					// Cap maximum delay at 30 seconds
+					if delay > 30*time.Second {
+						delay = 30 * time.Second
+					}
+					fs.Debugf(srcObj, "Rate limited when opening range. Waiting %v before retry %d/%d", delay, retry+1, maxRetries)
 					time.Sleep(delay)
 				}
 
@@ -741,11 +822,19 @@ func calcBlockSHA1(ctx context.Context, in io.Reader, src fs.ObjectInfo, rangeSp
 					break // Success
 				}
 
-				fs.Debugf(srcObj, "Error opening source object for range SHA1 (attempt %d/5): %v", retry+1, err)
-
-				// Break early for errors that shouldn't be retried
-				if !fserrors.ShouldRetry(err) {
+				// Check if this is a rate limit error that we should retry
+				shouldRetryErr, _ := shouldRetry(ctx, nil, err)
+				if !shouldRetryErr {
+					// Non-retryable error, break early
+					fs.Debugf(srcObj, "Non-retryable error when opening range directly: %v", err)
 					break
+				}
+
+				fs.Debugf(srcObj, "Retryable error opening source object for range SHA1 (attempt %d/%d): %v", retry+1, maxRetries, err)
+
+				// For the last retry, just give up
+				if retry == maxRetries-1 {
+					fs.Logf(srcObj, "Giving up opening range directly after %d retries: %v", maxRetries, err)
 				}
 			}
 
