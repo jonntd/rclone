@@ -1,20 +1,22 @@
-// Implements multipart uploading for 115 using OSS SDK v2.
+// Implements multipart uploading for 115. Mostly from lib/multipart
 package _115
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
-	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss"
-	"github.com/cenkalti/backoff/v4"
+	"github.com/rclone/rclone/backend/115/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
+	"github.com/rclone/rclone/fs/chunksize"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/lib/atexit"
+	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/pool"
 	"golang.org/x/sync/errgroup"
 )
@@ -31,7 +33,7 @@ var (
 	bufferPoolOnce sync.Once
 )
 
-// getPool gets a buffer pool, initializing it on first use.
+// get a buffer pool
 func getPool() *pool.Pool {
 	bufferPoolOnce.Do(func() {
 		ci := fs.GetConfig(context.Background())
@@ -41,50 +43,28 @@ func getPool() *pool.Pool {
 	return bufferPool
 }
 
-// NewRW gets a pool.RW using the multipart pool.
+// NewRW gets a pool.RW using the multipart pool
 func NewRW() *pool.RW {
 	return pool.NewRW(getPool())
 }
 
-// ossChunkWriter handles the state for OSS multipart uploads.
-type ossChunkWriter struct {
-	chunkSize     int64
-	size          int64
-	con           int // Concurrency (hardcoded to 1)
-	f             *Fs
-	o             *Object
-	in            io.Reader // Potentially buffered input
-	mu            sync.Mutex
-	uploadedParts []oss.UploadPart // Store completed parts
-	client        *oss.Client      // OSS SDK v2 client
-	callback      string           // Base64 encoded callback info
-	callbackVar   string           // Base64 encoded callback vars
-	callbackRes   map[string]any   // Result from CompleteMultipartUpload callback
-	imur          *oss.InitiateMultipartUploadResult
-	cleanup       func() // Cleanup function for temp file or buffer
-}
-
-// Upload performs the multipart upload.
+// UploadMultipart does a generic multipart upload from src using f as OpenChunkWriter.
+//
+// in is read seqentially and chunks from it are uploaded in parallel.
+//
+// It returns the chunkWriter used in case the caller needs to extract any private info from it.
 func (w *ossChunkWriter) Upload(ctx context.Context) (err error) {
+	// make concurrency machinery
+	tokens := pacer.NewTokenDispenser(w.con)
+
 	uploadCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-
-	// Ensure cleanup runs if buffering was used
-	if w.cleanup != nil {
-		defer w.cleanup()
-	}
-
-	// Abort upload on error
 	defer atexit.OnError(&err, func() {
-		cancel() // Cancel any ongoing part uploads
-		fs.Debugf(w.o, "OSS multipart upload error: %v. Aborting upload ID %s...", err, *w.imur.UploadId)
-		abortCtx, abortCancel := context.WithTimeout(context.Background(), 30*time.Second) // Use background context for abort
-		defer abortCancel()
-		abortErr := w.Abort(abortCtx)
-		if abortErr != nil {
-			fs.Errorf(w.o, "Failed to abort OSS multipart upload %s: %v", *w.imur.UploadId, abortErr)
-		} else {
-			fs.Debugf(w.o, "Successfully aborted OSS multipart upload %s", *w.imur.UploadId)
+		cancel()
+		fs.Debugf(w.o, "multipart upload: Cancelling...")
+		errCancel := w.Abort(ctx)
+		if errCancel != nil {
+			fs.Debugf(w.o, "multipart upload: failed to cancel: %v", errCancel)
 		}
 	})()
 
@@ -96,235 +76,293 @@ func (w *ossChunkWriter) Upload(ctx context.Context) (err error) {
 		chunkSize = w.chunkSize
 	)
 
-	// Unwrap accounting from the input reader
+	// Do the accounting manually
 	in, acc := accounting.UnWrapAccounting(w.in)
 
-	// Since concurrency is 1, we don't need the token dispenser.
-	// Upload parts sequentially.
 	for partNum := int64(0); !finished; partNum++ {
-		// Check for cancellation before reading next chunk
+		// Get a block of memory from the pool and token which limits concurrency.
+		tokens.Get()
+		rw := NewRW()
+		if acc != nil {
+			rw.SetAccounting(acc.AccountRead)
+		}
+
+		free := func() {
+			// return the memory and token
+			_ = rw.Close() // Can't return an error
+			tokens.Put()
+		}
+
+		// Fail fast, in case an errgroup managed function returns an error
+		// gCtx is cancelled. There is no point in uploading all the other parts.
 		if gCtx.Err() != nil {
-			fs.Debugf(w.o, "Context cancelled before reading chunk %d", partNum)
+			free()
 			break
 		}
 
-		// Get a buffer from the pool
-		rw := NewRW()
-		if acc != nil {
-			rw.SetAccounting(acc.AccountRead) // Apply accounting to buffer reads
-		}
-
-		// Read the chunk into the buffer
-		n, readErr := io.CopyN(rw, in, chunkSize)
-		if readErr == io.EOF {
-			if n == 0 && partNum != 0 { // End if no data read and not the first chunk
-				_ = rw.Close() // Close the empty buffer
+		// Read the chunk
+		var n int64
+		n, err = io.CopyN(rw, in, chunkSize)
+		if err == io.EOF {
+			if n == 0 && partNum != 0 { // end if no data and if not first chunk
+				free()
 				break
 			}
-			finished = true // Mark as finished after reading the last chunk
-		} else if readErr != nil {
-			_ = rw.Close()
-			return fmt.Errorf("multipart upload: failed to read source for chunk %d: %w", partNum, readErr)
+			finished = true
+		} else if err != nil {
+			free()
+			return fmt.Errorf("multipart upload: failed to read source: %w", err)
 		}
 
-		// Prepare part upload in the sequential loop (concurrency=1)
-		partNumber := partNum // Capture loop variable
-		partOffset := off
+		partNum := partNum
+		partOff := off
 		off += n
-
-		fs.Debugf(w.o, "Uploading chunk %d (size %v, offset %v/%v)", partNumber, fs.SizeSuffix(n), fs.SizeSuffix(partOffset), fs.SizeSuffix(size))
-		_, err = w.WriteChunk(gCtx, int32(partNumber), rw) // Use gCtx for cancellation
-		_ = rw.Close()                                     // Close buffer after WriteChunk finishes or errors
-		if err != nil {
-			// Error occurred during WriteChunk, errgroup context will be cancelled
-			fs.Errorf(w.o, "Failed to upload chunk %d: %v", partNumber, err)
-			return err // Return error immediately
-		}
+		g.Go(func() (err error) {
+			defer free()
+			fs.Debugf(w.o, "multipart upload: starting chunk %d size %v offset %v/%v", partNum, fs.SizeSuffix(n), fs.SizeSuffix(partOff), fs.SizeSuffix(size))
+			_, err = w.WriteChunk(gCtx, int32(partNum), rw)
+			return err
+		})
 	}
 
-	// Wait for any potential lingering goroutines (shouldn't be any with concurrency=1)
 	err = g.Wait()
 	if err != nil {
-		return err // Return error from chunk uploads
+		return err
 	}
 
-	// Complete the multipart upload
 	err = w.Close(ctx)
 	if err != nil {
-		return fmt.Errorf("multipart upload: failed to finalize: %w", err)
+		return fmt.Errorf("multipart upload: failed to finalise: %w", err)
 	}
 
-	fs.Debugf(w.o, "OSS multipart upload completed successfully.")
 	return nil
 }
 
-// addCompletedPart adds metadata about a successfully uploaded part.
+var warnStreamUpload sync.Once
+
+// state of ChunkWriter
+type ossChunkWriter struct {
+	chunkSize     int64
+	size          int64
+	con           int
+	f             *Fs
+	o             *Object
+	in            io.Reader
+	mu            sync.Mutex
+	uploadedParts []oss.UploadPart
+	client        *oss.Client
+	callback      string
+	callbackVar   string
+	callbackRes   map[string]any
+	imur          *oss.InitiateMultipartUploadResult
+}
+
+func (f *Fs) newChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, ui *api.UploadInitInfo, in io.Reader, options ...fs.OpenOption) (w *ossChunkWriter, err error) {
+	// Temporary Object under construction
+	o := &Object{
+		fs:     f,
+		remote: remote,
+	}
+
+	uploadParts := min(max(1, f.opt.MaxUploadParts), maxUploadParts)
+	size := src.Size()
+
+	// calculate size of parts
+	chunkSize := f.opt.ChunkSize
+
+	// size can be -1 here meaning we don't know the size of the incoming file. We use ChunkSize
+	// buffers here (default 5 MiB). With a maximum number of parts (10,000) this will be a file of
+	// 48 GiB which seems like a not too unreasonable limit.
+	if size == -1 {
+		warnStreamUpload.Do(func() {
+			fs.Logf(f, "Streaming uploads using chunk size %v will have maximum file size of %v",
+				f.opt.ChunkSize, fs.SizeSuffix(int64(chunkSize)*int64(uploadParts)))
+		})
+	} else {
+		chunkSize = chunksize.Calculator(src, size, uploadParts, chunkSize)
+	}
+
+	w = &ossChunkWriter{
+		chunkSize: int64(chunkSize),
+		size:      size,
+		con:       1,
+		f:         f,
+		o:         o,
+		in:        in,
+	}
+
+	var client *oss.Client
+	client, err = f.newOSSClient()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create OSS client: %w", err)
+	}
+	w.client = client
+
+	req := &oss.InitiateMultipartUploadRequest{
+		Bucket: oss.Ptr(ui.Bucket),
+		Key:    oss.Ptr(ui.Object),
+	}
+	req.Parameters = map[string]string{"x-oss-enable-sha1": ""}
+	if w.con == 1 {
+		req.Parameters["sequential"] = ""
+	}
+	// Apply upload options
+	for _, option := range options {
+		key, value := option.Header()
+		lowerKey := strings.ToLower(key)
+		switch lowerKey {
+		case "":
+			// ignore
+		case "cache-control":
+			req.CacheControl = oss.Ptr(value)
+		case "content-disposition":
+			req.ContentDisposition = oss.Ptr(value)
+		case "content-encoding":
+			req.ContentEncoding = oss.Ptr(value)
+		case "content-type":
+			req.ContentType = oss.Ptr(value)
+		}
+	}
+	err = w.f.globalPacer.Call(func() (bool, error) {
+		w.imur, err = w.client.InitiateMultipartUpload(ctx, req)
+		return w.shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create multipart upload failed: %w", err)
+	}
+	w.callback, w.callbackVar = ui.GetCallback(), ui.GetCallbackVar()
+	fs.Debugf(w.o, "multipart upload: %q initiated", *w.imur.UploadId)
+	return
+}
+
+// shouldRetry returns a boolean as to whether this err
+// deserve to be retried. It returns the err as a convenience
+func (w *ossChunkWriter) shouldRetry(ctx context.Context, err error) (bool, error) {
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
+	if fserrors.ShouldRetry(err) {
+		return true, err
+	}
+
+	// Since alibabacloud-oss-go-sdk-v2, oss.ServiceError is wrapped by oss.OperationError
+	// so we need to unwrap
+	if opErr, ok := err.(*oss.OperationError); ok {
+		err = opErr.Unwrap()
+	}
+
+	switch ossErr := err.(type) {
+	case *oss.ServiceError:
+		if ossErr.StatusCode == 403 && (ossErr.Code == "InvalidAccessKeyId" || ossErr.Code == "SecurityTokenExpired") {
+			// oss: service returned error: StatusCode=403, ErrorCode=InvalidAccessKeyId,
+			// ErrorMessage="The OSS Access Key Id you provided does not exist in our records.",
+
+			// oss: service returned error: StatusCode=403, ErrorCode=SecurityTokenExpired,
+			// ErrorMessage="The security token you provided has expired."
+
+			// These errors cannot be handled once token is expired. Should update token proactively.
+			return false, fserrors.FatalError(err)
+		}
+	}
+	return false, err
+}
+
+// add a part number and etag to the completed parts
 func (w *ossChunkWriter) addCompletedPart(part oss.UploadPart) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.uploadedParts = append(w.uploadedParts, part)
 }
 
-// WriteChunk uploads a single chunk to OSS.
+// WriteChunk will write chunk number with reader bytes, where chunk number >= 0
 func (w *ossChunkWriter) WriteChunk(ctx context.Context, chunkNumber int32, reader io.ReadSeeker) (currentChunkSize int64, err error) {
 	if chunkNumber < 0 {
-		return -1, fmt.Errorf("invalid chunk number provided: %v", chunkNumber)
+		err := fmt.Errorf("invalid chunk number provided: %v", chunkNumber)
+		return -1, err
 	}
 
-	ossPartNumber := chunkNumber + 1 // OSS part numbers are 1-based
-
-	// Determine chunk size
-	currentChunkSize, err = reader.Seek(0, io.SeekEnd)
-	if err != nil {
-		return -1, fmt.Errorf("failed to seek to end of chunk %d reader: %w", ossPartNumber, err)
-	}
-	if currentChunkSize == 0 {
-		fs.Debugf(w.o, "Skipping empty chunk %d", ossPartNumber)
-		return 0, nil // Nothing to upload
-	}
-	_, err = reader.Seek(0, io.SeekStart) // Rewind reader
-	if err != nil {
-		return -1, fmt.Errorf("failed to seek to start of chunk %d reader: %w", ossPartNumber, err)
-	}
-
-	// Prepare UploadPart request
-	req := &oss.UploadPartRequest{
-		Bucket:     w.imur.Bucket,
-		Key:        w.imur.Key,
-		UploadId:   w.imur.UploadId,
-		PartNumber: ossPartNumber,
-		Body:       reader,
-		// ContentLength is inferred by the SDK from the seeker
-	}
-
+	ossPartNumber := chunkNumber + 1
 	var res *oss.UploadPartResult
-	// Retry logic handled by the global pacer wrapping the Upload function's loop
-	err = w.f.globalPacer.Call(func() (bool, error) { // Pace each part upload
-		var uploadErr error
-		// Rewind reader before each attempt
-		if _, seekErr := reader.Seek(0, io.SeekStart); seekErr != nil {
-			return false, backoff.Permanent(fmt.Errorf("failed to rewind chunk %d reader for retry: %w", ossPartNumber, seekErr))
+	err = w.f.globalPacer.Call(func() (bool, error) {
+		// Discover the size by seeking to the end
+		currentChunkSize, err = reader.Seek(0, io.SeekEnd)
+		if err != nil {
+			return false, err
 		}
-		res, uploadErr = w.client.UploadPart(ctx, req)
-		retry, retryErr := shouldRetry(ctx, nil, uploadErr) // Check if error is retryable
-		if retry {
-			fs.Debugf(w.o, "Retrying upload for chunk %d: %v", ossPartNumber, retryErr)
-			return true, retryErr
+		// rewind the reader on retry and after reading md5
+		_, err := reader.Seek(0, io.SeekStart)
+		if err != nil {
+			return false, err
 		}
-		if uploadErr != nil {
-			return false, backoff.Permanent(uploadErr) // Non-retryable error
+		res, err = w.client.UploadPart(ctx, &oss.UploadPartRequest{
+			Bucket:     w.imur.Bucket,
+			Key:        w.imur.Key,
+			UploadId:   w.imur.UploadId,
+			PartNumber: ossPartNumber,
+			Body:       reader,
+		})
+		if err != nil {
+			if chunkNumber <= 8 {
+				return w.shouldRetry(ctx, err)
+			}
+			// retry all chunks once have done the first few
+			return true, err
 		}
-		return false, nil // Success
+		return false, nil
 	})
-
 	if err != nil {
-		return -1, fmt.Errorf("failed to upload chunk %d (size %v): %w", ossPartNumber, currentChunkSize, err)
+		return -1, fmt.Errorf("failed to upload chunk %d with %v bytes: %w", ossPartNumber, currentChunkSize, err)
 	}
 
-	if res == nil || res.ETag == nil {
-		return -1, fmt.Errorf("upload chunk %d succeeded but response or ETag is nil", ossPartNumber)
-	}
-
-	// Add part to the list for completion
 	w.addCompletedPart(oss.UploadPart{
 		PartNumber: ossPartNumber,
 		ETag:       res.ETag,
 	})
 
-	fs.Debugf(w.o, "Successfully uploaded chunk %d (ETag: %s)", ossPartNumber, *res.ETag)
-	return currentChunkSize, nil
+	fs.Debugf(w.o, "multipart upload: wrote chunk %d with %v bytes", ossPartNumber, currentChunkSize)
+	return currentChunkSize, err
 }
 
-// Abort the multipart upload.
+// Abort the multipart upload
 func (w *ossChunkWriter) Abort(ctx context.Context) (err error) {
-	if w.imur == nil || w.imur.UploadId == nil {
-		fs.Debugf(w.o, "Abort called but no valid upload ID found.")
-		return nil // Nothing to abort
-	}
-	fs.Debugf(w.o, "Aborting OSS multipart upload %s", *w.imur.UploadId)
-	req := &oss.AbortMultipartUploadRequest{
-		Bucket:   w.imur.Bucket,
-		Key:      w.imur.Key,
-		UploadId: w.imur.UploadId,
-	}
-	// Retry abort on failure? Usually not critical but good practice.
+	// Abort the upload session
 	err = w.f.globalPacer.Call(func() (bool, error) {
-		_, abortErr := w.client.AbortMultipartUpload(ctx, req)
-		retry, retryErr := shouldRetry(ctx, nil, abortErr)
-		if retry {
-			return true, retryErr
-		}
-		if abortErr != nil {
-			return false, backoff.Permanent(abortErr)
-		}
-		return false, nil
+		_, err = w.client.AbortMultipartUpload(ctx, &oss.AbortMultipartUploadRequest{
+			Bucket:   w.imur.Bucket,
+			Key:      w.imur.Key,
+			UploadId: w.imur.UploadId,
+		})
+		return w.shouldRetry(ctx, err)
 	})
-
 	if err != nil {
-		// Log error but don't necessarily fail the calling operation
-		fs.Errorf(w.o, "Failed to abort multipart upload %q: %v", *w.imur.UploadId, err)
-		return err // Return the error
+		return fmt.Errorf("failed to abort multipart upload %q: %w", *w.imur.UploadId, err)
 	}
-	fs.Debugf(w.o, "Successfully aborted multipart upload %q", *w.imur.UploadId)
-	return nil
+	// w.shutdownRenew()
+	fs.Debugf(w.o, "multipart upload: %q aborted", *w.imur.UploadId)
+	return
 }
 
-// Close finalizes the multipart upload by sending the CompleteMultipartUpload request.
+// Close and finalise the multipart upload
 func (w *ossChunkWriter) Close(ctx context.Context) (err error) {
-	if w.imur == nil || w.imur.UploadId == nil {
-		return errors.New("cannot complete multipart upload without a valid upload ID")
-	}
-	fs.Debugf(w.o, "Completing OSS multipart upload %s with %d parts", *w.imur.UploadId, len(w.uploadedParts))
-
-	// Sort parts by PartNumber as required by OSS
-	sort.Slice(w.uploadedParts, func(i, j int) bool {
-		return w.uploadedParts[i].PartNumber < w.uploadedParts[j].PartNumber
-	})
-
-	req := &oss.CompleteMultipartUploadRequest{
-		Bucket:   w.imur.Bucket,
-		Key:      w.imur.Key,
-		UploadId: w.imur.UploadId,
-		CompleteMultipartUpload: &oss.CompleteMultipartUpload{
-			Parts: w.uploadedParts,
-		},
-		Callback:    oss.Ptr(w.callback),    // Pass base64 encoded callback
-		CallbackVar: oss.Ptr(w.callbackVar), // Pass base64 encoded callback vars
-	}
-
+	// Finalise the upload session
 	var res *oss.CompleteMultipartUploadResult
-	err = w.f.globalPacer.Call(func() (bool, error) { // Pace the completion call
-		var completeErr error
-		res, completeErr = w.client.CompleteMultipartUpload(ctx, req)
-		retry, retryErr := shouldRetry(ctx, nil, completeErr)
-		if retry {
-			return true, retryErr
-		}
-		if completeErr != nil {
-			// Check for specific OSS error "CallbackFailed"
-			var ossErr *oss.ServiceError
-			if errors.As(completeErr, &ossErr) && ossErr.Code == "CallbackFailed" {
-				// Log the callback failure details but treat upload as potentially successful
-				fs.Errorf(w.o, "OSS CompleteMultipartUpload reported CallbackFailed: %v. Upload might be complete but callback processing failed.", ossErr)
-				// Don't retry, but maybe don't return error? Depends on desired behavior.
-				// Let's return the error for now.
-				return false, backoff.Permanent(completeErr)
-			}
-			return false, backoff.Permanent(completeErr) // Non-retryable error
-		}
-		return false, nil // Success
+	err = w.f.globalPacer.Call(func() (bool, error) {
+		res, err = w.client.CompleteMultipartUpload(ctx, &oss.CompleteMultipartUploadRequest{
+			Bucket:   w.imur.Bucket,
+			Key:      w.imur.Key,
+			UploadId: w.imur.UploadId,
+			CompleteMultipartUpload: &oss.CompleteMultipartUpload{
+				Parts: w.uploadedParts,
+			},
+			Callback:    oss.Ptr(w.callback),
+			CallbackVar: oss.Ptr(w.callbackVar),
+		})
+		return w.shouldRetry(ctx, err)
 	})
-
 	if err != nil {
-		return fmt.Errorf("failed to complete multipart upload %q: %w", *w.imur.UploadId, err)
+		return fmt.Errorf("failed to complete multipart upload: %w", err)
 	}
-
-	if res == nil {
-		return fmt.Errorf("complete multipart upload %q succeeded but response is nil", *w.imur.UploadId)
-	}
-
-	// Store the callback result for postUpload processing
 	w.callbackRes = res.CallbackResult
-	fs.Debugf(w.o, "Successfully completed multipart upload %q", *w.imur.UploadId)
-	return nil
+	fs.Debugf(w.o, "multipart upload: %q finished", *w.imur.UploadId)
+	return
 }
