@@ -45,7 +45,7 @@ const (
 	passportRootURL    = "https://passportapi.115.com"
 	qrCodeAPIRootURL   = "https://qrcodeapi.115.com"
 	hnQrCodeAPIRootURL = "https://hnqrcodeapi.115.com"     // For confirm step
-	appID              = "100195993"                       // Provided App ID
+	defaultAppID       = "100195123"                       // Provided App ID
 	tradUserAgent      = "Mozilla/5.0 115Browser/27.0.7.5" // Keep for traditional login mimicry?
 	defaultUserAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
 
@@ -109,6 +109,12 @@ Leave blank normally (uses the drive root '0').
 Fill in for rclone to use a non root folder as its starting point.`,
 			Advanced:  true,
 			Sensitive: true,
+		}, {
+			Name:     "app_id",
+			Default:  defaultAppID,
+			Advanced: true,
+			Help: fmt.Sprintf(`Custom App ID for authentication.
+Defaults to "%s". Only change this if you have a specific reason to use a different App ID.`, defaultAppID),
 		}, {
 			Name:     "list_chunk",
 			Default:  1150, // Max limit for OpenAPI file list
@@ -275,6 +281,7 @@ type Options struct {
 	NoCheck             bool                 `config:"no_check"`
 	NoBuffer            bool                 `config:"no_buffer"` // Skip disk buffering for uploads
 	Enc                 encoder.MultiEncoder `config:"encoding"`
+	AppID               string               `config:"app_id"` // Custom App ID for authentication
 }
 
 // Fs represents a remote 115 drive
@@ -594,8 +601,11 @@ func (f *Fs) setupLoginEnvironment(ctx context.Context) error {
 
 // getAuthDeviceCode calls the authDeviceCode API to start the login process
 func (f *Fs) getAuthDeviceCode(ctx context.Context, challenge string) (string, error) {
+	// Use configured AppID if provided, otherwise use default
+	clientID := f.opt.AppID
+
 	authData := url.Values{
-		"client_id":             {appID},
+		"client_id":             {clientID},
 		"code_challenge":        {challenge},
 		"code_challenge_method": {"sha256"}, // Use SHA256
 	}
