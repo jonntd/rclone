@@ -303,6 +303,7 @@ type Fs struct {
 	userkey       string // User key from traditional uploadinfo (needed for traditional upload init signature)
 	isShare       bool   // mark it is from shared or not
 	fileObj       *fs.Object
+	m             configmap.Mapper // config map for saving tokens
 
 	// Token management
 	tokenMu      sync.Mutex
@@ -311,8 +312,7 @@ type Fs struct {
 	tokenExpiry  time.Time
 	codeVerifier string // For PKCE
 	tokenRenewer *oauthutil.Renew
-
-	loginMu sync.Mutex
+	loginMu      sync.Mutex
 }
 
 // Object describes a 115 object
@@ -740,7 +740,7 @@ func (f *Fs) refreshTokenIfNecessary(ctx context.Context, refreshTokenExpired bo
 			return err
 		}
 		// Save the token after successful login
-		f.saveToken(ctx, configmap.Mapper(nil))
+		f.saveToken(ctx, f.m)
 		return nil
 	}
 
@@ -764,7 +764,7 @@ func (f *Fs) refreshTokenIfNecessary(ctx context.Context, refreshTokenExpired bo
 	f.updateTokens(result)
 
 	// Save the refreshed token to config
-	f.saveToken(ctx, configmap.Mapper(nil))
+	f.saveToken(ctx, f.m)
 
 	return nil
 }
@@ -942,6 +942,11 @@ func (f *Fs) updateTokens(refreshResp *api.RefreshTokenResp) {
 
 // saveToken saves the current token to the config
 func (f *Fs) saveToken(ctx context.Context, m configmap.Mapper) {
+	if m == nil {
+		fs.Debugf(f, "Not saving tokens - nil mapper provided")
+		return
+	}
+
 	f.tokenMu.Lock()
 	defer f.tokenMu.Unlock()
 
@@ -987,9 +992,7 @@ func (f *Fs) setupTokenRenewer(ctx context.Context, m configmap.Mapper) {
 			return err
 		}
 
-		// Save the refreshed token back to config
-		f.saveToken(ctx, m)
-		return nil
+		return nil // saveToken is already called in refreshTokenIfNecessary
 	}
 
 	// Create minimal OAuth config
@@ -1418,6 +1421,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		originalName: originalName,
 		root:         root,
 		opt:          *opt,
+		m:            m,
 	}
 
 	// Initialize features
@@ -2738,7 +2742,8 @@ var (
 
 // loadTokenFromConfig attempts to load and parse tokens from the config file
 func loadTokenFromConfig(f *Fs, m configmap.Mapper) bool {
-	// Try to load the token using oauthutil's method
+	// Try to load the token using oauthutil's method instead of
+	// directly accessing the config file
 	token, err := oauthutil.GetToken(f.originalName, m)
 	if err != nil {
 		fs.Debugf(f, "Failed to get token from config: %v", err)
