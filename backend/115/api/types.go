@@ -104,6 +104,42 @@ func (s *String) UnmarshalJSON(in []byte) error {
 	return nil
 }
 
+// StringOrNumber handles API fields that can be either a string or a number
+type StringOrNumber string
+
+func (s *StringOrNumber) UnmarshalJSON(data []byte) error {
+	// Try string first
+	var str string
+	if err := json.Unmarshal(data, &str); err == nil {
+		*s = StringOrNumber(str)
+		return nil
+	}
+
+	// Try number (int)
+	var intVal int
+	if err := json.Unmarshal(data, &intVal); err == nil {
+		*s = StringOrNumber(strconv.Itoa(intVal))
+		return nil
+	}
+
+	// Try number (float)
+	var floatVal float64
+	if err := json.Unmarshal(data, &floatVal); err == nil {
+		*s = StringOrNumber(strconv.FormatFloat(floatVal, 'f', -1, 64))
+		return nil
+	}
+
+	// If it's null or empty
+	if string(data) == "null" || string(data) == "" {
+		*s = ""
+		return nil
+	}
+
+	// Last resort: use the raw value
+	*s = StringOrNumber(strings.Trim(string(data), "\""))
+	return nil
+}
+
 // ------------------------------------------------------------
 // Base response structures
 // ------------------------------------------------------------
@@ -146,11 +182,11 @@ func (b *TraditionalBase) Err() error {
 // OpenAPIBase is for the new Open API
 
 type OpenAPIBase struct {
-	State   BoolOrInt `json:"state"` // Note: OpenAPI uses boolean state
-	Code    Int       `json:"code,omitempty"`
-	Message string    `json:"message,omitempty"`
-	Error   string    `json:"error,omitempty"` // Some endpoints might still use this
-	Errno   Int       `json:"errno,omitempty"` // Some endpoints might still use this
+	State   BoolOrInt      `json:"state"` // Note: OpenAPI uses boolean state
+	Code    Int            `json:"code,omitempty"`
+	Message StringOrNumber `json:"message,omitempty"` // Can be either string or number
+	Error   string         `json:"error,omitempty"`   // Some endpoints might still use this
+	Errno   Int            `json:"errno,omitempty"`   // Some endpoints might still use this
 }
 
 func (b *OpenAPIBase) ErrCode() Int {
@@ -161,8 +197,8 @@ func (b *OpenAPIBase) ErrCode() Int {
 }
 
 func (b *OpenAPIBase) ErrMsg() string {
-	if b.Message != "" {
-		return b.Message
+	if string(b.Message) != "" {
+		return string(b.Message)
 	}
 	return b.Error
 }
