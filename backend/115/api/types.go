@@ -153,42 +153,6 @@ type OpenAPIBase struct {
 	Errno   Int       `json:"errno,omitempty"` // Some endpoints might still use this
 }
 
-// UnmarshalJSON handles custom unmarshaling for OpenAPIBase to deal with inconsistent message field types
-func (b *OpenAPIBase) UnmarshalJSON(data []byte) error {
-	// Use a type alias to avoid recursive unmarshaling
-	type Alias OpenAPIBase
-	aux := &struct {
-		Message json.RawMessage `json:"message,omitempty"`
-		*Alias
-	}{
-		Alias: (*Alias)(b),
-	}
-
-	if err := json.Unmarshal(data, aux); err != nil {
-		return err
-	}
-
-	// Handle message field that can be either string or number
-	if len(aux.Message) > 0 {
-		// Try string first
-		var s string
-		if err := json.Unmarshal(aux.Message, &s); err == nil {
-			b.Message = s
-		} else {
-			// Try number
-			var n json.Number
-			if err := json.Unmarshal(aux.Message, &n); err == nil {
-				b.Message = n.String()
-			} else {
-				// Neither string nor number worked, just use raw bytes as string
-				b.Message = string(aux.Message)
-			}
-		}
-	}
-
-	return nil
-}
-
 func (b *OpenAPIBase) ErrCode() Int {
 	if b.Code != 0 {
 		return b.Code
