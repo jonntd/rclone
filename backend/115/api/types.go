@@ -215,6 +215,12 @@ func (b *OpenAPIBase) Err() error {
 
 	// Specific error codes to check based on API documentation
 	code := b.ErrCode()
+	// Check for rate limit error codes
+	if code == 0 && string(b.Message) == "770004" {
+		// This is a rate limit error
+		return fmt.Errorf("%s: rate limit exceeded", out)
+	}
+
 	switch code {
 	// Codes that require re-login
 	case 40140116: // refresh_token invalid (authorization revoked)

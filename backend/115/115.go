@@ -346,6 +346,12 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 		return false, err
 	}
 
+	// Check for specific error strings that indicate rate limiting
+	if err != nil && strings.Contains(err.Error(), "rate limit exceeded") {
+		fs.Debugf(nil, "Rate limit detected, retrying: %v", err)
+		return true, err
+	}
+
 	// Check for specific API errors that indicate retry
 	// Note: Error parsing is now handled within Call* methods based on API type
 	var apiErr *api.TokenError
@@ -1177,7 +1183,12 @@ func (f *Fs) checkResponseForAPIErrors(response any, skipToken bool, opts *rest.
 			method.Type().Out(0).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
 			result := method.Call(nil)
 			if !result[0].IsNil() {
-				return result[0].Interface().(error)
+				// Get the error and check if it's a rate limit error
+				err := result[0].Interface().(error)
+				if strings.Contains(err.Error(), "rate limit exceeded") {
+					fs.Debugf(f, "Rate limit error detected in response: %v", err)
+				}
+				return err
 			}
 		}
 	}
