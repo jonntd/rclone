@@ -215,8 +215,10 @@ func (b *OpenAPIBase) Err() error {
 
 	// Specific error codes to check based on API documentation
 	code := b.ErrCode()
-	// Check for rate limit error codes
-	if code == 0 && string(b.Message) == "770004" {
+	// Check for rate limit error codes in multiple formats
+	if code == 0 && (string(b.Message) == "770004" ||
+		strings.Contains(b.ErrMsg(), "770004") ||
+		strings.Contains(b.ErrMsg(), "已达到当前访问上限")) {
 		// This is a rate limit error
 		return fmt.Errorf("%s: rate limit exceeded", out)
 	}

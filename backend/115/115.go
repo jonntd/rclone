@@ -347,9 +347,15 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 	}
 
 	// Check for specific error strings that indicate rate limiting
-	if err != nil && strings.Contains(err.Error(), "rate limit exceeded") {
-		fs.Debugf(nil, "Rate limit detected, retrying: %v", err)
-		return true, err
+	if err != nil {
+		// Check for rate limit by error message
+		if strings.Contains(err.Error(), "已达到当前访问上限") ||
+			strings.Contains(err.Error(), "770004") {
+			fs.Debugf(nil, "Rate limit detected, retrying: %v", err)
+			// Enforce a slightly longer minimum delay for rate limit errors
+			time.Sleep(2 * time.Second)
+			return true, err
+		}
 	}
 
 	// Check for specific API errors that indicate retry
@@ -1187,6 +1193,8 @@ func (f *Fs) checkResponseForAPIErrors(response any, skipToken bool, opts *rest.
 				err := result[0].Interface().(error)
 				if strings.Contains(err.Error(), "rate limit exceeded") {
 					fs.Debugf(f, "Rate limit error detected in response: %v", err)
+					// Return the error as is - the shouldRetry function will handle it
+					// This ensures both CallOpenAPI and CallTraditionalAPI will retry rate limit errors
 				}
 				return err
 			}
