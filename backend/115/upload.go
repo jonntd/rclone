@@ -1221,33 +1221,22 @@ func (f *Fs) tryHashUpload(
 		switch status {
 		case 2: // 秒传 success!
 			fs.Debugf(o, "Hash upload (秒传) successful.")
-
-			// Check if we have a RereadableObject with a transfer
-			if ro, ok := newIn.(*RereadableObject); ok && ro.transfer != nil {
-				// Mark complete on RereadableObject (which handles accounting)
-				ro.MarkComplete(ctx)
-				fs.Debugf(o, "Marked RereadableObject transfer as complete after hash upload")
-			} else {
-				// Try to get stats and create a completed transfer
-				stats := accounting.Stats(ctx)
-				if stats != nil {
-					name := o.Remote()
-
-					// Create a new transfer for accounting
-					transfer := stats.NewTransferRemoteSize(name, size, nil, f)
-
-					// Mark transfer complete (this will record it as a server-side operation)
-					transfer.Done(ctx, nil)
-					fs.Debugf(o, "Created and completed transfer for server-side upload: %d bytes", size)
-				} else {
-					fs.Logf(o, "Warning: Could not account for server-side transfer of %d bytes", size)
-				}
+			// Mark accounting as server-side copy
+			reader, _ := accounting.UnWrap(newIn)
+			if acc, ok := reader.(*accounting.Account); ok && acc != nil {
+				acc.ServerSideTransferStart() // Mark start
+				acc.ServerSideCopyEnd(size)   // Mark end immediately
 			}
-
 			// Update object metadata from response (FileID is important)
 			o.id = ui.GetFileID()
 			o.pickCode = ui.GetPickCode() // Get pick code too
 			o.hasMetaData = true          // Mark as having basic metadata
+
+			// Mark complete on RereadableObject if applicable
+			if ro, ok := newIn.(*RereadableObject); ok {
+				ro.MarkComplete(ctx)
+				fs.Debugf(o, "Marked RereadableObject transfer as complete after hash upload")
+			}
 
 			// Optionally, call getFile to get full metadata, but might be slow/costly
 			// info, getErr := f.getFile(ctx, o.id, "")
