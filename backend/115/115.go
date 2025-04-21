@@ -349,12 +349,11 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 	// Check for specific error strings that indicate rate limiting
 	if err != nil {
 		// Check for rate limit by error message
-		if strings.Contains(err.Error(), "已达到当前访问上限") ||
-			strings.Contains(err.Error(), "770004") {
+		if strings.Contains(err.Error(), "770004") ||
+			strings.Contains(err.Error(), "已达到当前访问上限") {
 			fs.Debugf(nil, "Rate limit detected, retrying: %v", err)
-			// Enforce a slightly longer minimum delay for rate limit errors
-			time.Sleep(2 * time.Second)
-			return true, err
+			// Create a retryAfter error which the pacer will respect
+			return true, pacer.RetryAfterError(err, 2*time.Second)
 		}
 	}
 
