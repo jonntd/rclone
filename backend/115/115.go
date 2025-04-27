@@ -2354,7 +2354,18 @@ Usage:
     rclone backend stats 115:path/to/folder
 
 Returns information like total size, file count, folder count, etc.`,
-}}
+}, {
+	Name:  "getdownloadurl",
+	Short: "Get the download URL of a file by its path",
+	Long: `This command retrieves the download URL of a file using its path.
+
+Usage:
+
+rclone backend getdownloadurl 115:path/to/file
+
+The command returns the download URL for the specified file. Ensure the file path is correct.`,
+},
+}
 
 // Command executes backend-specific commands.
 func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (out any, err error) {
@@ -2400,9 +2411,40 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 			return nil, err
 		}
 		return f.getStats(ctx, cid) // Uses OpenAPI
+
+	case "getdownloadurl":
+		path := ""
+		if len(arg) > 0 {
+			path = arg[0]
+		}
+		return f.getDownloadURLByPath(ctx, path)
+
 	default:
 		return nil, fs.ErrorCommandNotFound
 	}
+}
+
+// getDownloadURLByPath 获取指定路径文件的下载地址
+func (f *Fs) getDownloadURLByPath(ctx context.Context, filePath string) (string, error) {
+	// 根据路径查找文件元数据
+	info, err := f.readMetaDataForPath(ctx, filePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read metadata for file path %q: %w", filePath, err)
+	}
+
+	// 检查文件是否有 pickCode
+	if info.PickCodeBest() == "" {
+		return "", errors.New("file does not have a valid pick code for download")
+	}
+
+	// 获取下载地址
+	downloadURL, err := f.getDownloadURL(ctx, info.PickCodeBest())
+	if err != nil {
+		return "", fmt.Errorf("failed to get download URL for file %q: %w", filePath, err)
+	}
+
+	// 返回下载地址
+	return downloadURL.URL, nil
 }
 
 // ------------------------------------------------------------
