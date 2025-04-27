@@ -49,7 +49,7 @@ const (
 	tradUserAgent      = "Mozilla/5.0 115Browser/27.0.7.5" // Keep for traditional login mimicry?
 	defaultUserAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
 
-	defaultGlobalMinSleep = fs.Duration(200 * time.Millisecond)  // 5 QPS default for global
+	defaultGlobalMinSleep = fs.Duration(300 * time.Millisecond)  // 5 QPS default for global
 	traditionalMinSleep   = fs.Duration(1112 * time.Millisecond) // ~0.9 QPS for traditional
 	maxSleep              = 2 * time.Second
 	decayConstant         = 2 // bigger for slower decay, exponential
