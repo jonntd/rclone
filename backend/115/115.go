@@ -329,6 +329,25 @@ type Object struct {
 	durl        *api.DownloadURL // link to download the object
 	durlMu      *sync.Mutex
 }
+type ApiResponse struct {
+	State   bool                `json:"state"`   // Indicates success or failure
+	Message string              `json:"message"` // Optional message
+	Code    int                 `json:"code"`    // Status code
+	Data    map[string]FileInfo `json:"data"`    // Map where keys are file IDs (strings) and values are FileInfo objects
+}
+
+// FileInfo represents the details of a single file.
+// The key for this object in the parent map (ApiResponse.Data) is the file ID.
+type FileInfo struct {
+	FileName string      `json:"file_name"` // Name of the file
+	FileSize int64       `json:"file_size"` // Size of the file in bytes (using int64 for potentially large files)
+	PickCode string      `json:"pick_code"` // File pick code (extraction code)
+	SHA1     string      `json:"sha1"`      // SHA1 hash of the file content
+	URL      DownloadURL `json:"url"`       // Object containing the download URL
+}
+type DownloadURL struct {
+	URL string `json:"url"` // The file download address
+}
 
 // retryErrorCodes is a slice of HTTP status codes that we will retry
 var retryErrorCodes = []int{
@@ -2364,6 +2383,16 @@ Usage:
 rclone backend getdownloadurl 115:path/to/file
 
 The command returns the download URL for the specified file. Ensure the file path is correct.`,
+}, {
+	Name:  "getdownloadurlau",
+	Short: "Get the download URL of a file by its path",
+	Long: `This command retrieves the download URL of a file using its path.
+
+Usage:
+
+rclone backend getdownloadurlau 115:path/to/file VidHub/1.7.24
+
+The command returns the download URL for the specified file. Ensure the file path is correct.`,
 },
 }
 
@@ -2419,6 +2448,14 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 		}
 		return f.getDownloadURLByPath(ctx, path)
 
+	case "getdownloadurlua":
+		path := ""
+		ua := ""
+		if len(arg) > 0 {
+			ua = arg[0]
+		}
+
+		return f.getDownloadURLByUA(ctx, path, ua)
 	default:
 		return nil, fs.ErrorCommandNotFound
 	}
@@ -2436,7 +2473,6 @@ func (f *Fs) getDownloadURLByPath(ctx context.Context, filePath string) (string,
 	if info.PickCodeBest() == "" {
 		return "", errors.New("file does not have a valid pick code for download")
 	}
-
 	// 获取下载地址
 	downloadURL, err := f.getDownloadURL(ctx, info.PickCodeBest())
 	if err != nil {
@@ -2445,6 +2481,62 @@ func (f *Fs) getDownloadURLByPath(ctx context.Context, filePath string) (string,
 
 	// 返回下载地址
 	return downloadURL.URL, nil
+}
+
+func (f *Fs) getDownloadURLByUA(ctx context.Context, filePath string, UA string) (string, error) {
+
+	info, err := f.readMetaDataForPath(ctx, filePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read metadata for file path %q: %w", filePath, err)
+	}
+
+	// 检查文件是否有 pickCode
+	if info.PickCodeBest() == "" {
+		return "", errors.New("file does not have a valid pick code for download")
+	}
+
+	client := &http.Client{}
+	req, err := http.NewRequest("POST", openAPIRootURL+"/open/ufile/downurl", strings.NewReader("pick_code="+info.PickCodeBest()))
+
+	if err != nil {
+		fs.Errorf(nil, "创建请求失败: %v", err)
+	}
+	opts := rest.Opts{}
+	f.prepareTokenForRequest(ctx, &opts)
+
+	// 如果没有提供 UA，使用默认值
+	if UA == "" {
+		UA = defaultUserAgent
+	}
+
+	// 设置请求头
+	req.Header.Set("Authorization", opts.ExtraHeaders["Authorization"])
+	req.Header.Set("User-Agent", UA)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	fs.Infof(nil, "Authorization: %s, User-Agent: %s", opts.ExtraHeaders["Authorization"], UA)
+
+	// 发送请求并处理响应
+	res, err := client.Do(req)
+	if err != nil {
+		fs.Logf(nil, "请求失败: %v", err)
+		return "", err
+	}
+	defer res.Body.Close()
+
+	// 解析响应
+	var response ApiResponse
+	if decodeErr := json.NewDecoder(res.Body).Decode(&response); decodeErr != nil {
+		fs.Logf(nil, "解析响应失败: %v", err)
+		return "", err
+	}
+
+	for _, downInfo := range response.Data {
+		if downInfo != (FileInfo{}) {
+			fs.Infof(nil, "获取到下载URL: %s", downInfo.URL.URL)
+			return downInfo.URL.URL, err
+		}
+	}
+	return "", err
 }
 
 // ------------------------------------------------------------
