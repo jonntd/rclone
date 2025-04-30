@@ -550,7 +550,7 @@ jobs:
 
   upload-release:
     if: ${{ contains(github.ref, 'refs/tags/') }}
-    needs: [create-release, build, termux]
+    needs: [create-release, build]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
