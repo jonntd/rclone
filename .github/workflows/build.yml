@@ -22,7 +22,7 @@ on:
 jobs:
   create-release:
     runs-on: ubuntu-latest
-    if: github.head_ref == '' && github.repository == 'Sakura-Byte/rclone'
+    if: github.head_ref == '' && github.repository == 'jonntd/rclone'
     outputs:
       upload_url: ${{ steps.set_upload_url.outputs.upload_url }}
     steps:
@@ -39,7 +39,7 @@ jobs:
 
             ## How to Update
             ```bash
-            curl -fsSL https://raw.githubusercontent.com/Sakura-Byte/rclone/master/install.sh | sudo bash 
+            curl -fsSL https://raw.githubusercontent.com/jonntd/rclone/master-115/install.sh | sudo bash 
             ```
           draft: true
           prerelease: false
@@ -53,7 +53,7 @@ jobs:
   build:
     needs:
       - create-release
-    if: ${{ inputs.manual || (github.repository == 'Sakura-Byte/rclone' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name)) }}
+    if: ${{ inputs.manual || (github.repository == 'jonntd/rclone' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name)) }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -246,7 +246,7 @@ jobs:
           RCLONE_CONFIG_PASS: ${{ secrets.RCLONE_CONFIG_PASS }}
         # working-directory: '$(modulePath)'
         # Deploy binaries if enabled in config && not a PR && not a fork
-        if: matrix.deploy && github.head_ref == '' && github.repository == 'Sakura-Byte/rclone'
+        if: matrix.deploy && github.head_ref == '' && github.repository == 'jonntd/rclone'
       - 
         if: ${{ contains(github.ref, 'refs/tags/') }}
         name: Upload Release Artifact
@@ -268,7 +268,7 @@ jobs:
             build/*arm64.zip
 
   # lint:
-  #   if: inputs.manual || (github.repository == 'Sakura-Byte/rclone' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name))
+  #   if: inputs.manual || (github.repository == 'jonntd/rclone' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name))
   #   timeout-minutes: 30
   #   name: "lint"
   #   runs-on: ubuntu-latest
@@ -449,7 +449,7 @@ jobs:
       - create-release
     timeout-minutes: 60
     runs-on: ubuntu-latest
-    if: github.head_ref == '' && github.repository == 'Sakura-Byte/rclone'
+    if: github.head_ref == '' && github.repository == 'jonntd/rclone'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
