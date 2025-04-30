@@ -480,11 +480,11 @@ jobs:
         if: github.event_name == 'push' && contains(github.ref, 'refs/heads/')
         shell: bash
         run: |
-          sed -i -r "s/^TERMUX_PKG_MAINTAINER=(.*)$/TERMUX_PKG_MAINTAINER=\"@Sakura-Byte\"/g" packages/rclone/build.sh
+          sed -i -r "s/^TERMUX_PKG_MAINTAINER=(.*)$/TERMUX_PKG_MAINTAINER=\"@jonntd\"/g" packages/rclone/build.sh
           sed -i -r "s/^TERMUX_PKG_VERSION=(.*)$/TERMUX_PKG_VERSION=\"${{ env.version }}\"/g" packages/rclone/build.sh
           grep -q "^TERMUX_PKG_REVISION" packages/rclone/build.sh || sed -i "/^TERMUX_PKG_VERSION=/a TERMUX_PKG_REVISION=0" packages/rclone/build.sh
           sed -i -r "s/^TERMUX_PKG_REVISION=(.*)$/TERMUX_PKG_REVISION=${{ env.revision }}/g" packages/rclone/build.sh
-          sed -i -r "s/^TERMUX_PKG_SRCURL=(.*)$/TERMUX_PKG_SRCURL=git+https:\/\/github.com\/Sakura-Byte\/rclone/g" packages/rclone/build.sh
+          sed -i -r "s/^TERMUX_PKG_SRCURL=(.*)$/TERMUX_PKG_SRCURL=git+https:\/\/github.com\/jonntd\/rclone/g" packages/rclone/build.sh
           sed -i -r "s/^TERMUX_PKG_SHA256=(.*)$/TERMUX_PKG_GIT_BRANCH=${{ env.branch }}/g" packages/rclone/build.sh
           sed -i -r "s/-ldflags \"(.*)\"/-ldflags \"-s -X github.com\/rclone\/rclone\/fs.Version=${{ env.version_all }}\"/g" packages/rclone/build.sh
           sed -i -r "s/cp rclone.1 (.*)/cp rclone.1 \1\n\tzip \$HOME\/termux-packages\/output\/rclone-${{ env.version_all }}-termux-\$TERMUX_ARCH.zip rclone/g" packages/rclone/build.sh
@@ -497,11 +497,11 @@ jobs:
         if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
         shell: bash
         run: |
-          sed -i -r "s/^TERMUX_PKG_MAINTAINER=(.*)$/TERMUX_PKG_MAINTAINER=\"@Sakura-Byte\"/g" packages/rclone/build.sh
+          sed -i -r "s/^TERMUX_PKG_MAINTAINER=(.*)$/TERMUX_PKG_MAINTAINER=\"@jonntd\"/g" packages/rclone/build.sh
           sed -i -r "s/^TERMUX_PKG_VERSION=(.*)$/TERMUX_PKG_VERSION=\"${{ env.version }}\"/g" packages/rclone/build.sh
           grep -q "^TERMUX_PKG_REVISION" packages/rclone/build.sh || sed -i "/^TERMUX_PKG_VERSION=/a TERMUX_PKG_REVISION=0" packages/rclone/build.sh
           sed -i -r "s/^TERMUX_PKG_REVISION=(.*)$/TERMUX_PKG_REVISION=${{ env.revision }}/g" packages/rclone/build.sh
-          sed -i -r "s/^TERMUX_PKG_SRCURL=(.*)$/TERMUX_PKG_SRCURL=git+https:\/\/github.com\/Sakura-Byte\/rclone/g" packages/rclone/build.sh
+          sed -i -r "s/^TERMUX_PKG_SRCURL=(.*)$/TERMUX_PKG_SRCURL=git+https:\/\/github.com\/jonntd\/rclone/g" packages/rclone/build.sh
           sed -i -r "s/^TERMUX_PKG_SHA256=(.*)$/TERMUX_PKG_GIT_BRANCH=${{ env.branch }}/g" packages/rclone/build.sh
           sed -i -r "s/-ldflags \"(.*)\"/-ldflags \"-s -X github.com\/rclone\/rclone\/fs.Version=${{ env.version_all }}\"/g" packages/rclone/build.sh
           sed -i -r "s/cp rclone.1 (.*)/cp rclone.1 \1\n\tzip \$HOME\/termux-packages\/output\/rclone-${{ env.version_all }}-termux-\$TERMUX_ARCH.zip rclone/g" packages/rclone/build.sh
