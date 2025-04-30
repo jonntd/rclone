@@ -3,7 +3,6 @@
 # -*- compile-command: "yamllint -f parsable build.yml" -*-
 
 name: build
-
 # Trigger the workflow on push or pull request
 on:
   push:
