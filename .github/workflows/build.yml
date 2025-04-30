@@ -444,8 +444,8 @@ jobs:
         if: env.RCLONE_CONFIG_PASS != '' && github.head_ref == '' && github.repository == 'rclone/rclone'
 
   termux:
-    # needs:
-    #   - create-release
+    needs:
+      - create-release
     timeout-minutes: 60
     runs-on: ubuntu-latest
     if: github.head_ref == '' && github.repository == 'jonntd/rclone'
@@ -549,7 +549,7 @@ jobs:
 
   upload-release:
     if: ${{ contains(github.ref, 'refs/tags/') }}
-    needs: [create-release, build]
+    needs: [create-release, build, termux]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
