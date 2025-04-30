@@ -12,12 +12,12 @@ set -e
 #when adding a tool to the list make sure to also add its corresponding command further in the script
 unzip_tools_list=('unzip' '7z' 'busybox')
 
-usage() { echo "Usage: sudo -v ; curl https://raw.githubusercontent.com/Sakura-Byte/rclone/master/install.sh | sudo bash" 1>&2; exit 1; }
+usage() { echo "Usage: sudo -v ; curl https://raw.githubusercontent.com/jonntd/rclone/master-115/install.sh | sudo bash" 1>&2; exit 1; }
 
 if [ -n "$1" ]; then
   tag_name="$1"
 else
-  tag_name=$(curl -fsS https://api.github.com/repos/Sakura-Byte/rclone/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+  tag_name=$(curl -fsS https://api.github.com/repos/jonntd/rclone/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
 fi
 
 
@@ -119,7 +119,7 @@ esac
 #download and unzip
 rclone_zip="rclone-${tag_name}-${OS}-${OS_type}.zip"
 [ $OS = "termux" ] && rclone_zip="rclone-${tag_name}-${OS}-$(dpkg --print-architecture).deb"
-download_link="https://github.com/Sakura-Byte/rclone/releases/download/${tag_name}/${rclone_zip}"
+download_link="https://github.com/jonntd/rclone/releases/download/${tag_name}/${rclone_zip}"
 
 curl -fLJO "$download_link"
 unzip_dir="tmp_unzip_dir_for_rclone"
