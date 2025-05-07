@@ -18,7 +18,6 @@ else
   tag_name=$(curl -fsS https://api.github.com/repos/jonntd/rclone/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
 fi
 
-
 #make sure unzip tool is available and choose one to work with
 set +e
 for tool in "${unzip_tools_list[@]}"; do
