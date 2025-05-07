@@ -8,10 +8,8 @@
 # 4 - supported unzip tools are not available
 
 set -e
-
 #when adding a tool to the list make sure to also add its corresponding command further in the script
 unzip_tools_list=('unzip' '7z' 'busybox')
-
 usage() { echo "Usage: sudo -v ; curl https://raw.githubusercontent.com/jonntd/rclone/master-115/install.sh | sudo bash" 1>&2; exit 1; }
 
 if [ -n "$1" ]; then
