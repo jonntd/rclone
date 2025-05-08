@@ -278,6 +278,11 @@ var ConfigOptionsInfo = Options{{
 	Help:    "Use recursive list if available; uses more memory but fewer transactions",
 	Groups:  "Listing",
 }, {
+	Name:    "list_cutoff",
+	Default: 1_000_000,
+	Help:    "To save memory, sort directory listings on disk above this threshold",
+	Groups:  "Sync",
+}, {
 	Name:    "tpslimit",
 	Default: 0.0,
 	Help:    "Limit HTTP transactions per second to this",
@@ -414,6 +419,11 @@ var ConfigOptionsInfo = Options{{
 	Help:    "Use mmap allocator (see docs)",
 	Groups:  "Config",
 }, {
+	Name:    "max_buffer_memory",
+	Default: SizeSuffix(-1),
+	Help:    "If set, don't allocate more than this amount of memory as buffers",
+	Groups:  "Config",
+}, {
 	Name:    "ca_cert",
 	Default: []string{},
 	Help:    "CA certificate used to verify servers",
@@ -534,6 +544,12 @@ var ConfigOptionsInfo = Options{{
 	Default: ".partial",
 	Help:    "Add partial-suffix to temporary file name when --inplace is not used",
 	Groups:  "Copy",
+}, {
+	Name:     "max_connections",
+	Help:     "Maximum number of simultaneous backend API connections, 0 for unlimited.",
+	Default:  0,
+	Advanced: true,
+	Groups:   "Networking",
 }}
 
 // ConfigInfo is filesystem config options
@@ -585,6 +601,7 @@ type ConfigInfo struct {
 	Suffix                     string            `config:"suffix"`
 	SuffixKeepExtension        bool              `config:"suffix_keep_extension"`
 	UseListR                   bool              `config:"fast_list"`
+	ListCutoff                 int               `config:"list_cutoff"`
 	BufferSize                 SizeSuffix        `config:"buffer_size"`
 	BwLimit                    BwTimetable       `config:"bwlimit"`
 	BwLimitFile                BwTimetable       `config:"bwlimit_file"`
@@ -613,6 +630,7 @@ type ConfigInfo struct {
 	ProgressTerminalTitle      bool              `config:"progress_terminal_title"`
 	Cookie                     bool              `config:"use_cookies"`
 	UseMmap                    bool              `config:"use_mmap"`
+	MaxBufferMemory            SizeSuffix        `config:"max_buffer_memory"`
 	CaCert                     []string          `config:"ca_cert"`     // Client Side CA
 	ClientCert                 string            `config:"client_cert"` // Client Side Cert
 	ClientKey                  string            `config:"client_key"`  // Client Side Key
@@ -642,6 +660,7 @@ type ConfigInfo struct {
 	Inplace                    bool              `config:"inplace"`      // Download directly to destination file instead of atomic download to temp/rename
 	PartialSuffix              string            `config:"partial_suffix"`
 	MetadataMapper             SpaceSepList      `config:"metadata_mapper"`
+	MaxConnections             int               `config:"max_connections"`
 }
 
 func init() {
