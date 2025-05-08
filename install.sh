@@ -50,9 +50,6 @@ if [ "$version" = "$tag_name" ]; then
   printf "\nThe latest version of rclone mod %s is already installed.\n\n" "${version}"
   exit 3
 fi
-
-
-
 #detect the platform
 OS="$(uname)"
 case $OS in
