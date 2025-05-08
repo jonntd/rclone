@@ -133,6 +133,11 @@ jobs:
           go-version: ${{ matrix.go }}
           check-latest: true
 
+      - name: Install purego dependency
+        shell: bash
+        run: |
+          go get github.com/ebitengine/purego@5047c08
+
       - name: Set environment variables
         shell: bash
         run: |
