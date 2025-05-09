@@ -83,7 +83,7 @@
             - job_name: mac_amd64
               os: macos-latest
               go: '>=1.24.0-rc.1'
-              gotags: 'cmount,noselfupdate'
+              gotags: 'cmount,noselfupdate,nopurego'
               build_flags: '-include "^darwin/amd64" -cgo -cgo-cflags=-I/usr/local/include -cgo-ldflags=-L/usr/local/lib'
               quicktest: true
               racequicktest: true
