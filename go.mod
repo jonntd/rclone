@@ -107,7 +107,9 @@ require (
 	github.com/ProtonMail/go-srp v0.0.7 // indirect
 	github.com/ProtonMail/gopenpgp/v2 v2.7.4 // indirect
 	github.com/PuerkitoBio/goquery v1.8.1 // indirect
+	github.com/Sakura-Byte/go-mega v0.0.0-20250419044022-6bded2a233e8 // indirect
 	github.com/akavel/rsrc v0.10.2 // indirect
+	github.com/aliyun/alibabacloud-oss-go-sdk-v2 v1.2.2 // indirect
 	github.com/anacrolix/generics v0.0.1 // indirect
 	github.com/andybalholm/cascadia v1.3.2 // indirect
 	github.com/appscode/go-querystring v0.0.0-20170504095604-0126cfb3f1dc // indirect
@@ -129,6 +131,7 @@ require (
 	github.com/bradenaw/juniper v0.15.2 // indirect
 	github.com/bradfitz/iter v0.0.0-20191230175014-e8f45d346db8 // indirect
 	github.com/calebcase/tmpfile v1.0.3 // indirect
+	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/chilts/sid v0.0.0-20190607042430-660e94789ec9 // indirect
 	github.com/cloudflare/circl v1.3.7 // indirect
