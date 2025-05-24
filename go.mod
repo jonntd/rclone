@@ -53,6 +53,7 @@ require (
 	github.com/koofr/go-httpclient v0.0.0-20240520111329-e20f8f203988
 	github.com/koofr/go-koofrclient v0.0.0-20221207135200-cbd7fc9ad6a6
 	github.com/lanrat/extsort v1.0.2
+	github.com/lunny/log v0.0.0-20160921050905-7887c61bf0de
 	github.com/mattn/go-colorable v0.1.14
 	github.com/mattn/go-runewidth v0.0.16
 	github.com/minio/minio-go/v7 v7.0.87
@@ -71,7 +72,7 @@ require (
 	github.com/rfjakob/eme v1.1.2
 	github.com/rivo/uniseg v0.4.7
 	github.com/rogpeppe/go-internal v1.14.1
-	github.com/shirou/gopsutil/v4 v4.25.1
+	github.com/shirou/gopsutil/v4 v4.25.4
 	github.com/sirupsen/logrus v1.9.3
 	github.com/skratchdot/open-golang v0.0.0-20200116055534-eef842397966
 	github.com/spf13/cobra v1.9.1
@@ -143,7 +144,7 @@ require (
 	github.com/cronokirby/saferith v0.33.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/ebitengine/purego v0.9.0-alpha.3 // indirect
+	github.com/ebitengine/purego v0.8.4 // indirect
 	github.com/emersion/go-message v0.18.0 // indirect
 	github.com/emersion/go-textwrapper v0.0.0-20200911093747-65d896831594 // indirect
 	github.com/emersion/go-vcard v0.0.0-20230815062825-8fda7d206ec9 // indirect
