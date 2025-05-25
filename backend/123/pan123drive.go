@@ -103,10 +103,7 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 		path := ""
 		ua := ""
 		if len(arg) > 0 {
-			path = arg[0] // Assuming path is the first argument
-		}
-		if len(arg) > 1 {
-			ua = arg[1] // Assuming UA is the second argument
+			ua = arg[0]
 		}
 		return f.getDownloadURLByUA(ctx, path, ua)
 	default:
@@ -399,21 +396,11 @@ func (f *Fs) getDownloadURLByUA(ctx context.Context, filePath string, UA string)
 	if UA == "" {
 		UA = defaultUserAgent
 	}
-	fs.Debugf(f, "Token: %s", f.token)
-	// Now use f.token for API calls
-	// ... (rest of the function logic)
-	// response, err := f.ListFile(ctx, 0, 100, "", "", 0)
-	// if err != nil {
-	// 	return "", fmt.Errorf("error listing files: %w", err)
-	// }
-	// fs.Debugf(f, "ListFile Response Code: %d, Message: %s", response.Code, response.Message)
-	// fs.Debugf(f, "ListFile Response LastFileId: %d", response.Data.LastFileId)
-	// fs.Debugf(f, "ListFile Response FileList:")
-	// for _, fileInfo := range response.Data.FileList {
-	// 	fs.Debugf(f, "  FileID: %d, Filename: %s, Type: %d, Size: %d",
-	// 		fileInfo.FileID, fileInfo.Filename, fileInfo.Type, fileInfo.Size)
-	// }
-
+	// fs.Debugf(f, "Token: %s", f.token)
+	// fs.Debugf(f, "Token: %s", f.root)
+	if filePath == "" {
+		filePath = f.root
+	}
 	fileID, err := f.pathToFileID(ctx, filePath)
 	if err != nil {
 		return "", fmt.Errorf("failed to get file ID for path %q: %w", filePath, err)
@@ -1083,5 +1070,6 @@ func getHTTPClient(ctx context.Context, clientID, clientSecret string) *http.Cli
 	return fshttp.NewClient(ctx)
 }
 
-// ./rclone backend getdownloadurlua 123test: "video/zc/我的世界大电影[4KHDR.CN]A.Minecraft.Movie.2025.2160p.iT.WEB-DL.DV.H.265.DDP5.1.Atmos-4KHDR世界.mkv/我的世界大电影[4KHDR.CN]A.Minecraft.Movie.2025.2160p.iT.WEB-DL.DV.H.265.DDP5.1.Atmos-4KHDR世界.mkv" "" --log-level DEBUG
 // ./rclone ls 123test: --log-level DEBUG
+// ./rclone backend getdownloadurlua "123test:/test/独裁者 (2012) {tmdb-76493}.mkv" "test" --log-level DEBUG
+// ./rclone backend getdownloadurlua "116:/电影/刮削/4K REMUX/200X/007：大破量子危机（2008）/007：大破量子危机 (2008) 2160p DTSHD-MA.mkv" "test" --log-level DEBUG
