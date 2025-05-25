@@ -428,7 +428,7 @@ func (f *Fs) getDownloadURLByUA(ctx context.Context, filePath string, UA string)
 	if err = json.Unmarshal(bodyBytes, &result); err != nil {
 		fmt.Printf("解析JSON失败: %v\n", err)
 	}
-	fmt.Println(string(result["data"].(map[string]interface{})["downloadUrl"].(string)))
+	fs.Debug(f, string(result["data"].(map[string]interface{})["downloadUrl"].(string)))
 	// return string(result["data"].(map[string]interface{})["downloadUrl"].(string)), err
 	// fs.Debugf(f, "File ID for path %q: %s", filePath, fileID)
 	// client := &http.Client{Timeout: 30 * time.Second}
