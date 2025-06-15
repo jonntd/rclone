@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"net/url"
 	"path"
@@ -2441,13 +2442,6 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 		}
 		return f.getStats(ctx, cid) // Uses OpenAPI
 
-	case "getdownloadurl":
-		path := ""
-		if len(arg) > 0 {
-			path = arg[0]
-		}
-		return f.getDownloadURLByPath(ctx, path)
-
 	case "getdownloadurlua":
 		path := ""
 		ua := ""
@@ -2461,42 +2455,79 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 	}
 }
 
-// getDownloadURLByPath 获取指定路径文件的下载地址
-func (f *Fs) getDownloadURLByPath(ctx context.Context, filePath string) (string, error) {
-	// 根据路径查找文件元数据
-	info, err := f.readMetaDataForPath(ctx, filePath)
-	if err != nil {
-		return "", fmt.Errorf("failed to read metadata for file path %q: %w", filePath, err)
-	}
+type FileInfoResponse struct {
+	State   bool      `json:"state"`
+	Message string    `json:"message"`
+	Code    int       `json:"code"`
+	Data    *struct { // 直接定义匿名结构体，只包含 PickCode
+		PickCode string `json:"pick_code"`
+	} `json:"data"`
+}
 
-	// 检查文件是否有 pickCode
-	if info.PickCodeBest() == "" {
-		return "", errors.New("file does not have a valid pick code for download")
-	}
-	// 获取下载地址
-	downloadURL, err := f.getDownloadURL(ctx, info.PickCodeBest())
-	if err != nil {
-		return "", fmt.Errorf("failed to get download URL for file %q: %w", filePath, err)
-	}
+func (f *Fs) GetPickCodeByPath(ctx context.Context, path string) (string, error) {
+	opts := rest.Opts{}
+	f.prepareTokenForRequest(ctx, &opts)
+	client := &http.Client{}
+	formData := url.Values{}
+	formData.Add("path", path)
 
-	// 返回下载地址
-	return downloadURL.URL, nil
+	reqBody := bytes.NewBufferString(formData.Encode())
+	req, err := http.NewRequest("POST", openAPIRootURL+"/open/folder/get_info", reqBody)
+	if err != nil {
+		return "", fmt.Errorf("创建请求失败: %w", err)
+	}
+	req.Header.Set("Authorization", opts.ExtraHeaders["Authorization"])
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("发送请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("读取响应体失败: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("API请求返回非成功状态码: %d, 响应: %s", resp.StatusCode, string(body))
+	}
+	var fileInfoResp FileInfoResponse
+	if err := json.Unmarshal(body, &fileInfoResp); err != nil {
+		return "", fmt.Errorf("解析JSON响应失败: %w, 响应: %s", err, string(body))
+	}
+	// 检查API返回的状态
+	if !fileInfoResp.State {
+		return "", fmt.Errorf("API返回错误: %s (Code: %d)", fileInfoResp.Message, fileInfoResp.Code)
+	}
+	// 确保 Data 字段不为空，并返回 PickCode
+	if fileInfoResp.Data != nil {
+		return fileInfoResp.Data.PickCode, nil
+	}
+	return "", fmt.Errorf("未从API响应中获取到数据 (Data字段为空)")
 }
 
 func (f *Fs) getDownloadURLByUA(ctx context.Context, filePath string, UA string) (string, error) {
 
-	info, err := f.readMetaDataForPath(ctx, filePath)
+	// info, err := f.readMetaDataForPath(ctx, filePath)
+	// if err != nil {
+	// 	return "", fmt.Errorf("failed to read metadata for file path %q: %w", filePath, err)
+	// }
+
+	// // 检查文件是否有 pickCode
+	// if info.PickCodeBest() == "" {
+	// 	return "", errors.New("file does not have a valid pick code for download")
+	// }
+
+	pickCode, err := f.GetPickCodeByPath(ctx, filePath)
 	if err != nil {
 		return "", fmt.Errorf("failed to read metadata for file path %q: %w", filePath, err)
 	}
-
-	// 检查文件是否有 pickCode
-	if info.PickCodeBest() == "" {
-		return "", errors.New("file does not have a valid pick code for download")
-	}
+	// formData := url.Values{}
+	// formData.Set("path", filePath)
+	// req.Body = ioutil.NopCloser(bytes.NewBufferString(formData.Encode()))
 
 	client := &http.Client{}
-	req, err := http.NewRequest("POST", openAPIRootURL+"/open/ufile/downurl", strings.NewReader("pick_code="+info.PickCodeBest()))
+	// req, err := http.NewRequest("POST", openAPIRootURL+"/open/ufile/downurl", strings.NewReader("pick_code="+info.PickCodeBest()))
+	req, err := http.NewRequest("POST", openAPIRootURL+"/open/ufile/downurl", strings.NewReader("pick_code="+pickCode))
 
 	if err != nil {
 		fs.Errorf(nil, "创建请求失败: %v", err)
@@ -2920,3 +2951,5 @@ func loadTokenFromConfig(f *Fs, m configmap.Mapper) bool {
 	fs.Debugf(f, "Loaded token from config file, expires at %v", f.tokenExpiry)
 	return true
 }
+
+// rclone backend getdownloadurlua "116:/电影/2025_电影/独裁者 (2012) {tmdb-76493} 23.8GB.mkv" "VidHub/1.7.2"
