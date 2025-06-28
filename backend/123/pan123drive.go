@@ -3,11 +3,14 @@ package _123
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -254,6 +257,8 @@ type FileListInfoRespDataV2 struct {
 }
 
 func (f *Fs) ListFile(ctx context.Context, parentFileID, limit int, searchData, searchMode string, lastFileID int) (*ListResponse, error) {
+	fs.Debugf(f, "ListFile called with parentFileID=%d, limit=%d, lastFileID=%d", parentFileID, limit, lastFileID)
+
 	// Construct query parameters
 	params := url.Values{}
 	params.Add("parentFileId", fmt.Sprintf("%d", parentFileID))
@@ -271,14 +276,17 @@ func (f *Fs) ListFile(ctx context.Context, parentFileID, limit int, searchData, 
 
 	// Construct endpoint with query parameters
 	endpoint := "/api/v2/file/list?" + params.Encode()
+	fs.Debugf(f, "API endpoint: %s%s", openAPIRootURL, endpoint)
 
 	// Use apiCall for proper rate limiting and error handling
 	var result ListResponse
 	err := f.apiCall(ctx, "GET", endpoint, nil, &result)
 	if err != nil {
+		fs.Debugf(f, "ListFile API call failed: %v", err)
 		return nil, err
 	}
 
+	fs.Debugf(f, "ListFile API response: code=%d, message=%s, fileCount=%d", result.Code, result.Message, len(result.Data.FileList))
 	return &result, nil
 }
 
@@ -483,6 +491,18 @@ type UploadUrlResp struct {
 	} `json:"data"`
 }
 
+// UploadProgress tracks the progress of a multipart upload for resume capability
+type UploadProgress struct {
+	PreuploadID   string         `json:"preuploadID"`
+	TotalParts    int64          `json:"totalParts"`
+	ChunkSize     int64          `json:"chunkSize"`
+	FileSize      int64          `json:"fileSize"`
+	UploadedParts map[int64]bool `json:"uploadedParts"` // partNumber -> uploaded
+	FilePath      string         `json:"filePath"`      // local file path for resume
+	MD5Hash       string         `json:"md5Hash"`       // file MD5 for verification
+	CreatedAt     time.Time      `json:"createdAt"`
+}
+
 type UserInfoResp struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
@@ -617,7 +637,7 @@ func (f *Fs) getPacerForEndpoint(endpoint string) *fs.Pacer {
 		return f.listPacer // 3 QPS
 	case strings.Contains(endpoint, "/api/v1/file/list"):
 		return f.listPacer // 4 QPS, but we use the same pacer
-	case strings.Contains(endpoint, "/upload/v1/file/"):
+	case strings.Contains(endpoint, "/upload/v1/file/"), strings.Contains(endpoint, "/upload/v2/file/"):
 		return f.uploadPacer // 2 QPS
 	case strings.Contains(endpoint, "/api/v1/access_token"):
 		return f.strictPacer // 1 QPS
@@ -836,11 +856,17 @@ func (f *Fs) createUpload(ctx context.Context, parentFileID int64, filename, eta
 	reqBody := map[string]interface{}{
 		"parentFileId": parentFileID,
 		"filename":     filename,
-		"etag":         strings.ToLower(etag),
 		"size":         size,
-		"duplicate":    2, // Allow duplicates
+		"duplicate":    1, // 1: 保留两者，新文件名将自动添加后缀; 2: 覆盖原文件
 		"containDir":   false,
 	}
+
+	// etag is required for 123 API
+	if etag == "" {
+		return nil, fmt.Errorf("etag (MD5 hash) is required for 123 API but not provided")
+	}
+	reqBody["etag"] = strings.ToLower(etag)
+	fs.Debugf(f, "Including etag for 123 API: %s", etag)
 
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
@@ -848,9 +874,21 @@ func (f *Fs) createUpload(ctx context.Context, parentFileID int64, filename, eta
 	}
 
 	var response UploadCreateResp
-	err = f.apiCall(ctx, "POST", "/upload/v1/file/create", bytes.NewReader(bodyBytes), &response)
+
+	// Try v2 API first (updated API)
+	err = f.apiCall(ctx, "POST", "/upload/v2/file/create", bytes.NewReader(bodyBytes), &response)
 	if err != nil {
-		return nil, err
+		fs.Debugf(f, "v2 API failed, trying v1 API: %v", err)
+
+		// Fallback to v1 API (use same request body since both APIs expect etag field)
+		fs.Debugf(f, "v1 API request body: %+v", reqBody)
+		err = f.apiCall(ctx, "POST", "/upload/v1/file/create", bytes.NewReader(bodyBytes), &response)
+		if err != nil {
+			return nil, fmt.Errorf("both v2 and v1 APIs failed: %w", err)
+		}
+		fs.Debugf(f, "v1 API succeeded as fallback")
+	} else {
+		fs.Debugf(f, "v2 API succeeded")
 	}
 
 	if response.Code != 0 {
@@ -862,6 +900,11 @@ func (f *Fs) createUpload(ctx context.Context, parentFileID int64, filename, eta
 
 // uploadFile uploads file content using the upload session
 func (f *Fs) uploadFile(ctx context.Context, in io.Reader, createResp *UploadCreateResp, size int64) error {
+	return f.uploadFileWithPath(ctx, in, createResp, size, "")
+}
+
+// uploadFileWithPath uploads file content using the upload session with resume capability
+func (f *Fs) uploadFileWithPath(ctx context.Context, in io.Reader, createResp *UploadCreateResp, size int64, filePath string) error {
 	// Determine chunk size
 	chunkSize := createResp.Data.SliceSize
 	if chunkSize <= 0 {
@@ -876,7 +919,7 @@ func (f *Fs) uploadFile(ctx context.Context, in io.Reader, createResp *UploadCre
 		chunkSize = int64(maxChunkSize)
 	}
 
-	// For small files, read all into memory
+	// For small files, read all into memory (no resume needed)
 	if size <= chunkSize {
 		data, err := io.ReadAll(in)
 		if err != nil {
@@ -891,8 +934,8 @@ func (f *Fs) uploadFile(ctx context.Context, in io.Reader, createResp *UploadCre
 		return f.uploadSinglePart(ctx, createResp.Data.PreuploadID, data)
 	}
 
-	// Multi-part upload for larger files
-	return f.uploadMultiPart(ctx, in, createResp.Data.PreuploadID, size, chunkSize)
+	// Multi-part upload for larger files with resume capability
+	return f.uploadMultiPartWithResume(ctx, in, createResp.Data.PreuploadID, size, chunkSize, filePath)
 }
 
 // uploadSinglePart uploads a file in a single part
@@ -913,8 +956,13 @@ func (f *Fs) uploadSinglePart(ctx context.Context, preuploadID string, data []by
 	return f.completeUpload(ctx, preuploadID)
 }
 
-// uploadMultiPart uploads a file in multiple parts
+// uploadMultiPart uploads a file in multiple parts with resume capability
 func (f *Fs) uploadMultiPart(ctx context.Context, in io.Reader, preuploadID string, size, chunkSize int64) error {
+	return f.uploadMultiPartWithResume(ctx, in, preuploadID, size, chunkSize, "")
+}
+
+// uploadMultiPartWithResume uploads a file in multiple parts with resume capability
+func (f *Fs) uploadMultiPartWithResume(ctx context.Context, in io.Reader, preuploadID string, size, chunkSize int64, filePath string) error {
 	uploadNums := (size + chunkSize - 1) / chunkSize
 
 	// Limit the number of parts
@@ -922,10 +970,90 @@ func (f *Fs) uploadMultiPart(ctx context.Context, in io.Reader, preuploadID stri
 		return fmt.Errorf("file too large: would require %d parts, max allowed is %d", uploadNums, f.opt.MaxUploadParts)
 	}
 
+	// Try to load existing progress
+	progress, err := f.loadUploadProgress(preuploadID)
+	if err != nil {
+		fs.Debugf(f, "Failed to load upload progress: %v", err)
+		progress = nil
+	}
+
+	// Create new progress if none exists or parameters don't match
+	if progress == nil || progress.TotalParts != uploadNums || progress.ChunkSize != chunkSize || progress.FileSize != size {
+		fs.Debugf(f, "Creating new upload progress for %s", preuploadID)
+		progress = &UploadProgress{
+			PreuploadID:   preuploadID,
+			TotalParts:    uploadNums,
+			ChunkSize:     chunkSize,
+			FileSize:      size,
+			UploadedParts: make(map[int64]bool),
+			FilePath:      filePath,
+			CreatedAt:     time.Now(),
+		}
+	} else {
+		fs.Debugf(f, "Resuming upload for %s: %d/%d parts already uploaded",
+			preuploadID, len(progress.UploadedParts), progress.TotalParts)
+	}
+
+	// Check if we can resume from file (if filePath is provided and file exists)
+	var fileReader *os.File
+	canResumeFromFile := filePath != "" && len(progress.UploadedParts) > 0
+
+	if canResumeFromFile {
+		fileReader, err = os.Open(filePath)
+		if err != nil {
+			fs.Debugf(f, "Cannot open file for resume, falling back to stream: %v", err)
+			canResumeFromFile = false
+		} else {
+			defer fileReader.Close()
+			// Use file reader instead of stream for resume capability
+			in = fileReader
+		}
+	}
+
 	buffer := make([]byte, chunkSize)
 
 	for partIndex := int64(0); partIndex < uploadNums; partIndex++ {
 		partNumber := partIndex + 1
+
+		// Skip if this part is already uploaded
+		if progress.UploadedParts[partNumber] {
+			fs.Debugf(f, "Skipping already uploaded part %d/%d", partNumber, uploadNums)
+
+			// If we can seek (file reader), seek to next part
+			if canResumeFromFile && fileReader != nil {
+				nextOffset := (partIndex + 1) * chunkSize
+				if nextOffset < size {
+					_, err := fileReader.Seek(nextOffset, io.SeekStart)
+					if err != nil {
+						return fmt.Errorf("failed to seek to part %d: %w", partNumber+1, err)
+					}
+				}
+			} else {
+				// Still need to read and discard the data to advance the reader
+				if partIndex == uploadNums-1 {
+					remaining := size - partIndex*chunkSize
+					_, err := io.ReadFull(in, make([]byte, remaining))
+					if err != nil {
+						return fmt.Errorf("failed to skip part %d data: %w", partNumber, err)
+					}
+				} else {
+					_, err := io.ReadFull(in, buffer)
+					if err != nil {
+						return fmt.Errorf("failed to skip part %d data: %w", partNumber, err)
+					}
+				}
+			}
+			continue
+		}
+
+		// If we can seek and this is not the first unuploaded part, seek to correct position
+		if canResumeFromFile && fileReader != nil {
+			currentOffset := partIndex * chunkSize
+			_, err := fileReader.Seek(currentOffset, io.SeekStart)
+			if err != nil {
+				return fmt.Errorf("failed to seek to part %d: %w", partNumber, err)
+			}
+		}
 
 		// Read chunk data
 		var partData []byte
@@ -958,14 +1086,38 @@ func (f *Fs) uploadMultiPart(ctx context.Context, in io.Reader, preuploadID stri
 			return shouldRetry(ctx, nil, err)
 		})
 		if err != nil {
+			// Save progress before returning error
+			saveErr := f.saveUploadProgress(progress)
+			if saveErr != nil {
+				fs.Debugf(f, "Failed to save progress after upload error: %v", saveErr)
+			}
 			return fmt.Errorf("failed to upload part %d: %w", partNumber, err)
+		}
+
+		// Mark this part as uploaded and save progress
+		progress.UploadedParts[partNumber] = true
+		err = f.saveUploadProgress(progress)
+		if err != nil {
+			fs.Debugf(f, "Failed to save upload progress: %v", err)
 		}
 
 		fs.Debugf(f, "Uploaded part %d/%d", partNumber, uploadNums)
 	}
 
 	// Complete the upload
-	return f.completeUpload(ctx, preuploadID)
+	err = f.completeUpload(ctx, preuploadID)
+	if err != nil {
+		// Save progress before returning error
+		saveErr := f.saveUploadProgress(progress)
+		if saveErr != nil {
+			fs.Debugf(f, "Failed to save progress after complete error: %v", saveErr)
+		}
+		return err
+	}
+
+	// Upload completed successfully, remove progress file
+	f.removeUploadProgress(preuploadID)
+	return nil
 }
 
 // getUploadURL gets the upload URL for a specific part
@@ -981,9 +1133,15 @@ func (f *Fs) getUploadURL(ctx context.Context, preuploadID string, sliceNo int64
 	}
 
 	var response UploadUrlResp
-	err = f.apiCall(ctx, "POST", "/upload/v1/file/get_upload_url", bytes.NewReader(bodyBytes), &response)
+	// Try v2 API first
+	err = f.apiCall(ctx, "POST", "/upload/v2/file/get_upload_url", bytes.NewReader(bodyBytes), &response)
 	if err != nil {
-		return "", err
+		fs.Debugf(f, "v2 get_upload_url failed, trying v1: %v", err)
+		// Fallback to v1 API
+		err = f.apiCall(ctx, "POST", "/upload/v1/file/get_upload_url", bytes.NewReader(bodyBytes), &response)
+		if err != nil {
+			return "", fmt.Errorf("both v2 and v1 get_upload_url APIs failed: %w", err)
+		}
 	}
 
 	if response.Code != 0 {
@@ -1046,25 +1204,200 @@ func (f *Fs) completeUpload(ctx context.Context, preuploadID string) error {
 		} `json:"data"`
 	}
 
-	err = f.apiCall(ctx, "POST", "/upload/v1/file/upload_complete", bytes.NewReader(bodyBytes), &response)
+	// Try v2 API first
+	err = f.apiCall(ctx, "POST", "/upload/v2/file/upload_complete", bytes.NewReader(bodyBytes), &response)
 	if err != nil {
-		return fmt.Errorf("failed to complete upload: %w", err)
+		fs.Debugf(f, "v2 upload_complete failed, trying v1: %v", err)
+		// Fallback to v1 API
+		err = f.apiCall(ctx, "POST", "/upload/v1/file/upload_complete", bytes.NewReader(bodyBytes), &response)
+		if err != nil {
+			return fmt.Errorf("both v2 and v1 upload_complete APIs failed: %w", err)
+		}
 	}
 
 	if response.Code != 0 {
 		return fmt.Errorf("upload completion failed: API error %d: %s", response.Code, response.Message)
 	}
 
-	// If async processing, we might need to wait
+	// If async processing, we need to wait for completion
 	if response.Data.Async && !response.Data.Completed {
-		fs.Debugf(f, "Upload completed asynchronously, file ID: %d", response.Data.FileID)
-		// TODO: In a full implementation, we might want to poll for completion status
-		// For now, we assume the upload will complete successfully
+		fs.Debugf(f, "Upload is async, polling for completion, file ID: %d", response.Data.FileID)
+		err = f.pollAsyncUpload(ctx, preuploadID)
+		if err != nil {
+			return fmt.Errorf("failed to wait for async upload completion: %w", err)
+		}
+		fs.Debugf(f, "Async upload completed successfully, file ID: %d", response.Data.FileID)
 	} else {
 		fs.Debugf(f, "Upload completed synchronously, file ID: %d", response.Data.FileID)
 	}
 
 	return nil
+}
+
+// pollAsyncUpload polls for async upload completion
+func (f *Fs) pollAsyncUpload(ctx context.Context, preuploadID string) error {
+	fs.Debugf(f, "Polling async upload completion for preuploadID: %s", preuploadID)
+
+	// Poll with exponential backoff, max 30 seconds
+	maxAttempts := 10
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		reqBody := map[string]interface{}{
+			"preuploadID": preuploadID,
+		}
+
+		bodyBytes, err := json.Marshal(reqBody)
+		if err != nil {
+			return fmt.Errorf("failed to marshal async request: %w", err)
+		}
+
+		var response struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+			Data    struct {
+				Completed bool  `json:"completed"`
+				FileID    int64 `json:"fileID"`
+			} `json:"data"`
+		}
+
+		// Try v2 API first
+		err = f.apiCall(ctx, "POST", "/upload/v2/file/upload_async_result", bytes.NewReader(bodyBytes), &response)
+		if err != nil {
+			fs.Debugf(f, "v2 async_result failed, trying v1: %v", err)
+			// Fallback to v1 API
+			err = f.apiCall(ctx, "POST", "/upload/v1/file/upload_async_result", bytes.NewReader(bodyBytes), &response)
+			if err != nil {
+				fs.Debugf(f, "Async poll attempt %d failed (both APIs): %v", attempt+1, err)
+				// Continue polling even if individual requests fail
+			}
+		} else if response.Code != 0 {
+			fs.Debugf(f, "Async poll attempt %d returned error: API error %d: %s", attempt+1, response.Code, response.Message)
+		} else if response.Data.Completed {
+			fs.Debugf(f, "Async upload completed successfully after %d attempts", attempt+1)
+			return nil
+		}
+
+		// Wait before next attempt (exponential backoff: 1s, 2s, 4s, ...)
+		waitTime := time.Duration(1<<uint(attempt)) * time.Second
+		if waitTime > 8*time.Second {
+			waitTime = 8 * time.Second // Cap at 8 seconds
+		}
+
+		fs.Debugf(f, "Async upload not yet complete, waiting %v before next poll (attempt %d/%d)", waitTime, attempt+1, maxAttempts)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(waitTime):
+			// Continue to next attempt
+		}
+	}
+
+	return fmt.Errorf("async upload did not complete after %d attempts", maxAttempts)
+}
+
+// saveUploadProgress saves upload progress to a temporary file for resume capability
+func (f *Fs) saveUploadProgress(progress *UploadProgress) error {
+	progressDir := filepath.Join(os.TempDir(), "rclone-123pan-progress")
+	err := os.MkdirAll(progressDir, 0755)
+	if err != nil {
+		return fmt.Errorf("failed to create progress directory: %w", err)
+	}
+
+	// Use MD5 hash of preuploadID to avoid filename length issues
+	hasher := md5.New()
+	hasher.Write([]byte(progress.PreuploadID))
+	shortID := fmt.Sprintf("%x", hasher.Sum(nil))
+
+	progressFile := filepath.Join(progressDir, shortID+".json")
+	data, err := json.Marshal(progress)
+	if err != nil {
+		return fmt.Errorf("failed to marshal progress: %w", err)
+	}
+
+	err = os.WriteFile(progressFile, data, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to save progress file: %w", err)
+	}
+
+	fs.Debugf(f, "Saved upload progress for %s: %d/%d parts completed",
+		progress.PreuploadID[:20]+"...", len(progress.UploadedParts), progress.TotalParts)
+	return nil
+}
+
+// loadUploadProgress loads upload progress from a temporary file
+func (f *Fs) loadUploadProgress(preuploadID string) (*UploadProgress, error) {
+	progressDir := filepath.Join(os.TempDir(), "rclone-123pan-progress")
+
+	// Use MD5 hash of preuploadID to avoid filename length issues
+	hasher := md5.New()
+	hasher.Write([]byte(preuploadID))
+	shortID := fmt.Sprintf("%x", hasher.Sum(nil))
+
+	progressFile := filepath.Join(progressDir, shortID+".json")
+
+	data, err := os.ReadFile(progressFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil // No progress file exists
+		}
+		return nil, fmt.Errorf("failed to read progress file: %w", err)
+	}
+
+	var progress UploadProgress
+	err = json.Unmarshal(data, &progress)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal progress: %w", err)
+	}
+
+	fs.Debugf(f, "Loaded upload progress for %s: %d/%d parts completed",
+		preuploadID, len(progress.UploadedParts), progress.TotalParts)
+	return &progress, nil
+}
+
+// removeUploadProgress removes the progress file after successful upload
+func (f *Fs) removeUploadProgress(preuploadID string) {
+	progressDir := filepath.Join(os.TempDir(), "rclone-123pan-progress")
+
+	// Use MD5 hash of preuploadID to avoid filename length issues
+	hasher := md5.New()
+	hasher.Write([]byte(preuploadID))
+	shortID := fmt.Sprintf("%x", hasher.Sum(nil))
+
+	progressFile := filepath.Join(progressDir, shortID+".json")
+
+	err := os.Remove(progressFile)
+	if err != nil && !os.IsNotExist(err) {
+		fs.Debugf(f, "Failed to remove progress file %s: %v", progressFile, err)
+	} else {
+		fs.Debugf(f, "Removed upload progress file for %s", preuploadID)
+	}
+}
+
+// computeMD5FromReader computes MD5 hash from an io.Reader
+func (f *Fs) computeMD5FromReader(ctx context.Context, in io.Reader, size int64) (string, error) {
+	hasher := md5.New()
+
+	// Copy data from reader to hasher
+	written, err := io.Copy(hasher, in)
+	if err != nil {
+		return "", fmt.Errorf("failed to read data for MD5 computation: %w", err)
+	}
+
+	// Verify we read the expected amount
+	if size >= 0 && written != size {
+		return "", fmt.Errorf("size mismatch: expected %d bytes, read %d bytes", size, written)
+	}
+
+	// Return hex-encoded MD5 hash
+	return fmt.Sprintf("%x", hasher.Sum(nil)), nil
+}
+
+// TODO: Future optimization - implement streaming upload with on-the-fly MD5 calculation
+// This would eliminate the need for double download in cross-cloud transfers
+func (f *Fs) streamingPutWithMD5(ctx context.Context, in io.Reader, src fs.ObjectInfo) (*Object, error) {
+	// This is a placeholder for future streaming implementation
+	// Would use io.TeeReader to compute MD5 while uploading
+	return nil, fmt.Errorf("streaming upload not yet implemented")
 }
 
 // deleteFile deletes a file by moving it to trash
@@ -1414,10 +1747,22 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		return nil, fmt.Errorf("invalid parent ID: %s", parentID)
 	}
 
-	// Calculate MD5 hash if available
+	// Calculate MD5 hash - required for 123 API
 	var md5Hash string
 	if hashValue, err := src.Hash(ctx, hash.MD5); err == nil && hashValue != "" {
 		md5Hash = hashValue
+		fs.Debugf(f, "Using existing MD5 hash: %s", md5Hash)
+	} else {
+		// Compute MD5 hash from source (this will consume the reader)
+		fs.Debugf(f, "Computing MD5 hash from source for 123 API compatibility")
+		md5Hash, err = f.computeMD5FromReader(ctx, in, src.Size())
+		if err != nil {
+			return nil, fmt.Errorf("failed to compute MD5 hash: %w", err)
+		}
+		fs.Debugf(f, "Computed MD5 hash: %s", md5Hash)
+
+		// Note: reader is now consumed, we'll need to get a fresh one for upload
+		in = nil
 	}
 
 	// Create upload session
@@ -1441,6 +1786,26 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	}
 
 	// Upload the file
+	// If reader was consumed for MD5 calculation, get a fresh one
+	if in == nil {
+		fs.Debugf(f, "Getting fresh reader for upload after MD5 calculation")
+		if srcObj, ok := src.(fs.Object); ok {
+			in, err = srcObj.Open(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("failed to reopen source for upload: %w", err)
+			}
+			defer func() {
+				if closer, ok := in.(io.Closer); ok {
+					if closeErr := closer.Close(); closeErr != nil {
+						fs.Debugf(f, "Failed to close source reader: %v", closeErr)
+					}
+				}
+			}()
+		} else {
+			return nil, fmt.Errorf("source does not support reopening for upload")
+		}
+	}
+
 	err = f.uploadFile(ctx, in, createResp, src.Size())
 	if err != nil {
 		return nil, err
@@ -2081,10 +2446,13 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	fs.Debugf(f, "List called for directory: %s", dir)
 
 	// Use dircache to find the directory ID
+	fs.Debugf(f, "Finding directory ID for: %s", dir)
 	dirID, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
+		fs.Debugf(f, "FindDir failed for %s: %v", dir, err)
 		return nil, err
 	}
+	fs.Debugf(f, "Found directory ID: %s for dir: %s", dirID, dir)
 
 	// Convert dirID to int64
 	parentFileID, err := strconv.ParseInt(dirID, 10, 64)
@@ -2212,17 +2580,38 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, fmt.Errorf("invalid destination directory ID: %s", dstDirID)
 	}
 
-	// Move the file
-	err = f.moveFile(ctx, fileID, dstParentID)
+	// Get source directory ID for comparison
+	_, srcDirID, err := f.dirCache.FindPath(ctx, srcObj.Remote(), false)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to find source directory: %w", err)
 	}
 
-	// If the name changed, rename the file
-	if dstName != srcObj.Remote() {
-		err = f.renameFile(ctx, fileID, dstName)
+	// Check if we're moving to the same directory
+	if srcDirID == dstDirID {
+		// Same directory - only rename if name changed
+		if dstName != srcObj.Remote() {
+			fs.Debugf(f, "Same directory move, only renaming %s to %s", srcObj.Remote(), dstName)
+			err = f.renameFile(ctx, fileID, dstName)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			fs.Debugf(f, "Same directory and same name - no operation needed")
+		}
+	} else {
+		// Different directory - move first, then rename if needed
+		fs.Debugf(f, "Moving file from directory %s to %s", srcDirID, dstDirID)
+		err = f.moveFile(ctx, fileID, dstParentID)
 		if err != nil {
 			return nil, err
+		}
+
+		// If the name changed, rename the file
+		if dstName != srcObj.Remote() {
+			err = f.renameFile(ctx, fileID, dstName)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 

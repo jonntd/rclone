@@ -1585,14 +1585,18 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 				return f, nil
 			}
 			// Check if it's a file
+			fs.Debugf(f, "Checking if %q is a file in directory %q", remote, newRoot)
 			_, err := tempF.newObjectWithInfo(ctx, remote, nil)
 			if err != nil {
 				if err == fs.ErrorObjectNotFound {
 					// File doesn't exist so return old f
+					fs.Debugf(f, "File %q not found, treating as directory", remote)
 					return f, nil
 				}
+				fs.Debugf(f, "Error checking file %q: %v", remote, err)
 				return nil, err
 			}
+			fs.Debugf(f, "Found file %q, returning fs.ErrorIsFile", remote)
 			// Copy the features
 			f.features.Fill(ctx, &tempF)
 			// Update the dir cache in the old f
@@ -1659,7 +1663,9 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (foundID string, found bool, err error) {
 	// Use listAll which now uses OpenAPI
 	found, err = f.listAll(ctx, pathID, f.opt.ListChunk, false, false, func(item *api.File) bool {
-		if item.FileNameBest() == leaf {
+		// Compare with decoded name to handle special characters correctly
+		decodedName := f.opt.Enc.ToStandardName(item.FileNameBest())
+		if decodedName == leaf {
 			foundID = item.ID()
 			// Cache the found item's path/ID mapping
 			parentPath, ok := f.dirCache.GetInv(pathID)
@@ -2293,7 +2299,9 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.Fi
 
 	// List the directory and find the leaf
 	found, err := f.listAll(ctx, dirID, f.opt.ListChunk, true, false, func(item *api.File) bool {
-		if item.FileNameBest() == leaf {
+		// Compare with decoded name to handle special characters correctly
+		decodedName := f.opt.Enc.ToStandardName(item.FileNameBest())
+		if decodedName == leaf {
 			info = item
 			return true // Found it
 		}
