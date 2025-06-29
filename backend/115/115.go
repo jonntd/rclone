@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -326,29 +327,42 @@ type PathCacheEntry struct {
 	ID        string
 	IsDir     bool
 	Timestamp time.Time
+	// LRU链表节点
+	prev, next *PathCacheEntry
+	key        string // 存储key用于从map中删除
 }
 
-// PathCache 简单的路径缓存实现
+// PathCache LRU路径缓存实现，O(1)时间复杂度
 type PathCache struct {
 	cache   map[string]*PathCacheEntry
 	mu      sync.RWMutex
 	ttl     time.Duration
 	maxSize int
+	// LRU双向链表
+	head, tail *PathCacheEntry
 }
 
 // NewPathCache 创建新的路径缓存
 func NewPathCache(ttl time.Duration, maxSize int) *PathCache {
-	return &PathCache{
+	pc := &PathCache{
 		cache:   make(map[string]*PathCacheEntry),
 		ttl:     ttl,
 		maxSize: maxSize,
 	}
+
+	// 初始化LRU链表的哨兵节点
+	pc.head = &PathCacheEntry{}
+	pc.tail = &PathCacheEntry{}
+	pc.head.next = pc.tail
+	pc.tail.prev = pc.head
+
+	return pc
 }
 
-// Get 从缓存获取路径信息
+// Get 从缓存获取路径信息，实现LRU访问
 func (pc *PathCache) Get(path string) (*PathCacheEntry, bool) {
-	pc.mu.RLock()
-	defer pc.mu.RUnlock()
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
 
 	entry, exists := pc.cache[path]
 	if !exists {
@@ -357,10 +371,50 @@ func (pc *PathCache) Get(path string) (*PathCacheEntry, bool) {
 
 	// 检查是否过期
 	if time.Since(entry.Timestamp) > pc.ttl {
+		// 过期的条目需要从缓存中删除
+		pc.removeFromList(entry)
+		delete(pc.cache, path)
 		return nil, false
 	}
 
+	// 移动到链表头部（最近使用）
+	pc.moveToHead(entry)
+
 	return entry, true
+}
+
+// addToHead 将节点添加到链表头部
+func (pc *PathCache) addToHead(entry *PathCacheEntry) {
+	entry.prev = pc.head
+	entry.next = pc.head.next
+	pc.head.next.prev = entry
+	pc.head.next = entry
+}
+
+// removeFromList 从链表中移除节点
+func (pc *PathCache) removeFromList(entry *PathCacheEntry) {
+	if entry.prev != nil {
+		entry.prev.next = entry.next
+	}
+	if entry.next != nil {
+		entry.next.prev = entry.prev
+	}
+}
+
+// moveToHead 将节点移动到链表头部
+func (pc *PathCache) moveToHead(entry *PathCacheEntry) {
+	pc.removeFromList(entry)
+	pc.addToHead(entry)
+}
+
+// removeTail 移除链表尾部节点
+func (pc *PathCache) removeTail() *PathCacheEntry {
+	lastEntry := pc.tail.prev
+	if lastEntry == pc.head {
+		return nil // 链表为空
+	}
+	pc.removeFromList(lastEntry)
+	return lastEntry
 }
 
 // Put 将路径信息放入缓存
@@ -368,46 +422,48 @@ func (pc *PathCache) Put(path, id string, isDir bool) {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 
-	// 如果缓存已满，清理最旧的条目
-	if len(pc.cache) >= pc.maxSize {
-		pc.evictOldest()
-	}
-
-	pc.cache[path] = &PathCacheEntry{
-		ID:        id,
-		IsDir:     isDir,
-		Timestamp: time.Now(),
-	}
-}
-
-// evictOldest 清理最旧的缓存条目
-func (pc *PathCache) evictOldest() {
-	if len(pc.cache) == 0 {
+	// 检查是否已存在
+	if existingEntry, exists := pc.cache[path]; exists {
+		// 更新现有条目并移动到头部
+		existingEntry.ID = id
+		existingEntry.IsDir = isDir
+		existingEntry.Timestamp = time.Now()
+		pc.moveToHead(existingEntry)
 		return
 	}
 
-	var oldestKey string
-	var oldestTime time.Time
-	first := true
-
-	for key, entry := range pc.cache {
-		if first || entry.Timestamp.Before(oldestTime) {
-			oldestKey = key
-			oldestTime = entry.Timestamp
-			first = false
+	// 如果缓存已满，移除最旧的条目
+	if len(pc.cache) >= pc.maxSize {
+		tailEntry := pc.removeTail()
+		if tailEntry != nil && tailEntry.key != "" {
+			delete(pc.cache, tailEntry.key)
 		}
 	}
 
-	if oldestKey != "" {
-		delete(pc.cache, oldestKey)
+	// 创建新条目
+	newEntry := &PathCacheEntry{
+		ID:        id,
+		IsDir:     isDir,
+		Timestamp: time.Now(),
+		key:       path,
 	}
+
+	// 添加到缓存和链表头部
+	pc.cache[path] = newEntry
+	pc.addToHead(newEntry)
 }
 
 // Clear 清空缓存
 func (pc *PathCache) Clear() {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
+
+	// 清空map
 	pc.cache = make(map[string]*PathCacheEntry)
+
+	// 重新初始化链表
+	pc.head.next = pc.tail
+	pc.tail.prev = pc.head
 }
 
 // AsyncCacheUpdate 异步更新缓存，避免阻塞主要操作
@@ -719,15 +775,31 @@ func (cr *Credential) UserID() string {
 	return userID
 }
 
-// getHTTPClient makes an http client according to the options
+// getHTTPClient makes an http client according to the options with optimized connection pool
 func getHTTPClient(ctx context.Context, opt *Options) *http.Client {
 	t := fshttp.NewTransportCustom(ctx, func(t *http.Transport) {
 		t.TLSHandshakeTimeout = time.Duration(opt.ConTimeout)
 		t.ResponseHeaderTimeout = time.Duration(opt.Timeout)
-		// Removed download_no_proxy logic
+
+		// 优化连接池配置
+		t.MaxIdleConns = 100                 // 最大空闲连接数
+		t.MaxIdleConnsPerHost = 20           // 每个主机的最大空闲连接数
+		t.MaxConnsPerHost = 50               // 每个主机的最大连接数
+		t.IdleConnTimeout = 90 * time.Second // 空闲连接超时
+		t.DisableKeepAlives = false          // 启用Keep-Alive
+		t.ForceAttemptHTTP2 = true           // 强制尝试HTTP/2
+
+		// 优化超时设置
+		t.DialContext = (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext
+		t.ExpectContinueTimeout = 1 * time.Second
 	})
+
 	return &http.Client{
 		Transport: t,
+		Timeout:   time.Duration(opt.Timeout) + 30*time.Second, // 总超时时间
 	}
 }
 
@@ -805,14 +877,17 @@ func (f *Fs) login(ctx context.Context) error {
 	f.loginMu.Lock()
 	defer f.loginMu.Unlock()
 
-	f.tokenMu.Lock()
-	// Check if another thread has successfully logged in while we were waiting
-	if f.accessToken != "" && time.Now().Before(f.tokenExpiry) {
+	// Check if login is needed (avoid nested locking)
+	needLogin := func() bool {
+		f.tokenMu.Lock()
+		defer f.tokenMu.Unlock()
+		return f.accessToken == "" || time.Now().After(f.tokenExpiry)
+	}()
+
+	if !needLogin {
 		fs.Debugf(f, "Token is already valid after waiting for login mutex, skipping login")
-		f.tokenMu.Unlock()
 		return nil
 	}
-	defer f.tokenMu.Unlock()
 
 	// Parse cookie and setup clients
 	if err := f.setupLoginEnvironment(ctx); err != nil {
@@ -1000,10 +1075,13 @@ func (f *Fs) exchangeDeviceCodeForToken(ctx context.Context, loginUID string) er
 		return fmt.Errorf("deviceCodeToToken returned empty data: %v", tokenResp)
 	}
 
-	// Store tokens
+	// Store tokens with proper locking
+	f.tokenMu.Lock()
 	f.accessToken = tokenResp.Data.AccessToken
 	f.refreshToken = tokenResp.Data.RefreshToken
 	f.tokenExpiry = time.Now().Add(time.Duration(tokenResp.Data.ExpiresIn) * time.Second)
+	f.tokenMu.Unlock()
+
 	fs.Debugf(f, "Successfully obtained access token, expires at %v", f.tokenExpiry)
 
 	return nil
@@ -1078,14 +1156,6 @@ func shouldPerformFullLogin(f *Fs, refreshTokenExpired bool) bool {
 // isTokenStillValid checks if the current token is still valid
 func isTokenStillValid(f *Fs) bool {
 	return time.Now().Before(f.tokenExpiry.Add(-tokenRefreshWindow))
-}
-
-// prepareForRefresh gets the refresh token and unlocks the mutex
-func (f *Fs) prepareForRefresh() string {
-	fs.Debugf(f, "Access token expired, nearing expiry, or refresh forced. Attempting refresh.")
-	refreshTokenToUse := f.refreshToken
-	f.tokenMu.Unlock() // Unlock before making API call
-	return refreshTokenToUse
 }
 
 // performTokenRefresh handles the actual API call to refresh the token
@@ -1230,7 +1300,7 @@ func (f *Fs) updateTokens(refreshResp *api.RefreshTokenResp) {
 }
 
 // saveToken saves the current token to the config
-func (f *Fs) saveToken(ctx context.Context, m configmap.Mapper) {
+func (f *Fs) saveToken(_ context.Context, m configmap.Mapper) {
 	if m == nil {
 		fs.Debugf(f, "Not saving tokens - nil mapper provided")
 		return
@@ -1453,7 +1523,7 @@ func (f *Fs) handleTokenError(ctx context.Context, opts *rest.Opts, apiErr error
 }
 
 // checkResponseForAPIErrors examines the response for API-level errors using reflection
-func (f *Fs) checkResponseForAPIErrors(response any, skipToken bool, opts *rest.Opts) error {
+func (f *Fs) checkResponseForAPIErrors(response any, _ bool, _ *rest.Opts) error {
 	if response == nil {
 		return nil
 	}
@@ -2800,17 +2870,6 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 			return nil, err
 		}
 		return nil, f.copyFromShare(ctx, shareCode, receiveCode, "", dirID) // Uses traditional API
-	case "stats":
-		path := ""
-		if len(arg) > 0 {
-			path = arg[0]
-		}
-		cid, err := f.getID(ctx, path) // Get ID first
-		if err != nil {
-			return nil, err
-		}
-		return f.getStats(ctx, cid) // Uses OpenAPI
-
 	case "getdownloadurlua":
 		path := ""
 		ua := ""

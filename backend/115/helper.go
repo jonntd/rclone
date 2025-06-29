@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -88,57 +87,6 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly, di
 		}
 	}
 	return found, nil
-}
-
-// getDirPath returns the absolute path for a directory ID using OpenAPI.
-func (f *Fs) getDirPath(ctx context.Context, dirID string) (dirPath string, err error) {
-	if dirID == "0" {
-		return "", nil
-	}
-	if f.isShare {
-		// Path calculation for shares might need traditional API or different logic
-		return "", errors.New("getDirPath not supported for shared filesystem")
-	}
-
-	// Use OpenAPI folder details endpoint
-	params := url.Values{}
-	params.Set("file_id", dirID)
-	opts := rest.Opts{
-		Method:     "GET",
-		Path:       "/open/folder/get_info",
-		Parameters: params,
-	}
-
-	var info api.FileStats // Reusing FileStats struct, mapping fields from FolderInfoData
-	err = f.CallOpenAPI(ctx, &opts, nil, &info, false)
-	if err != nil {
-		// Check if it's a "not found" error
-		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "不存在") { // Heuristic check
-			return "", fs.ErrorDirNotFound
-		}
-		return "", fmt.Errorf("OpenAPI get_info failed for ID %s: %w", dirID, err)
-	}
-
-	if info.Data == nil || len(info.Data.Paths) == 0 {
-		// If path is empty but call succeeded, it might be the root or an issue
-		if dirID == f.rootFolderID { // Check if it's the configured root
-			return "", nil // Path is empty for the root itself
-		}
-		return "", fmt.Errorf("OpenAPI get_info for ID %s returned no path data", dirID)
-	}
-
-	// Construct path from response
-	var pathParts []string
-	for _, p := range info.Data.Paths {
-		// Skip the root "0" if present in the path
-		if p.FileID == "0" {
-			continue
-		}
-		pathParts = append(pathParts, f.opt.Enc.ToStandardName(p.FileName))
-	}
-	dirPath = path.Join(pathParts...)
-
-	return dirPath, nil
 }
 
 // makeDir creates a directory using OpenAPI.
@@ -361,133 +309,6 @@ func (f *Fs) getDownloadURL(ctx context.Context, pickCode string) (durl *api.Dow
 	}
 
 	return nil, fs.ErrorObjectNotFound // Or appropriate error if map is empty
-}
-
-// getFile gets information about a file or directory using OpenAPI list endpoint.
-// Note: OpenAPI doesn't have a direct get_info equivalent that works for both files and folders by ID easily.
-// We list the parent and find the item.
-func (f *Fs) getFile(ctx context.Context, fid, pc string) (file *api.File, err error) {
-	if fid == "0" {
-		// Return a synthetic root directory object
-		return &api.File{
-			CID:      "0",
-			FileName: "", // Root has no name relative to itself
-			IsFolder: 0,  // Mark as folder
-		}, nil
-	}
-	if f.isShare {
-		// Share info needs traditional API or specific share logic
-		return nil, errors.New("getFile not supported for shared filesystem, use listShare")
-	}
-
-	// Strategy:
-	// 1. If pickCode is provided, try getting download URL first, as it returns file info.
-	// 2. If only fid is provided, or step 1 fails, list the parent to find the item.
-
-	if pc != "" {
-		// Try getting info via downurl endpoint
-		form := url.Values{"pick_code": {pc}}
-		opts := rest.Opts{
-			Method: "POST", Path: "/open/ufile/downurl", Body: strings.NewReader(form.Encode()),
-			ExtraHeaders: map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
-		}
-		var respData api.OpenAPIDownloadResp
-		apiErr := f.CallOpenAPI(ctx, &opts, nil, &respData, false)
-		if apiErr == nil {
-			for itemFid, downInfo := range respData.Data {
-				if downInfo != nil {
-					// Construct an api.File from the download info
-					return &api.File{
-						FID:      itemFid, // Key is the file ID
-						FileName: downInfo.FileName,
-						FileSize: downInfo.FileSize,
-						PickCode: downInfo.PickCode,
-						Sha1:     downInfo.Sha1,
-						IsFolder: 1, // Assume file if downurl works
-						// Timestamps are missing here
-					}, nil
-				}
-			}
-		}
-		// If downurl failed or returned empty, fall through to listing parent
-		fs.Debugf(f, "downurl failed for pickcode %s, falling back to listing parent: %v", pc, apiErr)
-	}
-
-	if fid == "" {
-		return nil, errors.New("getFile requires either fid or pickCode")
-	}
-
-	// Need parent ID to list. How to get parent ID from child ID efficiently?
-	// OpenAPI doesn't seem to offer this directly.
-	// Fallback: Use traditional /files/get_info which might still work? Risky.
-	// Alternative: Assume the caller knows the parent or accept inefficiency.
-	// Let's try the traditional endpoint as a last resort, requires cookie.
-	fs.Debugf(f, "Attempting traditional get_info for fid %s as OpenAPI lacks direct equivalent", fid)
-	params := url.Values{}
-	params.Set("file_id", fid)
-	opts := rest.Opts{
-		Method:     "GET",
-		Path:       "/files/get_info", // Traditional endpoint
-		Parameters: params,
-	}
-	var info api.FileInfo
-	err = f.CallTraditionalAPI(ctx, &opts, nil, &info, false) // Needs encryption
-	if err != nil {
-		return nil, fmt.Errorf("traditional get_info failed for ID %s: %w", fid, err)
-	}
-	if len(info.Data) > 0 {
-		file = info.Data[0]
-		// Decode name from traditional response
-		file.Name = f.opt.Enc.ToStandardName(file.Name)
-		// Map traditional fields to common fields if needed
-		file.FileName = file.Name
-		file.FileSize = file.Size
-		file.Sha1 = file.Sha
-		// IsDir check needs traditional logic here
-		if file.FID == "" && file.CID != "" { // Traditional folder check
-			file.IsFolder = 0
-		} else {
-			file.IsFolder = 1
-		}
-		return file, nil
-	}
-
-	return nil, fs.ErrorObjectNotFound // Not found via traditional API either
-}
-
-// getStats gets folder statistics using OpenAPI.
-func (f *Fs) getStats(ctx context.Context, cid string) (info *api.FileStats, err error) {
-	if cid == "0" {
-		// Maybe return default stats for root? Or error?
-		return nil, errors.New("getting stats for root directory '0' is not directly supported")
-	}
-	if f.isShare {
-		return nil, errors.New("getStats unsupported for shared filesystem")
-	}
-
-	params := url.Values{}
-	params.Set("file_id", cid)
-	opts := rest.Opts{
-		Method:     "GET",
-		Path:       "/open/folder/get_info",
-		Parameters: params,
-	}
-
-	info = new(api.FileStats) // Initialize the struct
-	err = f.CallOpenAPI(ctx, &opts, nil, info, false)
-	if err != nil {
-		return nil, fmt.Errorf("OpenAPI get_info (for stats) failed for ID %s: %w", cid, err)
-	}
-	if info.Data != nil {
-		// Decode names in path
-		info.Data.FileName = f.opt.Enc.ToStandardName(info.Data.FileName)
-		for i := range info.Data.Paths {
-			info.Data.Paths[i].FileName = f.opt.Enc.ToStandardName(info.Data.Paths[i].FileName)
-		}
-	} else {
-		return nil, errors.New("OpenAPI get_info (for stats) returned no data")
-	}
-	return info, nil
 }
 
 // ------------------------------------------------------------

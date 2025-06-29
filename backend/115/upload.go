@@ -60,9 +60,11 @@ func NewRereadableObject(ctx context.Context, src fs.ObjectInfo, options ...fs.O
 	if o, ok := src.(fs.Object); ok {
 		// If it's a direct Object
 		fsInfo = o.Fs()
-	} else if o, ok := fs.UnWrapObjectInfo(src).(fs.Object); ok {
-		// Try to unwrap it first
-		fsInfo = o.Fs()
+	} else if unwrapped := fs.UnWrapObjectInfo(src); unwrapped != src {
+		// Try to unwrap it first, only if it actually unwrapped something
+		if o, ok := unwrapped.(fs.Object); ok {
+			fsInfo = o.Fs()
+		}
 	} else if i, ok := src.(interface{ Fs() fs.Info }); ok {
 		// If it has an Fs() method that returns fs.Info
 		fsInfo = i.Fs()
@@ -587,19 +589,16 @@ func (f *Fs) initUploadOpenAPI(ctx context.Context, size int64, name, dirID, sha
 	err := f.CallOpenAPI(ctx, &opts, nil, &info, false)
 	if err != nil {
 		// Try to extract more specific error information
-		var apiErr error
-		if errors.As(err, &apiErr) {
-			// If it's a parameter error (code 1001), provide more context
-			if strings.Contains(err.Error(), "参数错误") || strings.Contains(err.Error(), "1001") {
-				return nil, fmt.Errorf("OpenAPI initUpload failed with parameter error: %w (file_name=%q, size=%d, dirID=%s)",
-					err, name, size, dirID)
-			}
+		// If it's a parameter error (code 1001), provide more context
+		if strings.Contains(err.Error(), "参数错误") || strings.Contains(err.Error(), "1001") {
+			return nil, fmt.Errorf("OpenAPI initUpload failed with parameter error: %w (file_name=%q, size=%d, dirID=%s)",
+				err, name, size, dirID)
+		}
 
-			// If it's a rate limit error, provide advice
-			if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "Too Many Requests") {
-				return nil, fmt.Errorf("OpenAPI initUpload failed due to rate limiting: %w. Consider using --low-level-retries flag to increase retries",
-					err)
-			}
+		// If it's a rate limit error, provide advice
+		if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "Too Many Requests") {
+			return nil, fmt.Errorf("OpenAPI initUpload failed due to rate limiting: %w. Consider using --low-level-retries flag to increase retries",
+				err)
 		}
 
 		// General error handling
@@ -1005,7 +1004,7 @@ func (f *Fs) sampleInitUpload(ctx context.Context, size int64, name, dirID strin
 }
 
 // sampleUploadForm uses multipart form to upload smaller files via traditional sample upload flow.
-func (f *Fs) sampleUploadForm(ctx context.Context, in io.Reader, initResp *api.SampleInitResp, name string, size int64, options ...fs.OpenOption) (*api.CallbackData, error) {
+func (f *Fs) sampleUploadForm(ctx context.Context, in io.Reader, initResp *api.SampleInitResp, name string, _ int64, options ...fs.OpenOption) (*api.CallbackData, error) {
 	// Safety check for nil input
 	if in == nil {
 		return nil, errors.New("nil input reader provided to sampleUploadForm")
@@ -1391,11 +1390,11 @@ func (f *Fs) getUploadInfo(
 // performOSSUpload handles the actual upload process
 func (f *Fs) performOSSUpload(
 	ctx context.Context,
-	client *oss.Client,
+	_ *oss.Client,
 	in io.Reader,
 	src fs.ObjectInfo,
 	o *Object,
-	size int64,
+	_ int64,
 	ui *api.UploadInitInfo,
 	options ...fs.OpenOption,
 ) (*api.CallbackData, error) {
