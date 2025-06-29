@@ -21,6 +21,16 @@ import (
 	"github.com/rclone/rclone/fs"
 )
 
+// isAPILimitError 检查错误是否为API限制错误
+func isAPILimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "770004") ||
+		strings.Contains(errStr, "已达到当前访问上限")
+}
+
 // DirCache caches paths to directory IDs and vice versa
 type DirCache struct {
 	cacheMu  sync.RWMutex // protects cache and invCache
@@ -237,6 +247,14 @@ func (dc *DirCache) _findDir(ctx context.Context, path string, create bool) (pat
 			dc.Put(path, pathID)
 			return
 		}
+
+		// 检查是否是API限制错误，如果是则立即返回，不要继续递归搜索
+		if isAPILimitError(err) {
+			// API限制错误，清理缓存并立即返回
+			dc.ResetRoot()
+			return "", err
+		}
+
 		// not found but doesn't have to create so return error
 		if !create {
 			return "", err
@@ -267,6 +285,11 @@ func (dc *DirCache) _findDir(ctx context.Context, path string, create bool) (pat
 	// Find the leaf in parentPathID
 	pathID, found, err := dc.fs.FindLeaf(ctx, parentPathID, leaf)
 	if err != nil {
+		// 检查是否是API限制错误，如果是则清理缓存并立即返回
+		if isAPILimitError(err) {
+			// API限制错误，清理缓存并立即返回
+			dc.ResetRoot()
+		}
 		return "", err
 	}
 

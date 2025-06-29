@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"path"
@@ -50,7 +49,7 @@ const (
 	tradUserAgent      = "Mozilla/5.0 115Browser/27.0.7.5" // Keep for traditional login mimicry?
 	defaultUserAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
 
-	defaultGlobalMinSleep = fs.Duration(300 * time.Millisecond)  // 5 QPS default for global
+	defaultGlobalMinSleep = fs.Duration(500 * time.Millisecond)  // 2 QPS - 优化后的稳定设置
 	traditionalMinSleep   = fs.Duration(1112 * time.Millisecond) // ~0.9 QPS for traditional
 	maxSleep              = 2 * time.Second
 	decayConstant         = 2 // bigger for slower decay, exponential
@@ -314,6 +313,265 @@ type Fs struct {
 	codeVerifier string // For PKCE
 	tokenRenewer *oauthutil.Renew
 	loginMu      sync.Mutex
+
+	// 路径缓存优化
+	pathCache *PathCache
+
+	// HTTP连接池优化
+	httpClient *http.Client
+}
+
+// PathCacheEntry 路径缓存条目
+type PathCacheEntry struct {
+	ID        string
+	IsDir     bool
+	Timestamp time.Time
+}
+
+// PathCache 简单的路径缓存实现
+type PathCache struct {
+	cache   map[string]*PathCacheEntry
+	mu      sync.RWMutex
+	ttl     time.Duration
+	maxSize int
+}
+
+// NewPathCache 创建新的路径缓存
+func NewPathCache(ttl time.Duration, maxSize int) *PathCache {
+	return &PathCache{
+		cache:   make(map[string]*PathCacheEntry),
+		ttl:     ttl,
+		maxSize: maxSize,
+	}
+}
+
+// Get 从缓存获取路径信息
+func (pc *PathCache) Get(path string) (*PathCacheEntry, bool) {
+	pc.mu.RLock()
+	defer pc.mu.RUnlock()
+
+	entry, exists := pc.cache[path]
+	if !exists {
+		return nil, false
+	}
+
+	// 检查是否过期
+	if time.Since(entry.Timestamp) > pc.ttl {
+		return nil, false
+	}
+
+	return entry, true
+}
+
+// Put 将路径信息放入缓存
+func (pc *PathCache) Put(path, id string, isDir bool) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+
+	// 如果缓存已满，清理最旧的条目
+	if len(pc.cache) >= pc.maxSize {
+		pc.evictOldest()
+	}
+
+	pc.cache[path] = &PathCacheEntry{
+		ID:        id,
+		IsDir:     isDir,
+		Timestamp: time.Now(),
+	}
+}
+
+// evictOldest 清理最旧的缓存条目
+func (pc *PathCache) evictOldest() {
+	if len(pc.cache) == 0 {
+		return
+	}
+
+	var oldestKey string
+	var oldestTime time.Time
+	first := true
+
+	for key, entry := range pc.cache {
+		if first || entry.Timestamp.Before(oldestTime) {
+			oldestKey = key
+			oldestTime = entry.Timestamp
+			first = false
+		}
+	}
+
+	if oldestKey != "" {
+		delete(pc.cache, oldestKey)
+	}
+}
+
+// Clear 清空缓存
+func (pc *PathCache) Clear() {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	pc.cache = make(map[string]*PathCacheEntry)
+}
+
+// AsyncCacheUpdate 异步更新缓存，避免阻塞主要操作
+func (f *Fs) AsyncCacheUpdate(ctx context.Context, path, id string, isDir bool) {
+	select {
+	case <-ctx.Done():
+		fs.Debugf(f, "AsyncCacheUpdate cancelled for path: %s", path)
+		return
+	default:
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fs.Debugf(f, "AsyncCacheUpdate panic for path %s: %v", path, r)
+				}
+			}()
+
+			// 使用带超时的context防止goroutine长时间运行
+			updateCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			select {
+			case <-updateCtx.Done():
+				fs.Debugf(f, "AsyncCacheUpdate timeout for path: %s", path)
+				return
+			case <-ctx.Done():
+				fs.Debugf(f, "AsyncCacheUpdate cancelled during execution for path: %s", path)
+				return
+			default:
+				// 检查缓存是否仍然有效（避免在清理后更新脏数据）
+				if f.pathCache != nil {
+					f.pathCache.Put(path, id, isDir)
+					fs.Debugf(f, "AsyncCacheUpdate completed for path: %s", path)
+				}
+			}
+		}()
+	}
+}
+
+// AsyncDirCacheUpdate 异步更新目录缓存
+func (f *Fs) AsyncDirCacheUpdate(ctx context.Context, path, id string) {
+	select {
+	case <-ctx.Done():
+		fs.Debugf(f, "AsyncDirCacheUpdate cancelled for path: %s", path)
+		return
+	default:
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fs.Debugf(f, "AsyncDirCacheUpdate panic for path %s: %v", path, r)
+				}
+			}()
+
+			// 使用带超时的context防止goroutine长时间运行
+			updateCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			select {
+			case <-updateCtx.Done():
+				fs.Debugf(f, "AsyncDirCacheUpdate timeout for path: %s", path)
+				return
+			case <-ctx.Done():
+				fs.Debugf(f, "AsyncDirCacheUpdate cancelled during execution for path: %s", path)
+				return
+			default:
+				// 检查目录缓存是否仍然有效
+				if f.dirCache != nil {
+					f.dirCache.Put(path, id)
+					fs.Debugf(f, "AsyncDirCacheUpdate completed for path: %s", path)
+				}
+			}
+		}()
+	}
+}
+
+// BatchFindRequest 批量查找请求
+type BatchFindRequest struct {
+	PathID string
+	Leaf   string
+}
+
+// BatchFindResult 批量查找结果
+type BatchFindResult struct {
+	Request BatchFindRequest
+	ID      string
+	Found   bool
+	IsDir   bool
+	Error   error
+}
+
+// BatchFindLeaf 批量查找叶节点，优化多个查找操作
+func (f *Fs) BatchFindLeaf(ctx context.Context, requests []BatchFindRequest) ([]BatchFindResult, error) {
+	results := make([]BatchFindResult, len(requests))
+
+	// 按父目录ID分组请求
+	groupedRequests := make(map[string][]int)
+	for i, req := range requests {
+		groupedRequests[req.PathID] = append(groupedRequests[req.PathID], i)
+	}
+
+	// 对每个父目录执行一次listAll操作
+	for pathID, indices := range groupedRequests {
+		// 创建查找映射
+		leafMap := make(map[string][]int)
+		for _, idx := range indices {
+			leaf := requests[idx].Leaf
+			leafMap[leaf] = append(leafMap[leaf], idx)
+		}
+
+		// 执行单次listAll操作
+		_, err := f.listAll(ctx, pathID, f.opt.ListChunk, false, false, func(item *api.File) bool {
+			decodedName := f.opt.Enc.ToStandardName(item.FileNameBest())
+			if indices, exists := leafMap[decodedName]; exists {
+				for _, idx := range indices {
+					results[idx] = BatchFindResult{
+						Request: requests[idx],
+						ID:      item.ID(),
+						Found:   true,
+						IsDir:   item.IsDir(),
+						Error:   nil,
+					}
+				}
+				delete(leafMap, decodedName) // 避免重复处理
+			}
+			return len(leafMap) == 0 // 如果所有项目都找到了就停止
+		})
+
+		if err != nil {
+			// 如果API调用失败，标记所有相关结果为错误
+			for _, idx := range indices {
+				if results[idx].Error == nil { // 只设置尚未设置的错误
+					results[idx] = BatchFindResult{
+						Request: requests[idx],
+						Found:   false,
+						Error:   err,
+					}
+				}
+			}
+		}
+
+		// 标记未找到的项目
+		for _, indices := range leafMap {
+			for _, idx := range indices {
+				if results[idx].Error == nil {
+					results[idx] = BatchFindResult{
+						Request: requests[idx],
+						Found:   false,
+						Error:   nil,
+					}
+				}
+			}
+		}
+	}
+
+	return results, nil
+}
+
+// isAPILimitError 检查错误是否为API限制错误
+func isAPILimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "770004") ||
+		strings.Contains(errStr, "已达到当前访问上限")
 }
 
 // Object describes a 115 object
@@ -369,11 +627,11 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 	// Check for specific error strings that indicate rate limiting
 	if err != nil {
 		// Check for rate limit by error message
-		if strings.Contains(err.Error(), "770004") ||
-			strings.Contains(err.Error(), "已达到当前访问上限") {
+		if isAPILimitError(err) {
 			fs.Debugf(nil, "Rate limit detected, retrying: %v", err)
 			// Create a retryAfter error which the pacer will respect
-			return true, pacer.RetryAfterError(err, 2*time.Second)
+			// 增加重试延迟到10秒，给115网盘更多时间恢复
+			return true, pacer.RetryAfterError(err, 10*time.Second)
 		}
 	}
 
@@ -1469,6 +1727,20 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		NoMultiThreading:        true, // Keep true as downloads might still use traditional API
 	}).Fill(ctx, f)
 
+	// 初始化路径缓存 (10秒TTL用于测试, 最大1000条目)
+	f.pathCache = NewPathCache(10*time.Second, 1000)
+
+	// 初始化优化的HTTP客户端
+	f.httpClient = &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        100,              // 最大空闲连接数
+			MaxIdleConnsPerHost: 10,               // 每个主机的最大空闲连接数
+			IdleConnTimeout:     90 * time.Second, // 空闲连接超时
+			DisableCompression:  false,            // 启用压缩
+		},
+		Timeout: 30 * time.Second, // 请求超时
+	}
+
 	// Setting appVer (needed for traditional calls)
 	re := regexp.MustCompile(`\d+\.\d+\.\d+(\.\d+)?$`)
 	if m := re.FindStringSubmatch(tradUserAgent); m == nil {
@@ -1575,9 +1847,34 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		if err != nil {
 			// Assume it is a file or doesn't exist
 			newRoot, remote := dircache.SplitPath(f.root)
-			tempF := *f
-			tempF.dirCache = dircache.New(newRoot, f.rootFolderID, &tempF)
-			tempF.root = newRoot
+			// 创建新的Fs实例，避免复制mutex
+			tempF := &Fs{
+				name:          f.name,
+				originalName:  f.originalName,
+				root:          newRoot,
+				opt:           f.opt,
+				features:      f.features,
+				tradClient:    f.tradClient,
+				openAPIClient: f.openAPIClient,
+				globalPacer:   f.globalPacer,
+				tradPacer:     f.tradPacer,
+				rootFolder:    f.rootFolder,
+				rootFolderID:  f.rootFolderID,
+				appVer:        f.appVer,
+				userID:        f.userID,
+				userkey:       f.userkey,
+				isShare:       f.isShare,
+				fileObj:       f.fileObj,
+				m:             f.m,
+				accessToken:   f.accessToken,
+				refreshToken:  f.refreshToken,
+				tokenExpiry:   f.tokenExpiry,
+				codeVerifier:  f.codeVerifier,
+				tokenRenewer:  f.tokenRenewer,
+				pathCache:     f.pathCache,
+				httpClient:    f.httpClient,
+			}
+			tempF.dirCache = dircache.New(newRoot, f.rootFolderID, tempF)
 			// Make new Fs which is the parent
 			err = tempF.dirCache.FindRoot(ctx, false)
 			if err != nil {
@@ -1585,20 +1882,20 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 				return f, nil
 			}
 			// Check if it's a file
-			fs.Debugf(f, "Checking if %q is a file in directory %q", remote, newRoot)
 			_, err := tempF.newObjectWithInfo(ctx, remote, nil)
 			if err != nil {
-				if err == fs.ErrorObjectNotFound {
-					// File doesn't exist so return old f
-					fs.Debugf(f, "File %q not found, treating as directory", remote)
+				// 检查是否是API限制错误，如果是则直接返回目录模式，避免路径混乱
+				if isAPILimitError(err) {
 					return f, nil
 				}
-				fs.Debugf(f, "Error checking file %q: %v", remote, err)
+				if err == fs.ErrorObjectNotFound {
+					// File doesn't exist so return old f
+					return f, nil
+				}
 				return nil, err
 			}
-			fs.Debugf(f, "Found file %q, returning fs.ErrorIsFile", remote)
 			// Copy the features
-			f.features.Fill(ctx, &tempF)
+			f.features.Fill(ctx, tempF)
 			// Update the dir cache in the old f
 			f.dirCache = tempF.dirCache
 			f.root = tempF.root
@@ -1661,22 +1958,54 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 // FindLeaf finds a directory or file leaf in the parent folder pathID.
 // Used by dircache.
 func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (foundID string, found bool, err error) {
+	// 构建缓存键
+	cacheKey := pathID + "/" + leaf
+
+	// 首先检查缓存
+	if entry, exists := f.pathCache.Get(cacheKey); exists {
+		if entry.IsDir {
+			return entry.ID, true, nil
+		} else {
+			// 找到的是文件，返回空ID表示这是文件而不是目录
+			return "", true, nil
+		}
+	}
+
 	// Use listAll which now uses OpenAPI
 	found, err = f.listAll(ctx, pathID, f.opt.ListChunk, false, false, func(item *api.File) bool {
 		// Compare with decoded name to handle special characters correctly
 		decodedName := f.opt.Enc.ToStandardName(item.FileNameBest())
 		if decodedName == leaf {
-			foundID = item.ID()
-			// Cache the found item's path/ID mapping
-			parentPath, ok := f.dirCache.GetInv(pathID)
-			if ok {
-				itemPath := path.Join(parentPath, leaf)
-				f.dirCache.Put(itemPath, foundID)
+			// 检查找到的项目是否为目录
+			if item.IsDir() {
+				// 这是目录，返回目录ID
+				foundID = item.ID()
+				// Cache the found item's path/ID mapping (only for directories)
+				parentPath, ok := f.dirCache.GetInv(pathID)
+				if ok {
+					itemPath := path.Join(parentPath, leaf)
+					f.dirCache.Put(itemPath, foundID)
+				}
+				// 同时更新路径缓存
+				f.pathCache.Put(cacheKey, foundID, true)
+			} else {
+				// 这是文件，不返回ID（保持foundID为空字符串）
+				foundID = "" // 明确设置为空，表示找到的是文件而不是目录
+				// 缓存文件信息
+				f.pathCache.Put(cacheKey, item.ID(), false)
 			}
 			return true // Stop searching
 		}
 		return false // Continue searching
 	})
+
+	// 如果遇到API限制错误，清理目录缓存和路径缓存以防止路径混乱
+	if isAPILimitError(err) {
+		fs.Debugf(f, "API限制错误，清理所有缓存: %v", err)
+		f.dirCache.ResetRoot()
+		f.pathCache.Clear()
+	}
+
 	return foundID, found, err
 }
 
@@ -1698,10 +2027,23 @@ func (f *Fs) GetDirID(ctx context.Context, dir string) (string, error) {
 		encodedPart := f.opt.Enc.FromStandardName(part) // Encode each part
 		foundID, found, err := f.FindLeaf(ctx, currentID, encodedPart)
 		if err != nil {
+			// 如果是API限制错误，立即返回，不要继续递归搜索
+			if isAPILimitError(err) {
+				// 清理缓存以防止路径混乱
+				f.dirCache.ResetRoot()
+				f.pathCache.Clear()
+				return "", err
+			}
 			return "", fmt.Errorf("error searching for %q in %q: %w", encodedPart, currentID, err)
 		}
 		if !found {
 			return "", fs.ErrorDirNotFound
+		}
+
+		// 验证找到的项目确实是目录
+		// 如果是文件，则这个路径不应该被当作目录路径处理
+		if foundID == "" {
+			return "", fmt.Errorf("path component %q is a file, not a directory", encodedPart)
 		}
 		// Check if the found item is actually a directory
 		// Need a way to confirm type without full listing again. Assume FindLeaf returns correct type for now.
@@ -1714,10 +2056,21 @@ func (f *Fs) GetDirID(ctx context.Context, dir string) (string, error) {
 
 // List the objects and directories in dir into entries.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+	fs.Debugf(f, "List调用，目录: %q", dir)
+
 	dirID, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
+		// 如果是API限制错误，记录详细信息并返回
+		if strings.Contains(err.Error(), "770004") ||
+			strings.Contains(err.Error(), "已达到当前访问上限") {
+			fs.Debugf(f, "List遇到API限制错误，目录: %q, 错误: %v", dir, err)
+			return nil, err
+		}
+		fs.Debugf(f, "List查找目录失败，目录: %q, 错误: %v", dir, err)
 		return nil, err
 	}
+
+	fs.Debugf(f, "List找到目录ID: %s，目录: %q", dirID, dir)
 	var iErr error
 	_, err = f.listAll(ctx, dirID, f.opt.ListChunk, false, false, func(item *api.File) bool {
 		entry, err := f.itemToDirEntry(ctx, path.Join(dir, item.FileNameBest()), item)
@@ -2291,6 +2644,14 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *api.Fil
 func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.File, err error) {
 	leaf, dirID, err := f.dirCache.FindPath(ctx, path, false)
 	if err != nil {
+		// 检查是否是API限制错误，如果是则立即返回，避免路径混乱
+		if isAPILimitError(err) {
+			fs.Debugf(f, "readMetaDataForPath遇到API限制错误，路径: %q, 错误: %v", path, err)
+			// 清理缓存以防止路径混乱
+			f.dirCache.ResetRoot()
+			f.pathCache.Clear()
+			return nil, err
+		}
 		if err == fs.ErrorDirNotFound {
 			return nil, fs.ErrorObjectNotFound
 		}
@@ -2473,109 +2834,75 @@ type FileInfoResponse struct {
 }
 
 func (f *Fs) GetPickCodeByPath(ctx context.Context, path string) (string, error) {
-	opts := rest.Opts{}
-	f.prepareTokenForRequest(ctx, &opts)
-	client := &http.Client{}
+	// 使用CallOpenAPI通过pacer进行调用
 	formData := url.Values{}
 	formData.Add("path", path)
 
-	reqBody := bytes.NewBufferString(formData.Encode())
-	req, err := http.NewRequest("POST", openAPIRootURL+"/open/folder/get_info", reqBody)
+	opts := rest.Opts{
+		Method:      "POST",
+		Path:        "/open/folder/get_info",
+		ContentType: "application/x-www-form-urlencoded",
+		Body:        strings.NewReader(formData.Encode()),
+	}
+
+	var response struct {
+		State   int    `json:"state"`
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			PickCode string `json:"pick_code"`
+		} `json:"data"`
+	}
+
+	err := f.CallOpenAPI(ctx, &opts, nil, &response, false)
 	if err != nil {
-		return "", fmt.Errorf("创建请求失败: %w", err)
+		return "", fmt.Errorf("获取PickCode失败: %w", err)
 	}
-	req.Header.Set("Authorization", opts.ExtraHeaders["Authorization"])
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("发送请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("读取响应体失败: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("API请求返回非成功状态码: %d, 响应: %s", resp.StatusCode, string(body))
-	}
-	var fileInfoResp FileInfoResponse
-	if err := json.Unmarshal(body, &fileInfoResp); err != nil {
-		return "", fmt.Errorf("解析JSON响应失败: %w, 响应: %s", err, string(body))
-	}
+
 	// 检查API返回的状态
-	if !fileInfoResp.State {
-		return "", fmt.Errorf("API返回错误: %s (Code: %d)", fileInfoResp.Message, fileInfoResp.Code)
+	if response.Code != 0 {
+		return "", fmt.Errorf("API返回错误: %s (Code: %d)", response.Message, response.Code)
 	}
-	// 确保 Data 字段不为空，并返回 PickCode
-	if fileInfoResp.Data != nil {
-		return fileInfoResp.Data.PickCode, nil
-	}
-	return "", fmt.Errorf("未从API响应中获取到数据 (Data字段为空)")
+
+	// 返回 PickCode
+	return response.Data.PickCode, nil
 }
 
 func (f *Fs) getDownloadURLByUA(ctx context.Context, filePath string, UA string) (string, error) {
-
-	// info, err := f.readMetaDataForPath(ctx, filePath)
-	// if err != nil {
-	// 	return "", fmt.Errorf("failed to read metadata for file path %q: %w", filePath, err)
-	// }
-
-	// // 检查文件是否有 pickCode
-	// if info.PickCodeBest() == "" {
-	// 	return "", errors.New("file does not have a valid pick code for download")
-	// }
-
 	pickCode, err := f.GetPickCodeByPath(ctx, filePath)
 	if err != nil {
 		return "", fmt.Errorf("failed to read metadata for file path %q: %w", filePath, err)
 	}
-	// formData := url.Values{}
-	// formData.Set("path", filePath)
-	// req.Body = ioutil.NopCloser(bytes.NewBufferString(formData.Encode()))
-
-	client := &http.Client{}
-	// req, err := http.NewRequest("POST", openAPIRootURL+"/open/ufile/downurl", strings.NewReader("pick_code="+info.PickCodeBest()))
-	req, err := http.NewRequest("POST", openAPIRootURL+"/open/ufile/downurl", strings.NewReader("pick_code="+pickCode))
-
-	if err != nil {
-		fs.Errorf(nil, "创建请求失败: %v", err)
-	}
-	opts := rest.Opts{}
-	f.prepareTokenForRequest(ctx, &opts)
 
 	// 如果没有提供 UA，使用默认值
 	if UA == "" {
 		UA = defaultUserAgent
 	}
 
-	// 设置请求头
-	req.Header.Set("Authorization", opts.ExtraHeaders["Authorization"])
-	req.Header.Set("User-Agent", UA)
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	fs.Infof(nil, "Authorization: %s, User-Agent: %s", opts.ExtraHeaders["Authorization"], UA)
-
-	// 发送请求并处理响应
-	res, err := client.Do(req)
-	if err != nil {
-		fs.Logf(nil, "请求失败: %v", err)
-		return "", err
+	// 使用CallOpenAPI通过pacer进行调用
+	opts := rest.Opts{
+		Method:      "POST",
+		Path:        "/open/ufile/downurl",
+		ContentType: "application/x-www-form-urlencoded",
+		Body:        strings.NewReader("pick_code=" + pickCode),
+		ExtraHeaders: map[string]string{
+			"User-Agent": UA,
+		},
 	}
-	defer res.Body.Close()
 
-	// 解析响应
 	var response ApiResponse
-	if decodeErr := json.NewDecoder(res.Body).Decode(&response); decodeErr != nil {
-		fs.Logf(nil, "解析响应失败: %v", err)
-		return "", err
+	err = f.CallOpenAPI(ctx, &opts, nil, &response, false)
+	if err != nil {
+		return "", fmt.Errorf("获取下载URL失败: %w", err)
 	}
 
 	for _, downInfo := range response.Data {
 		if downInfo != (FileInfo{}) {
 			fs.Infof(nil, "获取到下载URL: %s", downInfo.URL.URL)
-			return downInfo.URL.URL, err
+			return downInfo.URL.URL, nil
 		}
 	}
-	return "", err
+	return "", fmt.Errorf("未从API响应中获取到下载URL")
 }
 
 // ------------------------------------------------------------
