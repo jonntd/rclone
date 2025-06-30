@@ -246,7 +246,7 @@ func equal(ctx context.Context, src fs.ObjectInfo, dst fs.Object, opt equalOpt) 
 		return false
 	}
 	if opt.sizeOnly {
-		fs.Debugf(src, "Sizes identical")
+		fs.Debugf(src, "文件大小相同")
 		logger(ctx, Match, src, dst, nil)
 		return true
 	}
@@ -282,7 +282,7 @@ func equal(ctx context.Context, src fs.ObjectInfo, dst fs.Object, opt equalOpt) 
 		// Sizes the same so check the mtime
 		modifyWindow := fs.GetModifyWindow(ctx, src.Fs(), dst.Fs())
 		if modifyWindow == fs.ModTimeNotSupported {
-			fs.Debugf(src, "Sizes identical")
+			fs.Debugf(src, "文件大小相同")
 			logger(ctx, Match, src, dst, nil)
 			return true
 		}
@@ -1688,7 +1688,7 @@ func copyDest(ctx context.Context, fdst fs.Fs, dst, src fs.Object, CopyDest, bac
 			fs.Debugf(src, "Destination found in --copy-dest, using server-side copy")
 			return true, nil
 		}
-		fs.Debugf(src, "Unchanged skipping")
+		fs.Debugf(src, "文件未改变，跳过传输")
 		return true, nil
 	}
 	fs.Debugf(src, "Destination not found in --copy-dest")
@@ -1767,7 +1767,7 @@ func NeedTransfer(ctx context.Context, dst, src fs.Object) bool {
 			opt := defaultEqualOpt(ctx)
 			opt.forceModTimeMatch = true
 			if equal(ctx, src, dst, opt) {
-				fs.Debugf(src, "Unchanged skipping")
+				fs.Debugf(src, "文件未改变，跳过传输")
 				return false
 			}
 		default:
@@ -1787,7 +1787,7 @@ func NeedTransfer(ctx context.Context, dst, src fs.Object) bool {
 			return !equalFn(ctx, src, dst)
 		}
 		if Equal(ctx, src, dst) && !SameObject(src, dst) {
-			fs.Debugf(src, "Unchanged skipping")
+			fs.Debugf(src, "文件未改变，跳过传输")
 			return false
 		}
 	}

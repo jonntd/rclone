@@ -419,7 +419,7 @@ func (s *StatsInfo) String() string {
 	}
 
 	if !s.ci.StatsOneLine {
-		_, _ = fmt.Fprintf(buf, "\nTransferred:   	")
+		_, _ = fmt.Fprintf(buf, "\n已传输:   	")
 	} else {
 		xfrchk := []string{}
 		if ts.totalTransfers > 0 && s.transferQueue > 0 {
@@ -481,7 +481,7 @@ func (s *StatsInfo) String() string {
 			_, _ = fmt.Fprintf(buf, "Renamed:       %10d\n", s.renames)
 		}
 		if s.transfers != 0 || ts.totalTransfers != 0 {
-			_, _ = fmt.Fprintf(buf, "Transferred:   %10d / %d, %s\n",
+			_, _ = fmt.Fprintf(buf, "已传输:   %10d / %d, %s\n",
 				s.transfers, ts.totalTransfers, percent(s.transfers, ts.totalTransfers))
 		}
 		if s.serverSideCopies != 0 || s.serverSideCopyBytes != 0 {
@@ -494,7 +494,7 @@ func (s *StatsInfo) String() string {
 				s.serverSideMoves, fs.SizeSuffix(s.serverSideMoveBytes).ByteUnit(),
 			)
 		}
-		_, _ = fmt.Fprintf(buf, "Elapsed time:  %10ss\n", strings.TrimRight(fs.Duration(elapsedTime.Truncate(time.Minute)).ReadableString(), "0s")+fmt.Sprintf("%.1f", elapsedTimeSecondsOnly.Seconds()))
+		_, _ = fmt.Fprintf(buf, "耗时:  %10ss\n", strings.TrimRight(fs.Duration(elapsedTime.Truncate(time.Minute)).ReadableString(), "0s")+fmt.Sprintf("%.1f", elapsedTimeSecondsOnly.Seconds()))
 	}
 
 	// checking and transferring have their own locking so unlock
