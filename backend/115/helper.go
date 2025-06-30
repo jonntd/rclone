@@ -38,6 +38,8 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly, di
 	params.Set("asc", "0")        // Default sort: descending
 
 	offset := 0
+	var allFiles []api.File // 收集所有文件用于缓存
+
 	for {
 		params.Set("offset", strconv.Itoa(offset))
 		opts := rest.Opts{
@@ -71,8 +73,13 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly, di
 			// Decode name
 			item.FileName = f.opt.Enc.ToStandardName(item.FileNameBest()) // Use best name getter
 
+			// 收集文件用于缓存
+			allFiles = append(allFiles, *item)
+
 			if fn(item) {
 				found = true
+				// 在早期退出前也保存缓存
+				f.saveDirListToCache(dirID, allFiles)
 				return found, nil // Early exit
 			}
 		}
@@ -85,6 +92,11 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly, di
 		if info.Count > 0 && offset >= info.Count {
 			break // We've reached or exceeded the total count
 		}
+	}
+
+	// 保存完整的目录列表到缓存
+	if len(allFiles) > 0 {
+		f.saveDirListToCache(dirID, allFiles)
 	}
 	return found, nil
 }
