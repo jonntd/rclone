@@ -1063,11 +1063,13 @@ func (f *Fs) fileExists(ctx context.Context, parentFileID int64, fileName string
 
 // verifyParentFileID 验证父目录ID是否存在，使用BadgerDB缓存减少API调用
 func (f *Fs) verifyParentFileID(ctx context.Context, parentFileID int64) (bool, error) {
-	// 首先检查BadgerDB缓存
+	// 首先检查BadgerDB缓存（如果可用）
 	cacheKey := fmt.Sprintf("parent_%d", parentFileID)
-	if cached, found := f.parentIDCache.GetBool(cacheKey); found {
-		f.debugf(LogLevelVerbose, "父目录ID %d BadgerDB缓存验证通过: %v", parentFileID, cached)
-		return cached, nil
+	if f.parentIDCache != nil {
+		if cached, found := f.parentIDCache.GetBool(cacheKey); found {
+			f.debugf(LogLevelVerbose, "父目录ID %d BadgerDB缓存验证通过: %v", parentFileID, cached)
+			return cached, nil
+		}
 	}
 
 	fs.Debugf(f, "验证父目录ID: %d", parentFileID)
@@ -1087,10 +1089,12 @@ func (f *Fs) verifyParentFileID(ctx context.Context, parentFileID int64) (bool, 
 	}
 
 	// 缓存结果到BadgerDB（成功和失败都缓存，避免重复验证无效ID）
-	if err := f.parentIDCache.SetBool(cacheKey, isValid, f.cacheConfig.ParentIDCacheTTL); err != nil {
-		fs.Debugf(f, "保存父目录ID %d 缓存失败: %v", parentFileID, err)
-	} else {
-		f.debugf(LogLevelVerbose, "已保存父目录ID %d 到BadgerDB缓存: valid=%v, TTL=%v", parentFileID, isValid, f.cacheConfig.ParentIDCacheTTL)
+	if f.parentIDCache != nil {
+		if err := f.parentIDCache.SetBool(cacheKey, isValid, f.cacheConfig.ParentIDCacheTTL); err != nil {
+			fs.Debugf(f, "保存父目录ID %d 缓存失败: %v", parentFileID, err)
+		} else {
+			f.debugf(LogLevelVerbose, "已保存父目录ID %d 到BadgerDB缓存: valid=%v, TTL=%v", parentFileID, isValid, f.cacheConfig.ParentIDCacheTTL)
+		}
 	}
 
 	return isValid, nil
@@ -1705,13 +1709,13 @@ func init() {
 			Advanced: true,
 		}, {
 			Name:     "max_concurrent_uploads",
-			Help:     "最大并发上传数量。",
-			Default:  2,
+			Help:     "最大并发上传数量。减少此值可降低内存使用和提高稳定性。",
+			Default:  1, // 从2改为1，减少并发压力
 			Advanced: true,
 		}, {
 			Name:     "max_concurrent_downloads",
-			Help:     "最大并发下载数量。",
-			Default:  2,
+			Help:     "最大并发下载数量。减少此值可降低内存使用和提高稳定性。",
+			Default:  1, // 从2改为1，减少并发压力
 			Advanced: true,
 		}, {
 			Name:     "progress_update_interval",
@@ -5274,35 +5278,18 @@ func (f *Fs) streamingPutWithTempFile(ctx context.Context, in io.Reader, src fs.
 func (f *Fs) streamingPutWithTwoPhase(ctx context.Context, in io.Reader, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
 	fs.Debugf(f, "开始两阶段流式传输：第一阶段计算MD5")
 
-	// 第一阶段：快速计算MD5哈希
-	// 这里我们需要重新获取源文件流来计算MD5
+	// 优化的MD5计算策略：避免重复读取源文件
+	// 首先尝试从源对象获取已知的MD5哈希
 	if srcObj, ok := src.(fs.Object); ok {
-		// 获取新的流用于MD5计算
-		md5Reader, err := srcObj.Open(ctx)
-		if err != nil {
-			fs.Debugf(f, "无法重新打开源文件进行MD5计算，回退到临时文件策略: %v", err)
-			return f.streamingPutWithTempFileForced(ctx, in, src, parentFileID, fileName)
-		}
-		defer func() {
-			if closer, ok := md5Reader.(io.Closer); ok {
-				closer.Close()
-			}
-		}()
-
-		// 快速计算MD5（只读取，不存储）
-		hasher := md5.New()
-		_, err = io.Copy(hasher, md5Reader)
-		if err != nil {
-			fs.Debugf(f, "MD5计算失败，回退到临时文件策略: %v", err)
-			return f.streamingPutWithTempFileForced(ctx, in, src, parentFileID, fileName)
+		// 尝试获取已知的MD5哈希，避免重复计算
+		if md5Hash, err := srcObj.Hash(ctx, fshash.MD5); err == nil && md5Hash != "" {
+			fs.Debugf(f, "使用源对象已知MD5: %s", md5Hash)
+			return f.putWithKnownMD5(ctx, in, src, parentFileID, fileName, md5Hash)
 		}
 
-		md5Hash := fmt.Sprintf("%x", hasher.Sum(nil))
-		fs.Debugf(f, "第一阶段完成，计算得到MD5: %s", md5Hash)
-
-		// 第二阶段：使用已知MD5进行流式上传
-		fs.Debugf(f, "开始第二阶段：使用已知MD5进行流式上传")
-		return f.putWithKnownMD5(ctx, in, src, parentFileID, fileName, md5Hash)
+		// 如果没有已知MD5，使用临时文件策略确保数据一致性
+		fs.Debugf(f, "源对象无已知MD5，使用临时文件策略确保数据一致性")
+		return f.streamingPutWithTempFileForced(ctx, in, src, parentFileID, fileName)
 	}
 
 	// 如果无法获取源对象，回退到临时文件策略
@@ -5630,21 +5617,28 @@ func (f *Fs) finalizeChunkedUpload(ctx context.Context, createResp *UploadCreate
 func (f *Fs) attemptStreamingUpload(ctx context.Context, srcObj fs.Object, parentFileID int64, fileName string) (*Object, error) {
 	fs.Debugf(f, "尝试流式上传，避免临时文件和双倍流量")
 
-	// 第一步：快速计算MD5（只读取，不存储）
-	md5Reader, err := srcObj.Open(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("无法打开源文件计算MD5: %w", err)
-	}
-	defer md5Reader.Close()
+	// 优化的MD5获取策略：优先使用已知哈希，避免重复计算
+	var md5Hash string
+	if hash, err := srcObj.Hash(ctx, fshash.MD5); err == nil && hash != "" {
+		md5Hash = hash
+		fs.Debugf(f, "使用源对象已知MD5: %s", md5Hash)
+	} else {
+		// 如果没有已知MD5，计算MD5（只读取一次）
+		md5Reader, err := srcObj.Open(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("无法打开源文件计算MD5: %w", err)
+		}
+		defer md5Reader.Close()
 
-	hasher := md5.New()
-	_, err = io.Copy(hasher, md5Reader)
-	if err != nil {
-		return nil, fmt.Errorf("计算MD5失败: %w", err)
-	}
+		hasher := md5.New()
+		_, err = io.Copy(hasher, md5Reader)
+		if err != nil {
+			return nil, fmt.Errorf("计算MD5失败: %w", err)
+		}
 
-	md5Hash := fmt.Sprintf("%x", hasher.Sum(nil))
-	fs.Debugf(f, "流式传输MD5计算完成: %s", md5Hash)
+		md5Hash = fmt.Sprintf("%x", hasher.Sum(nil))
+		fs.Debugf(f, "流式传输MD5计算完成: %s", md5Hash)
+	}
 
 	// 第二步：使用已知MD5创建上传会话
 	createResp, err := f.createUpload(ctx, parentFileID, fileName, md5Hash, srcObj.Size())
@@ -6429,7 +6423,7 @@ func (f *Fs) moveFile(ctx context.Context, fileID, toParentFileID int64) error {
 	return nil
 }
 
-// renameFile 重命名文件
+// renameFile 重命名文件 - 增强版本，支持延迟和重试
 func (f *Fs) renameFile(ctx context.Context, fileID int64, fileName string) error {
 	fs.Debugf(f, "重命名文件%d为: %s", fileID, fileName)
 
@@ -6437,6 +6431,9 @@ func (f *Fs) renameFile(ctx context.Context, fileID int64, fileName string) erro
 	if err := validateFileName(fileName); err != nil {
 		return fmt.Errorf("重命名文件名验证失败: %w", err)
 	}
+
+	// 添加短暂延迟，让123网盘系统有时间处理文件
+	time.Sleep(2 * time.Second)
 
 	reqBody := map[string]interface{}{
 		"fileId":   fileID,
@@ -6453,10 +6450,32 @@ func (f *Fs) renameFile(ctx context.Context, fileID int64, fileName string) erro
 		Message string `json:"message"`
 	}
 
-	err = f.apiCall(ctx, "PUT", "/api/v1/file/name", bytes.NewReader(bodyBytes), &response)
-	if err != nil {
-		return fmt.Errorf("重命名文件失败: %w", err)
+	// 实现重试机制，最多重试3次
+	maxRetries := 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		fs.Debugf(f, "重命名文件尝试 %d/%d", attempt, maxRetries)
+
+		err = f.apiCall(ctx, "PUT", "/api/v1/file/name", bytes.NewReader(bodyBytes), &response)
+		if err == nil {
+			fs.Debugf(f, "重命名文件成功: %d -> %s", fileID, fileName)
+			return nil
+		}
+
+		// 检查是否是"文件未找到"错误
+		if strings.Contains(err.Error(), "没有找到文件") || strings.Contains(err.Error(), "API错误 1") {
+			if attempt < maxRetries {
+				waitTime := time.Duration(attempt*2) * time.Second
+				fs.Debugf(f, "文件未找到，等待%v后重试 (尝试 %d/%d)", waitTime, attempt, maxRetries)
+				time.Sleep(waitTime)
+				continue
+			}
+		}
+
+		// 其他错误或最后一次尝试失败
+		break
 	}
+
+	return fmt.Errorf("重命名文件失败 (尝试%d次): %w", maxRetries, err)
 
 	if response.Code != 0 {
 		return fmt.Errorf("重命名失败: API错误 %d: %s", response.Code, response.Message)
@@ -6565,9 +6584,9 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		opt.EnableProgressDisplay,
 	)
 
-	// 初始化内存管理器，防止内存泄漏
-	// 总内存限制200MB，单文件限制50MB
-	f.memoryManager = NewMemoryManager(200*1024*1024, 50*1024*1024)
+	// 初始化内存管理器，防止内存泄漏 - 优化内存限制
+	// 总内存限制150MB，单文件限制30MB，减少内存压力
+	f.memoryManager = NewMemoryManager(150*1024*1024, 30*1024*1024)
 
 	// 初始化性能指标收集器
 	f.performanceMetrics = NewPerformanceMetrics()
@@ -6713,13 +6732,25 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			m:                  f.m,
 			rootFolderID:       f.rootFolderID,
 			client:             f.client,
+			listPacer:          f.listPacer,
 			strictPacer:        f.strictPacer,
 			uploadPacer:        f.uploadPacer,
 			downloadPacer:      f.downloadPacer,
+			parentIDCache:      f.parentIDCache,
+			dirListCache:       f.dirListCache,
+			basicURLCache:      f.basicURLCache,
+			pathToIDCache:      f.pathToIDCache,
 			concurrencyManager: f.concurrencyManager,
 			progressTracker:    f.progressTracker,
 			memoryManager:      f.memoryManager,
 			performanceMetrics: f.performanceMetrics,
+			resourcePool:       f.resourcePool,
+			downloadURLCache:   f.downloadURLCache,
+			apiVersionManager:  f.apiVersionManager,
+			resumeManager:      f.resumeManager,
+			networkMonitor:     f.networkMonitor,
+			networkSpeedCache:  f.networkSpeedCache,
+			cacheConfig:        f.cacheConfig,
 		}
 		tempF.dirCache = dircache.New(newRoot, f.rootFolderID, tempF)
 		// Make new Fs which is the parent
@@ -9132,15 +9163,31 @@ func (f *Fs) executeSingleStepUpload(uploadCtx *UnifiedUploadContext) (*Object, 
 func (f *Fs) executeChunkedUpload(uploadCtx *UnifiedUploadContext) (*Object, error) {
 	fs.Debugf(f, "执行分片上传策略")
 
-	// 获取或计算MD5
+	// 获取或计算MD5 - 确保一致性
 	var md5Hash string
 	if hashValue, err := uploadCtx.src.Hash(uploadCtx.ctx, fshash.MD5); err == nil && hashValue != "" {
 		md5Hash = hashValue
 		fs.Debugf(f, "使用已知MD5: %s", md5Hash)
 	} else {
-		// 对于分片上传，可以使用临时MD5，后续会重新计算
-		md5Hash = fmt.Sprintf("%032x", time.Now().UnixNano())
-		fs.Debugf(f, "使用临时MD5: %s", md5Hash)
+		// 对于分片上传，必须计算准确的MD5，不能使用临时值
+		fs.Debugf(f, "计算文件MD5用于分片上传")
+		if srcObj, ok := uploadCtx.src.(fs.Object); ok {
+			md5Reader, err := srcObj.Open(uploadCtx.ctx)
+			if err != nil {
+				return nil, fmt.Errorf("无法打开源文件计算MD5: %w", err)
+			}
+			defer md5Reader.Close()
+
+			hasher := md5.New()
+			_, err = io.Copy(hasher, md5Reader)
+			if err != nil {
+				return nil, fmt.Errorf("计算MD5失败: %w", err)
+			}
+			md5Hash = fmt.Sprintf("%x", hasher.Sum(nil))
+			fs.Debugf(f, "分片上传MD5计算完成: %s", md5Hash)
+		} else {
+			return nil, fmt.Errorf("无法获取源对象进行MD5计算")
+		}
 	}
 
 	// 创建上传会话
@@ -9828,6 +9875,10 @@ func (f *Fs) v2UploadChunksSingleThreaded(ctx context.Context, in io.Reader, src
 		hasher := md5.New()
 		hasher.Write(chunkData)
 		chunkHash := fmt.Sprintf("%x", hasher.Sum(nil))
+
+		// 添加详细的MD5调试信息
+		fs.Debugf(f, "分片 %d MD5计算: 数据长度=%d, MD5=%s",
+			partNumber, len(chunkData), chunkHash)
 
 		// 上传分片
 		err = f.uploadChunkV2(ctx, preuploadID, partNumber, chunkData, chunkHash)
