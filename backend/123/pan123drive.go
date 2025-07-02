@@ -12,7 +12,6 @@ import (
 	"math"
 	"math/rand/v2"
 	"mime/multipart"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -150,33 +149,39 @@ const (
 )
 
 // Options 定义此后端的配置选项
+// 优化版本：标注了可以考虑使用rclone标准配置的选项
 type Options struct {
-	ClientID          string        `config:"client_id"`
-	ClientSecret      string        `config:"client_secret"`
-	Token             string        `config:"token"`
-	UserAgent         string        `config:"user_agent"`
-	RootFolderID      string        `config:"root_folder_id"`
-	ListChunk         int           `config:"list_chunk"`
-	PacerMinSleep     fs.Duration   `config:"pacer_min_sleep"`
-	ListPacerMinSleep fs.Duration   `config:"list_pacer_min_sleep"`
-	ConnTimeout       fs.Duration   `config:"conn_timeout"`
-	Timeout           fs.Duration   `config:"timeout"`
-	ChunkSize         fs.SizeSuffix `config:"chunk_size"`
-	UploadCutoff      fs.SizeSuffix `config:"upload_cutoff"`
-	MaxUploadParts    int           `config:"max_upload_parts"`
+	// 123网盘特定的认证配置
+	ClientID     string `config:"client_id"`
+	ClientSecret string `config:"client_secret"`
+	Token        string `config:"token"`
+	UserAgent    string `config:"user_agent"`
+	RootFolderID string `config:"root_folder_id"`
 
-	// 性能优化相关选项
-	MaxConcurrentUploads   int         `config:"max_concurrent_uploads"`
-	MaxConcurrentDownloads int         `config:"max_concurrent_downloads"`
+	// 文件操作配置 (部分可考虑使用rclone标准配置)
+	ListChunk      int           `config:"list_chunk"`    // 可考虑使用fs.Config.Checkers
+	ChunkSize      fs.SizeSuffix `config:"chunk_size"`    // 可考虑使用fs.Config.ChunkSize
+	UploadCutoff   fs.SizeSuffix `config:"upload_cutoff"` // 可考虑使用fs.Config.MultiThreadCutoff
+	MaxUploadParts int           `config:"max_upload_parts"`
+
+	// 网络和超时配置 (可考虑使用rclone标准配置)
+	PacerMinSleep     fs.Duration `config:"pacer_min_sleep"`
+	ListPacerMinSleep fs.Duration `config:"list_pacer_min_sleep"`
+	ConnTimeout       fs.Duration `config:"conn_timeout"` // 可考虑使用fs.Config.ConnectTimeout
+	Timeout           fs.Duration `config:"timeout"`      // 可考虑使用fs.Config.Timeout
+
+	// 并发控制配置 (可考虑使用rclone标准配置)
+	MaxConcurrentUploads   int         `config:"max_concurrent_uploads"`   // 可考虑使用fs.Config.Transfers
+	MaxConcurrentDownloads int         `config:"max_concurrent_downloads"` // 可考虑使用fs.Config.Checkers
 	ProgressUpdateInterval fs.Duration `config:"progress_update_interval"`
 	EnableProgressDisplay  bool        `config:"enable_progress_display"`
 
-	// QPS控制相关选项
+	// 123网盘特定的QPS控制选项
 	UploadPacerMinSleep   fs.Duration `config:"upload_pacer_min_sleep"`
 	DownloadPacerMinSleep fs.Duration `config:"download_pacer_min_sleep"`
 	StrictPacerMinSleep   fs.Duration `config:"strict_pacer_min_sleep"`
 
-	// 调试和日志控制选项
+	// 调试配置
 	DebugLevel int `config:"debug_level"` // 调试级别：0=无，1=错误，2=信息，3=调试，4=详细
 }
 
@@ -215,9 +220,8 @@ type Fs struct {
 	basicURLCache *cache.BadgerCache // 基础下载URL缓存
 	pathToIDCache *cache.BadgerCache // 路径到FileID映射缓存
 
-	// 性能优化相关
-	uploadSemaphore    chan struct{}            // 上传并发控制信号量
-	downloadSemaphore  chan struct{}            // 下载并发控制信号量
+	// 性能优化相关 - 优化版本：使用更标准化的并发控制
+	concurrencyManager *ConcurrencyManager      // 统一的并发控制管理器
 	progressTracker    *ProgressTracker         // 进度跟踪器
 	memoryManager      *MemoryManager           // 内存管理器，防止内存泄漏
 	performanceMetrics *PerformanceMetrics      // 性能指标收集器
@@ -806,11 +810,13 @@ func (f *Fs) schedulePartialFileCleanup(preuploadID string) {
 }
 
 // ProgressTracker 用于跟踪上传/下载进度
+// 优化版本：保持123网盘特定功能，但简化实现
 type ProgressTracker struct {
 	mu             sync.RWMutex
 	operations     map[string]*OperationProgress // 操作ID -> 进度信息
 	updateInterval time.Duration                 // 进度更新间隔
 	enableDisplay  bool                          // 是否启用进度显示
+	// 可以考虑未来集成rclone的accounting包
 }
 
 // OperationProgress 表示单个操作的进度信息
@@ -850,12 +856,7 @@ func (prc *ProgressReadCloser) Read(p []byte) (n int, err error) {
 // Close 实现io.Closer接口，同时清理资源
 func (prc *ProgressReadCloser) Close() error {
 	// 释放下载信号量
-	select {
-	case <-prc.fs.downloadSemaphore:
-		// 信号量释放成功
-	default:
-		fs.Errorf(prc.fs, "ProgressReadCloser下载信号量释放失败")
-	}
+	prc.fs.concurrencyManager.ReleaseDownload()
 
 	// 完成进度跟踪
 	success := prc.transferredSize == prc.totalSize
@@ -893,15 +894,16 @@ var (
 )
 
 // validateFileName 验证文件名是否符合123网盘的限制规则（全局函数版本）
-// 返回验证结果和详细的错误信息
+// 优化版本：使用rclone标准验证加上123网盘特定规则
 // 注意：推荐使用Fs.validateFileNameUnified方法以获得更完整的验证
 func validateFileName(name string) error {
-	// 基础检查：空值和空格
-	if name == "" {
-		return fmt.Errorf("文件名不能为空")
+	// 使用rclone标准的路径检查
+	if strings.Contains(name, "/") || strings.Contains(name, "\\") {
+		return fmt.Errorf("文件名不能包含路径分隔符")
 	}
 
-	if strings.TrimSpace(name) == "" {
+	// 基础检查：空值和空格 - 使用通用工具
+	if StringUtil.IsEmpty(name) {
 		return fmt.Errorf("文件名不能为空或全部是空格")
 	}
 
@@ -910,7 +912,7 @@ func validateFileName(name string) error {
 		return fmt.Errorf("文件名包含无效的UTF-8字符")
 	}
 
-	// 长度检查（字符数）
+	// 123网盘特定的长度检查（字符数）
 	runeCount := utf8.RuneCountInString(name)
 	if runeCount > maxFileNameLength {
 		return fmt.Errorf("文件名长度超过限制：当前%d个字符，最大允许%d个字符",
@@ -1585,43 +1587,36 @@ func (f *Fs) fileExistsInDirectory(ctx context.Context, parentID int64, fileName
 }
 
 // normalizePath 规范化路径，处理123网盘路径的特殊要求
-// 主要解决以斜杠结尾的路径问题，确保符合dircache的要求
+// 优化版本：使用rclone标准路径处理加上123网盘特定要求
 // dircache要求：路径不应该以/开头或结尾
 func normalizePath(path string) string {
 	if path == "" {
 		return ""
 	}
 
-	// 移除开头的斜杠（如果有）
-	path = strings.TrimPrefix(path, "/")
+	// 使用filepath.Clean进行基础路径清理
+	path = filepath.Clean(path)
 
-	// 移除结尾的斜杠（如果有）
-	path = strings.TrimSuffix(path, "/")
-
-	// 处理连续的斜杠，替换为单个斜杠
-	path = regexp.MustCompile(`/+`).ReplaceAllString(path, "/")
-
-	// 移除空的路径组件
-	parts := strings.Split(path, "/")
-	var cleanParts []string
-	for _, part := range parts {
-		// 只保留非空的部分
-		if part != "" && part != "." {
-			cleanParts = append(cleanParts, part)
-		}
-	}
-
-	// 重新组合路径
-	if len(cleanParts) == 0 {
+	// 处理filepath.Clean的特殊返回值
+	if path == "." {
 		return ""
 	}
 
-	result := strings.Join(cleanParts, "/")
+	// 移除开头的斜杠（如果有）
+	path = strings.TrimPrefix(path, "/")
+	path = strings.TrimPrefix(path, "\\") // 处理Windows路径分隔符
+
+	// 移除结尾的斜杠（如果有）
+	path = strings.TrimSuffix(path, "/")
+	path = strings.TrimSuffix(path, "\\")
+
+	// 将反斜杠转换为正斜杠（标准化路径分隔符）
+	path = strings.ReplaceAll(path, "\\", "/")
 
 	// 最终检查：确保结果不以/开头或结尾
-	result = strings.Trim(result, "/")
+	path = strings.Trim(path, "/")
 
-	return result
+	return path
 }
 
 // isRemoteSource 检查源对象是否来自远程云盘（非本地文件）
@@ -2230,77 +2225,206 @@ func isUnrecoverableError(err error) bool {
 	return false
 }
 
+// ConcurrencyManager 统一的并发控制管理器
+// 优化版本：提供更标准化的并发控制接口
+type ConcurrencyManager struct {
+	uploadSemaphore   chan struct{} // 上传并发控制信号量
+	downloadSemaphore chan struct{} // 下载并发控制信号量
+	maxUploads        int           // 最大并发上传数
+	maxDownloads      int           // 最大并发下载数
+}
+
+// NewConcurrencyManager 创建新的并发控制管理器
+func NewConcurrencyManager(maxUploads, maxDownloads int) *ConcurrencyManager {
+	return &ConcurrencyManager{
+		uploadSemaphore:   make(chan struct{}, maxUploads),
+		downloadSemaphore: make(chan struct{}, maxDownloads),
+		maxUploads:        maxUploads,
+		maxDownloads:      maxDownloads,
+	}
+}
+
+// AcquireUpload 获取上传信号量
+func (cm *ConcurrencyManager) AcquireUpload(ctx context.Context) error {
+	select {
+	case cm.uploadSemaphore <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// ReleaseUpload 释放上传信号量
+func (cm *ConcurrencyManager) ReleaseUpload() {
+	select {
+	case <-cm.uploadSemaphore:
+		// 信号量释放成功
+	default:
+		// 信号量释放失败，记录警告
+		fs.Debugf(nil, "上传信号量释放失败")
+	}
+}
+
+// AcquireDownload 获取下载信号量
+func (cm *ConcurrencyManager) AcquireDownload(ctx context.Context) error {
+	select {
+	case cm.downloadSemaphore <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// ReleaseDownload 释放下载信号量
+func (cm *ConcurrencyManager) ReleaseDownload() {
+	select {
+	case <-cm.downloadSemaphore:
+		// 信号量释放成功
+	default:
+		// 信号量释放失败，记录警告
+		fs.Debugf(nil, "下载信号量释放失败")
+	}
+}
+
+// GetStats 获取并发控制统计信息
+func (cm *ConcurrencyManager) GetStats() (uploadActive, downloadActive int) {
+	return cm.maxUploads - len(cm.uploadSemaphore), cm.maxDownloads - len(cm.downloadSemaphore)
+}
+
+// validateRequired 验证必需字段不为空
+func validateRequired(fieldName, value string) error {
+	if value == "" {
+		return fmt.Errorf("%s 不能为空", fieldName)
+	}
+	return nil
+}
+
+// validateRange 验证数值在指定范围内
+func validateRange(fieldName string, value, min, max int) error {
+	if value <= 0 || value < min || value > max {
+		return fmt.Errorf("%s 必须在 %d-%d 范围内", fieldName, min, max)
+	}
+	return nil
+}
+
+// validateDuration 验证时间配置不为负数
+func validateDuration(fieldName string, value time.Duration) error {
+	if value < 0 {
+		return fmt.Errorf("%s 不能为负数", fieldName)
+	}
+	return nil
+}
+
+// validateSize 验证大小配置
+func validateSize(fieldName string, value int64, min, max int64) error {
+	if value < min {
+		return fmt.Errorf("%s 不能小于 %d", fieldName, min)
+	}
+	if max > 0 && value > max {
+		return fmt.Errorf("%s 不能超过 %d", fieldName, max)
+	}
+	return nil
+}
+
 // validateOptions 验证配置选项的有效性
+// 优化版本：使用结构化验证方法，减少重复代码
 func validateOptions(opt *Options) error {
 	var errors []string
 
 	// 验证必需的认证信息
-	if opt.ClientID == "" {
-		errors = append(errors, "client_id 不能为空")
+	if err := validateRequired("client_id", opt.ClientID); err != nil {
+		errors = append(errors, err.Error())
 	}
-	if opt.ClientSecret == "" {
-		errors = append(errors, "client_secret 不能为空")
-	}
-
-	// 验证数值范围
-	if opt.ListChunk <= 0 || opt.ListChunk > MaxListChunk {
-		errors = append(errors, fmt.Sprintf("list_chunk 必须在 1-%d 范围内", MaxListChunk))
-	}
-	if opt.MaxUploadParts <= 0 || opt.MaxUploadParts > MaxUploadPartsLimit {
-		errors = append(errors, fmt.Sprintf("max_upload_parts 必须在 1-%d 范围内", MaxUploadPartsLimit))
-	}
-	if opt.MaxConcurrentUploads <= 0 || opt.MaxConcurrentUploads > MaxConcurrentLimit {
-		errors = append(errors, fmt.Sprintf("max_concurrent_uploads 必须在 1-%d 范围内", MaxConcurrentLimit))
-	}
-	if opt.MaxConcurrentDownloads <= 0 || opt.MaxConcurrentDownloads > MaxConcurrentLimit {
-		errors = append(errors, "max_concurrent_downloads 必须在 1-100 范围内")
+	if err := validateRequired("client_secret", opt.ClientSecret); err != nil {
+		errors = append(errors, err.Error())
 	}
 
-	// 验证时间配置
-	if time.Duration(opt.PacerMinSleep) < 0 {
-		errors = append(errors, "pacer_min_sleep 不能为负数")
+	// 验证数值范围 - 使用通用验证函数
+	if err := validateRange("list_chunk", opt.ListChunk, 1, MaxListChunk); err != nil {
+		errors = append(errors, err.Error())
 	}
-	if time.Duration(opt.ListPacerMinSleep) < 0 {
-		errors = append(errors, "list_pacer_min_sleep 不能为负数")
+	if err := validateRange("max_upload_parts", opt.MaxUploadParts, 1, MaxUploadPartsLimit); err != nil {
+		errors = append(errors, err.Error())
 	}
-	if time.Duration(opt.ConnTimeout) < 0 {
-		errors = append(errors, "conn_timeout 不能为负数")
+	if err := validateRange("max_concurrent_uploads", opt.MaxConcurrentUploads, 1, MaxConcurrentLimit); err != nil {
+		errors = append(errors, err.Error())
 	}
-	if time.Duration(opt.Timeout) < 0 {
-		errors = append(errors, "timeout 不能为负数")
-	}
-	if time.Duration(opt.ProgressUpdateInterval) < 0 {
-		errors = append(errors, "progress_update_interval 不能为负数")
+	if err := validateRange("max_concurrent_downloads", opt.MaxConcurrentDownloads, 1, MaxConcurrentLimit); err != nil {
+		errors = append(errors, err.Error())
 	}
 
-	// 验证大小配置
-	if int64(opt.ChunkSize) <= 0 {
-		errors = append(errors, "chunk_size 必须大于 0")
+	// 验证时间配置 - 使用通用验证函数
+	if err := validateDuration("pacer_min_sleep", time.Duration(opt.PacerMinSleep)); err != nil {
+		errors = append(errors, err.Error())
 	}
-	if int64(opt.ChunkSize) > 5*1024*1024*1024 { // 5GB
-		errors = append(errors, "chunk_size 不能超过 5GB")
+	if err := validateDuration("list_pacer_min_sleep", time.Duration(opt.ListPacerMinSleep)); err != nil {
+		errors = append(errors, err.Error())
 	}
-	if int64(opt.UploadCutoff) < 0 {
-		errors = append(errors, "upload_cutoff 不能为负数")
+	if err := validateDuration("conn_timeout", time.Duration(opt.ConnTimeout)); err != nil {
+		errors = append(errors, err.Error())
+	}
+	if err := validateDuration("timeout", time.Duration(opt.Timeout)); err != nil {
+		errors = append(errors, err.Error())
+	}
+	if err := validateDuration("progress_update_interval", time.Duration(opt.ProgressUpdateInterval)); err != nil {
+		errors = append(errors, err.Error())
 	}
 
-	// 验证UserAgent
+	// 验证大小配置 - 使用通用验证函数
+	if err := validateSize("chunk_size", int64(opt.ChunkSize), 1, 5*1024*1024*1024); err != nil {
+		errors = append(errors, err.Error())
+	}
+	if err := validateSize("upload_cutoff", int64(opt.UploadCutoff), 0, -1); err != nil {
+		errors = append(errors, err.Error())
+	}
+
+	// 验证UserAgent长度
 	if opt.UserAgent != "" && len(opt.UserAgent) > 200 {
 		errors = append(errors, "user_agent 长度不能超过 200 字符")
 	}
 
 	// 验证RootFolderID格式（如果提供）
 	if opt.RootFolderID != "" {
-		if _, err := strconv.ParseInt(opt.RootFolderID, 10, 64); err != nil {
+		if _, err := parseFileID(opt.RootFolderID); err != nil {
 			errors = append(errors, "root_folder_id 必须是有效的数字")
 		}
 	}
 
+	// 返回聚合的错误信息
 	if len(errors) > 0 {
 		return fmt.Errorf("配置验证失败: %s", strings.Join(errors, "; "))
 	}
 
 	return nil
+}
+
+// createPacer 创建pacer的工厂函数，减少重复配置代码
+func createPacer(ctx context.Context, minSleep, maxSleep time.Duration, decayConstant float64) *fs.Pacer {
+	return fs.NewPacer(ctx, pacer.NewDefault(
+		pacer.MinSleep(minSleep),
+		pacer.MaxSleep(maxSleep),
+		pacer.DecayConstant(decayConstant)))
+}
+
+// applyStandardConfigDefaults 应用rclone标准配置的默认值
+// 这个函数展示了如何在未来可以使用rclone的标准配置选项
+func applyStandardConfigDefaults(opt *Options) {
+	// 示例：如果未来要使用rclone标准配置，可以这样做：
+	// if opt.MaxConcurrentUploads <= 0 {
+	//     opt.MaxConcurrentUploads = fs.Config.Transfers
+	// }
+	// if opt.MaxConcurrentDownloads <= 0 {
+	//     opt.MaxConcurrentDownloads = fs.Config.Checkers
+	// }
+	// if opt.ConnTimeout <= 0 {
+	//     opt.ConnTimeout = fs.Duration(fs.Config.ConnectTimeout)
+	// }
+	// if opt.Timeout <= 0 {
+	//     opt.Timeout = fs.Duration(fs.Config.Timeout)
+	// }
+
+	// 目前保持现有的123网盘特定配置
+	_ = opt // 避免未使用变量警告
 }
 
 // normalizeOptions 标准化和修正配置选项
@@ -2629,41 +2753,37 @@ func (f *Fs) buildVersionedEndpoint(baseEndpoint, version string) string {
 }
 
 // shouldRetry 根据响应和错误确定是否重试API调用
-// 使用智能的指数退避策略
+// 优化版本：更多使用rclone标准错误处理，减少自定义逻辑
 func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	// 使用rclone标准的上下文错误检查
 	if fserrors.ContextError(ctx, &err) {
 		return false, err
 	}
 
 	// 网络错误时重试
 	if err != nil {
-		// 检查是否为不可恢复的错误
+		// 检查是否为不可恢复的错误（保留123网盘特定的错误检查）
 		if isUnrecoverableError(err) {
 			return false, err
 		}
 
-		if fserrors.ShouldRetry(err) {
-			// 使用基础重试延迟
-			return true, fserrors.NewErrorRetryAfter(baseRetryDelay)
-		}
-		return false, err
+		// 使用rclone标准的重试判断
+		return fserrors.ShouldRetry(err), err
 	}
 
-	// 检查HTTP状态码
+	// 检查HTTP状态码 - 使用rclone标准处理加上123网盘特定处理
 	if resp != nil {
 		switch resp.StatusCode {
 		case http.StatusTooManyRequests:
 			// 速率受限 - 使用较长的退避时间
-			retryAfter := calculateRetryDelay(3) // 第3次重试的延迟
 			fs.Debugf(nil, "速率受限（API错误429），将使用更长退避时间重试")
-			return true, fserrors.NewErrorRetryAfter(retryAfter)
+			return true, fserrors.NewErrorRetryAfter(calculateRetryDelay(3))
 		case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-			// 服务器错误 - 使用中等退避时间
-			retryAfter := calculateRetryDelay(2) // 第2次重试的延迟
-			fs.Debugf(nil, "服务器错误 %d，将在%v后重试", resp.StatusCode, retryAfter)
-			return true, fserrors.NewErrorRetryAfter(retryAfter)
+			// 服务器错误 - 使用标准重试
+			fs.Debugf(nil, "服务器错误 %d，将重试", resp.StatusCode)
+			return true, fserrors.NewErrorRetryAfter(baseRetryDelay)
 		case http.StatusUnauthorized:
-			// 令牌可能已过期 - 短暂延迟后让调用者处理令牌刷新
+			// 令牌可能已过期 - 不重试，让调用者处理令牌刷新
 			return false, fserrors.NewErrorRetryAfter(baseRetryDelay)
 		}
 	}
@@ -2777,30 +2897,25 @@ func (f *Fs) WrapError(err error, ctx ErrorContext) error {
 	return fmt.Errorf("%s: %w", ctx.Operation, err)
 }
 
-// calculateAdaptiveTimeout 根据操作类型和网络状况计算自适应超时时间
+// calculateAdaptiveTimeout 根据操作类型计算超时时间
+// 简化版本：使用rclone标准超时配置加上123网盘特定调整
 func (f *Fs) calculateAdaptiveTimeout(method, endpoint string) time.Duration {
+	// 使用rclone的标准超时配置
 	baseTimeout := time.Duration(f.opt.Timeout)
 	if baseTimeout <= 0 {
 		baseTimeout = defaultTimeout
 	}
 
-	// 根据操作类型调整超时时间
+	// 简化的操作类型调整
 	switch {
 	case strings.Contains(endpoint, "/upload/"):
-		// 上传操作需要更长的超时时间
-		return baseTimeout * 3
+		return baseTimeout * 3 // 上传操作需要更长时间
 	case strings.Contains(endpoint, "/download"):
-		// 下载操作需要更长的超时时间
-		return baseTimeout * 2
-	case strings.Contains(endpoint, "/file/list"):
-		// 文件列表操作通常较快
-		return baseTimeout
+		return baseTimeout * 2 // 下载操作需要更长时间
 	case method == "POST":
-		// POST操作通常需要更多时间
-		return baseTimeout * 2
+		return baseTimeout * 2 // POST操作通常需要更多时间
 	default:
-		// 默认超时时间
-		return baseTimeout
+		return baseTimeout // 使用标准超时
 	}
 }
 
@@ -3813,14 +3928,14 @@ func (ducm *DownloadURLCacheManager) parseExpireTime(urlStr string) time.Time {
 
 		// 尝试解析expires参数（Unix时间戳）
 		if expiresStr := query.Get("expires"); expiresStr != "" {
-			if expires, err := strconv.ParseInt(expiresStr, 10, 64); err == nil {
+			if expires, err := parseFileID(expiresStr); err == nil {
 				return time.Unix(expires, 0)
 			}
 		}
 
 		// 尝试解析expire参数
 		if expireStr := query.Get("expire"); expireStr != "" {
-			if expire, err := strconv.ParseInt(expireStr, 10, 64); err == nil {
+			if expire, err := parseFileID(expireStr); err == nil {
 				return time.Unix(expire, 0)
 			}
 		}
@@ -3920,12 +4035,93 @@ func (ducm *DownloadURLCacheManager) GetCacheStats() map[string]interface{} {
 	}
 }
 
-// apiCall 进行API调用，具有适当的错误处理和速率限制
-func (f *Fs) apiCall(ctx context.Context, method, endpoint string, body io.Reader, result interface{}) error {
+// parseFileID 通用的文件ID转换函数，统一错误处理
+func parseFileID(idStr string) (int64, error) {
+	if idStr == "" {
+		return 0, fmt.Errorf("文件ID不能为空")
+	}
+
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("无效的文件ID格式: %s", idStr)
+	}
+
+	if id < 0 {
+		return 0, fmt.Errorf("文件ID不能为负数: %d", id)
+	}
+
+	return id, nil
+}
+
+// parseFileIDWithContext 带上下文的文件ID转换函数，提供更详细的错误信息
+func parseFileIDWithContext(idStr, context string) (int64, error) {
+	id, err := parseFileID(idStr)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", context, err)
+	}
+	return id, nil
+}
+
+// parseParentID 解析父目录ID字符串为int64
+// 专门用于父目录ID转换，提供更明确的错误信息
+func parseParentID(idStr string) (int64, error) {
+	if idStr == "" {
+		return 0, fmt.Errorf("父目录ID不能为空")
+	}
+
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("无效的父目录ID格式: %s", idStr)
+	}
+
+	if id < 0 {
+		return 0, fmt.Errorf("父目录ID不能为负数: %d", id)
+	}
+
+	return id, nil
+}
+
+// parseDirID 解析目录ID字符串为int64
+// 专门用于目录ID转换，提供更明确的错误信息
+func parseDirID(idStr string) (int64, error) {
+	if idStr == "" {
+		return 0, fmt.Errorf("目录ID不能为空")
+	}
+
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("无效的目录ID格式: %s", idStr)
+	}
+
+	if id < 0 {
+		return 0, fmt.Errorf("目录ID不能为负数: %d", id)
+	}
+
+	return id, nil
+}
+
+// APICallOptions 统一API调用选项
+type APICallOptions struct {
+	Method          string            // HTTP方法
+	Endpoint        string            // API端点
+	Body            io.Reader         // 请求体
+	ContentType     string            // Content-Type，默认为application/json
+	Headers         map[string]string // 额外的请求头
+	UseUploadDomain bool              // 是否使用上传域名
+}
+
+// apiCallUnified 统一的API调用方法，整合了所有API调用功能
+func (f *Fs) apiCallUnified(ctx context.Context, opts APICallOptions, result interface{}) error {
 	// 记录API调用
 	f.performanceMetrics.RecordAPICall()
 
-	pacer := f.getPacerForEndpoint(endpoint)
+	// 设置默认Content-Type
+	if opts.ContentType == "" {
+		opts.ContentType = "application/json"
+	}
+
+	// 获取适当的调速器
+	pacer := f.getPacerForEndpoint(opts.Endpoint)
 	return pacer.Call(func() (bool, error) {
 		// 确保令牌在进行API调用前有效
 		err := f.refreshTokenIfNecessary(ctx, false, false)
@@ -3933,19 +4129,37 @@ func (f *Fs) apiCall(ctx context.Context, method, endpoint string, body io.Reade
 			return false, err
 		}
 
-		req, err := http.NewRequestWithContext(ctx, method, openAPIRootURL+endpoint, body)
+		// 确定基础URL
+		var baseURL string
+		if opts.UseUploadDomain && strings.Contains(opts.Endpoint, "/upload/") {
+			uploadDomain, err := f.getUploadDomain(ctx)
+			if err != nil {
+				return false, fmt.Errorf("获取上传域名失败: %w", err)
+			}
+			baseURL = uploadDomain
+		} else {
+			baseURL = openAPIRootURL
+		}
+
+		// 创建HTTP请求
+		req, err := http.NewRequestWithContext(ctx, opts.Method, baseURL+opts.Endpoint, opts.Body)
 		if err != nil {
 			return false, err
 		}
 
-		// 设置请求头
+		// 设置标准请求头
 		req.Header.Set("Authorization", "Bearer "+f.token)
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", opts.ContentType)
 		req.Header.Set("Platform", "open_platform")
 		req.Header.Set("User-Agent", f.opt.UserAgent)
 
+		// 设置额外的请求头
+		for key, value := range opts.Headers {
+			req.Header.Set(key, value)
+		}
+
 		// 使用自适应超时机制
-		timeout := f.calculateAdaptiveTimeout(method, endpoint)
+		timeout := f.calculateAdaptiveTimeout(opts.Method, opts.Endpoint)
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
@@ -3978,37 +4192,15 @@ func (f *Fs) apiCall(ctx context.Context, method, endpoint string, body io.Reade
 			Message string `json:"message"`
 		}
 		if err = json.Unmarshal(bodyBytes, &baseResp); err != nil {
-			return false, err
+			return false, fmt.Errorf("解析响应失败: %w", err)
 		}
 
-		// 处理API错误
-		switch baseResp.Code {
-		case 0:
-			// 成功
-			if result != nil {
-				return false, json.Unmarshal(bodyBytes, result)
-			}
-			return false, nil
-		case 401:
-			// 令牌过期，尝试刷新
-			fs.Debugf(f, "令牌已过期，尝试刷新")
-			err = f.refreshTokenIfNecessary(ctx, false, true)
-			if err != nil {
-				return false, err
-			}
-			return true, nil // 使用新令牌重试
-		case 429:
-			// 速率限制 - 对429错误使用更长的退避时间
-			fs.Debugf(f, "速率受限（API错误429），将使用更长退避时间重试")
-			return true, fserrors.NewErrorRetryAfter(30 * time.Second)
-		default:
-			// 记录API错误
-			f.performanceMetrics.RecordAPIError()
-			// 使用标准化错误格式
+		if baseResp.Code != 0 {
+			// 构建错误上下文
 			errCtx := ErrorContext{
 				Operation: "API调用",
-				Method:    method,
-				Endpoint:  endpoint,
+				Method:    opts.Method,
+				Endpoint:  opts.Endpoint,
 				Extra: map[string]string{
 					"错误代码": fmt.Sprintf("%d", baseResp.Code),
 					"错误消息": baseResp.Message,
@@ -4016,76 +4208,38 @@ func (f *Fs) apiCall(ctx context.Context, method, endpoint string, body io.Reade
 			}
 			return false, f.WrapError(fmt.Errorf("API错误 %d: %s", baseResp.Code, baseResp.Message), errCtx)
 		}
+
+		// 解析完整响应到结果对象
+		if result != nil {
+			if err = json.Unmarshal(bodyBytes, result); err != nil {
+				return false, fmt.Errorf("解析响应到结果对象失败: %w", err)
+			}
+		}
+
+		return false, nil
 	})
 }
 
+// apiCall 进行API调用，具有适当的错误处理和速率限制
+// 保留向后兼容性，内部使用统一的apiCallUnified
+func (f *Fs) apiCall(ctx context.Context, method, endpoint string, body io.Reader, result interface{}) error {
+	return f.apiCallUnified(ctx, APICallOptions{
+		Method:   method,
+		Endpoint: endpoint,
+		Body:     body,
+	}, result)
+}
+
 // apiCallMultipart 进行multipart API调用，类似apiCall但支持自定义Content-Type
+// 保留向后兼容性，内部使用统一的apiCallUnified
 func (f *Fs) apiCallMultipart(ctx context.Context, method, endpoint string, body io.Reader, contentType string, result interface{}) error {
-	// 记录API调用
-	f.performanceMetrics.RecordAPICall()
-
-	// 获取上传域名（对于上传API）
-	var baseURL string
-	if strings.Contains(endpoint, "/upload/") {
-		uploadDomain, err := f.getUploadDomain(ctx)
-		if err != nil {
-			return fmt.Errorf("获取上传域名失败: %w", err)
-		}
-		baseURL = uploadDomain
-	} else {
-		baseURL = openAPIRootURL
-	}
-
-	// 不使用pacer，因为调用方已经处理了QPS限制
-	// 确保令牌在进行API调用前有效
-	err := f.refreshTokenIfNecessary(ctx, false, false)
-	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, baseURL+endpoint, body)
-	if err != nil {
-		return err
-	}
-
-	// 设置请求头
-	req.Header.Set("Authorization", "Bearer "+f.token)
-	req.Header.Set("Content-Type", contentType) // 使用自定义Content-Type
-	req.Header.Set("Platform", "open_platform")
-	req.Header.Set("User-Agent", f.opt.UserAgent)
-
-	// 使用自适应超时机制
-	timeout := f.calculateAdaptiveTimeout(method, endpoint)
-	var cancel context.CancelFunc
-	ctx, cancel = context.WithTimeout(ctx, timeout)
-	defer cancel()
-	req = req.WithContext(ctx)
-
-	resp, err := f.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	// 首先检查HTTP错误
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP错误: status=%d, body=%s", resp.StatusCode, string(body))
-	}
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	// 解析响应
-	if result != nil {
-		if err = json.Unmarshal(bodyBytes, result); err != nil {
-			return fmt.Errorf("解析响应失败: %w, body: %s", err, string(bodyBytes))
-		}
-	}
-
-	return nil
+	return f.apiCallUnified(ctx, APICallOptions{
+		Method:          method,
+		Endpoint:        endpoint,
+		Body:            body,
+		ContentType:     contentType,
+		UseUploadDomain: strings.Contains(endpoint, "/upload/"),
+	}, result)
 }
 
 // handleHTTPError 处理HTTP级别的错误并确定重试行为
@@ -4121,9 +4275,9 @@ func (f *Fs) handleHTTPError(ctx context.Context, resp *http.Response) (bool, er
 // getFileInfo 根据ID获取文件的详细信息
 func (f *Fs) getFileInfo(ctx context.Context, fileID string) (*FileListInfoRespDataV2, error) {
 	// 验证文件ID
-	_, err := strconv.ParseInt(fileID, 10, 64)
+	_, err := parseFileIDWithContext(fileID, "获取文件信息")
 	if err != nil {
-		return nil, fmt.Errorf("invalid file ID: %s", fileID)
+		return nil, err
 	}
 
 	// 使用文件详情API
@@ -4196,9 +4350,9 @@ func (f *Fs) createDirectory(ctx context.Context, parentID, name string) error {
 	}
 
 	// 将父目录ID转换为int64
-	parentFileID, err := strconv.ParseInt(parentID, 10, 64)
+	parentFileID, err := parseParentID(parentID)
 	if err != nil {
-		return fmt.Errorf("invalid parent ID: %s", parentID)
+		return err
 	}
 
 	// 准备请求体
@@ -4786,18 +4940,20 @@ func (f *Fs) removeUploadProgress(preuploadID string) {
 }
 
 // computeMD5FromReader 从io.Reader计算MD5哈希
+// 优化版本：简化版本，保持功能性的同时减少复杂性
 func (f *Fs) computeMD5FromReader(_ context.Context, in io.Reader, size int64) (string, error) {
+	// 使用标准的MD5哈希器（保持简单有效）
 	hasher := md5.New()
 
 	// 将数据从读取器复制到哈希器
 	written, err := io.Copy(hasher, in)
 	if err != nil {
-		return "", fmt.Errorf("failed to read data for MD5 computation: %w", err)
+		return "", fmt.Errorf("读取数据进行MD5计算失败: %w", err)
 	}
 
 	// 验证我们读取了预期的数量
 	if size >= 0 && written != size {
-		return "", fmt.Errorf("size mismatch: expected %d bytes, read %d bytes", size, written)
+		return "", fmt.Errorf("大小不匹配: 期望%d字节，实际读取%d字节", size, written)
 	}
 
 	// 返回十六进制编码的MD5哈希
@@ -6104,48 +6260,15 @@ func (f *Fs) singleStepUpload(ctx context.Context, data []byte, parentFileID int
 }
 
 // validateFileNameUnified 统一的文件名验证入口点
-// 整合了所有验证规则，确保一致性
+// 优化版本：直接使用通用工具函数，减少代码重复
 func (f *Fs) validateFileNameUnified(fileName string) error {
-	// 基础检查：空值和空格
-	if fileName == "" {
-		return fmt.Errorf("文件名不能为空")
-	}
-
-	if strings.TrimSpace(fileName) == "" {
-		return fmt.Errorf("文件名不能为空或全部是空格")
-	}
-
-	// UTF-8有效性检查
-	if !utf8.ValidString(fileName) {
-		return fmt.Errorf("文件名包含无效的UTF-8字符")
-	}
-
-	// 长度检查（字符数）
-	runeCount := utf8.RuneCountInString(fileName)
-	if runeCount > maxFileNameLength {
-		return fmt.Errorf("文件名长度超过限制：当前%d个字符，最大允许%d个字符",
-			runeCount, maxFileNameLength)
-	}
-
-	// 字节长度检查
-	byteLength := len([]byte(fileName))
-	if byteLength > maxFileNameBytes {
-		return fmt.Errorf("文件名字节长度超过%d: %d", maxFileNameBytes, byteLength)
-	}
-
-	// 禁用字符检查：使用正则表达式更高效
-	if invalidCharsRegex.MatchString(fileName) {
-		invalidFound := invalidCharsRegex.FindAllString(fileName, -1)
-		return fmt.Errorf("文件名包含不允许的字符：%v，123网盘不允许使用以下字符：%s",
-			invalidFound, invalidChars)
-	}
-
-	return nil
+	return ValidationUtil.ValidateFileName(fileName)
 }
 
-// validateFileName 保持向后兼容的验证方法（已弃用，使用validateFileNameUnified）
+// validateFileName 保持向后兼容的验证方法
+// 优化版本：直接使用统一验证函数，减少函数调用层次
 func (f *Fs) validateFileName(fileName string) error {
-	return f.validateFileNameUnified(fileName)
+	return ValidationUtil.ValidateFileName(fileName)
 }
 
 // validateFileNameWithWarnings 验证文件名并提供警告信息
@@ -6397,15 +6520,14 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	// Initialize multiple pacers for different API rate limits based on official documentation
+	// 使用pacer工厂函数减少重复代码
+
 	// v2 API pacer - 高频率 (~14 QPS for api/v2/file/list)
 	listPacerSleep := listV2APIMinSleep
 	if opt.ListPacerMinSleep > 0 {
 		listPacerSleep = time.Duration(opt.ListPacerMinSleep)
 	}
-	f.listPacer = fs.NewPacer(ctx, pacer.NewDefault(
-		pacer.MinSleep(listPacerSleep),
-		pacer.MaxSleep(maxSleep),
-		pacer.DecayConstant(decayConstant)))
+	f.listPacer = createPacer(ctx, listPacerSleep, maxSleep, decayConstant)
 
 	// 严格API pacer - 中等频率 (~4 QPS for create, async_result, etc.)
 	strictPacerSleep := fileMoveMinSleep
@@ -6414,30 +6536,21 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	} else if opt.PacerMinSleep > 0 {
 		strictPacerSleep = time.Duration(opt.PacerMinSleep) // 向后兼容
 	}
-	f.strictPacer = fs.NewPacer(ctx, pacer.NewDefault(
-		pacer.MinSleep(strictPacerSleep),
-		pacer.MaxSleep(maxSleep),
-		pacer.DecayConstant(decayConstant)))
+	f.strictPacer = createPacer(ctx, strictPacerSleep, maxSleep, decayConstant)
 
 	// v2分片上传API pacer (~5 QPS for upload/v2/file/slice)
 	uploadPacerSleep := uploadV2SliceMinSleep
 	if opt.UploadPacerMinSleep > 0 {
 		uploadPacerSleep = time.Duration(opt.UploadPacerMinSleep)
 	}
-	f.uploadPacer = fs.NewPacer(ctx, pacer.NewDefault(
-		pacer.MinSleep(uploadPacerSleep),
-		pacer.MaxSleep(maxSleep),
-		pacer.DecayConstant(decayConstant)))
+	f.uploadPacer = createPacer(ctx, uploadPacerSleep, maxSleep, decayConstant)
 
 	// 下载和高频率API pacer (~16 QPS for upload_complete, get_upload_url, etc.)
 	downloadPacerSleep := downloadInfoMinSleep
 	if opt.DownloadPacerMinSleep > 0 {
 		downloadPacerSleep = time.Duration(opt.DownloadPacerMinSleep)
 	}
-	f.downloadPacer = fs.NewPacer(ctx, pacer.NewDefault(
-		pacer.MinSleep(downloadPacerSleep),
-		pacer.MaxSleep(maxSleep),
-		pacer.DecayConstant(decayConstant)))
+	f.downloadPacer = createPacer(ctx, downloadPacerSleep, maxSleep, decayConstant)
 
 	fs.Infof(f, "📊 QPS限制配置 - 列表API: %.1f QPS, 严格API: %.1f QPS, 上传API: %.1f QPS, 下载API: %.1f QPS",
 		1000.0/float64(listPacerSleep.Milliseconds()),
@@ -6445,9 +6558,8 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		1000.0/float64(uploadPacerSleep.Milliseconds()),
 		1000.0/float64(downloadPacerSleep.Milliseconds()))
 
-	// 初始化性能优化组件
-	f.uploadSemaphore = make(chan struct{}, opt.MaxConcurrentUploads)
-	f.downloadSemaphore = make(chan struct{}, opt.MaxConcurrentDownloads)
+	// 初始化性能优化组件 - 使用统一的并发控制管理器
+	f.concurrencyManager = NewConcurrencyManager(opt.MaxConcurrentUploads, opt.MaxConcurrentDownloads)
 	f.progressTracker = NewProgressTracker(
 		time.Duration(opt.ProgressUpdateInterval),
 		opt.EnableProgressDisplay,
@@ -6604,8 +6716,7 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			strictPacer:        f.strictPacer,
 			uploadPacer:        f.uploadPacer,
 			downloadPacer:      f.downloadPacer,
-			uploadSemaphore:    f.uploadSemaphore,
-			downloadSemaphore:  f.downloadSemaphore,
+			concurrencyManager: f.concurrencyManager,
 			progressTracker:    f.progressTracker,
 			memoryManager:      f.memoryManager,
 			performanceMetrics: f.performanceMetrics,
@@ -6698,20 +6809,11 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	f.performanceMetrics.RecordUploadStart(src.Size())
 
 	// 并发控制：获取上传信号量
-	select {
-	case f.uploadSemaphore <- struct{}{}:
-		// 使用命名返回值确保在panic时也能释放信号量
-		defer func() {
-			select {
-			case <-f.uploadSemaphore:
-				// 信号量释放成功
-			default:
-				fs.Errorf(f, "上传信号量释放失败")
-			}
-		}()
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	if err := f.concurrencyManager.AcquireUpload(ctx); err != nil {
+		return nil, fmt.Errorf("获取上传信号量失败: %w", err)
 	}
+	// 使用命名返回值确保在panic时也能释放信号量
+	defer f.concurrencyManager.ReleaseUpload()
 
 	// 规范化远程路径
 	normalizedRemote := normalizePath(src.Remote())
@@ -6744,9 +6846,9 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	}
 
 	// Convert parentID to int64
-	parentFileID, err := strconv.ParseInt(parentID, 10, 64)
+	parentFileID, err := parseParentID(parentID)
 	if err != nil {
-		return nil, fmt.Errorf("invalid parent ID: %s", parentID)
+		return nil, fmt.Errorf("解析父目录ID失败: %w", err)
 	}
 
 	// 验证parentFileID是否真的存在
@@ -6761,9 +6863,9 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		if err != nil {
 			return nil, fmt.Errorf("重新查找父目录失败: %w", err)
 		}
-		parentFileID, err = strconv.ParseInt(parentID, 10, 64)
+		parentFileID, err = parseParentID(parentID)
 		if err != nil {
-			return nil, fmt.Errorf("重新解析父目录ID失败: %s", parentID)
+			return nil, fmt.Errorf("重新解析父目录ID失败: %w", err)
 		}
 		fs.Debugf(f, "重新找到父目录ID: %d", parentFileID)
 	} else if !exists {
@@ -6774,9 +6876,9 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		if err != nil {
 			return nil, fmt.Errorf("重建目录缓存后查找失败: %w", err)
 		}
-		parentFileID, err = strconv.ParseInt(parentID, 10, 64)
+		parentFileID, err = parseParentID(parentID)
 		if err != nil {
-			return nil, fmt.Errorf("重建后解析父目录ID失败: %s", parentID)
+			return nil, fmt.Errorf("重建后解析父目录ID失败: %w", err)
 		}
 		fs.Debugf(f, "重建后找到父目录ID: %d", parentFileID)
 	} else {
@@ -6860,12 +6962,10 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	o.fs.performanceMetrics.RecordDownloadStart(o.size)
 
 	// 并发控制：获取下载信号量
-	select {
-	case o.fs.downloadSemaphore <- struct{}{}:
-		// 信号量将在ReadCloser关闭时释放
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	if err := o.fs.concurrencyManager.AcquireDownload(ctx); err != nil {
+		return nil, err
 	}
+	// 信号量将在ReadCloser关闭时释放
 
 	// 生成操作ID用于进度跟踪
 	operationID := fmt.Sprintf("download_%s_%d", o.remote, time.Now().UnixNano())
@@ -6944,12 +7044,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 
 	if err != nil {
 		// 释放下载信号量
-		select {
-		case <-o.fs.downloadSemaphore:
-			// 信号量释放成功
-		default:
-			fs.Errorf(o.fs, "下载信号量释放失败")
-		}
+		o.fs.concurrencyManager.ReleaseDownload()
 		// 标记下载失败
 		o.fs.progressTracker.CompleteOperation(operationID, false)
 		return nil, err
@@ -7021,9 +7116,9 @@ func (o *Object) Remove(ctx context.Context) error {
 	fs.Debugf(o.fs, "调用Remove: %s", o.remote)
 
 	// Convert file ID to int64
-	fileID, err := strconv.ParseInt(o.id, 10, 64)
+	fileID, err := parseFileID(o.id)
 	if err != nil {
-		return fmt.Errorf("invalid file ID: %s", o.id)
+		return fmt.Errorf("解析文件ID失败: %w", err)
 	}
 
 	err = o.fs.deleteFile(ctx, fileID)
@@ -7047,9 +7142,9 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (foundID string,
 	fs.Debugf(f, "查找叶节点: pathID=%s, leaf=%s", pathID, leaf)
 
 	// Convert pathID to int64
-	parentFileID, err := strconv.ParseInt(pathID, 10, 64)
+	parentFileID, err := parseParentID(pathID)
 	if err != nil {
-		return "", false, fmt.Errorf("invalid parent ID: %s", pathID)
+		return "", false, fmt.Errorf("解析父目录ID失败: %w", err)
 	}
 
 	// List files in the parent directory
@@ -7415,9 +7510,9 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 	}
 
 	// Convert dirID to int64
-	parentFileID, err := strconv.ParseInt(dirID, 10, 64)
+	parentFileID, err := parseDirID(dirID)
 	if err != nil {
-		return fmt.Errorf("invalid directory ID: %s", dirID)
+		return fmt.Errorf("解析目录ID失败: %w", err)
 	}
 
 	// List all files in the directory
@@ -7503,9 +7598,9 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	fs.Debugf(f, "找到目录ID: %s，目录: %s", dirID, dir)
 
 	// Convert dirID to int64
-	parentFileID, err := strconv.ParseInt(dirID, 10, 64)
+	parentFileID, err := parseDirID(dirID)
 	if err != nil {
-		return nil, fmt.Errorf("invalid directory ID: %s", dirID)
+		return nil, fmt.Errorf("解析目录ID失败: %w", err)
 	}
 
 	// List files in the directory
@@ -7614,8 +7709,8 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	fs.Debugf(f, "调用移动 %s 到 %s", src.Remote(), remote)
 
-	// 规范化目标路径
-	normalizedRemote := normalizePath(remote)
+	// 规范化目标路径 - 使用通用工具
+	normalizedRemote := PathUtil.NormalizePath(remote)
 	fs.Debugf(f, "Move操作规范化目标路径: %s -> %s", remote, normalizedRemote)
 
 	srcObj, ok := src.(*Object)
@@ -7852,8 +7947,8 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	fs.Debugf(f, "调用复制 %s 到 %s", src.Remote(), remote)
 
-	// 规范化目标路径
-	normalizedRemote := normalizePath(remote)
+	// 规范化目标路径 - 使用通用工具
+	normalizedRemote := PathUtil.NormalizePath(remote)
 	fs.Debugf(f, "Copy操作规范化目标路径: %s -> %s", remote, normalizedRemote)
 
 	srcObj, ok := src.(*Object)
@@ -7962,34 +8057,11 @@ func (oi *ObjectInfo) Hash(ctx context.Context, t fshash.Type) (string, error) {
 }
 
 // getHTTPClient makes an http client according to the options
+// 简化版本：直接使用rclone的标准HTTP客户端配置
 func getHTTPClient(ctx context.Context, name string, m configmap.Mapper) *http.Client {
-	// 创建带有默认超时设置的HTTP客户端
-	client := fshttp.NewClient(ctx)
-
-	// 设置默认超时，防止请求无限期挂起
-	if client.Timeout == 0 {
-		client.Timeout = defaultTimeout
-	}
-
-	// 配置传输层超时 - 针对大文件传输优化
-	if transport, ok := client.Transport.(*http.Transport); ok {
-		if transport.DialContext == nil {
-			transport.DialContext = (&net.Dialer{
-				Timeout:   defaultConnTimeout,
-				KeepAlive: 60 * time.Second, // 增加Keep-Alive时间
-			}).DialContext
-		}
-
-		// 设置其他超时参数 - 适应大文件传输
-		transport.TLSHandshakeTimeout = 30 * time.Second   // 增加TLS握手超时
-		transport.ResponseHeaderTimeout = 60 * time.Second // 增加响应头超时
-		transport.ExpectContinueTimeout = 5 * time.Second  // 增加Expect Continue超时
-		transport.IdleConnTimeout = 90 * time.Second       // 设置空闲连接超时
-		transport.MaxIdleConns = 100                       // 增加最大空闲连接数
-		transport.MaxIdleConnsPerHost = 10                 // 增加每主机最大空闲连接数
-	}
-
-	return client
+	// rclone的fshttp.NewClient已经提供了合适的默认配置
+	// 包括超时、连接池、TLS设置等，无需额外自定义
+	return fshttp.NewClient(ctx)
 }
 
 // getNetworkQuality 评估当前网络质量，返回0.0-1.0的质量分数
@@ -8227,15 +8299,14 @@ func (f *Fs) getOptimalChunkSize(fileSize int64, networkSpeed int64) int64 {
 }
 
 // ResourcePool 资源池管理器，用于优化内存使用和减少GC压力
+// 优化版本：简化实现，更多使用Go标准库的sync.Pool
 type ResourcePool struct {
-	bufferPool   sync.Pool     // 缓冲区池
-	hasherPool   sync.Pool     // MD5哈希计算器池
-	tempFilePool chan *os.File // 临时文件池
-	maxTempFiles int           // 最大临时文件数
-	mu           sync.Mutex    // 保护临时文件池的互斥锁
+	bufferPool sync.Pool // 缓冲区池
+	hasherPool sync.Pool // MD5哈希计算器池
 }
 
 // NewResourcePool 创建新的资源池
+// 优化版本：移除复杂的临时文件池，专注于内存池管理
 func NewResourcePool() *ResourcePool {
 	return &ResourcePool{
 		bufferPool: sync.Pool{
@@ -8249,8 +8320,6 @@ func NewResourcePool() *ResourcePool {
 				return md5.New()
 			},
 		},
-		tempFilePool: make(chan *os.File, 10), // 最多缓存10个临时文件
-		maxTempFiles: 10,
 	}
 }
 
@@ -8281,53 +8350,197 @@ func (rp *ResourcePool) PutHasher(hasher hash.Hash) {
 	rp.hasherPool.Put(hasher)
 }
 
-// GetTempFile 从池中获取临时文件，如果池为空则创建新文件
+// GetTempFile 创建临时文件
+// 优化版本：简化实现，直接创建临时文件而不使用池
 func (rp *ResourcePool) GetTempFile(prefix string) (*os.File, error) {
-	select {
-	case tempFile := <-rp.tempFilePool:
-		// 从池中获取现有临时文件
-		return tempFile, nil
-	default:
-		// 池为空，创建新临时文件
-		return os.CreateTemp("", prefix)
-	}
+	return os.CreateTemp("", prefix)
 }
 
-// PutTempFile 将临时文件归还到池中，如果池已满则直接删除
+// PutTempFile 清理临时文件
+// 优化版本：直接关闭和删除文件
 func (rp *ResourcePool) PutTempFile(tempFile *os.File) {
 	if tempFile == nil {
 		return
 	}
-
-	// 重置文件指针到开头
-	tempFile.Seek(0, io.SeekStart)
-
-	select {
-	case rp.tempFilePool <- tempFile:
-		// 成功归还到池中
-	default:
-		// 池已满，直接关闭并删除文件
-		tempFile.Close()
-		os.Remove(tempFile.Name())
-	}
+	tempFile.Close()
+	os.Remove(tempFile.Name())
 }
 
 // Close 关闭资源池，清理所有资源
+// 优化版本：简化实现，sync.Pool会自动管理资源
 func (rp *ResourcePool) Close() {
-	rp.mu.Lock()
-	defer rp.mu.Unlock()
+	// sync.Pool会自动管理内存池，无需手动清理
+	// 这个方法保留是为了接口兼容性
+}
 
-	// 清理临时文件池
-	for {
-		select {
-		case tempFile := <-rp.tempFilePool:
-			tempFile.Close()
-			os.Remove(tempFile.Name())
-		default:
-			return // 池已空
+// ===== 通用工具函数模块 =====
+// 这些函数可以被多个地方复用，提高代码的可维护性
+
+// StringUtils 字符串处理工具集合
+type StringUtils struct{}
+
+// IsEmpty 检查字符串是否为空或只包含空白字符
+func (StringUtils) IsEmpty(s string) bool {
+	return strings.TrimSpace(s) == ""
+}
+
+// TruncateString 截断字符串到指定字节长度，保持UTF-8完整性
+func (StringUtils) TruncateString(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+
+	// 确保不会在UTF-8字符中间截断
+	for i := maxBytes; i >= 0; i-- {
+		if utf8.ValidString(s[:i]) {
+			return s[:i]
 		}
 	}
+	return ""
 }
+
+// PathUtils 路径处理工具集合
+type PathUtils struct{}
+
+// NormalizePath 标准化路径处理
+func (PathUtils) NormalizePath(path string) string {
+	return normalizePath(path)
+}
+
+// SplitPath 分割路径为目录和文件名
+func (PathUtils) SplitPath(path string) (dir, name string) {
+	path = normalizePath(path)
+	if path == "" {
+		return "", ""
+	}
+
+	lastSlash := strings.LastIndex(path, "/")
+	if lastSlash == -1 {
+		return "", path
+	}
+
+	return path[:lastSlash], path[lastSlash+1:]
+}
+
+// ValidationUtils 验证工具集合
+type ValidationUtils struct{}
+
+// ValidateFileID 验证文件ID格式
+func (ValidationUtils) ValidateFileID(idStr string) (int64, error) {
+	return parseFileID(idStr)
+}
+
+// ValidateFileName 验证文件名
+func (ValidationUtils) ValidateFileName(name string) error {
+	return validateFileName(name)
+}
+
+// TimeUtils 时间处理工具集合
+type TimeUtils struct{}
+
+// CalculateRetryDelay 计算重试延迟时间
+func (TimeUtils) CalculateRetryDelay(attempt int) time.Duration {
+	return calculateRetryDelay(attempt)
+}
+
+// ParseUnixTimestamp 解析Unix时间戳
+func (TimeUtils) ParseUnixTimestamp(timestamp string) (time.Time, error) {
+	if timestamp == "" {
+		return time.Time{}, fmt.Errorf("时间戳不能为空")
+	}
+
+	ts, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("无效的时间戳格式: %s", timestamp)
+	}
+
+	return time.Unix(ts, 0), nil
+}
+
+// HTTPUtils HTTP处理工具集合
+type HTTPUtils struct{}
+
+// IsRetryableError 判断错误是否可重试
+func (HTTPUtils) IsRetryableError(ctx context.Context, err error, resp *http.Response) (bool, error) {
+	return shouldRetry(ctx, resp, err)
+}
+
+// BuildAPIEndpoint 构建API端点URL
+func (HTTPUtils) BuildAPIEndpoint(base, path string, params map[string]string) string {
+	endpoint := base + path
+	if len(params) > 0 {
+		values := url.Values{}
+		for k, v := range params {
+			values.Set(k, v)
+		}
+		endpoint += "?" + values.Encode()
+	}
+	return endpoint
+}
+
+// LoggingUtils 统一日志和调试接口
+type LoggingUtils struct{}
+
+// LogWithLevel 根据级别输出日志
+func (LoggingUtils) LogWithLevel(f *Fs, level int, format string, args ...interface{}) {
+	if f == nil {
+		return
+	}
+
+	// 检查是否应该输出此级别的日志
+	if !f.shouldLog(level) {
+		return
+	}
+
+	switch level {
+	case LogLevelError:
+		fs.Errorf(f, format, args...)
+	case LogLevelInfo:
+		fs.Infof(f, format, args...)
+	case LogLevelDebug, LogLevelVerbose:
+		fs.Debugf(f, format, args...)
+	default:
+		fs.Debugf(f, format, args...)
+	}
+}
+
+// LogError 输出错误日志
+func (LoggingUtils) LogError(f *Fs, format string, args ...interface{}) {
+	LoggingUtil.LogWithLevel(f, LogLevelError, format, args...)
+}
+
+// LogInfo 输出信息日志
+func (LoggingUtils) LogInfo(f *Fs, format string, args ...interface{}) {
+	LoggingUtil.LogWithLevel(f, LogLevelInfo, format, args...)
+}
+
+// LogDebug 输出调试日志
+func (LoggingUtils) LogDebug(f *Fs, format string, args ...interface{}) {
+	LoggingUtil.LogWithLevel(f, LogLevelDebug, format, args...)
+}
+
+// LogVerbose 输出详细日志
+func (LoggingUtils) LogVerbose(f *Fs, format string, args ...interface{}) {
+	LoggingUtil.LogWithLevel(f, LogLevelVerbose, format, args...)
+}
+
+// shouldLog 检查是否应该输出指定级别的日志
+func (f *Fs) shouldLog(level int) bool {
+	if f == nil {
+		return false
+	}
+	return level <= f.opt.DebugLevel
+}
+
+// 全局工具实例，方便使用
+var (
+	StringUtil     = StringUtils{}
+	PathUtil       = PathUtils{}
+	ValidationUtil = ValidationUtils{}
+	TimeUtil       = TimeUtils{}
+	HTTPUtil       = HTTPUtils{}
+	LoggingUtil    = LoggingUtils{}
+)
 
 // StreamingHashAccumulator 流式哈希累积器，用于消除MD5重复计算
 type StreamingHashAccumulator struct {
@@ -9051,7 +9264,13 @@ func (f *Fs) streamingPutSimplified(uploadCtx *UnifiedUploadContext) (*Object, e
 // ProgressTracker 方法实现
 
 // NewProgressTracker 创建新的进度跟踪器
+// 优化版本：添加了更好的默认值和验证
 func NewProgressTracker(updateInterval time.Duration, enableDisplay bool) *ProgressTracker {
+	// 设置合理的默认更新间隔
+	if updateInterval <= 0 {
+		updateInterval = 1 * time.Second
+	}
+
 	return &ProgressTracker{
 		operations:     make(map[string]*OperationProgress),
 		updateInterval: updateInterval,
@@ -9086,21 +9305,40 @@ func (pt *ProgressTracker) StartOperation(operationID, fileName string, totalSiz
 }
 
 // UpdateProgress 更新操作进度
+// 优化版本：减少锁的持有时间，提高并发性能
 func (pt *ProgressTracker) UpdateProgress(operationID string, transferredSize int64) {
 	if pt == nil {
 		return
 	}
 
+	// 使用读锁先检查操作是否存在
+	pt.mu.RLock()
+	op, exists := pt.operations[operationID]
+	if !exists {
+		pt.mu.RUnlock()
+		return
+	}
+
+	// 检查是否需要更新（避免频繁更新）
+	now := time.Now()
+	if now.Sub(op.LastUpdate) < pt.updateInterval {
+		pt.mu.RUnlock()
+		return
+	}
+	pt.mu.RUnlock()
+
+	// 使用写锁进行更新
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
 
-	op, exists := pt.operations[operationID]
+	// 再次检查操作是否存在（双重检查）
+	op, exists = pt.operations[operationID]
 	if !exists {
 		return
 	}
 
-	now := time.Now()
-	timeDiff := now.Sub(op.LastUpdate).Seconds()
+	updateTime := time.Now()
+	timeDiff := updateTime.Sub(op.LastUpdate).Seconds()
 
 	// 计算传输速度
 	if timeDiff > 0 {
@@ -9109,7 +9347,7 @@ func (pt *ProgressTracker) UpdateProgress(operationID string, transferredSize in
 	}
 
 	op.TransferredSize = transferredSize
-	op.LastUpdate = now
+	op.LastUpdate = updateTime
 
 	// 计算预计剩余时间
 	if op.Speed > 0 && op.TotalSize > 0 {
@@ -9118,7 +9356,7 @@ func (pt *ProgressTracker) UpdateProgress(operationID string, transferredSize in
 	}
 
 	// 显示进度（如果启用且达到更新间隔）
-	if pt.enableDisplay && now.Sub(op.StartTime) >= pt.updateInterval {
+	if pt.enableDisplay && updateTime.Sub(op.StartTime) >= pt.updateInterval {
 		percentage := float64(transferredSize) / float64(op.TotalSize) * 100
 		speed := fs.SizeSuffix(int64(op.Speed))
 		fs.Logf(nil, "%s进度: %s %.1f%% (%s/s, 剩余: %v)",
