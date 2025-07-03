@@ -1,0 +1,25 @@
+# .github/workflows/release.yml
+name: "Release a tag"
+
+on:
+  # push:
+  #   branches:
+  #     - main
+  workflow_dispatch: # 手动触发配置
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: '0'
+        
+    - name: Bump version and push tag
+      uses: anothrNick/github-tag-action@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GHCR_PAT }}
+        DEFAULT_BUMP : "patch"
+        TAG_PREFIX: v
