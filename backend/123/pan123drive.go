@@ -8857,30 +8857,70 @@ func (f *Fs) executeSingleStepUpload(uploadCtx *UnifiedUploadContext) (*Object, 
 func (f *Fs) executeChunkedUpload(uploadCtx *UnifiedUploadContext) (*Object, error) {
 	fs.Debugf(f, "执行分片上传策略")
 
-	// 获取或计算MD5 - 确保一致性
+	// 获取或计算MD5 - 增强跨云盘传输兼容性
 	var md5Hash string
 	if hashValue, err := uploadCtx.src.Hash(uploadCtx.ctx, fshash.MD5); err == nil && hashValue != "" {
 		md5Hash = hashValue
 		fs.Debugf(f, "使用已知MD5: %s", md5Hash)
 	} else {
-		// 对于分片上传，必须计算准确的MD5，不能使用临时值
-		fs.Debugf(f, "计算文件MD5用于分片上传")
+		// 对于分片上传，必须计算准确的MD5，支持跨云盘传输
+		fs.Debugf(f, "源对象无MD5哈希，尝试从输入流计算MD5")
+
+		// 优先尝试从fs.Object接口计算MD5
 		if srcObj, ok := uploadCtx.src.(fs.Object); ok {
+			fs.Debugf(f, "使用fs.Object接口计算MD5")
 			md5Reader, err := srcObj.Open(uploadCtx.ctx)
 			if err != nil {
-				return nil, fmt.Errorf("无法打开源文件计算MD5: %w", err)
+				fs.Debugf(f, "无法打开源对象，回退到输入流计算: %v", err)
+			} else {
+				defer md5Reader.Close()
+				hasher := md5.New()
+				_, err = io.Copy(hasher, md5Reader)
+				if err != nil {
+					fs.Debugf(f, "从源对象计算MD5失败，回退到输入流计算: %v", err)
+				} else {
+					md5Hash = fmt.Sprintf("%x", hasher.Sum(nil))
+					fs.Debugf(f, "从源对象计算MD5完成: %s", md5Hash)
+				}
 			}
-			defer md5Reader.Close()
+		}
 
-			hasher := md5.New()
-			_, err = io.Copy(hasher, md5Reader)
-			if err != nil {
-				return nil, fmt.Errorf("计算MD5失败: %w", err)
+		// 如果从源对象计算MD5失败，尝试通用方法计算MD5
+		if md5Hash == "" {
+			fs.Debugf(f, "使用通用方法计算MD5（跨云盘传输兼容模式）")
+
+			// 尝试通过fs.ObjectInfo接口重新打开源对象
+			if opener, ok := uploadCtx.src.(fs.ObjectInfo); ok {
+				fs.Debugf(f, "通过fs.ObjectInfo接口计算MD5")
+
+				// 检查是否有Open方法（通过接口断言）
+				if openable, hasOpen := opener.(interface {
+					Open(context.Context, ...fs.OpenOption) (io.ReadCloser, error)
+				}); hasOpen {
+					md5Reader, err := openable.Open(uploadCtx.ctx)
+					if err != nil {
+						fs.Debugf(f, "无法通过Open方法打开源对象: %v", err)
+					} else {
+						defer md5Reader.Close()
+						md5Hash, err = f.calculateMD5FromReader(uploadCtx.ctx, md5Reader, uploadCtx.src.Size())
+						if err != nil {
+							fs.Debugf(f, "通过Open方法计算MD5失败: %v", err)
+						} else {
+							fs.Debugf(f, "通过Open方法计算MD5成功: %s", md5Hash)
+						}
+					}
+				}
 			}
-			md5Hash = fmt.Sprintf("%x", hasher.Sum(nil))
-			fs.Debugf(f, "分片上传MD5计算完成: %s", md5Hash)
-		} else {
-			return nil, fmt.Errorf("无法获取源对象进行MD5计算")
+
+			// 如果仍然没有MD5，使用输入流缓存方法
+			if md5Hash == "" {
+				fs.Debugf(f, "使用输入流缓存方法计算MD5")
+				md5Hash, uploadCtx.in, err = f.calculateMD5WithStreamCache(uploadCtx.ctx, uploadCtx.in, uploadCtx.src.Size())
+				if err != nil {
+					return nil, fmt.Errorf("无法计算文件MD5: %w", err)
+				}
+				fs.Debugf(f, "输入流缓存方法计算MD5完成: %s", md5Hash)
+			}
 		}
 	}
 
@@ -9605,6 +9645,228 @@ func (f *Fs) verifyUploadMD5(ctx context.Context, preuploadID, expectedMD5 strin
 	}
 
 	return fmt.Errorf("MD5验证超时，无法确认文件MD5状态")
+}
+
+// calculateMD5WithStreamCache 从输入流计算MD5并缓存流内容，返回新的可读流
+// 使用分块读取和超时控制，避免大文件处理时的网络超时问题
+func (f *Fs) calculateMD5WithStreamCache(ctx context.Context, in io.Reader, expectedSize int64) (string, io.Reader, error) {
+	fs.Debugf(f, "开始从输入流计算MD5并缓存流内容，预期大小: %s", fs.SizeSuffix(expectedSize))
+
+	hasher := md5.New()
+
+	// 对于大文件，使用临时文件缓存
+	if expectedSize > maxMemoryBufferSize {
+		fs.Debugf(f, "大文件使用临时文件缓存流内容，采用分块读取策略")
+		tempFile, err := f.resourcePool.GetTempFile("stream_cache_")
+		if err != nil {
+			return "", nil, fmt.Errorf("创建临时文件失败: %w", err)
+		}
+
+		// 使用分块读取，避免一次性读取整个大文件导致超时
+		written, err := f.copyWithChunksAndTimeout(ctx, tempFile, hasher, in, expectedSize)
+		if err != nil {
+			tempFile.Close()
+			os.Remove(tempFile.Name())
+			return "", nil, fmt.Errorf("缓存流内容时复制数据失败: %w", err)
+		}
+
+		if expectedSize > 0 && written != expectedSize {
+			fs.Debugf(f, "警告：实际读取大小(%d)与预期大小(%d)不匹配", written, expectedSize)
+		}
+
+		// 重置文件指针到开头
+		_, err = tempFile.Seek(0, io.SeekStart)
+		if err != nil {
+			tempFile.Close()
+			os.Remove(tempFile.Name())
+			return "", nil, fmt.Errorf("重置临时文件指针失败: %w", err)
+		}
+
+		md5Hash := fmt.Sprintf("%x", hasher.Sum(nil))
+		fs.Debugf(f, "大文件MD5计算完成: %s，缓存了 %s 数据", md5Hash, fs.SizeSuffix(written))
+
+		// 返回一个自动清理的读取器
+		return md5Hash, &tempFileReader{file: tempFile}, nil
+	} else {
+		// 小文件在内存中缓存
+		fs.Debugf(f, "小文件在内存中缓存流内容")
+		var buffer bytes.Buffer
+		teeReader := io.TeeReader(in, &buffer)
+
+		written, err := io.Copy(hasher, teeReader)
+		if err != nil {
+			return "", nil, fmt.Errorf("计算MD5失败: %w", err)
+		}
+
+		if expectedSize > 0 && written != expectedSize {
+			fs.Debugf(f, "警告：实际读取大小(%d)与预期大小(%d)不匹配", written, expectedSize)
+		}
+
+		md5Hash := fmt.Sprintf("%x", hasher.Sum(nil))
+		fs.Debugf(f, "小文件MD5计算完成: %s，缓存了 %s 数据", md5Hash, fs.SizeSuffix(written))
+
+		return md5Hash, bytes.NewReader(buffer.Bytes()), nil
+	}
+}
+
+// copyWithChunksAndTimeout 分块复制数据，支持超时控制和进度监控
+// 同时写入到文件和MD5计算器，避免大文件一次性读取导致的超时问题
+func (f *Fs) copyWithChunksAndTimeout(ctx context.Context, file *os.File, hasher hash.Hash, in io.Reader, expectedSize int64) (int64, error) {
+	const (
+		chunkSize       = 8 * 1024 * 1024  // 8MB 分块大小
+		timeoutPerChunk = 30 * time.Second // 每个分块的超时时间
+	)
+
+	multiWriter := io.MultiWriter(file, hasher)
+	buffer := make([]byte, chunkSize)
+	var totalWritten int64
+
+	fs.Debugf(f, "开始分块复制，分块大小: %s，预期总大小: %s", fs.SizeSuffix(chunkSize), fs.SizeSuffix(expectedSize))
+
+	for {
+		// 为每个分块设置超时
+		chunkCtx, cancel := context.WithTimeout(ctx, timeoutPerChunk)
+
+		// 创建一个带超时的读取器
+		readDone := make(chan struct {
+			n   int
+			err error
+		}, 1)
+
+		go func() {
+			n, err := in.Read(buffer)
+			readDone <- struct {
+				n   int
+				err error
+			}{n, err}
+		}()
+
+		var n int
+		var readErr error
+
+		select {
+		case result := <-readDone:
+			n, readErr = result.n, result.err
+		case <-chunkCtx.Done():
+			cancel()
+			return totalWritten, fmt.Errorf("读取分块超时: %w", chunkCtx.Err())
+		}
+
+		cancel()
+
+		if readErr != nil {
+			if readErr == io.EOF {
+				break
+			}
+			return totalWritten, fmt.Errorf("读取数据失败: %w", readErr)
+		}
+
+		if n == 0 {
+			break
+		}
+
+		// 写入数据
+		written, writeErr := multiWriter.Write(buffer[:n])
+		if writeErr != nil {
+			return totalWritten, fmt.Errorf("写入数据失败: %w", writeErr)
+		}
+
+		if written != n {
+			return totalWritten, fmt.Errorf("写入数据不完整: 期望 %d，实际 %d", n, written)
+		}
+
+		totalWritten += int64(written)
+
+		// 每处理100MB输出一次进度
+		if totalWritten%(100*1024*1024) == 0 || (expectedSize > 0 && totalWritten >= expectedSize) {
+			if expectedSize > 0 {
+				progress := float64(totalWritten) / float64(expectedSize) * 100
+				fs.Debugf(f, "MD5计算进度: %s / %s (%.1f%%)",
+					fs.SizeSuffix(totalWritten), fs.SizeSuffix(expectedSize), progress)
+			} else {
+				fs.Debugf(f, "MD5计算进度: %s", fs.SizeSuffix(totalWritten))
+			}
+		}
+
+		// 检查上下文是否被取消
+		select {
+		case <-ctx.Done():
+			return totalWritten, fmt.Errorf("操作被取消: %w", ctx.Err())
+		default:
+		}
+	}
+
+	fs.Debugf(f, "分块复制完成，总共处理: %s", fs.SizeSuffix(totalWritten))
+	return totalWritten, nil
+}
+
+// tempFileReader 包装临时文件，实现自动清理
+type tempFileReader struct {
+	file *os.File
+}
+
+func (r *tempFileReader) Read(p []byte) (n int, err error) {
+	return r.file.Read(p)
+}
+
+func (r *tempFileReader) Close() error {
+	if r.file != nil {
+		fileName := r.file.Name()
+		r.file.Close()
+		os.Remove(fileName)
+		r.file = nil
+	}
+	return nil
+}
+
+// calculateMD5FromReader 从输入流计算MD5哈希，支持跨云盘传输
+// 使用分块读取和超时控制，避免大文件处理时的网络超时问题
+func (f *Fs) calculateMD5FromReader(ctx context.Context, in io.Reader, expectedSize int64) (string, error) {
+	fs.Debugf(f, "开始从输入流计算MD5，预期大小: %s", fs.SizeSuffix(expectedSize))
+
+	hasher := md5.New()
+
+	// 对于大文件，使用分块读取避免超时
+	if expectedSize > maxMemoryBufferSize {
+		fs.Debugf(f, "大文件使用分块读取计算MD5")
+		tempFile, err := f.resourcePool.GetTempFile("md5calc_")
+		if err != nil {
+			return "", fmt.Errorf("创建临时文件失败: %w", err)
+		}
+		defer func() {
+			tempFile.Close()
+			os.Remove(tempFile.Name())
+		}()
+
+		// 使用分块读取，避免一次性读取整个大文件导致超时
+		written, err := f.copyWithChunksAndTimeout(ctx, tempFile, hasher, in, expectedSize)
+		if err != nil {
+			return "", fmt.Errorf("计算MD5时复制数据失败: %w", err)
+		}
+
+		if expectedSize > 0 && written != expectedSize {
+			fs.Debugf(f, "警告：实际读取大小(%d)与预期大小(%d)不匹配", written, expectedSize)
+		}
+
+		fs.Debugf(f, "MD5计算完成，处理了 %s 数据", fs.SizeSuffix(written))
+	} else {
+		// 小文件直接在内存中计算
+		fs.Debugf(f, "小文件在内存中计算MD5")
+		written, err := io.Copy(hasher, in)
+		if err != nil {
+			return "", fmt.Errorf("计算MD5失败: %w", err)
+		}
+
+		if expectedSize > 0 && written != expectedSize {
+			fs.Debugf(f, "警告：实际读取大小(%d)与预期大小(%d)不匹配", written, expectedSize)
+		}
+
+		fs.Debugf(f, "MD5计算完成，处理了 %s 数据", fs.SizeSuffix(written))
+	}
+
+	md5Hash := fmt.Sprintf("%x", hasher.Sum(nil))
+	fs.Debugf(f, "MD5计算结果: %s", md5Hash)
+	return md5Hash, nil
 }
 
 // singleStepUploadMultipart 使用multipart form上传文件的专用方法
