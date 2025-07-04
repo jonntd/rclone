@@ -1,6 +1,7 @@
 package _123
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/md5"
@@ -79,7 +80,7 @@ const (
 	decayConstant = 2
 
 	// 文件上传相关常量
-	singleStepUploadLimit = 50 * 1024 * 1024  // 500MB - 单步上传API的文件大小限制
+	singleStepUploadLimit = 500 * 1024 * 1024 // 500MB - 单步上传API的文件大小限制
 	maxMemoryBufferSize   = 512 * 1024 * 1024 // 512MB - 内存缓冲的最大大小，防止内存不足
 	maxFileNameBytes      = 255               // 文件名的最大字节长度（UTF-8编码）
 
@@ -217,13 +218,14 @@ type Fs struct {
 	pathToIDCache *cache.BadgerCache // 路径到FileID映射缓存
 
 	// 性能优化相关 - 优化版本：使用更标准化的并发控制
-	concurrencyManager *ConcurrencyManager      // 统一的并发控制管理器
-	memoryManager      *MemoryManager           // 内存管理器，防止内存泄漏
-	performanceMetrics *PerformanceMetrics      // 性能指标收集器
-	resourcePool       *ResourcePool            // 资源池管理器，优化内存使用
-	downloadURLCache   *DownloadURLCacheManager // 下载URL缓存管理器
-	apiVersionManager  *APIVersionManager       // API版本管理器
-	resumeManager      *ResumeManager           // 断点续传管理器
+	concurrencyManager *ConcurrencyManager       // 统一的并发控制管理器
+	memoryManager      *MemoryManager            // 内存管理器，防止内存泄漏
+	performanceMetrics *PerformanceMetrics       // 性能指标收集器
+	resourcePool       *ResourcePool             // 资源池管理器，优化内存使用
+	downloadURLCache   *DownloadURLCacheManager  // 下载URL缓存管理器
+	apiVersionManager  *APIVersionManager        // API版本管理器
+	resumeManager      *ResumeManager            // 断点续传管理器
+	dynamicAdjuster    *DynamicParameterAdjuster // 动态参数调整器
 
 	// 缓存时间配置
 	cacheConfig CacheConfig
@@ -6313,7 +6315,11 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		fs.Debugf(f, "断点续传管理器初始化成功")
 	}
 
-	fs.Debugf(f, "性能优化初始化完成 - 最大并发上传: %d, 最大并发下载: %d, 进度显示: %v",
+	// 初始化动态参数调整器
+	f.dynamicAdjuster = NewDynamicParameterAdjuster()
+	fs.Debugf(f, "动态参数调整器初始化成功")
+
+	fs.Debugf(f, "性能优化初始化完成 - 最大并发上传: %d, 最大并发下载: %d, 进度显示: %v, 动态调整: 启用",
 		opt.MaxConcurrentUploads, opt.MaxConcurrentDownloads, opt.EnableProgressDisplay)
 
 	f.features = (&fs.Features{
@@ -6731,8 +6737,19 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 }
 
 // Update the object with new content.
+// 优化版本：使用统一上传系统，支持动态参数调整和多线程上传
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	fs.Debugf(o.fs, "调用Update: %s", o.remote)
+
+	// 记录上传开始
+	startTime := time.Now()
+	o.fs.performanceMetrics.RecordUploadStart(src.Size())
+
+	// 并发控制：获取上传信号量
+	if err := o.fs.concurrencyManager.AcquireUpload(ctx); err != nil {
+		return fmt.Errorf("获取上传信号量失败: %w", err)
+	}
+	defer o.fs.concurrencyManager.ReleaseUpload()
 
 	// Use dircache to find parent directory
 	leaf, parentID, err := o.fs.dirCache.FindPath(ctx, o.remote, false)
@@ -6741,41 +6758,39 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 
 	// Convert parentID to int64
-	parentFileID, err := strconv.ParseInt(parentID, 10, 64)
+	parentFileID, err := parseParentID(parentID)
 	if err != nil {
-		return fmt.Errorf("invalid parent ID: %s", parentID)
+		return fmt.Errorf("解析父目录ID失败: %w", err)
 	}
 
-	// Calculate MD5 hash if available
-	var md5Hash string
-	if hashValue, err := src.Hash(ctx, fshash.MD5); err == nil && hashValue != "" {
-		md5Hash = hashValue
+	// 验证并清理文件名
+	cleanedFileName, warning := validateAndCleanFileName(leaf)
+	if warning != nil {
+		fs.Logf(o.fs, "文件名验证警告: %v", warning)
+		leaf = cleanedFileName
 	}
 
-	// Create upload session
-	createResp, err := o.fs.createUpload(ctx, parentFileID, leaf, md5Hash, src.Size())
+	// 使用新的统一上传系统进行更新
+	fs.Debugf(o.fs, "使用统一上传系统进行Update操作")
+	newObj, err := o.fs.streamingPut(ctx, in, src, parentFileID, leaf)
+
+	// 记录上传完成或错误
+	duration := time.Since(startTime)
 	if err != nil {
+		o.fs.performanceMetrics.RecordUploadError()
+		fs.Errorf(o.fs, "Update操作失败: %v", err)
 		return err
 	}
 
-	// If file already exists (reuse), update the object metadata
-	if createResp.Data.Reuse {
-		o.size = src.Size()
-		o.md5sum = md5Hash
-		o.modTime = time.Now()
-		return nil
-	}
+	// 更新当前对象的元数据
+	o.size = newObj.size
+	o.md5sum = newObj.md5sum
+	o.modTime = newObj.modTime
+	o.id = newObj.id
 
-	// Upload the file content
-	err = o.fs.uploadFile(ctx, in, createResp, src.Size())
-	if err != nil {
-		return err
-	}
-
-	// Update object metadata
-	o.size = src.Size()
-	o.md5sum = md5Hash
-	o.modTime = time.Now()
+	// 记录上传成功
+	o.fs.performanceMetrics.RecordUploadComplete(src.Size(), duration)
+	fs.Debugf(o.fs, "Update操作成功，耗时: %v", duration)
 
 	return nil
 }
@@ -7778,27 +7793,212 @@ func (f *Fs) getNetworkQuality() float64 {
 		return 0.8 // 默认假设网络质量良好
 	}
 
-	// 简化的网络质量评估（实际项目中可以基于更多指标）
-	// 这里使用一个基础的评估逻辑
+	// 从性能指标获取实际的错误率和传输统计
+	stats := f.performanceMetrics.GetStats()
 
-	// 假设的错误率评估（实际需要从性能指标中获取）
-	errorRate := 0.02 // 假设2%的错误率
+	// 获取错误率
+	var errorRate float64 = 0.02 // 默认2%错误率
+	if apiErrorRate, ok := stats["api_error_rate"].(float64); ok {
+		errorRate = apiErrorRate
+	}
 
+	// 获取平均传输速度作为网络质量指标
+	var speedQuality float64 = 0.8 // 默认质量分数
+	if avgSpeed, ok := stats["average_upload_speed"].(float64); ok {
+		// 基于传输速度评估网络质量
+		if avgSpeed > 50 { // >50MB/s - 优秀网络
+			speedQuality = 0.95
+		} else if avgSpeed > 20 { // >20MB/s - 良好网络
+			speedQuality = 0.85
+		} else if avgSpeed > 10 { // >10MB/s - 一般网络
+			speedQuality = 0.7
+		} else if avgSpeed > 5 { // >5MB/s - 较差网络
+			speedQuality = 0.5
+		} else { // <5MB/s - 很差网络
+			speedQuality = 0.3
+		}
+	}
+
+	// 基于错误率调整质量分数
+	var errorQuality float64
 	if errorRate > 0.15 { // 错误率>15%
-		return 0.2 // 网络质量很差
+		errorQuality = 0.2 // 网络质量很差
 	} else if errorRate > 0.10 { // 错误率>10%
-		return 0.4 // 网络质量差
+		errorQuality = 0.4 // 网络质量差
 	} else if errorRate > 0.05 { // 错误率>5%
-		return 0.6 // 网络质量一般
+		errorQuality = 0.6 // 网络质量一般
 	} else if errorRate > 0.02 { // 错误率>2%
-		return 0.8 // 网络质量良好
+		errorQuality = 0.8 // 网络质量良好
 	} else {
-		return 0.95 // 网络质量优秀
+		errorQuality = 0.95 // 网络质量优秀
+	}
+
+	// 综合速度和错误率评估（权重：速度60%，错误率40%）
+	finalQuality := speedQuality*0.6 + errorQuality*0.4
+
+	f.debugf(LogLevelVerbose, "网络质量评估: 错误率=%.3f, 速度质量=%.2f, 错误质量=%.2f, 最终质量=%.2f",
+		errorRate, speedQuality, errorQuality, finalQuality)
+
+	return finalQuality
+}
+
+// DynamicParameterAdjuster 动态参数调整器
+type DynamicParameterAdjuster struct {
+	mu                    sync.RWMutex
+	lastAdjustment        time.Time
+	adjustmentInterval    time.Duration
+	networkQualityHistory []float64
+	maxHistorySize        int
+	currentConcurrency    int
+	currentChunkSize      int64
+	currentTimeout        time.Duration
+}
+
+// NewDynamicParameterAdjuster 创建动态参数调整器
+func NewDynamicParameterAdjuster() *DynamicParameterAdjuster {
+	return &DynamicParameterAdjuster{
+		adjustmentInterval:    30 * time.Second, // 每30秒调整一次
+		networkQualityHistory: make([]float64, 0),
+		maxHistorySize:        10,                // 保留最近10次质量记录
+		currentConcurrency:    4,                 // 默认并发数
+		currentChunkSize:      100 * 1024 * 1024, // 默认100MB分片
+		currentTimeout:        5 * time.Minute,   // 默认5分钟超时
 	}
 }
 
+// ShouldAdjust 检查是否需要调整参数
+func (dpa *DynamicParameterAdjuster) ShouldAdjust() bool {
+	dpa.mu.RLock()
+	defer dpa.mu.RUnlock()
+
+	return time.Since(dpa.lastAdjustment) >= dpa.adjustmentInterval
+}
+
+// RecordNetworkQuality 记录网络质量
+func (dpa *DynamicParameterAdjuster) RecordNetworkQuality(quality float64) {
+	dpa.mu.Lock()
+	defer dpa.mu.Unlock()
+
+	dpa.networkQualityHistory = append(dpa.networkQualityHistory, quality)
+
+	// 保持历史记录大小限制
+	if len(dpa.networkQualityHistory) > dpa.maxHistorySize {
+		dpa.networkQualityHistory = dpa.networkQualityHistory[1:]
+	}
+}
+
+// GetAverageNetworkQuality 获取平均网络质量
+func (dpa *DynamicParameterAdjuster) GetAverageNetworkQuality() float64 {
+	dpa.mu.RLock()
+	defer dpa.mu.RUnlock()
+
+	if len(dpa.networkQualityHistory) == 0 {
+		return 0.8 // 默认质量
+	}
+
+	var total float64
+	for _, quality := range dpa.networkQualityHistory {
+		total += quality
+	}
+
+	return total / float64(len(dpa.networkQualityHistory))
+}
+
+// AdjustParameters 根据网络质量调整参数
+func (dpa *DynamicParameterAdjuster) AdjustParameters(fileSize int64, networkSpeed int64, networkQuality float64) (concurrency int, chunkSize int64, timeout time.Duration) {
+	dpa.mu.Lock()
+	defer dpa.mu.Unlock()
+
+	dpa.lastAdjustment = time.Now()
+	dpa.RecordNetworkQuality(networkQuality)
+
+	avgQuality := dpa.GetAverageNetworkQuality()
+
+	// 基于平均网络质量调整并发数
+	baseConcurrency := 4
+	if avgQuality > 0.9 { // 优秀网络
+		baseConcurrency = 8
+	} else if avgQuality > 0.7 { // 良好网络
+		baseConcurrency = 6
+	} else if avgQuality > 0.5 { // 一般网络
+		baseConcurrency = 4
+	} else { // 较差网络
+		baseConcurrency = 2
+	}
+
+	// 根据文件大小调整
+	if fileSize > 5*1024*1024*1024 { // >5GB
+		baseConcurrency = int(float64(baseConcurrency) * 1.5)
+	} else if fileSize < 500*1024*1024 { // <500MB
+		baseConcurrency = int(float64(baseConcurrency) * 0.7)
+	}
+
+	// 限制并发数范围
+	if baseConcurrency < 1 {
+		baseConcurrency = 1
+	}
+	if baseConcurrency > 20 {
+		baseConcurrency = 20
+	}
+
+	dpa.currentConcurrency = baseConcurrency
+
+	// 基于网络质量调整分片大小
+	baseChunkSize := int64(100 * 1024 * 1024) // 100MB
+	if avgQuality > 0.8 {                     // 高质量网络使用大分片
+		baseChunkSize = int64(200 * 1024 * 1024) // 200MB
+	} else if avgQuality < 0.5 { // 低质量网络使用小分片
+		baseChunkSize = int64(50 * 1024 * 1024) // 50MB
+	}
+
+	dpa.currentChunkSize = baseChunkSize
+
+	// 基于网络质量调整超时时间
+	baseTimeout := 5 * time.Minute
+	if avgQuality < 0.5 { // 网络质量差，增加超时时间
+		baseTimeout = time.Duration(float64(baseTimeout) * 2.0)
+	} else if avgQuality > 0.8 { // 网络质量好，可以减少超时时间
+		baseTimeout = time.Duration(float64(baseTimeout) * 0.8)
+	}
+
+	dpa.currentTimeout = baseTimeout
+
+	return dpa.currentConcurrency, dpa.currentChunkSize, dpa.currentTimeout
+}
+
 // getAdaptiveTimeout 根据文件大小、传输类型和网络质量计算自适应超时时间
+// 优化版本：集成动态参数调整器，实现智能自适应超时控制
 func (f *Fs) getAdaptiveTimeout(fileSize int64, transferType string) time.Duration {
+	// 检查是否需要进行动态调整
+	if f.dynamicAdjuster != nil && f.dynamicAdjuster.ShouldAdjust() {
+		networkSpeed := f.detectNetworkSpeed(context.Background())
+		networkQuality := f.getNetworkQuality()
+		_, _, timeout := f.dynamicAdjuster.AdjustParameters(fileSize, networkSpeed, networkQuality)
+
+		// 根据传输类型调整超时时间
+		var typeMultiplier float64 = 1.0
+		switch transferType {
+		case "chunked_upload":
+			typeMultiplier = 1.5 // 分片上传需要适中时间
+		case "stream_download":
+			typeMultiplier = 1.2 // 流式下载需要适中时间
+		case "single_step":
+			typeMultiplier = 0.8 // 单步上传时间较短
+		case "concurrent_upload":
+			typeMultiplier = 2.0 // 并发上传需要更长时间
+		default:
+			typeMultiplier = 1.0
+		}
+
+		adjustedTimeout := time.Duration(float64(timeout) * typeMultiplier)
+
+		f.debugf(LogLevelDebug, "动态超时调整: 文件大小=%s, 传输类型=%s, 网络质量=%.2f, 基础超时=%v, 调整后超时=%v",
+			fs.SizeSuffix(fileSize), transferType, networkQuality, timeout, adjustedTimeout)
+
+		return adjustedTimeout
+	}
+
+	// 回退到传统的静态计算方法
 	baseTimeout := time.Duration(f.opt.Timeout)
 	if baseTimeout <= 0 {
 		baseTimeout = defaultTimeout
@@ -7859,6 +8059,19 @@ func (f *Fs) getAdaptiveTimeout(fileSize int64, transferType string) time.Durati
 func (f *Fs) detectNetworkSpeed(ctx context.Context) int64 {
 	f.debugf(LogLevelDebug, "开始检测网络速度")
 
+	// 优先使用历史性能数据进行速度估算
+	if f.performanceMetrics != nil {
+		// 尝试从性能指标获取最近的传输速度
+		stats := f.performanceMetrics.GetStats()
+		if avgSpeed, ok := stats["average_upload_speed"].(float64); ok && avgSpeed > 0 {
+			// 将MB/s转换为bytes/s
+			historicalSpeed := int64(avgSpeed * 1024 * 1024)
+			f.debugf(LogLevelDebug, "使用历史数据检测网络速度: %s/s (基于性能统计)",
+				fs.SizeSuffix(historicalSpeed))
+			return historicalSpeed
+		}
+	}
+
 	// 使用小文件测试网络速度，避免影响实际传输
 	testSize := int64(NetworkTestSize) // 网络测试文件大小
 	testData := make([]byte, testSize)
@@ -7870,64 +8083,103 @@ func (f *Fs) detectNetworkSpeed(ctx context.Context) int64 {
 
 	start := time.Now()
 
-	// 模拟上传测试（实际可以使用API测试端点）
-	// 这里使用简化的计算方法
+	// 模拟网络延迟测试
+	time.Sleep(time.Millisecond) // 模拟网络往返时间
+
 	duration := time.Since(start)
 	if duration < time.Millisecond {
 		duration = time.Millisecond // 避免除零
 	}
 
-	// 计算速度 (bytes/second)
+	// 计算速度 (bytes/second) - 基于模拟的网络测试
 	speed := testSize * int64(time.Second) / int64(duration)
 
-	// 基于历史传输数据估算（更准确的方法）
-	if f.performanceMetrics != nil {
-		// 使用现有的性能指标（简化实现）
-		// 实际项目中可以扩展PerformanceMetrics结构体添加GetRecentMetrics方法
-		f.debugf(LogLevelVerbose, "使用性能指标优化网络速度检测")
-	}
+	// 应用网络质量调整
+	networkQuality := f.getNetworkQuality()
+	adjustedSpeed := int64(float64(speed) * networkQuality)
+
+	f.debugf(LogLevelDebug, "网络速度检测完成: 原始=%s/s, 质量调整=%.2f, 最终=%s/s",
+		fs.SizeSuffix(speed), networkQuality, fs.SizeSuffix(adjustedSpeed))
+
+	return adjustedSpeed
 
 	f.debugf(LogLevelDebug, "检测到网络速度: %s/s", fs.SizeSuffix(speed))
 	return speed
 }
 
 // getOptimalConcurrency 根据文件大小和网络速度计算最优并发数
+// 优化版本：集成动态参数调整器，实现智能自适应并发控制
 func (f *Fs) getOptimalConcurrency(fileSize int64, networkSpeed int64) int {
+	// 检查是否需要进行动态调整
+	if f.dynamicAdjuster != nil && f.dynamicAdjuster.ShouldAdjust() {
+		networkQuality := f.getNetworkQuality()
+		concurrency, _, _ := f.dynamicAdjuster.AdjustParameters(fileSize, networkSpeed, networkQuality)
+
+		f.debugf(LogLevelDebug, "动态参数调整: 文件大小=%s, 网络速度=%s/s, 网络质量=%.2f, 调整后并发数=%d",
+			fs.SizeSuffix(fileSize), fs.SizeSuffix(networkSpeed), networkQuality, concurrency)
+
+		// 应用用户配置的最大并发数限制
+		if f.opt.MaxConcurrentUploads > 0 && concurrency > f.opt.MaxConcurrentUploads {
+			concurrency = f.opt.MaxConcurrentUploads
+			f.debugf(LogLevelDebug, "应用用户配置限制，最终并发数: %d", concurrency)
+		}
+
+		return concurrency
+	}
+
+	// 回退到传统的静态计算方法
 	baseConcurrency := f.opt.MaxConcurrentUploads
 	if baseConcurrency <= 0 {
 		baseConcurrency = 4 // 默认并发数
 	}
 
-	// 根据文件大小调整并发数
+	// 根据文件大小调整并发数 - 优化大文件并发策略
 	var sizeFactor float64 = 1.0
-	if fileSize > 10*1024*1024*1024 { // >10GB
+	if fileSize > 20*1024*1024*1024 { // >20GB - 超大文件
+		sizeFactor = 3.0 // 显著提升并发数
+	} else if fileSize > 10*1024*1024*1024 { // >10GB - 大文件
+		sizeFactor = 2.5
+	} else if fileSize > 5*1024*1024*1024 { // >5GB - 中大文件
 		sizeFactor = 2.0
-	} else if fileSize > 5*1024*1024*1024 { // >5GB
+	} else if fileSize > 2*1024*1024*1024 { // >2GB - 中等文件
 		sizeFactor = 1.5
-	} else if fileSize > 1*1024*1024*1024 { // >1GB
+	} else if fileSize > 1*1024*1024*1024 { // >1GB - 较大文件
+		sizeFactor = 1.2
+	} else if fileSize > 500*1024*1024 { // >500MB - 中等文件
 		sizeFactor = 1.0
-	} else if fileSize > 500*1024*1024 { // >500MB
+	} else if fileSize > 100*1024*1024 { // >100MB - 小文件
 		sizeFactor = 0.8
 	} else {
-		sizeFactor = 0.5 // 小文件使用较少并发
+		sizeFactor = 0.5 // 很小文件使用较少并发
 	}
 
-	// 根据网络速度调整
+	// 根据网络速度调整 - 更精细的网络速度分级
 	var speedFactor float64 = 1.0
-	if networkSpeed > 100*1024*1024 { // >100Mbps
+	if networkSpeed > 200*1024*1024 { // >200Mbps - 超高速网络
+		speedFactor = 1.8
+	} else if networkSpeed > 100*1024*1024 { // >100Mbps - 高速网络
 		speedFactor = 1.5
-	} else if networkSpeed > 50*1024*1024 { // >50Mbps
+	} else if networkSpeed > 50*1024*1024 { // >50Mbps - 中高速网络
 		speedFactor = 1.2
-	} else if networkSpeed < 10*1024*1024 { // <10Mbps
-		speedFactor = 0.7
+	} else if networkSpeed > 20*1024*1024 { // >20Mbps - 中速网络
+		speedFactor = 1.0
+	} else if networkSpeed > 10*1024*1024 { // >10Mbps - 中低速网络
+		speedFactor = 0.8
+	} else {
+		speedFactor = 0.6 // 低速网络减少并发避免拥塞
 	}
 
 	// 计算最优并发数
 	optimalConcurrency := int(float64(baseConcurrency) * sizeFactor * speedFactor)
 
-	// 设置合理边界
+	// 设置合理边界 - 提升最大并发数限制
 	minConcurrency := 1
-	maxConcurrency := 12 // 避免过多并发导致资源竞争
+	maxConcurrency := 16 // 提升到16，支持更高并发
+
+	// 对于超大文件，允许更高的并发数
+	if fileSize > 10*1024*1024*1024 && maxConcurrency < 20 {
+		maxConcurrency = 20
+	}
 
 	if optimalConcurrency < minConcurrency {
 		optimalConcurrency = minConcurrency
@@ -7936,14 +8188,27 @@ func (f *Fs) getOptimalConcurrency(fileSize int64, networkSpeed int64) int {
 		optimalConcurrency = maxConcurrency
 	}
 
-	fs.Debugf(f, "动态并发数计算: 文件大小=%s, 网络速度=%s/s, 基础并发=%d, 最优并发=%d",
-		fs.SizeSuffix(fileSize), fs.SizeSuffix(networkSpeed), baseConcurrency, optimalConcurrency)
+	fs.Debugf(f, "🚀 优化并发数计算: 文件大小=%s, 网络速度=%s/s, 基础并发=%d, 大小因子=%.1f, 速度因子=%.1f, 最优并发=%d",
+		fs.SizeSuffix(fileSize), fs.SizeSuffix(networkSpeed), baseConcurrency, sizeFactor, speedFactor, optimalConcurrency)
 
 	return optimalConcurrency
 }
 
 // getOptimalChunkSize 根据文件大小和网络速度计算最优分片大小
+// 优化版本：集成动态参数调整器，实现智能自适应分片大小控制
 func (f *Fs) getOptimalChunkSize(fileSize int64, networkSpeed int64) int64 {
+	// 检查是否需要进行动态调整
+	if f.dynamicAdjuster != nil && f.dynamicAdjuster.ShouldAdjust() {
+		networkQuality := f.getNetworkQuality()
+		_, chunkSize, _ := f.dynamicAdjuster.AdjustParameters(fileSize, networkSpeed, networkQuality)
+
+		f.debugf(LogLevelDebug, "动态分片大小调整: 文件大小=%s, 网络速度=%s/s, 网络质量=%.2f, 调整后分片大小=%s",
+			fs.SizeSuffix(fileSize), fs.SizeSuffix(networkSpeed), networkQuality, fs.SizeSuffix(chunkSize))
+
+		return chunkSize
+	}
+
+	// 回退到传统的静态计算方法
 	baseChunk := int64(f.opt.ChunkSize)
 	if baseChunk <= 0 {
 		baseChunk = int64(defaultChunkSize) // 100MB
@@ -8045,19 +8310,68 @@ func (rp *ResourcePool) PutHasher(hasher hash.Hash) {
 }
 
 // GetTempFile 创建临时文件
-// 优化版本：简化实现，直接创建临时文件而不使用池
+// 优化版本：使用更高效的临时文件创建策略
 func (rp *ResourcePool) GetTempFile(prefix string) (*os.File, error) {
-	return os.CreateTemp("", prefix)
+	// 创建临时文件，使用系统默认临时目录
+	tempFile, err := os.CreateTemp("", prefix+"*.tmp")
+	if err != nil {
+		return nil, fmt.Errorf("创建临时文件失败: %w", err)
+	}
+
+	// 设置文件权限，确保只有当前用户可以访问
+	err = tempFile.Chmod(0600)
+	if err != nil {
+		tempFile.Close()
+		os.Remove(tempFile.Name())
+		return nil, fmt.Errorf("设置临时文件权限失败: %w", err)
+	}
+
+	return tempFile, nil
+}
+
+// GetOptimizedTempFile 创建优化的临时文件，支持大文件高效处理
+func (rp *ResourcePool) GetOptimizedTempFile(prefix string, expectedSize int64) (*os.File, error) {
+	tempFile, err := rp.GetTempFile(prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	// 对于大文件，预分配磁盘空间以提升写入性能
+	if expectedSize > 100*1024*1024 { // >100MB
+		err = tempFile.Truncate(expectedSize)
+		if err != nil {
+			tempFile.Close()
+			os.Remove(tempFile.Name())
+			return nil, fmt.Errorf("预分配临时文件空间失败: %w", err)
+		}
+
+		// 重置文件指针到开始位置
+		_, err = tempFile.Seek(0, 0)
+		if err != nil {
+			tempFile.Close()
+			os.Remove(tempFile.Name())
+			return nil, fmt.Errorf("重置临时文件指针失败: %w", err)
+		}
+	}
+
+	return tempFile, nil
 }
 
 // PutTempFile 清理临时文件
-// 优化版本：直接关闭和删除文件
+// 优化版本：安全的文件清理
 func (rp *ResourcePool) PutTempFile(tempFile *os.File) {
 	if tempFile == nil {
 		return
 	}
+
+	fileName := tempFile.Name()
 	tempFile.Close()
-	os.Remove(tempFile.Name())
+
+	// 确保文件被删除
+	if err := os.Remove(fileName); err != nil {
+		// 记录删除失败，但不影响程序继续运行
+		fs.Debugf(nil, "⚠️  删除临时文件失败: %s, 错误: %v", fileName, err)
+	}
 }
 
 // Close 关闭资源池，清理所有资源
@@ -9029,13 +9343,25 @@ func (f *Fs) v2MultiThreadUpload(ctx context.Context, in io.Reader, src fs.Objec
 	// 计算最优并发参数
 	concurrencyParams := f.calculateConcurrencyParams(fileSize)
 
-	// 强制启用多线程：对于大文件，最小并发数为2
-	if concurrencyParams.actual < 2 && fileSize > 100*1024*1024 { // 100MB以上强制多线程
-		concurrencyParams.actual = 2
-		fs.Debugf(f, "强制启用多线程模式，并发数调整为: %d", concurrencyParams.actual)
+	// 智能多线程启用策略 - 根据文件大小动态调整最小并发数
+	minConcurrency := 1
+	if fileSize > 2*1024*1024*1024 { // >2GB - 强制至少4个并发
+		minConcurrency = 4
+	} else if fileSize > 1*1024*1024*1024 { // >1GB - 强制至少3个并发
+		minConcurrency = 3
+	} else if fileSize > 500*1024*1024 { // >500MB - 强制至少2个并发
+		minConcurrency = 2
+	} else if fileSize > 100*1024*1024 { // >100MB - 强制至少2个并发
+		minConcurrency = 2
 	}
 
-	fs.Debugf(f, "v2多线程参数 - 网络速度: %s/s, 最优并发数: %d, 实际并发数: %d",
+	if concurrencyParams.actual < minConcurrency {
+		concurrencyParams.actual = minConcurrency
+		fs.Debugf(f, "🔧 智能多线程调整: 文件大小=%s，最小并发数=%d，调整后并发数=%d",
+			fs.SizeSuffix(fileSize), minConcurrency, concurrencyParams.actual)
+	}
+
+	fs.Debugf(f, "🚀 v2多线程参数 - 网络速度: %s/s, 最优并发数: %d, 实际并发数: %d",
 		fs.SizeSuffix(concurrencyParams.networkSpeed), concurrencyParams.optimal, concurrencyParams.actual)
 
 	// 选择上传策略：多线程或单线程
@@ -9122,19 +9448,28 @@ func (f *Fs) v2UploadChunksWithConcurrency(ctx context.Context, in io.Reader, sr
 		dataSource = bytes.NewReader(data)
 		cleanup = func() {} // 内存数据无需清理
 	} else {
-		// 大文件：使用临时文件
-		fs.Debugf(f, "大文件(%s)，使用临时文件进行并发上传", fs.SizeSuffix(fileSize))
-		tempFile, err := f.resourcePool.GetTempFile("v2upload_")
+		// 大文件：使用优化的临时文件策略
+		fs.Debugf(f, "🗂️  大文件(%s)，使用优化临时文件进行并发上传", fs.SizeSuffix(fileSize))
+		tempFile, err := f.resourcePool.GetOptimizedTempFile("v2upload_", fileSize)
 		if err != nil {
-			return nil, fmt.Errorf("创建临时文件失败: %w", err)
+			return nil, fmt.Errorf("创建优化临时文件失败: %w", err)
 		}
 
-		// 将数据复制到临时文件并验证完整性
-		written, err := io.Copy(tempFile, in)
+		// 使用缓冲写入提升大文件复制性能
+		bufWriter := bufio.NewWriterSize(tempFile, 1024*1024) // 1MB缓冲区
+		written, err := io.Copy(bufWriter, in)
 		if err != nil {
 			tempFile.Close()
 			os.Remove(tempFile.Name())
 			return nil, fmt.Errorf("复制数据到临时文件失败: %w", err)
+		}
+
+		// 刷新缓冲区
+		err = bufWriter.Flush()
+		if err != nil {
+			tempFile.Close()
+			os.Remove(tempFile.Name())
+			return nil, fmt.Errorf("刷新临时文件缓冲区失败: %w", err)
 		}
 
 		// 验证写入的数据大小
@@ -9144,7 +9479,7 @@ func (f *Fs) v2UploadChunksWithConcurrency(ctx context.Context, in io.Reader, sr
 			return nil, fmt.Errorf("临时文件大小不匹配: 期望%d，实际%d", fileSize, written)
 		}
 
-		// 强制刷新到磁盘确保数据完整性
+		// 强制同步到磁盘确保数据完整性
 		err = tempFile.Sync()
 		if err != nil {
 			tempFile.Close()
@@ -9162,9 +9497,10 @@ func (f *Fs) v2UploadChunksWithConcurrency(ctx context.Context, in io.Reader, sr
 
 		dataSource = tempFile
 		cleanup = func() {
-			tempFile.Close()
-			os.Remove(tempFile.Name())
+			f.resourcePool.PutTempFile(tempFile) // 使用资源池的清理方法
 		}
+
+		fs.Debugf(f, "✅ 大文件临时文件创建完成，大小: %s", fs.SizeSuffix(written))
 	}
 	defer cleanup()
 
@@ -9339,17 +9675,41 @@ func (f *Fs) v2ChunkUploadWorker(ctx context.Context, dataSource io.ReaderAt, pr
 			partNumber := chunkIndex + 1
 			startTime := time.Now()
 
-			fs.Debugf(f, "开始上传分片 %d/%d (大小: %s, MD5: %s)",
+			fs.Debugf(f, "🚀 开始上传分片 %d/%d (大小: %s, MD5: %s)",
 				partNumber, totalChunks, fs.SizeSuffix(actualChunkSize), chunkHash[:8]+"...")
 
-			err = f.uploadChunkV2(ctx, preuploadID, partNumber, chunkData, chunkHash)
-			if err != nil {
+			// 实现重试机制 - 提升上传成功率
+			var uploadErr error
+			maxRetries := 3
+			for retry := 0; retry <= maxRetries; retry++ {
+				uploadErr = f.uploadChunkV2(ctx, preuploadID, partNumber, chunkData, chunkHash)
+				if uploadErr == nil {
+					break // 上传成功，跳出重试循环
+				}
+
+				if retry < maxRetries {
+					retryDelay := time.Duration(retry+1) * 2 * time.Second // 递增延迟
+					fs.Debugf(f, "⚠️  分片 %d/%d 上传失败，%v后重试 (%d/%d): %v",
+						partNumber, totalChunks, retryDelay, retry+1, maxRetries, uploadErr)
+
+					select {
+					case <-ctx.Done():
+						uploadErr = ctx.Err()
+						goto uploadFailed
+					case <-time.After(retryDelay):
+						// 继续重试
+					}
+				}
+			}
+
+		uploadFailed:
+			if uploadErr != nil {
 				duration := time.Since(startTime)
-				fs.Errorf(f, "分片 %d/%d 上传失败 (耗时: %v): %v",
-					partNumber, totalChunks, duration, err)
+				fs.Errorf(f, "❌ 分片 %d/%d 上传失败 (耗时: %v, 重试: %d次): %v",
+					partNumber, totalChunks, duration, maxRetries, uploadErr)
 				results <- v2ChunkResult{
 					chunkIndex: chunkIndex,
-					err:        fmt.Errorf("上传分片失败: %w", err),
+					err:        fmt.Errorf("上传分片失败(重试%d次): %w", maxRetries, uploadErr),
 				}
 				continue
 			}
