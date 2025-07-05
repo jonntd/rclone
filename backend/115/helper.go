@@ -21,12 +21,16 @@ import (
 type listAllFn func(*api.File) bool
 
 func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly, dirsOnly bool, fn listAllFn) (found bool, err error) {
+	fs.Debugf(f, "🔍 listAll开始: dirID=%q, limit=%d, filesOnly=%v, dirsOnly=%v", dirID, limit, filesOnly, dirsOnly)
+
 	if f.isShare {
 		// Use traditional share listing API
+		fs.Debugf(f, "🔍 listAll: 使用share模式")
 		return f.listShare(ctx, dirID, limit, fn)
 	}
 
 	// Use OpenAPI listing
+	fs.Debugf(f, "🔍 listAll: 使用OpenAPI模式")
 	params := url.Values{}
 	params.Set("cid", dirID)
 	params.Set("limit", strconv.Itoa(limit))
@@ -40,7 +44,9 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly, di
 	offset := 0
 	var allFiles []api.File // 收集所有文件用于缓存
 
+	fs.Debugf(f, "🔍 listAll: 开始分页循环")
 	for {
+		fs.Debugf(f, "🔍 listAll: 处理offset=%d", offset)
 		params.Set("offset", strconv.Itoa(offset))
 		opts := rest.Opts{
 			Method:     "GET",
@@ -48,10 +54,35 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly, di
 			Parameters: params,
 		}
 
+		fs.Debugf(f, "🔍 listAll: 准备调用CallOpenAPI")
 		var info api.FileList
 		err = f.CallOpenAPI(ctx, &opts, nil, &info, false) // Use OpenAPI call
 		if err != nil {
-			return found, fmt.Errorf("OpenAPI list failed for dir %s: %w", dirID, err)
+			fs.Debugf(f, "🔍 listAll: CallOpenAPI失败: %v", err)
+
+			// 检查是否是API限制错误
+			if strings.Contains(err.Error(), "770004") || strings.Contains(err.Error(), "已达到当前访问上限") {
+				fs.Infof(f, "⚠️  遇到115网盘API限制，等待30秒后重试...")
+
+				// 创建带超时的等待
+				select {
+				case <-time.After(30 * time.Second):
+					fs.Debugf(f, "🔍 listAll: API限制等待完成，重试调用")
+					// 重试一次
+					err = f.CallOpenAPI(ctx, &opts, nil, &info, false)
+					if err != nil {
+						fs.Debugf(f, "🔍 listAll: 重试后仍然失败: %v", err)
+						return found, fmt.Errorf("OpenAPI list failed for dir %s after retry: %w", dirID, err)
+					}
+					fs.Debugf(f, "🔍 listAll: 重试成功，返回%d个文件", len(info.Files))
+				case <-ctx.Done():
+					return found, fmt.Errorf("context cancelled while waiting for API limit: %w", ctx.Err())
+				}
+			} else {
+				return found, fmt.Errorf("OpenAPI list failed for dir %s: %w", dirID, err)
+			}
+		} else {
+			fs.Debugf(f, "🔍 listAll: CallOpenAPI成功，返回%d个文件", len(info.Files))
 		}
 
 		if len(info.Files) == 0 {

@@ -57,8 +57,8 @@ const (
 	maxSleep              = 2 * time.Second
 	decayConstant         = 2 // bigger for slower decay, exponential
 
-	defaultConTimeout = fs.Duration(10 * time.Second)
-	defaultTimeout    = fs.Duration(45 * time.Second)
+	defaultConTimeout = fs.Duration(30 * time.Second)  // 增加连接超时到30秒
+	defaultTimeout    = fs.Duration(300 * time.Second) // 增加总超时到5分钟，支持大文件跨云盘传输
 
 	maxUploadSize       = 115 * fs.Gibi // 115 GiB from https://proapi.115.com/app/uploadinfo (or OpenAPI equivalent)
 	maxUploadParts      = 10000         // Part number must be an integer between 1 and 10000, inclusive.
@@ -1383,7 +1383,7 @@ func getHTTPClient(ctx context.Context, opt *Options) *http.Client {
 
 	return &http.Client{
 		Transport: t,
-		Timeout:   time.Duration(opt.Timeout) + 30*time.Second, // 总超时时间
+		Timeout:   time.Duration(opt.Timeout) + 60*time.Second, // 增加缓冲时间到60秒，支持跨云盘大文件传输
 	}
 }
 
@@ -1975,6 +1975,8 @@ func (f *Fs) setupTokenRenewer(ctx context.Context, m configmap.Mapper) {
 // It handles token refresh and sets the Authorization header.
 // If skipToken is true, it skips adding the Authorization header (used for refresh itself).
 func (f *Fs) CallOpenAPI(ctx context.Context, opts *rest.Opts, request any, response any, skipToken bool) error {
+	fs.Debugf(f, "🔍 CallOpenAPI开始: path=%q, method=%q", opts.Path, opts.Method)
+
 	// Ensure root URL is set if not provided in opts
 	if opts.RootURL == "" {
 		opts.RootURL = openAPIRootURL
@@ -1982,14 +1984,19 @@ func (f *Fs) CallOpenAPI(ctx context.Context, opts *rest.Opts, request any, resp
 
 	// Wrap the entire attempt sequence with the global pacer, returning proper retry signals
 	return f.globalPacer.Call(func() (shouldRetryGlobal bool, errGlobal error) {
+		fs.Debugf(f, "🔍 CallOpenAPI: 进入globalPacer")
+
 		// Ensure token is available and current
 		if !skipToken {
+			fs.Debugf(f, "🔍 CallOpenAPI: 准备token")
 			if err := f.prepareTokenForRequest(ctx, opts); err != nil {
+				fs.Debugf(f, "🔍 CallOpenAPI: prepareTokenForRequest失败: %v", err)
 				return false, backoff.Permanent(err)
 			}
 		}
 
 		// Make the API call
+		fs.Debugf(f, "🔍 CallOpenAPI: 执行API调用")
 		resp, apiErr := f.executeOpenAPICall(ctx, opts, request, response)
 
 		// Handle retries for network/server errors
@@ -2060,21 +2067,34 @@ func (f *Fs) prepareTokenForRequest(ctx context.Context, opts *rest.Opts) error 
 
 // executeOpenAPICall makes the actual API call with the provided parameters
 func (f *Fs) executeOpenAPICall(ctx context.Context, opts *rest.Opts, request any, response any) (*http.Response, error) {
+	fs.Debugf(f, "🔍 executeOpenAPICall开始: path=%q", opts.Path)
+
+	var resp *http.Response
+	var err error
+
 	if request != nil && response != nil {
 		// Assume standard JSON request/response
-		return f.openAPIClient.CallJSON(ctx, opts, request, response)
+		fs.Debugf(f, "🔍 executeOpenAPICall: 标准JSON请求/响应模式")
+		resp, err = f.openAPIClient.CallJSON(ctx, opts, request, response)
 	} else if response != nil {
 		// Assume GET request with JSON response
-		return f.openAPIClient.CallJSON(ctx, opts, nil, response)
+		fs.Debugf(f, "🔍 executeOpenAPICall: GET请求JSON响应模式")
+		resp, err = f.openAPIClient.CallJSON(ctx, opts, nil, response)
 	} else {
 		// Assume call without specific request/response body
+		fs.Debugf(f, "🔍 executeOpenAPICall: 基础调用模式")
 		var baseResp api.OpenAPIBase
-		resp, err := f.openAPIClient.CallJSON(ctx, opts, nil, &baseResp)
+		resp, err = f.openAPIClient.CallJSON(ctx, opts, nil, &baseResp)
 		if err == nil {
 			err = baseResp.Err() // Check for API-level errors
 		}
-		return resp, err
 	}
+
+	if err != nil {
+		fs.Debugf(f, "🔍 executeOpenAPICall失败: %v", err)
+	}
+
+	return resp, err
 }
 
 // handleTokenError processes token-related errors and attempts to refresh or re-login
@@ -2630,14 +2650,24 @@ func (f *Fs) Hashes() hash.Set {
 
 // NewObject finds the Object at remote.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	fs.Debugf(f, "🔍 NewObject开始: remote=%q", remote)
+
 	if f.fileObj != nil { // Handle case where Fs points to a single file
+		fs.Debugf(f, "🔍 NewObject: 处理单文件模式")
 		obj := *f.fileObj
 		if obj.Remote() == remote || obj.Remote() == "isFile:"+remote {
+			fs.Debugf(f, "🔍 NewObject: 单文件匹配成功")
 			return obj, nil
 		}
+		fs.Debugf(f, "🔍 NewObject: 单文件不匹配，返回NotFound")
 		return nil, fs.ErrorObjectNotFound // If remote doesn't match the single file
 	}
-	return f.newObjectWithInfo(ctx, remote, nil)
+
+	result, err := f.newObjectWithInfo(ctx, remote, nil)
+	if err != nil {
+		fs.Debugf(f, "🔍 NewObject失败: %v", err)
+	}
+	return result, err
 }
 
 // FindLeaf finds a directory or file leaf in the parent folder pathID.
@@ -3332,6 +3362,8 @@ func (f *Fs) itemToDirEntry(ctx context.Context, remote string, item *api.File) 
 
 // newObjectWithInfo creates an fs.Object from an api.File or by reading metadata.
 func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *api.File) (fs.Object, error) {
+	fs.Debugf(f, "🔍 newObjectWithInfo开始: remote=%q, hasInfo=%v", remote, info != nil)
+
 	o := &Object{
 		fs:     f,
 		remote: remote,
@@ -3346,6 +3378,7 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *api.Fil
 		err = o.readMetaData(ctx)
 	}
 	if err != nil {
+		fs.Debugf(f, "🔍 newObjectWithInfo失败: %v", err)
 		return nil, err
 	}
 	return o, nil
@@ -3353,8 +3386,11 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *api.Fil
 
 // readMetaDataForPath finds metadata for a specific file path.
 func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.File, err error) {
+	fs.Debugf(f, "🔍 readMetaDataForPath开始: path=%q", path)
+
 	leaf, dirID, err := f.dirCache.FindPath(ctx, path, false)
 	if err != nil {
+		fs.Debugf(f, "🔍 readMetaDataForPath: FindPath失败: %v", err)
 		// 检查是否是API限制错误，如果是则立即返回，避免路径混乱
 		if isAPILimitError(err) {
 			fs.Debugf(f, "readMetaDataForPath遇到API限制错误，路径: %q, 错误: %v", path, err)
@@ -3368,22 +3404,29 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.Fi
 		return nil, err
 	}
 
+	fs.Debugf(f, "🔍 readMetaDataForPath: FindPath成功, leaf=%q, dirID=%q", leaf, dirID)
+
 	// List the directory and find the leaf
+	fs.Debugf(f, "🔍 readMetaDataForPath: 开始调用listAll")
 	found, err := f.listAll(ctx, dirID, f.opt.ListChunk, true, false, func(item *api.File) bool {
 		// Compare with decoded name to handle special characters correctly
 		decodedName := f.opt.Enc.ToStandardName(item.FileNameBest())
 		if decodedName == leaf {
+			fs.Debugf(f, "🔍 readMetaDataForPath: 找到匹配文件: %q", decodedName)
 			info = item
 			return true // Found it
 		}
 		return false // Keep looking
 	})
 	if err != nil {
+		fs.Debugf(f, "🔍 readMetaDataForPath: listAll失败: %v", err)
 		return nil, fmt.Errorf("failed to list directory %q to find %q: %w", dirID, leaf, err)
 	}
 	if !found {
+		fs.Debugf(f, "🔍 readMetaDataForPath: 未找到文件")
 		return nil, fs.ErrorObjectNotFound
 	}
+	fs.Debugf(f, "🔍 readMetaDataForPath: 成功找到文件元数据")
 	return info, nil
 }
 
@@ -3884,12 +3927,19 @@ func (o *Object) readMetaData(ctx context.Context) error {
 	if o.hasMetaData {
 		return nil
 	}
+
 	// Use the path-based lookup
 	info, err := o.fs.readMetaDataForPath(ctx, o.remote)
 	if err != nil {
+		fs.Debugf(o.fs, "🔍 readMetaData失败: %v", err)
 		return err // fs.ErrorObjectNotFound or other errors
 	}
-	return o.setMetaData(info)
+
+	err = o.setMetaData(info)
+	if err != nil {
+		fs.Debugf(o.fs, "🔍 readMetaData: setMetaData失败: %v", err)
+	}
+	return err
 }
 
 // setDownloadURL ensures a valid download URL is available with optimized concurrent access.

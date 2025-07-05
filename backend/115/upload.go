@@ -1219,6 +1219,7 @@ func (f *Fs) tryHashUpload(
 		status := ui.GetStatus()
 		switch status {
 		case 2: // 秒传 success!
+			fs.Infof(o, "🎉 秒传成功！文件已存在于服务器，无需重复上传")
 			fs.Debugf(o, "Hash upload (秒传) successful.")
 			// Mark accounting as server-side copy
 			reader, _ := accounting.UnWrap(newIn)
@@ -1349,6 +1350,7 @@ func (f *Fs) uploadToOSS(
 		fs.Debugf(o, "Marked RereadableObject transfer as complete")
 	}
 
+	fs.Infof(o, "🎉 多部分上传完成！文件大小: %s", fs.SizeSuffix(size))
 	fs.Debugf(o, "OSS multipart upload successful.")
 	return o, nil
 }
@@ -1458,6 +1460,7 @@ func (f *Fs) doSampleUpload(
 		fs.Debugf(o, "Marked RereadableObject transfer as complete after sample upload")
 	}
 
+	fs.Infof(o, "🎉 传统上传完成！文件大小: %s", fs.SizeSuffix(size))
 	fs.Debugf(o, "Traditional sample upload successful.")
 	return o, nil
 }
@@ -1799,6 +1802,7 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 		fs.Debugf(o, "Marked RereadableObject transfer as complete after PutObject upload")
 	}
 
+	fs.Infof(o, "🎉 文件上传完成！文件大小: %s", fs.SizeSuffix(size))
 	fs.Debugf(o, "OSS PutObject successful.")
 	return o, nil
 }

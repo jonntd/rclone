@@ -6,11 +6,26 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/dgraph-io/badger/v3"
 	"github.com/rclone/rclone/fs"
 )
+
+// PersistentCache 持久化缓存接口，支持多种实现
+type PersistentCache interface {
+	Set(key string, value interface{}, ttl time.Duration) error
+	Get(key string, result interface{}) (bool, error)
+	Delete(key string) error
+	DeletePrefix(prefix string) error
+	Clear() error
+	Stats() map[string]interface{}
+	ListAllKeys() ([]string, error)
+	GetAllEntries() (map[string]interface{}, error)
+	GetKeysByPrefix(prefix string) ([]string, error)
+	Close() error
+}
 
 // BadgerCache 基于BadgerDB的高性能持久化缓存
 type BadgerCache struct {
@@ -27,7 +42,7 @@ type CacheEntry struct {
 	ExpiresAt time.Time   `json:"expires_at"`
 }
 
-// NewBadgerCache 创建新的BadgerDB缓存实例
+// NewBadgerCache 创建新的BadgerDB缓存实例 - 支持多实例冲突处理
 func NewBadgerCache(name, basePath string) (*BadgerCache, error) {
 	// 创建缓存目录
 	cacheDir := filepath.Join(basePath, name)
@@ -49,10 +64,29 @@ func NewBadgerCache(name, basePath string) (*BadgerCache, error) {
 	opts.NumLevelZeroTablesStall = 4 // L0表停顿阈值
 	opts.ValueThreshold = 1024       // 1KB值阈值，小值存储在LSM中
 
-	// 打开数据库
+	// 多实例冲突处理：尝试打开数据库，如果失败则使用只读模式
 	db, err := badger.Open(opts)
 	if err != nil {
-		return nil, fmt.Errorf("打开BadgerDB失败: %w", err)
+		// 检查是否是数据库锁定错误（多实例冲突）
+		if isLockError(err) {
+			fs.Infof(nil, "检测到多实例缓存冲突，尝试只读模式: %s", cacheDir)
+
+			// 尝试只读模式
+			opts.ReadOnly = true
+			db, err = badger.Open(opts)
+			if err != nil {
+				fs.Infof(nil, "只读模式也失败，创建模拟缓存: %s, 错误: %v", cacheDir, err)
+				// 创建一个模拟的BadgerCache，所有操作都是空操作
+				return &BadgerCache{
+					db:       nil, // 空数据库指针，表示禁用状态
+					name:     name + "_disabled",
+					basePath: basePath,
+				}, nil
+			}
+			fs.Infof(nil, "使用只读缓存模式: %s", cacheDir)
+		} else {
+			return nil, fmt.Errorf("打开BadgerDB失败: %w", err)
+		}
 	}
 
 	cache := &BadgerCache{
@@ -61,15 +95,22 @@ func NewBadgerCache(name, basePath string) (*BadgerCache, error) {
 		basePath: basePath,
 	}
 
-	// 启动后台垃圾回收
-	go cache.runGC()
+	// 只有在非只读模式下才启动后台垃圾回收
+	if !opts.ReadOnly {
+		go cache.runGC()
+	}
 
-	fs.Debugf(nil, "BadgerDB缓存初始化成功: %s", cacheDir)
+	fs.Debugf(nil, "BadgerDB缓存初始化成功: %s (只读模式: %v)", cacheDir, opts.ReadOnly)
 	return cache, nil
 }
 
 // Set 设置缓存值，支持TTL
 func (c *BadgerCache) Set(key string, value interface{}, ttl time.Duration) error {
+	// 如果数据库被禁用，静默忽略
+	if c.db == nil {
+		return nil
+	}
+
 	entry := CacheEntry{
 		Key:       key,
 		Value:     value,
@@ -90,6 +131,11 @@ func (c *BadgerCache) Set(key string, value interface{}, ttl time.Duration) erro
 
 // Get 获取缓存值
 func (c *BadgerCache) Get(key string, result interface{}) (bool, error) {
+	// 如果数据库被禁用，总是返回未找到
+	if c.db == nil {
+		return false, nil
+	}
+
 	var found bool
 	var entry CacheEntry
 
@@ -157,6 +203,10 @@ func (c *BadgerCache) SetBool(key string, value bool, ttl time.Duration) error {
 
 // Delete 删除缓存条目
 func (c *BadgerCache) Delete(key string) error {
+	// 如果数据库被禁用，静默忽略
+	if c.db == nil {
+		return nil
+	}
 	return c.db.Update(func(txn *badger.Txn) error {
 		return txn.Delete([]byte(key))
 	})
@@ -164,6 +214,10 @@ func (c *BadgerCache) Delete(key string) error {
 
 // DeletePrefix 删除指定前缀的所有缓存条目
 func (c *BadgerCache) DeletePrefix(prefix string) error {
+	// 如果数据库被禁用，静默忽略
+	if c.db == nil {
+		return nil
+	}
 	return c.db.Update(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
@@ -182,22 +236,42 @@ func (c *BadgerCache) DeletePrefix(prefix string) error {
 
 // Clear 清空所有缓存
 func (c *BadgerCache) Clear() error {
+	// 如果数据库被禁用，静默忽略
+	if c.db == nil {
+		return nil
+	}
 	return c.db.DropAll()
 }
 
 // Stats 获取缓存统计信息
 func (c *BadgerCache) Stats() map[string]interface{} {
+	// 如果数据库被禁用，返回禁用状态信息
+	if c.db == nil {
+		return map[string]interface{}{
+			"name":       c.name,
+			"lsm_size":   0,
+			"vlog_size":  0,
+			"total_size": 0,
+			"status":     "disabled",
+		}
+	}
 	lsm, vlog := c.db.Size()
 	return map[string]interface{}{
 		"name":       c.name,
 		"lsm_size":   lsm,
 		"vlog_size":  vlog,
 		"total_size": lsm + vlog,
+		"status":     "active",
 	}
 }
 
 // ListAllKeys 列出所有缓存键
 func (c *BadgerCache) ListAllKeys() ([]string, error) {
+	// 如果数据库被禁用，返回空列表
+	if c.db == nil {
+		return []string{}, nil
+	}
+
 	var keys []string
 
 	err := c.db.View(func(txn *badger.Txn) error {
@@ -219,6 +293,11 @@ func (c *BadgerCache) ListAllKeys() ([]string, error) {
 
 // GetAllEntries 获取所有缓存条目
 func (c *BadgerCache) GetAllEntries() (map[string]interface{}, error) {
+	// 如果数据库被禁用，返回空映射
+	if c.db == nil {
+		return map[string]interface{}{}, nil
+	}
+
 	entries := make(map[string]interface{})
 
 	err := c.db.View(func(txn *badger.Txn) error {
@@ -261,6 +340,11 @@ func (c *BadgerCache) GetAllEntries() (map[string]interface{}, error) {
 
 // GetKeysByPrefix 根据前缀获取键
 func (c *BadgerCache) GetKeysByPrefix(prefix string) ([]string, error) {
+	// 如果数据库被禁用，返回空列表
+	if c.db == nil {
+		return []string{}, nil
+	}
+
 	var keys []string
 
 	err := c.db.View(func(txn *badger.Txn) error {
@@ -306,9 +390,9 @@ func (c *BadgerCache) runGC() {
 	}
 }
 
-// GetCacheDir 获取缓存目录路径
+// GetCacheDir 获取缓存目录路径 - 支持多实例共享
 func GetCacheDir(name string) string {
-	// 优先使用用户缓存目录
+	// 优先使用用户缓存目录 - 所有实例共享同一路径
 	if userCacheDir, err := os.UserCacheDir(); err == nil {
 		return filepath.Join(userCacheDir, "rclone", name)
 	}
@@ -343,4 +427,97 @@ func CleanupExpiredCaches(basePath string, maxAge time.Duration) error {
 	}
 
 	return nil
+}
+
+// isLockError 检查错误是否为数据库锁定错误（多实例冲突）
+func isLockError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	// 检查常见的数据库锁定错误信息
+	lockKeywords := []string{
+		"resource temporarily unavailable",
+		"database is locked",
+		"cannot acquire directory lock",
+		"lock",
+		"resource busy",
+	}
+
+	for _, keyword := range lockKeywords {
+		if strings.Contains(errStr, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+// NullCache 空缓存实现，用于多实例冲突时的降级方案
+type NullCache struct {
+	name     string
+	basePath string
+}
+
+// NewNullCache 创建空缓存实例
+func NewNullCache(name, basePath string) *NullCache {
+	return &NullCache{
+		name:     name,
+		basePath: basePath,
+	}
+}
+
+// Set 空实现，不执行任何操作
+func (c *NullCache) Set(key string, value interface{}, ttl time.Duration) error {
+	return nil // 静默忽略
+}
+
+// Get 空实现，总是返回未找到
+func (c *NullCache) Get(key string, result interface{}) (bool, error) {
+	return false, nil // 总是未找到
+}
+
+// Delete 空实现，不执行任何操作
+func (c *NullCache) Delete(key string) error {
+	return nil // 静默忽略
+}
+
+// DeletePrefix 空实现，不执行任何操作
+func (c *NullCache) DeletePrefix(prefix string) error {
+	return nil // 静默忽略
+}
+
+// Clear 空实现，不执行任何操作
+func (c *NullCache) Clear() error {
+	return nil // 静默忽略
+}
+
+// Stats 返回空统计信息
+func (c *NullCache) Stats() map[string]interface{} {
+	return map[string]interface{}{
+		"name":       c.name + "_null",
+		"lsm_size":   0,
+		"vlog_size":  0,
+		"total_size": 0,
+		"type":       "null_cache",
+	}
+}
+
+// ListAllKeys 返回空键列表
+func (c *NullCache) ListAllKeys() ([]string, error) {
+	return []string{}, nil
+}
+
+// GetAllEntries 返回空条目列表
+func (c *NullCache) GetAllEntries() (map[string]interface{}, error) {
+	return map[string]interface{}{}, nil
+}
+
+// GetKeysByPrefix 返回空键列表
+func (c *NullCache) GetKeysByPrefix(prefix string) ([]string, error) {
+	return []string{}, nil
+}
+
+// Close 空实现，不执行任何操作
+func (c *NullCache) Close() error {
+	return nil // 静默忽略
 }
