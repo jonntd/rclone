@@ -1780,6 +1780,8 @@ func (f *Fs) ListFile(ctx context.Context, parentFileID, limit int, searchData, 
 }
 
 func (f *Fs) pathToFileID(ctx context.Context, filePath string) (string, error) {
+	fs.Debugf(f, "🔍 pathToFileID开始: filePath=%s", filePath)
+
 	// 根目录
 	if filePath == "/" {
 		return "0", nil
@@ -1875,16 +1877,18 @@ func (f *Fs) pathToFileID(ctx context.Context, filePath string) (string, error) 
 	}
 
 	// 缓存路径映射结果（如果还没有被缓存）
-	if currentID != "0" {
-		// 检查是否已经缓存过
-		if _, _, found := f.getPathToIDFromCache(filePath); !found {
-			// 默认假设是目录，因为我们在查找路径
-			isDir := true
-			f.savePathToIDToCache(filePath, currentID, "0", isDir)
-			fs.Debugf(f, "缓存路径映射: %s -> ID=%s, isDir=%v", filePath, currentID, isDir)
-		}
-	}
+	// 注释掉错误的缓存逻辑，因为正确的类型信息已经在路径解析循环中缓存了
+	// if currentID != "0" {
+	// 	// 检查是否已经缓存过
+	// 	if _, _, found := f.getPathToIDFromCache(filePath); !found {
+	// 		// 默认假设是目录，因为我们在查找路径
+	// 		isDir := true
+	// 		f.savePathToIDToCache(filePath, currentID, "0", isDir)
+	// 		fs.Debugf(f, "缓存路径映射: %s -> ID=%s, isDir=%v", filePath, currentID, isDir)
+	// 	}
+	// }
 
+	fs.Debugf(f, "🔍 pathToFileID结果: filePath=%s -> currentID=%s", filePath, currentID)
 	return currentID, nil
 }
 
@@ -3744,9 +3748,12 @@ func (f *Fs) handleHTTPError(ctx context.Context, resp *http.Response) (bool, er
 
 // getFileInfo 根据ID获取文件的详细信息
 func (f *Fs) getFileInfo(ctx context.Context, fileID string) (*FileListInfoRespDataV2, error) {
+	fs.Debugf(f, "🔍 getFileInfo开始: fileID=%s", fileID)
+
 	// 验证文件ID
 	_, err := parseFileIDWithContext(fileID, "获取文件信息")
 	if err != nil {
+		fs.Debugf(f, "🔍 getFileInfo文件ID验证失败: %v", err)
 		return nil, err
 	}
 
@@ -3754,11 +3761,14 @@ func (f *Fs) getFileInfo(ctx context.Context, fileID string) (*FileListInfoRespD
 	var response FileDetailResponse
 	endpoint := fmt.Sprintf("/api/v1/file/detail?fileID=%s", fileID)
 
+	fs.Debugf(f, "🔍 getFileInfo调用API: %s", endpoint)
 	err = f.makeAPICallWithRest(ctx, endpoint, "GET", nil, &response)
 	if err != nil {
+		fs.Debugf(f, "🔍 getFileInfo API调用失败: %v", err)
 		return nil, err
 	}
 
+	fs.Debugf(f, "🔍 getFileInfo API响应: code=%d, message=%s", response.Code, response.Message)
 	if response.Code != 0 {
 		return nil, fmt.Errorf("API error %d: %s", response.Code, response.Message)
 	}
@@ -3775,6 +3785,7 @@ func (f *Fs) getFileInfo(ctx context.Context, fileID string) (*FileListInfoRespD
 		Category:     0, // 详情响应中未提供
 	}
 
+	fs.Debugf(f, "🔍 getFileInfo成功: fileID=%s, filename=%s, type=%d, size=%d", fileID, fileInfo.Filename, fileInfo.Type, fileInfo.Size)
 	return fileInfo, nil
 }
 
@@ -6763,6 +6774,9 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	var fullPath string
 	if f.root == "" {
 		fullPath = normalizedRemote
+	} else if normalizedRemote == "" {
+		// 当remote为空时，fullPath就是root本身
+		fullPath = f.root
 	} else {
 		fullPath = normalizePath(f.root + "/" + normalizedRemote)
 	}
@@ -6780,6 +6794,8 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		return nil, err
 	}
 
+	fs.Debugf(f, "🔍 NewObject pathToFileID结果: fullPath=%s -> fileID=%s", fullPath, fileID)
+
 	// Get file details
 	fileInfo, err := f.getFileInfo(ctx, fileID)
 	if err != nil {
@@ -6792,9 +6808,17 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		return nil, fs.ErrorNotAFile
 	}
 
+	// 确定正确的remote路径
+	objectRemote := remote
+	if objectRemote == "" && f.root != "" {
+		// 当remote为空且root指向文件时，使用文件名作为remote
+		objectRemote = fileInfo.Filename
+		fs.Debugf(f, "🔍 NewObject设置remote: %s -> %s", remote, objectRemote)
+	}
+
 	o := &Object{
 		fs:          f,
-		remote:      remote,
+		remote:      objectRemote,
 		hasMetaData: true,
 		id:          fileID,
 		size:        fileInfo.Size,
@@ -7647,6 +7671,19 @@ func (f *Fs) Shutdown(ctx context.Context) error {
 // List the objects and directories in dir into entries.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
 	fs.Debugf(f, "调用列表，目录: %s", dir)
+
+	// 特殊处理：如果dir为空且root指向文件，返回包含该文件的列表
+	if dir == "" && f.root != "" {
+		// 检查root是否指向一个文件
+		rootObj, err := f.NewObject(ctx, "")
+		if err == nil {
+			// root指向一个文件，返回包含该文件的列表
+			fs.Debugf(f, "root路径指向文件，返回包含该文件的列表: %s", f.root)
+			return fs.DirEntries{rootObj}, nil
+		}
+		// 如果NewObject失败，继续正常的目录列表逻辑
+		fs.Debugf(f, "root路径不是文件，继续目录列表逻辑: %s", f.root)
+	}
 
 	// 使用目录缓存查找目录ID
 	fs.Debugf(f, "查找目录ID: %s", dir)
