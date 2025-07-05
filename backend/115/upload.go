@@ -1465,6 +1465,30 @@ func (f *Fs) doSampleUpload(
 	return o, nil
 }
 
+// isRemoteSource 检查源对象是否来自远程云盘（非本地文件）
+func (f *Fs) isRemoteSource(src fs.ObjectInfo) bool {
+	// 检查源对象的类型，如果不是本地文件系统，则认为是远程源
+	srcFs := src.Fs()
+	if srcFs == nil {
+		fs.Debugf(f, "🔍 isRemoteSource: srcFs为nil，返回false")
+		return false
+	}
+
+	// 检查是否是本地文件系统
+	fsType := srcFs.Name()
+	isRemote := fsType != "local" && fsType != ""
+
+	fs.Debugf(f, "🔍 isRemoteSource检测: fsType='%s', isRemote=%v", fsType, isRemote)
+
+	// 特别检测123网盘和其他云盘
+	if strings.Contains(fsType, "123") || strings.Contains(fsType, "pan") {
+		fs.Debugf(f, "✅ 明确识别为云盘源: %s", fsType)
+		return true
+	}
+
+	return isRemote
+}
+
 // upload is the main entry point that decides which upload strategy to use.
 func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote string, options ...fs.OpenOption) (fs.Object, error) {
 	if f.isShare {
@@ -1529,6 +1553,32 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 	}()
 
 	// --- Upload Strategy Logic ---
+
+	// 🌐 跨云盘传输检测：优先尝试秒传，忽略大小限制
+	if f.isRemoteSource(src) && size >= 0 {
+		fs.Infof(o, "🌐 检测到跨云盘传输，强制尝试秒传...")
+		gotIt, _, newIn, localCleanup, err := f.tryHashUpload(ctx, in, src, o, leaf, dirID, size, options...)
+		cleanup = localCleanup // 设置清理函数
+		if err != nil {
+			fs.Logf(o, "跨云盘秒传尝试失败，回退到正常上传: %v", err)
+			// 重置状态，继续正常上传流程
+			gotIt = false
+			if !f.opt.NoBuffer {
+				newIn = in // 恢复原始输入
+				if cleanup != nil {
+					cleanup()
+					cleanup = nil
+				}
+			}
+		} else if gotIt {
+			fs.Infof(o, "🎉 跨云盘秒传成功！文件已存在于115网盘服务器")
+			return o, nil
+		} else {
+			fs.Debugf(o, "跨云盘秒传未命中，继续正常上传流程")
+			// 继续使用newIn进行后续上传
+			in = newIn
+		}
+	}
 
 	// 1. OnlyStream flag
 	if f.opt.OnlyStream {
