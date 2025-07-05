@@ -4764,19 +4764,541 @@ func (f *Fs) handleCrossCloudTransferSimplified(ctx context.Context, src fs.Obje
 // handleDownloadThenUpload 处理实际的下载然后上传逻辑
 func (f *Fs) handleDownloadThenUpload(ctx context.Context, srcReader io.ReadCloser, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
 	fileSize := src.Size()
-	fs.Infof(f, "🌐 开始简化跨云传输: %s (%s)", fileName, fs.SizeSuffix(fileSize))
+	fs.Infof(f, "🌐 开始优化跨云传输: %s (%s)", fileName, fs.SizeSuffix(fileSize))
+
+	// 根据文件大小选择最优传输策略
+	switch {
+	case fileSize <= 512*1024*1024: // 512MB以下 - 内存缓冲策略
+		fs.Infof(f, "📝 使用内存缓冲策略 (文件大小: %s)", fs.SizeSuffix(fileSize))
+		return f.memoryBufferedCrossCloudTransfer(ctx, srcReader, src, parentFileID, fileName)
+	case fileSize <= 2*1024*1024*1024: // 2GB以下 - 混合策略
+		fs.Infof(f, "🔄 使用混合缓冲策略 (文件大小: %s)", fs.SizeSuffix(fileSize))
+		return f.hybridCrossCloudTransfer(ctx, srcReader, src, parentFileID, fileName)
+	default: // 大文件 - 优化的磁盘策略
+		fs.Infof(f, "💾 使用优化磁盘策略 (文件大小: %s)", fs.SizeSuffix(fileSize))
+		return f.optimizedDiskCrossCloudTransfer(ctx, srcReader, src, parentFileID, fileName)
+	}
+}
+
+// memoryBufferedCrossCloudTransfer 内存缓冲跨云传输（512MB以下文件）
+func (f *Fs) memoryBufferedCrossCloudTransfer(ctx context.Context, srcReader io.ReadCloser, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
+	fileSize := src.Size()
+	fs.Debugf(f, "📝 开始内存缓冲跨云传输，文件大小: %s", fs.SizeSuffix(fileSize))
+
+	// 步骤1: 直接读取到内存
+	startTime := time.Now()
+	data := make([]byte, fileSize)
+	n, err := io.ReadFull(srcReader, data)
+	downloadDuration := time.Since(startTime)
+
+	if err != nil && err != io.ErrUnexpectedEOF {
+		return nil, fmt.Errorf("内存读取文件失败: %w", err)
+	}
+
+	if int64(n) != fileSize {
+		fs.Debugf(f, "实际读取大小(%d)与预期大小(%d)不匹配，使用实际大小", n, fileSize)
+		data = data[:n]
+		fileSize = int64(n)
+	}
+
+	fs.Infof(f, "📥 内存下载完成: %s, 用时: %v, 速度: %s/s",
+		fs.SizeSuffix(fileSize), downloadDuration,
+		fs.SizeSuffix(int64(float64(fileSize)/downloadDuration.Seconds())))
+
+	// 步骤2: 计算MD5
+	fs.Infof(f, "🔐 开始计算MD5哈希...")
+	md5StartTime := time.Now()
+	hasher := md5.New()
+	hasher.Write(data)
+	md5Hash := fmt.Sprintf("%x", hasher.Sum(nil))
+	md5Duration := time.Since(md5StartTime)
+
+	fs.Infof(f, "🔐 MD5计算完成: %s, 用时: %v", md5Hash, md5Duration)
+
+	// 步骤3: 检查秒传
+	fs.Infof(f, "⚡ 检查123网盘秒传功能...")
+	createResp, err := f.createUpload(ctx, parentFileID, fileName, md5Hash, fileSize)
+	if err != nil {
+		return nil, fmt.Errorf("创建上传会话失败: %w", err)
+	}
+
+	if createResp.Data.Reuse {
+		totalDuration := time.Since(startTime)
+		fs.Infof(f, "🎉 秒传成功！总用时: %v (下载: %v + MD5: %v)",
+			totalDuration, downloadDuration, md5Duration)
+		return &Object{
+			fs:          f,
+			remote:      fileName,
+			hasMetaData: true,
+			id:          strconv.FormatInt(createResp.Data.FileID, 10),
+			size:        fileSize,
+			md5sum:      md5Hash,
+			modTime:     time.Now(),
+			isDir:       false,
+		}, nil
+	}
+
+	// 步骤4: 内存上传
+	fs.Infof(f, "📤 开始从内存上传到123网盘...")
+	uploadStartTime := time.Now()
+
+	// 使用内存数据创建reader进行上传
+	dataReader := bytes.NewReader(data)
+	err = f.uploadFile(ctx, dataReader, createResp, fileSize)
+	if err != nil {
+		return nil, fmt.Errorf("内存上传失败: %w", err)
+	}
+
+	uploadDuration := time.Since(uploadStartTime)
+	totalDuration := time.Since(startTime)
+
+	fs.Infof(f, "✅ 内存缓冲跨云传输完成！总用时: %v (下载: %v + MD5: %v + 上传: %v)",
+		totalDuration, downloadDuration, md5Duration, uploadDuration)
+
+	// 返回上传成功的文件对象
+	return &Object{
+		fs:          f,
+		remote:      fileName,
+		hasMetaData: true,
+		id:          strconv.FormatInt(createResp.Data.FileID, 10),
+		size:        fileSize,
+		md5sum:      md5Hash,
+		modTime:     time.Now(),
+		isDir:       false,
+	}, nil
+}
+
+// hybridCrossCloudTransfer 混合缓冲跨云传输（512MB-2GB文件）
+func (f *Fs) hybridCrossCloudTransfer(ctx context.Context, srcReader io.ReadCloser, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
+	fileSize := src.Size()
+	fs.Debugf(f, "🔄 开始混合缓冲跨云传输，文件大小: %s", fs.SizeSuffix(fileSize))
+
+	// 对于中等大小文件，尝试并发下载优化
+	if srcObj, ok := src.(fs.Object); ok && fileSize > 100*1024*1024 { // 100MB以上才使用并发下载
+		fs.Infof(f, "🚀 尝试并发下载优化策略")
+		return f.concurrentDownloadCrossCloudTransfer(ctx, srcObj, parentFileID, fileName)
+	}
+
+	// 回退到优化的磁盘策略
+	return f.optimizedDiskCrossCloudTransfer(ctx, srcReader, src, parentFileID, fileName)
+}
+
+// concurrentDownloadCrossCloudTransfer 并发下载跨云传输
+func (f *Fs) concurrentDownloadCrossCloudTransfer(ctx context.Context, srcObj fs.Object, parentFileID int64, fileName string) (*Object, error) {
+	fileSize := srcObj.Size()
+	fs.Infof(f, "🚀 开始并发下载跨云传输: %s (%s)", fileName, fs.SizeSuffix(fileSize))
+
+	// 计算分片参数
+	chunkSize := int64(32 * 1024 * 1024) // 32MB per chunk
+	if fileSize < chunkSize*2 {
+		// 文件太小，不值得并发下载
+		fs.Debugf(f, "文件太小，回退到普通下载")
+		srcReader, err := srcObj.Open(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("打开源文件失败: %w", err)
+		}
+		defer srcReader.Close()
+		return f.optimizedDiskCrossCloudTransfer(ctx, srcReader, srcObj, parentFileID, fileName)
+	}
+
+	numChunks := (fileSize + chunkSize - 1) / chunkSize
+	maxConcurrency := int64(4) // 最多4个并发下载
+	if numChunks < maxConcurrency {
+		maxConcurrency = numChunks
+	}
+
+	fs.Infof(f, "📊 并发下载参数: 分片大小=%s, 分片数=%d, 并发数=%d",
+		fs.SizeSuffix(chunkSize), numChunks, maxConcurrency)
+
+	// 创建临时文件用于组装
+	tempFile, err := f.resourcePool.GetOptimizedTempFile("concurrent_download_", fileSize)
+	if err != nil {
+		return nil, fmt.Errorf("创建临时文件失败: %w", err)
+	}
+	defer f.resourcePool.PutTempFile(tempFile)
+
+	// 并发下载各个分片
+	startTime := time.Now()
+	err = f.downloadChunksConcurrently(ctx, srcObj, tempFile, chunkSize, numChunks, maxConcurrency)
+	downloadDuration := time.Since(startTime)
+
+	if err != nil {
+		fs.Debugf(f, "并发下载失败，回退到普通下载: %v", err)
+		// 回退到普通下载
+		srcReader, err := srcObj.Open(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("回退打开源文件失败: %w", err)
+		}
+		defer srcReader.Close()
+		return f.optimizedDiskCrossCloudTransfer(ctx, srcReader, srcObj, parentFileID, fileName)
+	}
+
+	fs.Infof(f, "📥 并发下载完成: %s, 用时: %v, 速度: %s/s",
+		fs.SizeSuffix(fileSize), downloadDuration,
+		fs.SizeSuffix(int64(float64(fileSize)/downloadDuration.Seconds())))
+
+	// 重置文件指针并继续后续处理
+	_, err = tempFile.Seek(0, io.SeekStart)
+	if err != nil {
+		return nil, fmt.Errorf("重置文件指针失败: %w", err)
+	}
+
+	// 继续MD5计算和上传流程
+	return f.continueAfterDownload(ctx, tempFile, srcObj, parentFileID, fileName, downloadDuration)
+}
+
+// downloadChunksConcurrently 并发下载文件分片
+func (f *Fs) downloadChunksConcurrently(ctx context.Context, srcObj fs.Object, tempFile *os.File, chunkSize, numChunks, maxConcurrency int64) error {
+	// 创建工作池
+	semaphore := make(chan struct{}, maxConcurrency)
+	errChan := make(chan error, numChunks)
+	var wg sync.WaitGroup
+
+	for i := int64(0); i < numChunks; i++ {
+		wg.Add(1)
+		go func(chunkIndex int64) {
+			defer wg.Done()
+
+			// 获取信号量
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			// 计算分片范围
+			start := chunkIndex * chunkSize
+			end := start + chunkSize - 1
+			if end >= srcObj.Size() {
+				end = srcObj.Size() - 1
+			}
+
+			// 下载分片
+			err := f.downloadChunk(ctx, srcObj, tempFile, start, end, chunkIndex)
+			if err != nil {
+				errChan <- fmt.Errorf("下载分片 %d 失败: %w", chunkIndex, err)
+				return
+			}
+
+			fs.Debugf(f, "分片 %d 下载完成: %d-%d", chunkIndex, start, end)
+		}(i)
+	}
+
+	// 等待所有下载完成
+	wg.Wait()
+	close(errChan)
+
+	// 检查是否有错误
+	for err := range errChan {
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// downloadChunk 下载单个文件分片
+func (f *Fs) downloadChunk(ctx context.Context, srcObj fs.Object, tempFile *os.File, start, end, chunkIndex int64) error {
+	// 使用Range选项打开文件分片
+	rangeOption := &fs.RangeOption{Start: start, End: end}
+	chunkReader, err := srcObj.Open(ctx, rangeOption)
+	if err != nil {
+		return fmt.Errorf("打开分片失败: %w", err)
+	}
+	defer chunkReader.Close()
+
+	// 读取分片数据
+	chunkData, err := io.ReadAll(chunkReader)
+	if err != nil {
+		return fmt.Errorf("读取分片数据失败: %w", err)
+	}
+
+	// 写入临时文件的正确位置
+	_, err = tempFile.WriteAt(chunkData, start)
+	if err != nil {
+		return fmt.Errorf("写入分片数据失败: %w", err)
+	}
+
+	return nil
+}
+
+// continueAfterDownload 下载完成后继续MD5计算和上传流程
+func (f *Fs) continueAfterDownload(ctx context.Context, tempFile *os.File, src fs.ObjectInfo, parentFileID int64, fileName string, downloadDuration time.Duration) (*Object, error) {
+	fileSize := src.Size()
+	startTime := time.Now().Add(-downloadDuration) // 调整开始时间以包含下载时间
+
+	// 步骤2: 计算MD5
+	fs.Infof(f, "🔐 开始计算MD5哈希...")
+	md5StartTime := time.Now()
+
+	_, err := tempFile.Seek(0, io.SeekStart)
+	if err != nil {
+		return nil, fmt.Errorf("重置文件指针失败: %w", err)
+	}
+
+	hasher := md5.New()
+	_, err = io.Copy(hasher, tempFile)
+	if err != nil {
+		return nil, fmt.Errorf("计算MD5失败: %w", err)
+	}
+
+	md5Hash := fmt.Sprintf("%x", hasher.Sum(nil))
+	md5Duration := time.Since(md5StartTime)
+
+	fs.Infof(f, "🔐 MD5计算完成: %s, 用时: %v", md5Hash, md5Duration)
+
+	// 步骤3: 检查秒传
+	fs.Infof(f, "⚡ 检查123网盘秒传功能...")
+	createResp, err := f.createUpload(ctx, parentFileID, fileName, md5Hash, fileSize)
+	if err != nil {
+		return nil, fmt.Errorf("创建上传会话失败: %w", err)
+	}
+
+	if createResp.Data.Reuse {
+		totalDuration := time.Since(startTime)
+		fs.Infof(f, "🎉 秒传成功！总用时: %v (下载: %v + MD5: %v)",
+			totalDuration, downloadDuration, md5Duration)
+		return &Object{
+			fs:          f,
+			remote:      fileName,
+			hasMetaData: true,
+			id:          strconv.FormatInt(createResp.Data.FileID, 10),
+			size:        fileSize,
+			md5sum:      md5Hash,
+			modTime:     time.Now(),
+			isDir:       false,
+		}, nil
+	}
+
+	// 步骤4: 上传文件
+	fs.Infof(f, "📤 开始上传到123网盘...")
+	uploadStartTime := time.Now()
+
+	_, err = tempFile.Seek(0, io.SeekStart)
+	if err != nil {
+		return nil, fmt.Errorf("重置文件指针用于上传失败: %w", err)
+	}
+
+	err = f.uploadFile(ctx, tempFile, createResp, fileSize)
+	if err != nil {
+		return nil, fmt.Errorf("上传失败: %w", err)
+	}
+
+	uploadDuration := time.Since(uploadStartTime)
+	totalDuration := time.Since(startTime)
+
+	fs.Infof(f, "✅ 并发下载跨云传输完成！总用时: %v (下载: %v + MD5: %v + 上传: %v)",
+		totalDuration, downloadDuration, md5Duration, uploadDuration)
+
+	// 返回上传成功的文件对象
+	return &Object{
+		fs:          f,
+		remote:      fileName,
+		hasMetaData: true,
+		id:          strconv.FormatInt(createResp.Data.FileID, 10),
+		size:        fileSize,
+		md5sum:      md5Hash,
+		modTime:     time.Now(),
+		isDir:       false,
+	}, nil
+}
+
+// MD5缓存管理器
+type CrossCloudMD5Cache struct {
+	cache map[string]CrossCloudMD5Entry
+	mutex sync.RWMutex
+}
+
+type CrossCloudMD5Entry struct {
+	MD5Hash    string
+	FileSize   int64
+	ModTime    time.Time
+	CachedTime time.Time
+}
+
+var globalMD5Cache = &CrossCloudMD5Cache{
+	cache: make(map[string]CrossCloudMD5Entry),
+}
+
+// getCachedMD5 尝试从缓存获取MD5
+func (f *Fs) getCachedMD5(src fs.ObjectInfo) (string, bool) {
+	// 生成缓存键：源文件系统类型 + 路径 + 大小 + 修改时间
+	srcFs := src.Fs()
+	if srcFs == nil {
+		return "", false
+	}
+
+	cacheKey := fmt.Sprintf("%s:%s:%d:%d",
+		srcFs.Name(), src.Remote(), src.Size(), src.ModTime(context.Background()).Unix())
+
+	globalMD5Cache.mutex.RLock()
+	defer globalMD5Cache.mutex.RUnlock()
+
+	entry, exists := globalMD5Cache.cache[cacheKey]
+	if !exists {
+		return "", false
+	}
+
+	// 检查缓存是否过期（24小时）
+	if time.Since(entry.CachedTime) > 24*time.Hour {
+		// 异步清理过期缓存
+		go func() {
+			globalMD5Cache.mutex.Lock()
+			delete(globalMD5Cache.cache, cacheKey)
+			globalMD5Cache.mutex.Unlock()
+		}()
+		return "", false
+	}
+
+	// 验证文件信息是否匹配
+	if entry.FileSize == src.Size() && entry.ModTime.Equal(src.ModTime(context.Background())) {
+		fs.Debugf(f, "🎯 MD5缓存命中: %s -> %s", cacheKey, entry.MD5Hash)
+		return entry.MD5Hash, true
+	}
+
+	return "", false
+}
+
+// cacheMD5 将MD5存入缓存
+func (f *Fs) cacheMD5(src fs.ObjectInfo, md5Hash string) {
+	srcFs := src.Fs()
+	if srcFs == nil {
+		return
+	}
+
+	cacheKey := fmt.Sprintf("%s:%s:%d:%d",
+		srcFs.Name(), src.Remote(), src.Size(), src.ModTime(context.Background()).Unix())
+
+	entry := CrossCloudMD5Entry{
+		MD5Hash:    md5Hash,
+		FileSize:   src.Size(),
+		ModTime:    src.ModTime(context.Background()),
+		CachedTime: time.Now(),
+	}
+
+	globalMD5Cache.mutex.Lock()
+	globalMD5Cache.cache[cacheKey] = entry
+	globalMD5Cache.mutex.Unlock()
+
+	fs.Debugf(f, "💾 MD5已缓存: %s -> %s", cacheKey, md5Hash)
+}
+
+// continueWithKnownMD5 使用已知MD5继续上传流程
+func (f *Fs) continueWithKnownMD5(ctx context.Context, tempFile *os.File, src fs.ObjectInfo, parentFileID int64, fileName string, md5Hash string, downloadDuration, md5Duration time.Duration, startTime time.Time) (*Object, error) {
+	fileSize := src.Size()
+
+	// 步骤3: 检查秒传
+	fs.Infof(f, "⚡ 检查123网盘秒传功能...")
+	createResp, err := f.createUpload(ctx, parentFileID, fileName, md5Hash, fileSize)
+	if err != nil {
+		return nil, fmt.Errorf("创建上传会话失败: %w", err)
+	}
+
+	if createResp.Data.Reuse {
+		totalDuration := time.Since(startTime)
+		fs.Infof(f, "🎉 秒传成功！总用时: %v (下载: %v + MD5: %v)",
+			totalDuration, downloadDuration, md5Duration)
+		return &Object{
+			fs:          f,
+			remote:      fileName,
+			hasMetaData: true,
+			id:          strconv.FormatInt(createResp.Data.FileID, 10),
+			size:        fileSize,
+			md5sum:      md5Hash,
+			modTime:     time.Now(),
+			isDir:       false,
+		}, nil
+	}
+
+	// 步骤4: 上传文件
+	fs.Infof(f, "📤 开始上传到123网盘...")
+	uploadStartTime := time.Now()
+
+	_, err = tempFile.Seek(0, io.SeekStart)
+	if err != nil {
+		return nil, fmt.Errorf("重置文件指针用于上传失败: %w", err)
+	}
+
+	err = f.uploadFile(ctx, tempFile, createResp, fileSize)
+	if err != nil {
+		return nil, fmt.Errorf("上传失败: %w", err)
+	}
+
+	uploadDuration := time.Since(uploadStartTime)
+	totalDuration := time.Since(startTime)
+
+	// 缓存MD5以供后续使用
+	f.cacheMD5(src, md5Hash)
+
+	fs.Infof(f, "✅ 优化跨云传输完成！总用时: %v (下载: %v + MD5: %v + 上传: %v)",
+		totalDuration, downloadDuration, md5Duration, uploadDuration)
+
+	// 返回上传成功的文件对象
+	return &Object{
+		fs:          f,
+		remote:      fileName,
+		hasMetaData: true,
+		id:          strconv.FormatInt(createResp.Data.FileID, 10),
+		size:        fileSize,
+		md5sum:      md5Hash,
+		modTime:     time.Now(),
+		isDir:       false,
+	}, nil
+}
+
+// optimizedDiskCrossCloudTransfer 优化的磁盘跨云传输（原有逻辑优化版）
+func (f *Fs) optimizedDiskCrossCloudTransfer(ctx context.Context, srcReader io.ReadCloser, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
+	fileSize := src.Size()
+	startTime := time.Now()
+
+	// 步骤1: 检查MD5缓存
+	var md5Hash string
+	var downloadDuration, md5Duration time.Duration
+
+	if cachedMD5, found := f.getCachedMD5(src); found {
+		fs.Infof(f, "🎯 使用缓存的MD5: %s", cachedMD5)
+		md5Hash = cachedMD5
+		md5Duration = 0 // 缓存命中，无需计算时间
+
+		// 仍需要下载文件用于上传，但可以跳过MD5计算
+		tempFile, err := f.resourcePool.GetOptimizedTempFile("cross_cloud_cached_", fileSize)
+		if err != nil {
+			return nil, fmt.Errorf("创建跨云传输临时文件失败: %w", err)
+		}
+		defer f.resourcePool.PutTempFile(tempFile)
+
+		downloadStartTime := time.Now()
+		written, err := f.copyWithProgressAndValidation(ctx, tempFile, srcReader, fileSize, false) // 不需要计算MD5
+		downloadDuration = time.Since(downloadStartTime)
+
+		if err != nil {
+			return nil, fmt.Errorf("下载文件失败: %w", err)
+		}
+
+		if written != fileSize {
+			return nil, fmt.Errorf("下载文件大小不匹配: 期望 %d, 实际 %d", fileSize, written)
+		}
+
+		fs.Infof(f, "📥 下载完成 (使用缓存MD5): %s, 用时: %v, 速度: %s/s",
+			fs.SizeSuffix(fileSize), downloadDuration,
+			fs.SizeSuffix(int64(float64(fileSize)/downloadDuration.Seconds())))
+
+		// 直接跳转到上传步骤
+		return f.continueWithKnownMD5(ctx, tempFile, src, parentFileID, fileName, md5Hash, downloadDuration, md5Duration, startTime)
+	}
+
+	// 步骤2: 缓存未命中，正常下载并计算MD5
+	fs.Infof(f, "💾 MD5缓存未命中，开始下载并计算MD5")
 
 	// 创建本地临时文件
-	tempFile, err := f.resourcePool.GetOptimizedTempFile("cross_cloud_simple_", fileSize)
+	tempFile, err := f.resourcePool.GetOptimizedTempFile("cross_cloud_optimized_", fileSize)
 	if err != nil {
 		return nil, fmt.Errorf("创建跨云传输临时文件失败: %w", err)
 	}
 	defer f.resourcePool.PutTempFile(tempFile)
 
-	// 完整下载文件
-	startTime := time.Now()
+	// 完整下载文件并计算MD5
+	downloadStartTime := time.Now()
 	written, err := f.copyWithProgressAndValidation(ctx, tempFile, srcReader, fileSize, true)
-	downloadDuration := time.Since(startTime)
+	downloadDuration = time.Since(downloadStartTime)
 
 	if err != nil {
 		return nil, fmt.Errorf("下载文件失败: %w", err)
@@ -4805,8 +5327,8 @@ func (f *Fs) handleDownloadThenUpload(ctx context.Context, srcReader io.ReadClos
 		return nil, fmt.Errorf("计算MD5失败: %w", err)
 	}
 
-	md5Hash := fmt.Sprintf("%x", hasher.Sum(nil))
-	md5Duration := time.Since(md5StartTime)
+	md5Hash = fmt.Sprintf("%x", hasher.Sum(nil))
+	md5Duration = time.Since(md5StartTime)
 	fs.Infof(f, "✅ 步骤2完成: MD5计算成功 %s，耗时: %v", md5Hash, md5Duration.Round(time.Second))
 
 	// 步骤3: 创建上传会话并检查秒传
@@ -4870,6 +5392,9 @@ func (f *Fs) handleDownloadThenUpload(ctx context.Context, srcReader io.ReadClos
 	uploadDuration := time.Since(uploadStartTime)
 	uploadSpeed := float64(fileSize) / uploadDuration.Seconds() / (1024 * 1024) // MB/s
 	totalDuration := time.Since(startTime)
+
+	// 缓存MD5以供后续使用
+	f.cacheMD5(src, md5Hash)
 
 	fs.Infof(f, "🎉 跨云传输完成: %s，总耗时: %v (下载: %v + MD5: %v + 上传: %v)，上传速度: %.2f MB/s",
 		fs.SizeSuffix(fileSize), totalDuration.Round(time.Second),
