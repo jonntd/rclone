@@ -14,17 +14,17 @@ echo "===================="
 echo ""
 echo "1️⃣ 列出115网盘根目录："
 echo "命令: ./rclone lsd 116:"
-./rclone lsd 116:
+./rclone lsd 115:
 
 echo ""
 echo "2️⃣ 列出115网盘test115目录文件："
-echo "命令: ./rclone ls 116:test115/"
-./rclone ls 116:test115/
+echo "命令: ./rclone ls 115:test115/"
+./rclone ls 115:test115/
 
 echo ""
 echo "3️⃣ 显示115网盘目录树："
-echo "命令: ./rclone tree115 116:"
-./rclone tree115 116:
+echo "命令: ./rclone tree115 115:"
+./rclone tree115 115:
 
 echo ""
 echo "=========================================="
@@ -35,18 +35,18 @@ echo "===================="
 
 echo ""
 echo "1️⃣ 列出123网盘根目录："
-echo "命令: ./rclone lsd 123test:"
-./rclone lsd 123test:
+echo "命令: ./rclone lsd 123:"
+./rclone lsd 123:
 
 echo ""
 echo "2️⃣ 列出123网盘test123目录文件："
-echo "命令: ./rclone ls 123test:test123/"
-./rclone ls 123test:test123/
+echo "命令: ./rclone ls 123:test123/"
+./rclone ls 123:test123/
 
 echo ""
 echo "3️⃣ 显示123网盘目录树："
-echo "命令: ./rclone tree123 123test:"
-./rclone tree123 123test:
+echo "命令: ./rclone tree123 123:"
+./rclone tree123 123:
 
 echo ""
 echo "=========================================="
