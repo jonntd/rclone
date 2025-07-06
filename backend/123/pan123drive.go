@@ -2727,6 +2727,67 @@ func (f *Fs) makeAPICallWithRest(ctx context.Context, endpoint string, method st
 	return nil
 }
 
+// makeAPICallWithRestMultipartToDomain 使用rclone标准rest客户端进行multipart API调用到指定域名
+func (f *Fs) makeAPICallWithRestMultipartToDomain(ctx context.Context, domain string, endpoint string, method string, body io.Reader, contentType string, respBody any) error {
+	fs.Debugf(f, "🔄 使用rclone标准方法调用multipart API到域名: %s %s %s", method, domain, endpoint)
+
+	// 确保令牌在进行API调用前有效
+	err := f.refreshTokenIfNecessary(ctx, false, false)
+	if err != nil {
+		return fmt.Errorf("刷新令牌失败: %w", err)
+	}
+
+	// 根据端点获取适当的调速器
+	pacer := f.getPacerForEndpoint(endpoint)
+
+	// 使用调速器进行API调用
+	return pacer.Call(func() (bool, error) {
+		opts := rest.Opts{
+			Method:  method,
+			RootURL: domain,
+			Path:    endpoint,
+			Body:    body,
+			ExtraHeaders: map[string]string{
+				"Content-Type": contentType,
+			},
+		}
+
+		// 添加必要的认证头
+		opts.ExtraHeaders["Authorization"] = "Bearer " + f.token
+		opts.ExtraHeaders["Platform"] = "open_platform"
+		opts.ExtraHeaders["User-Agent"] = f.opt.UserAgent
+
+		var resp *http.Response
+		var err error
+		resp, err = f.rst.Call(ctx, &opts)
+		if err != nil {
+			// 检查是否需要重试
+			if fserrors.ShouldRetry(err) {
+				fs.Debugf(f, "API调用失败，将重试: %v", err)
+				return true, err
+			}
+			return false, fmt.Errorf("API调用失败: %w", err)
+		}
+		defer resp.Body.Close()
+
+		// 检查响应状态
+		if resp.StatusCode >= 400 {
+			body, _ := io.ReadAll(resp.Body)
+			return false, fmt.Errorf("API返回错误状态 %d: %s", resp.StatusCode, string(body))
+		}
+
+		// 解析响应JSON
+		if respBody != nil {
+			err = json.NewDecoder(resp.Body).Decode(respBody)
+			if err != nil {
+				return false, fmt.Errorf("解析响应JSON失败: %w", err)
+			}
+		}
+
+		return false, nil
+	})
+}
+
 // makeAPICallWithRestMultipart 使用rclone标准rest客户端进行multipart API调用
 func (f *Fs) makeAPICallWithRestMultipart(ctx context.Context, endpoint string, method string, body io.Reader, contentType string, respBody any) error {
 	fs.Debugf(f, "🔄 使用rclone标准方法调用multipart API: %s %s", method, endpoint)
@@ -4141,17 +4202,11 @@ func (f *Fs) uploadFileWithPath(ctx context.Context, in io.Reader, createResp *U
 
 // uploadSinglePart 单部分上传文件
 func (f *Fs) uploadSinglePart(ctx context.Context, preuploadID string, data []byte) error {
-	// 获取上传域名
-	uploadDomain, err := f.getUploadDomain(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get upload domain: %w", err)
-	}
+	// 计算分片MD5
+	chunkHash := fmt.Sprintf("%x", md5.Sum(data))
 
-	// 构造分片上传URL
-	uploadURL := fmt.Sprintf("%s/upload/v2/file/slice", uploadDomain)
-
-	// 上传数据
-	err = f.uploadPart(ctx, uploadURL, data)
+	// 使用正确的multipart上传方法
+	err := f.uploadPartWithMultipart(ctx, preuploadID, 1, chunkHash, data)
 	if err != nil {
 		return fmt.Errorf("failed to upload part: %w", err)
 	}
@@ -4278,30 +4333,26 @@ func (f *Fs) uploadMultiPartWithResume(ctx context.Context, in io.Reader, preupl
 			partData = buffer
 		}
 
-		// 获取上传域名
-		uploadDomain, err := f.getUploadDomain(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to get upload domain for part %d: %w", partNumber, err)
-		}
+		// 计算分片MD5
+		chunkHash := fmt.Sprintf("%x", md5.Sum(partData))
 
-		// 构造分片上传URL
-		uploadURL := fmt.Sprintf("%s/upload/v2/file/slice", uploadDomain)
-
-		// 使用重试上传此分片
-		err = f.uploadPacer.Call(func() (bool, error) {
-			err := f.uploadPart(ctx, uploadURL, partData)
-
+		// 使用正确的multipart上传方法，包含重试逻辑
+		err = func() error {
 			// 对于跨云盘传输，使用专门的重试策略
-			if err != nil {
-				// 计算已传输字节数
-				transferredBytes := partIndex * chunkSize
-				if shouldRetryTransfer, retryDelay := f.shouldRetryCrossCloudTransfer(err, 0, transferredBytes, size); shouldRetryTransfer {
-					return true, fserrors.NewErrorRetryAfter(retryDelay)
-				}
-			}
+			return f.uploadPacer.Call(func() (bool, error) {
+				err := f.uploadPartWithMultipart(ctx, preuploadID, partNumber, chunkHash, partData)
 
-			return shouldRetry(ctx, nil, err)
-		})
+				if err != nil {
+					// 计算已传输字节数
+					transferredBytes := partIndex * chunkSize
+					if shouldRetryTransfer, retryDelay := f.shouldRetryCrossCloudTransfer(err, 0, transferredBytes, size); shouldRetryTransfer {
+						return true, fserrors.NewErrorRetryAfter(retryDelay)
+					}
+				}
+
+				return shouldRetry(ctx, nil, err)
+			})
+		}()
 		if err != nil {
 			// 返回错误前保存进度
 			saveErr := f.saveUploadProgress(progress)
@@ -4337,38 +4388,78 @@ func (f *Fs) uploadMultiPartWithResume(ctx context.Context, in io.Reader, preupl
 	return nil
 }
 
-// uploadPart 将单个分片上传到给定URL
+// uploadPart 将单个分片上传到123网盘 - 使用正确的multipart/form-data格式
 func (f *Fs) uploadPart(ctx context.Context, uploadURL string, data []byte) error {
-	req, err := http.NewRequestWithContext(ctx, "PUT", uploadURL, bytes.NewReader(data))
-	if err != nil {
-		return fmt.Errorf("failed to create upload request: %w", err)
+	// 这个方法已废弃，应该使用 uploadPartWithMultipart
+	return fmt.Errorf("uploadPart方法已废弃，请使用uploadPartWithMultipart")
+}
+
+// uploadPartWithMultipart 使用正确的multipart/form-data格式上传分片
+func (f *Fs) uploadPartWithMultipart(ctx context.Context, preuploadID string, partNumber int64, chunkHash string, data []byte) error {
+	if len(data) == 0 {
+		return fmt.Errorf("分片数据不能为空")
 	}
 
-	req.ContentLength = int64(len(data))
-	req.Header.Set("Content-Type", "application/octet-stream")
+	fs.Debugf(f, "开始上传分片 %d，预上传ID: %s, 分片MD5: %s, 数据大小: %d 字节",
+		partNumber, preuploadID, chunkHash, len(data))
 
-	// 为请求添加超时（确保总是有超时保护）
-	timeout := time.Duration(f.opt.Timeout)
-	if timeout <= 0 {
-		timeout = defaultTimeout // 使用默认超时
-	}
-	var cancel context.CancelFunc
-	ctx, cancel = context.WithTimeout(ctx, timeout)
-	defer cancel()
-	req = req.WithContext(ctx)
+	// 使用uploadPacer进行QPS限制控制
+	return f.uploadPacer.Call(func() (bool, error) {
+		// 获取上传域名
+		uploadDomain, err := f.getUploadDomain(ctx)
+		if err != nil {
+			return false, fmt.Errorf("获取上传域名失败: %w", err)
+		}
 
-	resp, err := f.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("upload request failed: %w", err)
-	}
-	defer resp.Body.Close()
+		// 创建multipart表单数据
+		var buf bytes.Buffer
+		writer := multipart.NewWriter(&buf)
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("upload part failed with status %d: %s", resp.StatusCode, string(body))
-	}
+		// 添加表单字段
+		writer.WriteField("preuploadID", preuploadID)
+		writer.WriteField("sliceNo", fmt.Sprintf("%d", partNumber))
+		writer.WriteField("sliceMD5", chunkHash)
 
-	return nil
+		// 添加文件数据
+		part, err := writer.CreateFormFile("slice", fmt.Sprintf("chunk_%d", partNumber))
+		if err != nil {
+			return false, fmt.Errorf("创建表单文件字段失败: %w", err)
+		}
+
+		_, err = part.Write(data)
+		if err != nil {
+			return false, fmt.Errorf("写入分片数据失败: %w", err)
+		}
+
+		err = writer.Close()
+		if err != nil {
+			return false, fmt.Errorf("关闭multipart writer失败: %w", err)
+		}
+
+		// 使用上传域名进行multipart上传
+		var response struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		}
+
+		// 使用上传域名调用分片上传API
+		err = f.makeAPICallWithRestMultipartToDomain(ctx, uploadDomain, "/upload/v2/file/slice", "POST", &buf, writer.FormDataContentType(), &response)
+		if err != nil {
+			// 检查是否是QPS限制错误
+			if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "频率") {
+				fs.Debugf(f, "分片%d遇到QPS限制，将重试: %v", partNumber, err)
+				return true, err
+			}
+			return false, fmt.Errorf("上传分片数据失败: %w", err)
+		}
+
+		if response.Code != 0 {
+			return false, fmt.Errorf("分片上传API错误 %d: %s", response.Code, response.Message)
+		}
+
+		fs.Debugf(f, "分片 %d 上传成功", partNumber)
+		return false, nil
+	})
 }
 
 // UploadCompleteResult 上传完成结果
@@ -5266,7 +5357,7 @@ func (f *Fs) optimizedDiskCrossCloudTransfer(ctx context.Context, srcReader io.R
 		defer f.resourcePool.PutTempFile(tempFile)
 
 		downloadStartTime := time.Now()
-		written, err := f.copyWithProgressAndValidation(ctx, tempFile, srcReader, fileSize, false) // 不需要计算MD5
+		written, err := f.copyWithProgressAndValidation(ctx, tempFile, srcReader, fileSize, false, fileName) // 不需要计算MD5
 		downloadDuration = time.Since(downloadStartTime)
 
 		if err != nil {
@@ -5297,7 +5388,7 @@ func (f *Fs) optimizedDiskCrossCloudTransfer(ctx context.Context, srcReader io.R
 
 	// 完整下载文件并计算MD5
 	downloadStartTime := time.Now()
-	written, err := f.copyWithProgressAndValidation(ctx, tempFile, srcReader, fileSize, true)
+	written, err := f.copyWithProgressAndValidation(ctx, tempFile, srcReader, fileSize, true, fileName)
 	downloadDuration = time.Since(downloadStartTime)
 
 	if err != nil {
@@ -6182,14 +6273,7 @@ func (f *Fs) uploadSingleChunkWithStream(ctx context.Context, srcObj fs.Object, 
 		return fmt.Errorf("重新定位分片 %d 临时文件失败: %w", partNumber, err)
 	}
 
-	// 获取上传域名
-	uploadDomain, err := f.getUploadDomain(ctx)
-	if err != nil {
-		return fmt.Errorf("获取上传域名失败 分片 %d: %w", partNumber, err)
-	}
-
-	// 构造分片上传URL
-	uploadURL := fmt.Sprintf("%s/upload/v2/file/slice", uploadDomain)
+	// 注意：新的uploadPartWithMultipart方法内部会获取上传域名，这里不再需要
 
 	// 读取临时文件数据用于上传
 	chunkData, err := io.ReadAll(tempFile)
@@ -6197,13 +6281,14 @@ func (f *Fs) uploadSingleChunkWithStream(ctx context.Context, srcObj fs.Object, 
 		return fmt.Errorf("读取分片 %d 临时文件失败: %w", partNumber, err)
 	}
 
-	// 上传分片数据
-	err = f.uploadPart(ctx, uploadURL, chunkData)
+	// 计算分片MD5
+	chunkMD5 := fmt.Sprintf("%x", chunkHasher.Sum(nil))
+
+	// 使用正确的multipart上传方法
+	err = f.uploadPartWithMultipart(ctx, preuploadID, partNumber, chunkMD5, chunkData)
 	if err != nil {
 		return fmt.Errorf("上传分片 %d 数据失败: %w", partNumber, err)
 	}
-
-	chunkMD5 := fmt.Sprintf("%x", chunkHasher.Sum(nil))
 	fs.Debugf(f, "分片 %d 流式上传成功，大小: %d, MD5: %s", partNumber, written, chunkMD5)
 
 	return nil
@@ -8174,6 +8259,12 @@ func (f *Fs) Shutdown(ctx context.Context) error {
 		f.tokenRenewer = nil
 	}
 
+	// 清理所有临时文件
+	if f.resourcePool != nil {
+		f.resourcePool.CleanupAllTempFiles()
+		f.resourcePool.Close()
+	}
+
 	// 关闭所有BadgerDB缓存
 	caches := []*cache.BadgerCache{
 		f.parentIDCache,
@@ -9146,6 +9237,10 @@ func (f *Fs) getOptimalChunkSize(fileSize int64, networkSpeed int64) int64 {
 type ResourcePool struct {
 	bufferPool sync.Pool // 缓冲区池
 	hasherPool sync.Pool // MD5哈希计算器池
+
+	// 临时文件跟踪
+	tempFilesMu sync.Mutex
+	tempFiles   map[string]bool // 跟踪创建的临时文件
 }
 
 // NewResourcePool 创建新的资源池
@@ -9163,6 +9258,7 @@ func NewResourcePool() *ResourcePool {
 				return md5.New()
 			},
 		},
+		tempFiles: make(map[string]bool),
 	}
 }
 
@@ -9202,10 +9298,16 @@ func (rp *ResourcePool) GetTempFile(prefix string) (*os.File, error) {
 		return nil, fmt.Errorf("创建临时文件失败: %w", err)
 	}
 
+	// 跟踪临时文件
+	rp.tempFilesMu.Lock()
+	rp.tempFiles[tempFile.Name()] = true
+	rp.tempFilesMu.Unlock()
+
 	// 设置文件权限，确保只有当前用户可以访问
 	err = tempFile.Chmod(0600)
 	if err != nil {
 		tempFile.Close()
+		rp.removeTempFileFromTracking(tempFile.Name())
 		os.Remove(tempFile.Name())
 		return nil, fmt.Errorf("设置临时文件权限失败: %w", err)
 	}
@@ -9220,11 +9322,17 @@ func (rp *ResourcePool) GetOptimizedTempFile(prefix string, expectedSize int64) 
 		return nil, err
 	}
 
+	// 跟踪临时文件
+	rp.tempFilesMu.Lock()
+	rp.tempFiles[tempFile.Name()] = true
+	rp.tempFilesMu.Unlock()
+
 	// 对于大文件，预分配磁盘空间以提升写入性能
 	if expectedSize > 100*1024*1024 { // >100MB
 		err = tempFile.Truncate(expectedSize)
 		if err != nil {
 			tempFile.Close()
+			rp.removeTempFileFromTracking(tempFile.Name())
 			os.Remove(tempFile.Name())
 			return nil, fmt.Errorf("预分配临时文件空间失败: %w", err)
 		}
@@ -9233,12 +9341,20 @@ func (rp *ResourcePool) GetOptimizedTempFile(prefix string, expectedSize int64) 
 		_, err = tempFile.Seek(0, 0)
 		if err != nil {
 			tempFile.Close()
+			rp.removeTempFileFromTracking(tempFile.Name())
 			os.Remove(tempFile.Name())
 			return nil, fmt.Errorf("重置临时文件指针失败: %w", err)
 		}
 	}
 
 	return tempFile, nil
+}
+
+// removeTempFileFromTracking 从跟踪列表中移除临时文件
+func (rp *ResourcePool) removeTempFileFromTracking(fileName string) {
+	rp.tempFilesMu.Lock()
+	delete(rp.tempFiles, fileName)
+	rp.tempFilesMu.Unlock()
 }
 
 // PutTempFile 清理临时文件
@@ -9251,6 +9367,9 @@ func (rp *ResourcePool) PutTempFile(tempFile *os.File) {
 	fileName := tempFile.Name()
 	tempFile.Close()
 
+	// 从跟踪列表中移除
+	rp.removeTempFileFromTracking(fileName)
+
 	// 确保文件被删除
 	if err := os.Remove(fileName); err != nil {
 		// 记录删除失败，但不影响程序继续运行
@@ -9258,9 +9377,34 @@ func (rp *ResourcePool) PutTempFile(tempFile *os.File) {
 	}
 }
 
+// CleanupAllTempFiles 清理所有跟踪的临时文件
+func (rp *ResourcePool) CleanupAllTempFiles() {
+	rp.tempFilesMu.Lock()
+	defer rp.tempFilesMu.Unlock()
+
+	cleanedCount := 0
+	for fileName := range rp.tempFiles {
+		if err := os.Remove(fileName); err != nil {
+			if !os.IsNotExist(err) {
+				fs.Debugf(nil, "⚠️  清理临时文件失败: %s, 错误: %v", fileName, err)
+			}
+		} else {
+			cleanedCount++
+		}
+		delete(rp.tempFiles, fileName)
+	}
+
+	if cleanedCount > 0 {
+		fs.Debugf(nil, "🧹 资源池清理完成，删除了 %d 个临时文件", cleanedCount)
+	}
+}
+
 // Close 关闭资源池，清理所有资源
 // 优化版本：简化实现，sync.Pool会自动管理资源
 func (rp *ResourcePool) Close() {
+	// 清理所有临时文件
+	rp.CleanupAllTempFiles()
+
 	// sync.Pool会自动管理内存池，无需手动清理
 	// 这个方法保留是为了接口兼容性
 }
@@ -10384,7 +10528,7 @@ func (f *Fs) downloadThenUpload(ctx context.Context, src fs.ObjectInfo, createRe
 
 	// 使用带进度显示的复制函数
 	startTime := time.Now()
-	written, err := f.copyWithProgressAndValidation(ctx, tempFile, srcReader, fileSize, true)
+	written, err := f.copyWithProgressAndValidation(ctx, tempFile, srcReader, fileSize, true, fileName)
 	downloadDuration := time.Since(startTime)
 
 	if err != nil {
@@ -10525,7 +10669,7 @@ func (f *Fs) v2UploadChunksWithConcurrency(ctx context.Context, in io.Reader, sr
 	} else {
 		// 大文件：使用临时文件进行并发上传
 		fs.Debugf(f, "🗂️  大文件(%s)，使用临时文件进行并发上传", fs.SizeSuffix(fileSize))
-		tempFile, written, err := f.createTempFileWithRetry(ctx, in, fileSize, false)
+		tempFile, written, err := f.createTempFileWithRetry(ctx, in, fileSize, false, fileName)
 		if err != nil {
 			return nil, fmt.Errorf("创建临时文件失败: %w", err)
 		}
@@ -11562,7 +11706,7 @@ func (f *Fs) readToMemoryWithRetry(ctx context.Context, in io.Reader, expectedSi
 }
 
 // createTempFileWithRetry 增强的临时文件创建函数，支持跨云传输重试
-func (f *Fs) createTempFileWithRetry(ctx context.Context, in io.Reader, expectedSize int64, isRemoteSource bool) (*os.File, int64, error) {
+func (f *Fs) createTempFileWithRetry(ctx context.Context, in io.Reader, expectedSize int64, isRemoteSource bool, fileName ...string) (*os.File, int64, error) {
 	maxRetries := 1
 	if isRemoteSource {
 		maxRetries = 3 // 跨云传输增加重试次数
@@ -11586,7 +11730,7 @@ func (f *Fs) createTempFileWithRetry(ctx context.Context, in io.Reader, expected
 
 		// 使用缓冲写入提升性能
 		bufWriter := bufio.NewWriterSize(tempFile, 1024*1024) // 1MB缓冲区
-		written, err := f.copyWithProgressAndValidation(ctx, bufWriter, in, expectedSize, isRemoteSource)
+		written, err := f.copyWithProgressAndValidation(ctx, bufWriter, in, expectedSize, isRemoteSource, fileName...)
 
 		// 刷新缓冲区
 		flushErr := bufWriter.Flush()
@@ -11675,16 +11819,22 @@ func (f *Fs) createTempFileWithRetry(ctx context.Context, in io.Reader, expected
 }
 
 // copyWithProgressAndValidation 带进度和验证的数据复制
-func (f *Fs) copyWithProgressAndValidation(ctx context.Context, dst io.Writer, src io.Reader, expectedSize int64, isRemoteSource bool) (int64, error) {
-	// 对于跨云传输，使用更小的缓冲区以便更好地处理网络中断
-	bufferSize := 64 * 1024 // 64KB
+func (f *Fs) copyWithProgressAndValidation(ctx context.Context, dst io.Writer, src io.Reader, expectedSize int64, isRemoteSource bool, fileName ...string) (int64, error) {
+	// 优化缓冲区大小以提升传输速度
+	bufferSize := 1024 * 1024 // 1MB - 大幅提升速度
 	if isRemoteSource {
-		bufferSize = 32 * 1024 // 32KB for remote sources
+		// 跨云传输使用更大的缓冲区以提升速度
+		if expectedSize > 1024*1024*1024 { // 大于1GB的文件
+			bufferSize = 2 * 1024 * 1024 // 2MB缓冲区
+		} else {
+			bufferSize = 1024 * 1024 // 1MB缓冲区
+		}
 	}
 
 	buffer := make([]byte, bufferSize)
 	var totalWritten int64
-	lastProgressTime := time.Now()
+	startTime := time.Now()
+	lastProgressTime := startTime
 
 	for {
 		select {
@@ -11710,14 +11860,36 @@ func (f *Fs) copyWithProgressAndValidation(ctx context.Context, dst io.Writer, s
 			}
 			totalWritten += int64(written)
 
-			// 定期输出进度
-			if time.Since(lastProgressTime) > 5*time.Second {
+			// 定期输出进度 - 更频繁的进度更新
+			progressInterval := 2 * time.Second                  // 每2秒更新一次进度
+			if isRemoteSource && expectedSize > 1024*1024*1024 { // 大文件跨云传输
+				progressInterval = 1 * time.Second // 每1秒更新一次进度
+			}
+
+			if time.Since(lastProgressTime) > progressInterval {
 				progress := float64(totalWritten) / float64(expectedSize) * 100
+				elapsed := time.Since(startTime).Seconds()
+				currentSpeed := float64(totalWritten) / elapsed / (1024 * 1024) // MB/s
+
+				// 获取文件名用于显示
+				displayFileName := "文件"
+				if len(fileName) > 0 && fileName[0] != "" {
+					displayFileName = fileName[0]
+					// 如果文件名太长，截取显示
+					if len(displayFileName) > 30 {
+						displayFileName = displayFileName[:27] + "..."
+					}
+				}
+
 				if expectedSize > 0 {
-					fs.Debugf(f, "📊 数据复制进度: %s/%s (%.1f%%)",
-						fs.SizeSuffix(totalWritten), fs.SizeSuffix(expectedSize), progress)
+					remainingBytes := expectedSize - totalWritten
+					eta := time.Duration(float64(remainingBytes) / (currentSpeed * 1024 * 1024) * float64(time.Second))
+					// 使用DEBUG日志输出，避免与-P参数冲突
+					fs.Debugf(f, "📊 [%s] 数据复制进度: %s/%s (%.1f%%) - 速度: %.2f MB/s - 预计剩余: %v",
+						displayFileName, fs.SizeSuffix(totalWritten), fs.SizeSuffix(expectedSize), progress, currentSpeed, eta.Round(time.Second))
 				} else {
-					fs.Debugf(f, "📊 数据复制进度: %s", fs.SizeSuffix(totalWritten))
+					fs.Debugf(f, "📊 [%s] 数据复制进度: %s - 速度: %.2f MB/s",
+						displayFileName, fs.SizeSuffix(totalWritten), currentSpeed)
 				}
 				lastProgressTime = time.Now()
 			}

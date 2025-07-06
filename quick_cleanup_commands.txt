@@ -1,0 +1,62 @@
+# 立即清理rclone临时文件的命令
+
+## 🚨 紧急清理命令（直接复制粘贴到终端）
+
+# 1. 检查磁盘空间
+df -h
+
+# 2. 查看这些大文件
+ls -lh /tmp/cross_cloud_*.tmp
+
+# 3. 停止rclone进程（如果在运行）
+sudo pkill -f rclone
+
+# 4. 删除所有rclone临时文件（一次性清理31.2GB）
+sudo rm -f /tmp/cross_cloud_*.tmp
+sudo rm -f /tmp/rclone-*
+sudo rm -rf /tmp/rclone-*-progress
+sudo rm -f /tmp/*123pan*
+sudo rm -f /tmp/v2upload_*.tmp
+
+# 5. 确认清理结果
+df -h
+ls -lh /tmp/ | grep -E "(rclone|cross_cloud|123pan)"
+
+## 📋 逐步清理（更安全）
+
+# 步骤1: 先删除最大的4个文件
+sudo rm -f /tmp/cross_cloud_optimized_3423857899.tmp
+sudo rm -f /tmp/cross_cloud_simple_3049484754.tmp  
+sudo rm -f /tmp/cross_cloud_optimized_2684089203.tmp
+sudo rm -f /tmp/cross_cloud_simple_263914211.tmp
+
+# 步骤2: 检查释放的空间
+df -h
+
+# 步骤3: 清理其他rclone文件
+sudo rm -f /tmp/cross_cloud_*.tmp
+sudo rm -rf /tmp/rclone-*
+
+## 🔍 检查命令
+
+# 查看/tmp目录大小
+du -sh /tmp
+
+# 查看最大的文件
+ls -lhS /tmp/ | head -10
+
+# 查看磁盘使用情况
+df -h
+
+## ⚠️ 注意事项
+
+1. 确保没有rclone进程在运行：ps aux | grep rclone
+2. 这些文件是安全删除的，不会影响系统
+3. 删除后立即释放31.2GB空间
+4. 如果删除失败，可能需要root权限：sudo
+
+## 🎯 一键清理脚本
+
+如果想要交互式清理，上传并运行：
+chmod +x cleanup_rclone_temp_linux.sh
+sudo ./cleanup_rclone_temp_linux.sh
