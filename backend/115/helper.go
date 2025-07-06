@@ -323,6 +323,15 @@ func (f *Fs) getDownloadURL(ctx context.Context, pickCode string) (durl *api.Dow
 		// Should call getDownloadURLFromShare for shared links
 		return nil, errors.New("use getDownloadURLFromShare for shared filesystems")
 	}
+
+	// 首先尝试从缓存获取
+	if cachedURL, found := f.getDownloadURLFromCache(pickCode); found {
+		fs.Debugf(f, "115网盘下载URL缓存命中: pickCode=%s", pickCode)
+		return &api.DownloadURL{URL: cachedURL}, nil
+	}
+
+	fs.Debugf(f, "115网盘下载URL缓存未命中，调用API: pickCode=%s", pickCode)
+
 	form := url.Values{}
 	form.Set("pick_code", pickCode)
 
@@ -341,17 +350,53 @@ func (f *Fs) getDownloadURL(ctx context.Context, pickCode string) (durl *api.Dow
 		return nil, fmt.Errorf("OpenAPI downurl failed for pickcode %s: %w", pickCode, err)
 	}
 
-	// The response data is a map where the key is the file ID.
-	// We need to extract the URL from the first (and likely only) entry.
-	for _, downInfo := range respData.Data {
-		if downInfo != nil {
-			// Manually add cookies from the response if needed (though OpenAPI shouldn't need them)
-			// downInfo.URL.Cookies = resp.Cookies() // 'resp' is not available here
-			return &downInfo.URL, nil
-		}
+	// 使用新的GetDownloadInfo方法处理map和array两种格式
+	downInfo, err := respData.GetDownloadInfo()
+	if err != nil {
+		fs.Debugf(f, "115网盘下载URL响应解析失败: %v, 原始数据: %s", err, string(respData.Data))
+		return nil, fmt.Errorf("failed to parse download URL response for pickcode %s: %w", pickCode, err)
 	}
 
-	return nil, fs.ErrorObjectNotFound // Or appropriate error if map is empty
+	if downInfo == nil {
+		return nil, fmt.Errorf("no download info found for pickcode %s", pickCode)
+	}
+
+	fs.Debugf(f, "115网盘成功获取下载URL: pickCode=%s, fileName=%s, fileSize=%d",
+		pickCode, downInfo.FileName, int64(downInfo.FileSize))
+
+	// 从URL中解析真实的过期时间
+	realExpiresAt := f.parseURLExpiry(downInfo.URL.URL)
+	if realExpiresAt.IsZero() {
+		// 如果无法解析过期时间，使用默认的1小时
+		realExpiresAt = time.Now().Add(1 * time.Hour)
+		fs.Debugf(f, "115网盘无法解析URL过期时间，使用默认1小时: pickCode=%s", pickCode)
+	} else {
+		fs.Debugf(f, "115网盘解析到URL过期时间: pickCode=%s, 过期时间=%v", pickCode, realExpiresAt)
+	}
+
+	f.saveDownloadURLToCache(pickCode, downInfo.URL.URL, realExpiresAt)
+
+	return &downInfo.URL, nil
+}
+
+// parseURLExpiry 从URL中解析过期时间
+func (f *Fs) parseURLExpiry(urlStr string) time.Time {
+	if p, err := url.Parse(urlStr); err == nil {
+		if q, err := url.ParseQuery(p.RawQuery); err == nil {
+			if t := q.Get("t"); t != "" {
+				if i, err := strconv.ParseInt(t, 10, 64); err == nil {
+					return time.Unix(i, 0)
+				}
+			}
+			// Check for OSS expiry parameter (might be different)
+			if exp := q.Get("Expires"); exp != "" {
+				if i, err := strconv.ParseInt(exp, 10, 64); err == nil {
+					return time.Unix(i, 0)
+				}
+			}
+		}
+	}
+	return time.Time{}
 }
 
 // ------------------------------------------------------------

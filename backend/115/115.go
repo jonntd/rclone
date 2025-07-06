@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"path/filepath"
 	"reflect"
@@ -329,6 +330,9 @@ type Fs struct {
 
 	// 缓存时间配置
 	cacheConfig CacheConfig115
+
+	// 下载URL缓存互斥锁，防止并发竞争
+	downloadURLCacheMu sync.RWMutex
 
 	// HTTP连接池优化
 	httpClient *http.Client
@@ -967,6 +971,10 @@ func (f *Fs) getDownloadURLFromCache(pickCode string) (string, bool) {
 		return "", false
 	}
 
+	// 使用读锁保护缓存读取
+	f.downloadURLCacheMu.RLock()
+	defer f.downloadURLCacheMu.RUnlock()
+
 	cacheKey := fmt.Sprintf("download_url_%s", pickCode)
 	var entry DownloadURLCacheEntry
 
@@ -982,9 +990,13 @@ func (f *Fs) getDownloadURLFromCache(pickCode string) (string, bool) {
 			fs.Debugf(f, "下载URL缓存命中: pickCode=%s", pickCode)
 			return entry.URL, true
 		} else {
-			// 过期了，异步删除
-			go f.downloadURLCache.Delete(cacheKey)
-			fs.Debugf(f, "下载URL缓存已过期: pickCode=%s", pickCode)
+			// 过期了，需要立即删除（使用写锁）
+			go func() {
+				f.downloadURLCacheMu.Lock()
+				f.downloadURLCache.Delete(cacheKey)
+				f.downloadURLCacheMu.Unlock()
+				fs.Debugf(f, "下载URL缓存已过期并删除: pickCode=%s", pickCode)
+			}()
 		}
 	}
 
@@ -996,6 +1008,10 @@ func (f *Fs) saveDownloadURLToCache(pickCode, url string, expiresAt time.Time) {
 	if f.downloadURLCache == nil {
 		return
 	}
+
+	// 使用写锁保护缓存写入
+	f.downloadURLCacheMu.Lock()
+	defer f.downloadURLCacheMu.Unlock()
 
 	cacheKey := fmt.Sprintf("download_url_%s", pickCode)
 	entry := DownloadURLCacheEntry{
@@ -3784,6 +3800,12 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
 
+	// 🚀 115网盘并发下载优化：检测大文件和跨云传输场景
+	if o.size > 100*1024*1024 && o.shouldUseConcurrentDownload(ctx, options) {
+		fs.Infof(o, "🚀 115网盘大文件检测，启用并发下载优化: %s", fs.SizeSuffix(o.size))
+		return o.openWithConcurrency(ctx, options...)
+	}
+
 	// Get/refresh download URL
 	err = o.setDownloadURL(ctx)
 	if err != nil {
@@ -3959,7 +3981,7 @@ func (o *Object) setDownloadURL(ctx context.Context) error {
 		return nil
 	}
 
-	fs.Debugf(o, "Fetching download URL...")
+	fs.Debugf(o, "115网盘开始获取下载URL: pickCode=%s", o.pickCode)
 	var err error
 	var newURL *api.DownloadURL
 
@@ -3972,25 +3994,39 @@ func (o *Object) setDownloadURL(ctx context.Context) error {
 		if o.id == "" {
 			return errors.New("cannot get share download URL without file ID")
 		}
+		fs.Debugf(o, "115网盘使用分享链接API获取下载URL: fileID=%s", o.id)
 		newURL, err = o.fs.getDownloadURLFromShare(urlCtx, o.id)
 	} else {
 		// Use OpenAPI download URL endpoint
 		if o.pickCode == "" {
 			// If pickCode is missing, try getting it from metadata first
+			fs.Debugf(o, "115网盘pickCode为空，尝试从元数据获取")
 			metaErr := o.readMetaData(urlCtx)
 			if metaErr != nil || o.pickCode == "" {
 				return fmt.Errorf("cannot get download URL without pick code (metadata read error: %v)", metaErr)
 			}
+			fs.Debugf(o, "115网盘从元数据获取到pickCode: %s", o.pickCode)
 		}
+		fs.Debugf(o, "115网盘使用OpenAPI获取下载URL: pickCode=%s", o.pickCode)
 		newURL, err = o.fs.getDownloadURL(urlCtx, o.pickCode)
 	}
 
 	if err != nil {
 		o.durl = nil // Clear invalid URL
+
+		// 检查是否是502错误
+		if strings.Contains(err.Error(), "502") || strings.Contains(err.Error(), "Bad Gateway") {
+			fs.Debugf(o, "115网盘获取下载URL遇到502错误，服务器过载: %v", err)
+			return fmt.Errorf("server overload (502) when fetching download URL: %w", err)
+		}
+
 		// Check if it's a context timeout
 		if errors.Is(err, context.DeadlineExceeded) {
 			return fmt.Errorf("timeout fetching download URL: %w", err)
 		}
+
+		// 记录详细的错误信息用于调试
+		fs.Debugf(o, "115网盘获取下载URL失败: pickCode=%s, error=%v", o.pickCode, err)
 		return fmt.Errorf("failed to get download URL: %w", err)
 	}
 
@@ -3998,7 +4034,9 @@ func (o *Object) setDownloadURL(ctx context.Context) error {
 	if !o.durl.Valid() {
 		// This might happen if the link expires immediately or is invalid
 		fs.Logf(o, "Fetched download URL is invalid or expired immediately: %s", o.durl.URL)
-		// Don't return error here, let the open call fail if it's truly invalid
+		// 清除无效的URL，强制下次重新获取
+		o.durl = nil
+		return fmt.Errorf("fetched download URL is invalid or expired immediately")
 	} else {
 		fs.Debugf(o, "Successfully fetched download URL")
 	}
@@ -4054,3 +4092,521 @@ func loadTokenFromConfig(f *Fs, m configmap.Mapper) bool {
 }
 
 // rclone backend getdownloadurlua "116:/电影/2025_电影/独裁者 (2012) {tmdb-76493} 23.8GB.mkv" "VidHub/1.7.2"
+
+// downloadWithConcurrency 115网盘多线程并发下载实现
+// 基于123网盘的并发下载架构，专门为115网盘优化
+func (f *Fs) downloadWithConcurrency(ctx context.Context, srcObj *Object, tempFile *os.File, fileSize int64) (int64, error) {
+	// 计算最优分片参数
+	chunkSize := f.calculateDownloadChunkSize(fileSize)
+	numChunks := (fileSize + chunkSize - 1) / chunkSize
+	maxConcurrency := f.calculateDownloadConcurrency(fileSize)
+
+	fs.Infof(f, "📊 115网盘并发下载参数: 分片大小=%s, 分片数=%d, 并发数=%d",
+		fs.SizeSuffix(chunkSize), numChunks, maxConcurrency)
+
+	fs.Infof(f, "🚀 115网盘开始并发下载: %s (%s)", srcObj.remote, fs.SizeSuffix(fileSize))
+
+	// 使用并发下载实现
+	downloadStartTime := time.Now()
+	err := f.downloadChunksConcurrently(ctx, srcObj, tempFile, chunkSize, numChunks, int64(maxConcurrency))
+	downloadDuration := time.Since(downloadStartTime)
+	if err != nil {
+		return 0, fmt.Errorf("115网盘并发下载失败: %w", err)
+	}
+
+	// 验证下载完整性
+	stat, err := tempFile.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("获取下载文件信息失败: %w", err)
+	}
+
+	actualSize := stat.Size()
+	if actualSize != fileSize {
+		return 0, fmt.Errorf("下载文件大小不匹配: 期望%s，实际%s",
+			fs.SizeSuffix(fileSize), fs.SizeSuffix(actualSize))
+	}
+
+	// 计算平均下载速度
+	avgSpeed := float64(actualSize) / downloadDuration.Seconds() / 1024 / 1024 // MB/s
+
+	fs.Infof(f, "✅ 115网盘并发下载完成: %s | 用时: %v | 平均速度: %.2f MB/s",
+		fs.SizeSuffix(actualSize), downloadDuration, avgSpeed)
+	return actualSize, nil
+}
+
+// DownloadProgress 115网盘下载进度跟踪器
+type DownloadProgress struct {
+	totalChunks     int64
+	completedChunks int64
+	totalBytes      int64
+	downloadedBytes int64
+	startTime       time.Time
+	lastUpdateTime  time.Time
+	chunkSizes      map[int64]int64         // 记录每个分片的大小
+	chunkTimes      map[int64]time.Duration // 记录每个分片的下载时间
+	peakSpeed       float64                 // 峰值速度 MB/s
+	mu              sync.RWMutex
+}
+
+// NewDownloadProgress 创建新的下载进度跟踪器
+func NewDownloadProgress(totalChunks, totalBytes int64) *DownloadProgress {
+	return &DownloadProgress{
+		totalChunks:    totalChunks,
+		totalBytes:     totalBytes,
+		startTime:      time.Now(),
+		lastUpdateTime: time.Now(),
+		chunkSizes:     make(map[int64]int64),
+		chunkTimes:     make(map[int64]time.Duration),
+		peakSpeed:      0,
+	}
+}
+
+// UpdateChunkProgress 更新分片下载进度
+func (dp *DownloadProgress) UpdateChunkProgress(chunkIndex, chunkSize int64, chunkDuration time.Duration) {
+	dp.mu.Lock()
+	defer dp.mu.Unlock()
+
+	// 如果这个分片还没有记录，增加完成计数
+	if _, exists := dp.chunkSizes[chunkIndex]; !exists {
+		dp.completedChunks++
+		dp.downloadedBytes += chunkSize
+		dp.chunkSizes[chunkIndex] = chunkSize
+		dp.chunkTimes[chunkIndex] = chunkDuration
+		dp.lastUpdateTime = time.Now()
+
+		// 计算并更新峰值速度
+		if chunkDuration.Seconds() > 0 {
+			chunkSpeed := float64(chunkSize) / chunkDuration.Seconds() / 1024 / 1024 // MB/s
+			if chunkSpeed > dp.peakSpeed {
+				dp.peakSpeed = chunkSpeed
+			}
+		}
+	}
+}
+
+// GetProgressInfo 获取当前进度信息
+func (dp *DownloadProgress) GetProgressInfo() (percentage float64, avgSpeed float64, peakSpeed float64, eta time.Duration, completed, total int64, downloadedBytes, totalBytes int64) {
+	dp.mu.RLock()
+	defer dp.mu.RUnlock()
+
+	elapsed := time.Since(dp.startTime)
+	percentage = float64(dp.completedChunks) / float64(dp.totalChunks) * 100
+
+	if elapsed.Seconds() > 0 {
+		avgSpeed = float64(dp.downloadedBytes) / elapsed.Seconds() / 1024 / 1024 // MB/s
+	}
+
+	peakSpeed = dp.peakSpeed
+
+	if avgSpeed > 0 && dp.downloadedBytes > 0 {
+		remainingBytes := dp.totalBytes - dp.downloadedBytes
+		etaSeconds := float64(remainingBytes) / (avgSpeed * 1024 * 1024)
+		eta = time.Duration(etaSeconds) * time.Second
+	}
+
+	return percentage, avgSpeed, peakSpeed, eta, dp.completedChunks, dp.totalChunks, dp.downloadedBytes, dp.totalBytes
+}
+
+// downloadChunksConcurrently 115网盘并发下载文件分片（带进度显示）
+func (f *Fs) downloadChunksConcurrently(ctx context.Context, srcObj *Object, tempFile *os.File, chunkSize, numChunks, maxConcurrency int64) error {
+	// 创建进度跟踪器
+	progress := NewDownloadProgress(numChunks, srcObj.Size())
+
+	// 启动进度显示协程
+	progressCtx, cancelProgress := context.WithCancel(ctx)
+	defer cancelProgress()
+
+	go f.displayDownloadProgress(progressCtx, progress, srcObj.remote)
+
+	// 创建工作池
+	semaphore := make(chan struct{}, maxConcurrency)
+	errChan := make(chan error, numChunks)
+	var wg sync.WaitGroup
+
+	for i := int64(0); i < numChunks; i++ {
+		wg.Add(1)
+		go func(chunkIndex int64) {
+			defer wg.Done()
+
+			// 获取信号量
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			// 计算分片范围
+			start := chunkIndex * chunkSize
+			end := start + chunkSize - 1
+			if end >= srcObj.Size() {
+				end = srcObj.Size() - 1
+			}
+			actualChunkSize := end - start + 1
+
+			// 下载分片（带进度跟踪）
+			chunkStartTime := time.Now()
+			err := f.downloadChunk(ctx, srcObj, tempFile, start, end, chunkIndex)
+			chunkDuration := time.Since(chunkStartTime)
+
+			if err != nil {
+				errChan <- fmt.Errorf("下载分片 %d 失败: %w", chunkIndex, err)
+				return
+			}
+
+			// 更新进度（包含下载时间）
+			progress.UpdateChunkProgress(chunkIndex, actualChunkSize, chunkDuration)
+
+			// 计算分片下载速度
+			chunkSpeed := float64(actualChunkSize) / chunkDuration.Seconds() / 1024 / 1024 // MB/s
+
+			fs.Debugf(f, "115网盘分片 %d 下载成功: %d-%d (%s) | 用时: %v | 速度: %.2f MB/s",
+				chunkIndex, start, end, fs.SizeSuffix(actualChunkSize), chunkDuration, chunkSpeed)
+		}(i)
+	}
+
+	// 等待所有下载完成
+	wg.Wait()
+	close(errChan)
+
+	// 检查是否有错误
+	for err := range errChan {
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// displayDownloadProgress 显示115网盘下载进度
+func (f *Fs) displayDownloadProgress(ctx context.Context, progress *DownloadProgress, fileName string) {
+	ticker := time.NewTicker(2 * time.Second) // 每2秒更新一次进度
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// 显示最终进度
+			percentage, avgSpeed, peakSpeed, _, completed, total, downloadedBytes, totalBytes := progress.GetProgressInfo()
+			fs.Infof(f, "📥 115网盘下载完成: %s | %d/%d分片 (%.1f%%) | %s/%s | 平均: %.2f MB/s | 峰值: %.2f MB/s",
+				fileName, completed, total, percentage,
+				fs.SizeSuffix(downloadedBytes), fs.SizeSuffix(totalBytes), avgSpeed, peakSpeed)
+			return
+		case <-ticker.C:
+			percentage, avgSpeed, peakSpeed, eta, completed, total, downloadedBytes, totalBytes := progress.GetProgressInfo()
+
+			// 构建ETA字符串
+			var etaStr string
+			if eta > 0 {
+				if eta > time.Hour {
+					etaStr = fmt.Sprintf("ETA: %dh%dm", int(eta.Hours()), int(eta.Minutes())%60)
+				} else if eta > time.Minute {
+					etaStr = fmt.Sprintf("ETA: %dm%ds", int(eta.Minutes()), int(eta.Seconds())%60)
+				} else {
+					etaStr = fmt.Sprintf("ETA: %ds", int(eta.Seconds()))
+				}
+			} else {
+				etaStr = "ETA: 计算中..."
+			}
+
+			// 显示详细进度信息
+			if completed > 0 {
+				// 创建进度条
+				progressBar := f.createProgressBar(percentage)
+
+				fs.Infof(f, "📥 115网盘下载进度: %s", fileName)
+				fs.Infof(f, "   %s %.1f%% | %d/%d分片 | %s/%s",
+					progressBar, percentage, completed, total,
+					fs.SizeSuffix(downloadedBytes), fs.SizeSuffix(totalBytes))
+				fs.Infof(f, "   平均速度: %.2f MB/s | 峰值速度: %.2f MB/s | %s",
+					avgSpeed, peakSpeed, etaStr)
+			}
+		}
+	}
+}
+
+// createProgressBar 创建进度条字符串
+func (f *Fs) createProgressBar(percentage float64) string {
+	const barLength = 30
+	filled := int(percentage / 100 * barLength)
+	if filled > barLength {
+		filled = barLength
+	}
+
+	bar := "["
+	for i := 0; i < barLength; i++ {
+		if i < filled {
+			bar += "█"
+		} else {
+			bar += "░"
+		}
+	}
+	bar += "]"
+	return bar
+}
+
+// downloadChunk 115网盘下载单个文件分片
+func (f *Fs) downloadChunk(ctx context.Context, srcObj *Object, tempFile *os.File, start, end, chunkIndex int64) error {
+	rangeOption := &fs.RangeOption{Start: start, End: end}
+	expectedSize := end - start + 1
+
+	// 重试机制：最多重试5次，处理URL过期问题
+	maxRetries := 5
+	var lastErr error
+
+	for retry := 0; retry < maxRetries; retry++ {
+		// 在每次重试前强制刷新URL
+		if retry > 0 {
+			fs.Debugf(f, "115网盘分片 %d 重试 %d/%d: 强制刷新下载URL", chunkIndex, retry, maxRetries-1)
+
+			// 强制清除当前URL，确保获取新的URL
+			srcObj.durlMu.Lock()
+			srcObj.durl = nil
+			srcObj.durlMu.Unlock()
+
+			err := srcObj.setDownloadURL(ctx)
+			if err != nil {
+				lastErr = fmt.Errorf("刷新下载URL失败: %w", err)
+				time.Sleep(time.Duration(retry) * time.Second) // 增加延迟
+				continue
+			}
+
+			// 验证新URL是否有效
+			if !srcObj.durl.Valid() {
+				lastErr = fmt.Errorf("刷新后的URL仍然无效")
+				time.Sleep(time.Duration(retry) * time.Second)
+				continue
+			}
+
+			// 递增延迟避免过于频繁的重试
+			time.Sleep(time.Duration(retry) * 500 * time.Millisecond)
+		}
+
+		// 尝试打开分片
+		chunkReader, err := srcObj.open(ctx, rangeOption)
+		if err != nil {
+			lastErr = err
+
+			// 检查是否是502 Bad Gateway错误
+			if strings.Contains(err.Error(), "502") || strings.Contains(err.Error(), "Bad Gateway") {
+				fs.Debugf(f, "115网盘分片 %d 遇到502错误，服务器过载，延长重试间隔", chunkIndex)
+				// 502错误使用指数退避策略
+				backoffDelay := time.Duration(1<<uint(retry)) * time.Second
+				if backoffDelay > 30*time.Second {
+					backoffDelay = 30 * time.Second
+				}
+				time.Sleep(backoffDelay)
+				continue
+			}
+
+			// 如果是URL无效错误，继续重试
+			if strings.Contains(err.Error(), "download URL is invalid or expired") {
+				fs.Debugf(f, "115网盘分片 %d URL过期，准备重试", chunkIndex)
+				continue
+			}
+
+			// 检查是否是其他服务器错误（5xx）
+			if strings.Contains(err.Error(), "50") {
+				fs.Debugf(f, "115网盘分片 %d 遇到服务器错误，延长重试间隔: %v", chunkIndex, err)
+				time.Sleep(time.Duration(retry+1) * 2 * time.Second)
+				continue
+			}
+
+			// 其他错误直接返回
+			return fmt.Errorf("打开分片失败: %w", err)
+		}
+
+		// 读取分片数据
+		chunkData, err := io.ReadAll(chunkReader)
+		chunkReader.Close()
+		if err != nil {
+			lastErr = err
+			fs.Debugf(f, "115网盘分片 %d 读取数据失败，准备重试: %v", chunkIndex, err)
+			continue
+		}
+
+		// 检测HTML错误响应（通常是79字节左右的错误页面）
+		if len(chunkData) < 1000 && isHTMLErrorResponse(chunkData) {
+			lastErr = fmt.Errorf("收到HTML错误响应，可能是URL过期: 大小=%d", len(chunkData))
+			fs.Debugf(f, "115网盘分片 %d 检测到HTML错误响应，准备重试: %v", chunkIndex, lastErr)
+			continue
+		}
+
+		// 验证分片大小
+		if int64(len(chunkData)) != expectedSize {
+			// 如果是最后一个分片，可能大小不足
+			if chunkIndex == (srcObj.Size()+expectedSize-1)/expectedSize-1 {
+				// 最后一个分片，检查是否是合理的剩余大小
+				remainingSize := srcObj.Size() - start
+				if int64(len(chunkData)) == remainingSize {
+					fs.Debugf(f, "115网盘分片 %d 是最后分片，大小正确: %d", chunkIndex, len(chunkData))
+				} else {
+					lastErr = fmt.Errorf("最后分片大小不匹配: 期望%d，实际%d", remainingSize, len(chunkData))
+					fs.Debugf(f, "115网盘分片 %d 最后分片大小不匹配，准备重试: %v", chunkIndex, lastErr)
+					continue
+				}
+			} else {
+				lastErr = fmt.Errorf("分片大小不匹配: 期望%d，实际%d", expectedSize, len(chunkData))
+				fs.Debugf(f, "115网盘分片 %d 大小不匹配，准备重试: %v", chunkIndex, lastErr)
+				continue
+			}
+		}
+
+		// 写入临时文件的正确位置
+		_, err = tempFile.WriteAt(chunkData, start)
+		if err != nil {
+			return fmt.Errorf("写入分片数据失败: %w", err)
+		}
+
+		// 成功完成
+		fs.Debugf(f, "115网盘分片 %d 下载成功: %d-%d (%d字节)", chunkIndex, start, end, len(chunkData))
+		return nil
+	}
+
+	// 所有重试都失败了
+	return fmt.Errorf("分片 %d 下载失败，已重试 %d 次: %w", chunkIndex, maxRetries, lastErr)
+}
+
+// isHTMLErrorResponse 检测是否是HTML错误响应
+func isHTMLErrorResponse(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+
+	// 转换为小写字符串进行检查
+	content := strings.ToLower(string(data))
+
+	// 检查常见的HTML错误响应特征
+	htmlIndicators := []string{
+		"<html",
+		"<!doctype",
+		"<head>",
+		"<title>",
+		"error",
+		"404",
+		"403",
+		"500",
+		"expired",
+		"invalid",
+	}
+
+	for _, indicator := range htmlIndicators {
+		if strings.Contains(content, indicator) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// calculateDownloadChunkSize 115网盘计算下载分片大小
+func (f *Fs) calculateDownloadChunkSize(fileSize int64) int64 {
+	switch {
+	case fileSize < 500*1024*1024: // <500MB
+		return 16 * 1024 * 1024 // 16MB分片
+	case fileSize < 2*1024*1024*1024: // <2GB
+		return 32 * 1024 * 1024 // 32MB分片
+	default: // >2GB
+		return 64 * 1024 * 1024 // 64MB分片
+	}
+}
+
+// calculateDownloadConcurrency 115网盘计算下载并发数
+// 考虑115网盘的API限制和服务器稳定性，降低并发数避免502错误
+func (f *Fs) calculateDownloadConcurrency(fileSize int64) int {
+	// 基于文件大小和服务器稳定性考虑，进一步降低并发数
+	switch {
+	case fileSize < 500*1024*1024: // <500MB
+		return 1 // 1并发，小文件不需要并发
+	case fileSize < 2*1024*1024*1024: // <2GB
+		return 2 // 2并发，减少API压力
+	default: // >2GB
+		return 2 // 2并发，即使大文件也保持较低并发避免502错误
+	}
+}
+
+// shouldUseConcurrentDownload 判断是否应该使用并发下载
+func (o *Object) shouldUseConcurrentDownload(ctx context.Context, options []fs.OpenOption) bool {
+	// 检查文件大小，只对大文件使用并发下载
+	if o.size < 100*1024*1024 { // 小于100MB
+		return false
+	}
+
+	// 检查是否有用户指定的Range选项
+	// 如果用户明确指定了Range，说明只想下载文件的一部分，不应该使用并发下载
+	for _, option := range options {
+		if rangeOpt, ok := option.(*fs.RangeOption); ok {
+			// 如果Range覆盖了整个文件，则可以使用并发下载
+			if rangeOpt.Start == 0 && (rangeOpt.End == -1 || rangeOpt.End >= o.size-1) {
+				fs.Debugf(o, "检测到全文件Range选项，允许并发下载")
+				break
+			} else {
+				fs.Debugf(o, "检测到部分Range选项 (%d-%d)，跳过并发下载", rangeOpt.Start, rangeOpt.End)
+				return false
+			}
+		}
+	}
+
+	fs.Debugf(o, "115网盘大文件并发下载条件满足: %s", fs.SizeSuffix(o.size))
+	return true
+}
+
+// openWithConcurrency 使用并发下载打开文件
+func (o *Object) openWithConcurrency(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	fs.Infof(o, "🚀 115网盘启动并发下载: %s", fs.SizeSuffix(o.size))
+
+	// 创建临时文件用于并发下载
+	tempFile, err := os.CreateTemp("", "115_concurrent_download_*.tmp")
+	if err != nil {
+		fs.Debugf(o, "创建临时文件失败，回退到普通下载: %v", err)
+		return o.open(ctx, options...)
+	}
+
+	// 使用并发下载到临时文件
+	downloadedSize, err := o.fs.downloadWithConcurrency(ctx, o, tempFile, o.size)
+	if err != nil {
+		tempFile.Close()
+		os.Remove(tempFile.Name())
+		fs.Debugf(o, "并发下载失败，回退到普通下载: %v", err)
+		return o.open(ctx, options...)
+	}
+
+	// 验证下载大小
+	if downloadedSize != o.size {
+		tempFile.Close()
+		os.Remove(tempFile.Name())
+		fs.Debugf(o, "下载大小不匹配，回退到普通下载: 期望%d，实际%d", o.size, downloadedSize)
+		return o.open(ctx, options...)
+	}
+
+	// 重置文件指针到开始位置
+	_, err = tempFile.Seek(0, io.SeekStart)
+	if err != nil {
+		tempFile.Close()
+		os.Remove(tempFile.Name())
+		return nil, fmt.Errorf("重置临时文件指针失败: %w", err)
+	}
+
+	fs.Infof(o, "✅ 115网盘并发下载完成: %s", fs.SizeSuffix(downloadedSize))
+
+	// 返回一个包装的ReadCloser，在关闭时删除临时文件
+	return &ConcurrentDownloadReader{
+		file:     tempFile,
+		tempPath: tempFile.Name(),
+	}, nil
+}
+
+// ConcurrentDownloadReader 并发下载的文件读取器
+type ConcurrentDownloadReader struct {
+	file     *os.File
+	tempPath string
+}
+
+// Read 实现io.Reader接口
+func (r *ConcurrentDownloadReader) Read(p []byte) (n int, err error) {
+	return r.file.Read(p)
+}
+
+// Close 实现io.Closer接口，关闭时删除临时文件
+func (r *ConcurrentDownloadReader) Close() error {
+	err := r.file.Close()
+	os.Remove(r.tempPath) // 删除临时文件
+	return err
+}

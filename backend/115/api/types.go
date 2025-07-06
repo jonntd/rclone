@@ -671,10 +671,45 @@ type OpenAPIDownloadInfo struct {
 }
 
 // OpenAPIDownloadResp represents the response from POST /open/ufile/downurl
+// 115网盘API有时返回map格式，有时返回array格式，需要灵活处理
 type OpenAPIDownloadResp struct {
 	OpenAPIBase
-	// Data is a map where the key is the file ID
-	Data map[string]*OpenAPIDownloadInfo `json:"data"`
+	// Data can be either a map or an array, we'll handle both formats
+	Data json.RawMessage `json:"data"`
+}
+
+// GetDownloadInfo 从响应中提取下载信息，处理map和array两种格式
+func (r *OpenAPIDownloadResp) GetDownloadInfo() (*OpenAPIDownloadInfo, error) {
+	if len(r.Data) == 0 {
+		return nil, errors.New("empty data field in download response")
+	}
+
+	// 尝试解析为map格式
+	var mapData map[string]*OpenAPIDownloadInfo
+	if err := json.Unmarshal(r.Data, &mapData); err == nil {
+		// 成功解析为map，返回第一个有效的下载信息
+		for _, info := range mapData {
+			if info != nil {
+				return info, nil
+			}
+		}
+		return nil, errors.New("no valid download info found in map data")
+	}
+
+	// 尝试解析为array格式
+	var arrayData []*OpenAPIDownloadInfo
+	if err := json.Unmarshal(r.Data, &arrayData); err == nil {
+		// 成功解析为array，返回第一个有效的下载信息
+		for _, info := range arrayData {
+			if info != nil {
+				return info, nil
+			}
+		}
+		return nil, errors.New("no valid download info found in array data")
+	}
+
+	// 两种格式都解析失败
+	return nil, fmt.Errorf("unable to parse data field as either map or array: %s", string(r.Data))
 }
 
 // ------------------------------------------------------------
