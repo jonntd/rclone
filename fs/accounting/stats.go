@@ -795,6 +795,23 @@ func (s *StatsInfo) GetTransfers() int64 {
 	return s.transfers
 }
 
+// GetInProgressAccount 获取指定名称的正在进行的传输Account
+func (s *StatsInfo) GetInProgressAccount(name string) *Account {
+	return s.inProgress.get(name)
+}
+
+// ListInProgressAccounts 列出所有正在进行的传输Account名称（用于调试）
+func (s *StatsInfo) ListInProgressAccounts() []string {
+	s.inProgress.mu.Lock()
+	defer s.inProgress.mu.Unlock()
+
+	var names []string
+	for name := range s.inProgress.m {
+		names = append(names, name)
+	}
+	return names
+}
+
 // NewTransfer adds a transfer to the stats from the object.
 //
 // The obj is uses as the srcFs, the dstFs must be supplied

@@ -1,6 +1,7 @@
 package _115
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/rclone/rclone/backend/115/api"
+	"github.com/rclone/rclone/fs"
 )
 
 // CacheViewer115 115网盘缓存查看器
@@ -80,17 +82,7 @@ func (cv *CacheViewer115) ViewAllCaches() (*CacheSummary115, error) {
 		summary.Statistics["dirList"] = stats
 	}
 
-	// 查看下载URL缓存
-	if cv.fs.downloadURLCache != nil {
-		downloadURLCaches, err := cv.viewDownloadURLCache()
-		if err == nil {
-			summary.CacheDetails = append(summary.CacheDetails, downloadURLCaches...)
-			summary.CacheTypes["downloadURL"] = len(downloadURLCaches)
-		}
-
-		stats := cv.fs.downloadURLCache.Stats()
-		summary.Statistics["downloadURL"] = stats
-	}
+	// 🗑️ 下载URL缓存已删除
 
 	// 查看文件元数据缓存
 	if cv.fs.metadataCache != nil {
@@ -179,32 +171,7 @@ func (cv *CacheViewer115) viewDirListCache() ([]CacheInfo115, error) {
 	return caches, nil
 }
 
-// viewDownloadURLCache 查看下载URL缓存
-func (cv *CacheViewer115) viewDownloadURLCache() ([]CacheInfo115, error) {
-	var caches []CacheInfo115
-
-	if cv.fs.downloadURLCache == nil {
-		return caches, nil
-	}
-
-	entries, err := cv.fs.downloadURLCache.GetAllEntries()
-	if err != nil {
-		return caches, err
-	}
-
-	for key, value := range entries {
-		cache := CacheInfo115{
-			Type:        "downloadURL",
-			Key:         key,
-			Value:       value,
-			Size:        len(fmt.Sprintf("%v", value)),
-			Description: fmt.Sprintf("下载URL: %s", key),
-		}
-		caches = append(caches, cache)
-	}
-
-	return caches, nil
-}
+// 🗑️ viewDownloadURLCache 已删除 - 下载URL缓存已移除
 
 // viewMetadataCache 查看文件元数据缓存
 func (cv *CacheViewer115) viewMetadataCache() ([]CacheInfo115, error) {
@@ -324,7 +291,7 @@ func (cv *CacheViewer115) GetCacheByType(cacheType string) ([]CacheInfo115, erro
 	case "dirlist":
 		return cv.viewDirListCache()
 	case "downloadurl":
-		return cv.viewDownloadURLCache()
+		return []CacheInfo115{}, nil // 🗑️ 下载URL缓存已删除
 	case "metadata":
 		return cv.viewMetadataCache()
 	case "fileid":
@@ -379,9 +346,7 @@ func (cv *CacheViewer115) GetCacheStats() map[string]interface{} {
 	if cv.fs.dirListCache != nil {
 		stats["dirList"] = cv.fs.dirListCache.Stats()
 	}
-	if cv.fs.downloadURLCache != nil {
-		stats["downloadURL"] = cv.fs.downloadURLCache.Stats()
-	}
+	// 🗑️ 下载URL缓存已删除
 	if cv.fs.metadataCache != nil {
 		stats["metadata"] = cv.fs.metadataCache.Stats()
 	}
@@ -770,6 +735,7 @@ type HierarchyNode115 struct {
 }
 
 // GenerateDirectoryTreeText 生成文本格式的目录树
+// 🔧 修复缓存优化后的兼容性问题：如果缓存为空，主动获取数据
 func (cv *CacheViewer115) GenerateDirectoryTreeText() (string, error) {
 	var result strings.Builder
 	result.WriteString("115网盘\n")
@@ -783,10 +749,95 @@ func (cv *CacheViewer115) GenerateDirectoryTreeText() (string, error) {
 		}
 	}
 
-	result.WriteString("└── (没有可用的缓存数据)\n")
-	result.WriteString("提示: 请先运行 'rclone ls' 或 'rclone lsd' 命令生成缓存数据\n")
+	// 🚀 缓存为空时，主动获取根目录数据
+	result.WriteString("🔄 缓存为空，正在获取目录数据...\n")
 
+	// 获取根目录列表
+	ctx := context.Background()
+	entries, err := cv.fs.List(ctx, "")
+	if err != nil {
+		result.WriteString(fmt.Sprintf("└── ❌ 获取目录数据失败: %v\n", err))
+		return result.String(), nil
+	}
+
+	if len(entries) == 0 {
+		result.WriteString("└── (根目录为空)\n")
+		return result.String(), nil
+	}
+
+	// 基于获取的数据生成目录树
+	result.WriteString(cv.generateFromEntries(entries))
 	return result.String(), nil
+}
+
+// generateFromEntries 基于fs.DirEntry列表生成目录树
+// 🔧 新增方法：支持从实时获取的数据生成目录树
+func (cv *CacheViewer115) generateFromEntries(entries []fs.DirEntry) string {
+	var result strings.Builder
+
+	// 分离目录和文件
+	var dirs []fs.DirEntry
+	var files []fs.DirEntry
+
+	for _, entry := range entries {
+		if entry.Remote() == "" {
+			continue // 跳过空路径
+		}
+
+		switch entry.(type) {
+		case fs.Directory:
+			dirs = append(dirs, entry)
+		case fs.Object:
+			files = append(files, entry)
+		}
+	}
+
+	// 显示目录
+	for i, dir := range dirs {
+		isLast := i == len(dirs)-1 && len(files) == 0
+		connector := "├── "
+		if isLast {
+			connector = "└── "
+		}
+		result.WriteString(fmt.Sprintf("%s%s/\n", connector, dir.Remote()))
+	}
+
+	// 显示文件
+	for i, file := range files {
+		isLast := i == len(files)-1
+		connector := "├── "
+		if isLast {
+			connector = "└── "
+		}
+
+		// 获取文件大小
+		if obj, ok := file.(fs.Object); ok {
+			size := obj.Size()
+			result.WriteString(fmt.Sprintf("%s%s (%s)\n", connector, file.Remote(), formatSize115(size)))
+		} else {
+			result.WriteString(fmt.Sprintf("%s%s\n", connector, file.Remote()))
+		}
+	}
+
+	if len(dirs) == 0 && len(files) == 0 {
+		result.WriteString("└── (目录为空)\n")
+	}
+
+	return result.String()
+}
+
+// formatSize115 格式化文件大小显示
+func formatSize115(size int64) string {
+	const unit = 1024
+	if size < unit {
+		return fmt.Sprintf("%d B", size)
+	}
+	div, exp := int64(unit), 0
+	for n := size / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(size)/float64(div), "KMGTPE"[exp])
 }
 
 // generateFromDirListCache 从目录列表缓存生成树

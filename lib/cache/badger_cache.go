@@ -29,9 +29,10 @@ type PersistentCache interface {
 
 // BadgerCache 基于BadgerDB的高性能持久化缓存
 type BadgerCache struct {
-	db       *badger.DB
-	name     string
-	basePath string
+	db             *badger.DB
+	name           string
+	basePath       string
+	operationCount int64 // 🔧 轻量级优化：操作计数器，用于定期检查缓存大小
 }
 
 // CacheEntry 缓存条目的通用结构
@@ -50,19 +51,19 @@ func NewBadgerCache(name, basePath string) (*BadgerCache, error) {
 		return nil, fmt.Errorf("创建缓存目录失败: %w", err)
 	}
 
-	// 配置BadgerDB选项 - 优化内存使用和性能
+	// 配置BadgerDB选项 - 轻量级优化：提高性能和稳定性
 	opts := badger.DefaultOptions(cacheDir)
 	opts.Logger = nil                // 禁用BadgerDB日志，避免干扰rclone日志
 	opts.SyncWrites = false          // 异步写入，提高性能
 	opts.CompactL0OnClose = true     // 关闭时压缩，减少磁盘占用
 	opts.ValueLogFileSize = 64 << 20 // 64MB value log文件，适合大文件传输
-	opts.MemTableSize = 32 << 20     // 32MB内存表大小，减少内存使用
+	opts.MemTableSize = 64 << 20     // 🔧 从32MB增加到64MB，提高写入性能
 	opts.BaseTableSize = 8 << 20     // 8MB基础表大小
 	opts.BaseLevelSize = 64 << 20    // 64MB基础级别大小
-	opts.NumMemtables = 2            // 限制内存表数量
+	opts.NumMemtables = 3            // 🔧 从2增加到3，提高并发性能
 	opts.NumLevelZeroTables = 2      // 限制L0表数量
 	opts.NumLevelZeroTablesStall = 4 // L0表停顿阈值
-	opts.ValueThreshold = 1024       // 1KB值阈值，小值存储在LSM中
+	opts.ValueThreshold = 512        // 🔧 从1024减少到512，更多数据存储在LSM中，提高读取性能
 
 	// 多实例冲突处理：尝试打开数据库，如果失败则使用只读模式
 	db, err := badger.Open(opts)
@@ -109,6 +110,12 @@ func (c *BadgerCache) Set(key string, value interface{}, ttl time.Duration) erro
 	// 如果数据库被禁用，静默忽略
 	if c.db == nil {
 		return nil
+	}
+
+	// 🔧 轻量级优化：定期检查缓存大小
+	c.operationCount++
+	if c.operationCount%1000 == 0 {
+		c.checkCacheSize()
 	}
 
 	entry := CacheEntry{
@@ -386,6 +393,31 @@ func (c *BadgerCache) runGC() {
 			fs.Debugf(nil, "BadgerDB垃圾回收失败 %s: %v", c.name, err)
 		} else if err == nil {
 			fs.Debugf(nil, "BadgerDB垃圾回收完成 %s", c.name)
+		}
+	}
+}
+
+// checkCacheSize 检查缓存大小，超过限制时清理
+// 🔧 轻量级优化：简单的缓存大小控制机制
+func (c *BadgerCache) checkCacheSize() {
+	if c.db == nil {
+		return
+	}
+
+	// 获取数据库大小信息
+	lsm, vlog := c.db.Size()
+	totalSize := lsm + vlog
+
+	// 设置最大缓存大小为100MB
+	const maxCacheSize = 100 << 20 // 100MB
+
+	if totalSize > maxCacheSize {
+		fs.Debugf(nil, "缓存 %s 大小超过限制 (%d MB)，执行清理", c.name, totalSize>>20)
+		// 简单策略：超过限制就清空缓存
+		if err := c.Clear(); err != nil {
+			fs.Debugf(nil, "清理缓存 %s 失败: %v", c.name, err)
+		} else {
+			fs.Debugf(nil, "已清理缓存 %s", c.name)
 		}
 	}
 }

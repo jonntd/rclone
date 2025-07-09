@@ -319,18 +319,22 @@ func (f *Fs) indexInfo(ctx context.Context) (data *api.IndexData, err error) {
 
 // getDownloadURL gets a download URL using OpenAPI.
 func (f *Fs) getDownloadURL(ctx context.Context, pickCode string) (durl *api.DownloadURL, err error) {
+	return f.getDownloadURLWithForce(ctx, pickCode, false)
+}
+
+// getDownloadURLWithForce gets a download URL using OpenAPI with optional cache bypass.
+func (f *Fs) getDownloadURLWithForce(ctx context.Context, pickCode string, forceRefresh bool) (durl *api.DownloadURL, err error) {
 	if f.isShare {
 		// Should call getDownloadURLFromShare for shared links
 		return nil, errors.New("use getDownloadURLFromShare for shared filesystems")
 	}
 
-	// 首先尝试从缓存获取
-	if cachedURL, found := f.getDownloadURLFromCache(pickCode); found {
-		fs.Debugf(f, "115网盘下载URL缓存命中: pickCode=%s", pickCode)
-		return &api.DownloadURL{URL: cachedURL}, nil
+	// 🗑️ 下载URL缓存已删除，直接调用API获取
+	if forceRefresh {
+		fs.Debugf(f, "115网盘强制刷新下载URL: pickCode=%s", pickCode)
+	} else {
+		fs.Debugf(f, "115网盘获取下载URL: pickCode=%s", pickCode)
 	}
-
-	fs.Debugf(f, "115网盘下载URL缓存未命中，调用API: pickCode=%s", pickCode)
 
 	form := url.Values{}
 	form.Set("pick_code", pickCode)
@@ -345,7 +349,8 @@ func (f *Fs) getDownloadURL(ctx context.Context, pickCode string) (durl *api.Dow
 	}
 
 	var respData api.OpenAPIDownloadResp
-	err = f.CallOpenAPI(ctx, &opts, nil, &respData, false)
+	// 🔧 使用专用的下载URL调速器，防止API调用频率过高
+	err = f.CallDownloadURLAPI(ctx, &opts, nil, &respData, false)
 	if err != nil {
 		return nil, fmt.Errorf("OpenAPI downurl failed for pickcode %s: %w", pickCode, err)
 	}
@@ -374,7 +379,8 @@ func (f *Fs) getDownloadURL(ctx context.Context, pickCode string) (durl *api.Dow
 		fs.Debugf(f, "115网盘解析到URL过期时间: pickCode=%s, 过期时间=%v", pickCode, realExpiresAt)
 	}
 
-	f.saveDownloadURLToCache(pickCode, downInfo.URL.URL, realExpiresAt)
+	// 🗑️ 下载URL缓存已删除，不再保存到缓存
+	fs.Debugf(f, "115网盘下载URL获取成功，不使用缓存: pickCode=%s", pickCode)
 
 	return &downInfo.URL, nil
 }

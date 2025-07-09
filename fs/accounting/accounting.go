@@ -73,6 +73,10 @@ type Account struct {
 	tokenBucket buckets // per file bandwidth limiter (may be nil)
 
 	values accountValues
+
+	// 🔧 新增：网盘特定的进度信息扩展
+	extraInfo string       // 用于显示网盘特定的额外信息（如分片进度）
+	extraMu   sync.RWMutex // 保护extraInfo的并发访问
 }
 
 // accountValues holds statistics for this Account
@@ -514,6 +518,21 @@ func shortenName(in string, size int) string {
 	return string(name)
 }
 
+// SetExtraInfo 设置网盘特定的额外进度信息
+func (acc *Account) SetExtraInfo(info string) {
+	acc.extraMu.Lock()
+	acc.extraInfo = info
+	acc.extraMu.Unlock()
+}
+
+// GetExtraInfo 获取网盘特定的额外进度信息
+func (acc *Account) GetExtraInfo() string {
+	acc.extraMu.RLock()
+	info := acc.extraInfo
+	acc.extraMu.RUnlock()
+	return info
+}
+
 // String produces stats for this file
 func (acc *Account) String() string {
 	a, b := acc.progress()
@@ -537,7 +556,10 @@ func (acc *Account) String() string {
 		percentageDone = int(100 * float64(a) / float64(b))
 	}
 
-	return fmt.Sprintf("%*s:%3d%% /%s, %s/s, %s",
+	// 🔧 新增：获取网盘特定的额外信息
+	extraInfo := acc.GetExtraInfo()
+
+	baseString := fmt.Sprintf("%*s:%3d%% /%s, %s/s, %s",
 		acc.ci.StatsFileNameLength,
 		shortenName(acc.name, acc.ci.StatsFileNameLength),
 		percentageDone,
@@ -545,6 +567,13 @@ func (acc *Account) String() string {
 		fs.SizeSuffix(cur),
 		etas,
 	)
+
+	// 如果有额外信息，则附加到基础字符串后面
+	if extraInfo != "" {
+		return baseString + " " + extraInfo
+	}
+
+	return baseString
 }
 
 // rcStats adds remote control stats for this file
