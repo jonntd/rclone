@@ -874,7 +874,8 @@ func (f *Fs) newOSSClient() (*oss.Client, error) {
 		WithUseDualStackEndpoint(f.opt.DualStack).
 		WithUseInternalEndpoint(f.opt.Internal).
 		WithConnectTimeout(time.Duration(f.opt.ConTimeout)). // Set timeouts
-		WithReadWriteTimeout(time.Duration(f.opt.Timeout))
+		// 🔧 大幅增加OSS读写超时时间，支持大文件上传
+		WithReadWriteTimeout(15 * time.Minute) // 从2分钟增加到15分钟
 
 	// Create the client
 	client := oss.NewClient(cfg)
@@ -1196,7 +1197,11 @@ func (f *Fs) sampleUploadForm(ctx context.Context, in io.Reader, initResp *api.S
 	// 🔧 使用专用的上传调速器，优化样本上传API调用频率
 	var resp *http.Response
 	err = f.uploadPacer.Call(func() (bool, error) {
-		httpClient := fshttp.NewClient(ctx)
+		// 🔧 使用优化过的HTTP客户端而不是默认客户端
+		httpClient := f.httpClient
+		if httpClient == nil {
+			httpClient = fshttp.NewClient(ctx)
+		}
 		resp, err = httpClient.Do(req)
 		if err != nil {
 			retry, retryErr := shouldRetry(ctx, resp, err)
@@ -1622,6 +1627,18 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 	if f.isShare {
 		return nil, errors.New("upload unsupported for shared filesystem")
 	}
+
+	// 🔧 设置上传标志，防止预热干扰上传
+	f.uploadingMu.Lock()
+	f.isUploading = true
+	f.uploadingMu.Unlock()
+
+	defer func() {
+		f.uploadingMu.Lock()
+		f.isUploading = false
+		f.uploadingMu.Unlock()
+		fs.Debugf(f, "🔧 上传完成，清除上传标志")
+	}()
 
 	// Start the token renewer if we have a valid one
 	if f.tokenRenewer != nil {

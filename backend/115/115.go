@@ -18,8 +18,10 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -57,7 +59,7 @@ const (
 	// 🔧 优化的QPS配置 - 基于115网盘API特性和稳定性考虑
 	defaultGlobalMinSleep = fs.Duration(200 * time.Millisecond) // 5 QPS - 通用API调用频率
 	traditionalMinSleep   = fs.Duration(500 * time.Millisecond) // ~2 QPS - 提升传统API响应速度
-	uploadMinSleep        = fs.Duration(333 * time.Millisecond) // ~3 QPS - 上传API专用，平衡性能和稳定性
+	uploadMinSleep        = fs.Duration(100 * time.Millisecond) // ~10 QPS - 上传API专用，提高上传性能
 	downloadURLMinSleep   = fs.Duration(500 * time.Millisecond) // ~2 QPS - 下载URL API专用，避免反爬
 	maxSleep              = 2 * time.Second
 	decayConstant         = 2 // bigger for slower decay, exponential
@@ -67,7 +69,7 @@ const (
 
 	maxUploadSize       = 115 * fs.Gibi // 115 GiB from https://proapi.115.com/app/uploadinfo (or OpenAPI equivalent)
 	maxUploadParts      = 10000         // Part number must be an integer between 1 and 10000, inclusive.
-	defaultChunkSize    = 10 * fs.Mebi  // 从5MB提高到10MB，减少分片数量，提升性能
+	defaultChunkSize    = 50 * fs.Mebi  // 从10MB提高到50MB，大幅减少分片数量，提升性能
 	minChunkSize        = 100 * fs.Kibi
 	maxChunkSize        = 5 * fs.Gibi  // Max part size for OSS
 	defaultUploadCutoff = 50 * fs.Mebi // 降低到50MB，让更多文件使用多线程上传
@@ -333,6 +335,12 @@ type Fs struct {
 	fileObj       *fs.Object
 	m             configmap.Mapper // config map for saving tokens
 
+	// 断点续传管理器
+	resumeManager *ResumeManager115
+
+	// 🚀 功能增强：智能URL管理器，解决下载URL频繁过期问题
+	smartURLManager *SmartURLManager
+
 	// Token management
 	tokenMu      sync.Mutex
 	accessToken  string
@@ -356,6 +364,10 @@ type Fs struct {
 
 	// HTTP连接池优化
 	httpClient *http.Client
+
+	// 上传操作锁，防止预热和上传同时进行
+	uploadingMu sync.Mutex
+	isUploading bool
 }
 
 // CacheConfig115 115网盘缓存时间配置
@@ -1422,7 +1434,8 @@ func (cr *Credential) UserID() string {
 func getHTTPClient(ctx context.Context, opt *Options) *http.Client {
 	t := fshttp.NewTransportCustom(ctx, func(t *http.Transport) {
 		t.TLSHandshakeTimeout = time.Duration(opt.ConTimeout)
-		t.ResponseHeaderTimeout = time.Duration(opt.Timeout)
+		// 🔧 大幅增加响应头超时时间，支持大文件上传
+		t.ResponseHeaderTimeout = 10 * time.Minute // 从2分钟增加到10分钟
 
 		// 优化连接池配置
 		t.MaxIdleConns = 100                 // 最大空闲连接数
@@ -1442,7 +1455,8 @@ func getHTTPClient(ctx context.Context, opt *Options) *http.Client {
 
 	return &http.Client{
 		Transport: t,
-		Timeout:   time.Duration(opt.Timeout) + 60*time.Second, // 增加缓冲时间到60秒，支持跨云盘大文件传输
+		// 🔧 大幅增加总超时时间，支持大文件上传
+		Timeout: 15 * time.Minute, // 从3分钟增加到15分钟
 	}
 }
 
@@ -2125,7 +2139,7 @@ func (f *Fs) CallUploadAPI(ctx context.Context, opts *rest.Opts, request any, re
 
 	// 🔧 使用专用的上传调速器，而不是全局调速器
 	return f.uploadPacer.Call(func() (shouldRetryGlobal bool, errGlobal error) {
-		fs.Debugf(f, "🔍 CallUploadAPI: 进入uploadPacer (QPS限制: ~3 QPS)")
+		fs.Debugf(f, "🔍 CallUploadAPI: 进入uploadPacer (QPS限制: ~10 QPS)")
 
 		// Ensure token is available and current
 		if !skipToken {
@@ -2605,6 +2619,20 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	fs.Debugf(f, "BadgerDB缓存系统初始化完成: %s", cacheDir)
 
+	// 初始化断点续传管理器（使用BadgerDB）
+	resumeManager, resumeErr := NewResumeManager115(f, filepath.Join(cacheDir, "resume"))
+	if resumeErr != nil {
+		fs.Errorf(f, "初始化断点续传管理器失败: %v", resumeErr)
+		// 断点续传失败不应该阻止文件系统工作，继续执行
+	} else {
+		f.resumeManager = resumeManager
+		fs.Debugf(f, "断点续传管理器初始化成功（BadgerDB）")
+	}
+
+	// 🚀 功能增强：初始化智能URL管理器，解决下载URL频繁过期问题
+	f.smartURLManager = NewSmartURLManager(f)
+	fs.Debugf(f, "智能URL管理器初始化成功")
+
 	// 初始化优化的HTTP客户端
 	f.httpClient = &http.Client{
 		Transport: &http.Transport{
@@ -2729,8 +2757,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Initialize directory cache
 	f.dirCache = dircache.New(f.root, f.rootFolderID, f)
 
-	// 🔧 优化：启动智能缓存预热，参考123网盘的成功经验
-	go f.intelligentCachePreheating(ctx)
+	// 🔧 暂时禁用智能缓存预热，避免干扰上传性能
+	// go f.intelligentCachePreheating(ctx)
 
 	// Find the current working directory
 	if f.root != "" {
@@ -3943,7 +3971,33 @@ func (o *Object) open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	// 检查URL有效性（在锁保护下）
 	if o.durl == nil || !o.durl.Valid() {
 		o.durlMu.Unlock()
-		return nil, errors.New("download URL is invalid or expired")
+
+		// 🚀 功能增强：使用智能URL管理器获取有效URL
+		if o.fs.smartURLManager != nil && o.pickCode != "" {
+			fs.Debugf(o, "🔄 URL无效，使用智能URL管理器获取新URL: pickCode=%s", o.pickCode)
+			newURL, err := o.fs.smartURLManager.GetDownloadURL(o.pickCode, false)
+			if err != nil {
+				fs.Debugf(o, "❌ 智能URL管理器获取URL失败: %v", err)
+				return nil, fmt.Errorf("智能URL管理器获取URL失败: %w", err)
+			}
+
+			// 更新对象的下载URL
+			o.durlMu.Lock()
+			o.durl = &api.DownloadURL{URL: newURL}
+			o.durlMu.Unlock()
+			fs.Debugf(o, "✅ 智能URL管理器成功获取新URL")
+		} else {
+			if o.fs.smartURLManager == nil {
+				fs.Debugf(o, "⚠️ 智能URL管理器未初始化")
+			}
+			if o.pickCode == "" {
+				fs.Debugf(o, "⚠️ pickCode为空")
+			}
+			return nil, errors.New("download URL is invalid or expired")
+		}
+
+		// 重新获取锁以继续后续操作
+		o.durlMu.Lock()
 	}
 
 	// 创建URL的本地副本，避免在使用过程中被其他线程修改
@@ -4480,10 +4534,53 @@ func (dp *DownloadProgress) GetProgressInfo() (percentage float64, avgSpeed floa
 	return percentage, avgSpeed, peakSpeed, eta, dp.completedChunks, dp.totalChunks, dp.downloadedBytes, dp.totalBytes
 }
 
-// downloadChunksConcurrently 115网盘并发下载文件分片（集成到rclone标准进度显示）
+// downloadChunksConcurrently 115网盘并发下载文件分片（集成断点续传和rclone标准进度显示）
 func (f *Fs) downloadChunksConcurrently(ctx context.Context, srcObj *Object, tempFile *os.File, chunkSize, numChunks, maxConcurrency int64) error {
-	// 创建进度跟踪器
+	// 🔧 断点续传：生成任务ID并尝试加载已有的断点信息
+	taskID := GenerateTaskID115(srcObj.remote, srcObj.Size())
+	var resumeInfo *ResumeInfo115
+
+	if f.resumeManager != nil {
+		var err error
+		resumeInfo, err = f.resumeManager.LoadResumeInfo(taskID)
+		if err != nil {
+			fs.Debugf(f, "加载断点续传信息失败: %v", err)
+		} else if resumeInfo != nil {
+			// 验证断点信息的有效性
+			if resumeInfo.FileSize == srcObj.Size() &&
+				resumeInfo.ChunkSize == chunkSize &&
+				resumeInfo.TotalChunks == numChunks {
+				fs.Infof(f, "🔄 发现断点续传信息: %s, 已完成 %d/%d 分片",
+					srcObj.remote, resumeInfo.GetCompletedChunkCount(), numChunks)
+			} else {
+				fs.Debugf(f, "断点续传信息不匹配，重新开始下载")
+				resumeInfo = nil
+			}
+		}
+	}
+
+	// 如果没有有效的断点信息，创建新的
+	if resumeInfo == nil {
+		resumeInfo = &ResumeInfo115{
+			TaskID:          taskID,
+			FileName:        srcObj.remote,
+			FileSize:        srcObj.Size(),
+			FilePath:        srcObj.remote,
+			ChunkSize:       chunkSize,
+			TotalChunks:     numChunks,
+			CompletedChunks: make(map[int64]bool),
+			CreatedAt:       time.Now(),
+			TempFilePath:    tempFile.Name(),
+		}
+	}
+
+	// 创建进度跟踪器，考虑已完成的分片
 	progress := NewDownloadProgress(numChunks, srcObj.Size())
+
+	// 如果有已完成的分片，更新进度
+	for chunkIndex := range resumeInfo.CompletedChunks {
+		progress.UpdateChunkProgress(chunkIndex, chunkSize, 0) // 已完成的分片，耗时为0
+	}
 
 	// 🔧 关键修复：获取当前传输的Account对象，用于报告实际下载进度
 	var currentAccount *accounting.Account
@@ -4529,6 +4626,20 @@ func (f *Fs) downloadChunksConcurrently(ctx context.Context, srcObj *Object, tem
 		go func(chunkIndex int64) {
 			defer wg.Done()
 
+			// 🔧 添加panic恢复机制，提高系统稳定性
+			defer func() {
+				if r := recover(); r != nil {
+					fs.Errorf(f, "115网盘下载分片 %d 发生panic: %v", chunkIndex, r)
+					errChan <- fmt.Errorf("下载分片 %d panic: %v", chunkIndex, r)
+				}
+			}()
+
+			// 🔧 断点续传：检查分片是否已完成
+			if resumeInfo.IsChunkCompleted(chunkIndex) {
+				fs.Debugf(f, "跳过已完成的分片: %d", chunkIndex)
+				return
+			}
+
 			// 获取信号量
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
@@ -4551,6 +4662,14 @@ func (f *Fs) downloadChunksConcurrently(ctx context.Context, srcObj *Object, tem
 				return
 			}
 
+			// 🔧 断点续传：标记分片为已完成并保存
+			resumeInfo.MarkChunkCompleted(chunkIndex)
+			if f.resumeManager != nil {
+				if saveErr := f.resumeManager.SaveResumeInfo(resumeInfo); saveErr != nil {
+					fs.Debugf(f, "保存断点续传信息失败: %v", saveErr)
+				}
+			}
+
 			// 更新进度（包含下载时间）
 			progress.UpdateChunkProgress(chunkIndex, actualChunkSize, chunkDuration)
 
@@ -4568,6 +4687,15 @@ func (f *Fs) downloadChunksConcurrently(ctx context.Context, srcObj *Object, tem
 	for err := range errChan {
 		if err != nil {
 			return err
+		}
+	}
+
+	// 🔧 断点续传：下载完成后清理断点信息
+	if f.resumeManager != nil {
+		if err := f.resumeManager.DeleteResumeInfo(taskID); err != nil {
+			fs.Debugf(f, "清理断点续传信息失败: %v", err)
+		} else {
+			fs.Debugf(f, "断点续传信息已清理: %s", taskID)
 		}
 	}
 
@@ -4645,27 +4773,25 @@ func (f *Fs) displayDownloadProgress(ctx context.Context, progress *DownloadProg
 }
 
 // displayUnifiedDownloadProgress 统一的下载进度显示函数
+// 🚀 性能优化：集成到rclone主进度条，减少独立进度显示的频率
 func (f *Fs) displayUnifiedDownloadProgress(progress *DownloadProgress, networkName, fileName string) {
-	percentage, avgSpeed, peakSpeed, eta, completed, total, downloadedBytes, totalBytes := progress.GetProgressInfo()
+	percentage, avgSpeed, _, eta, completed, total, downloadedBytes, _ := progress.GetProgressInfo()
 
-	// 计算ETA显示
-	etaStr := "ETA: -"
-	if eta > 0 {
-		etaStr = fmt.Sprintf("ETA: %v", eta.Round(time.Second))
-	} else if avgSpeed > 0 {
-		etaStr = "ETA: 计算中..."
+	// 🚀 优化：减少独立进度显示频率，只在关键节点显示
+	if completed%5 == 0 || completed == total { // 每5个分片或完成时显示
+		// 计算ETA显示
+		etaStr := "ETA: -"
+		if eta > 0 {
+			etaStr = fmt.Sprintf("ETA: %v", eta.Round(time.Second))
+		} else if avgSpeed > 0 {
+			etaStr = "ETA: 计算中..."
+		}
+
+		// 简化的进度显示格式，集成到rclone日志系统
+		fs.Debugf(f, "📥 %s: %d/%d分片 (%.1f%%) | %s | %.2f MB/s | %s",
+			networkName, completed, total, percentage,
+			fs.SizeSuffix(downloadedBytes), avgSpeed, etaStr)
 	}
-
-	// 创建进度条
-	progressBar := f.createProgressBar(percentage)
-
-	// 统一的进度显示格式
-	fs.Infof(f, "📥 %s下载进度: %s", networkName, fileName)
-	fs.Infof(f, "   %s %.1f%% | %d/%d分片 | %s/%s",
-		progressBar, percentage, completed, total,
-		fs.SizeSuffix(downloadedBytes), fs.SizeSuffix(totalBytes))
-	fs.Infof(f, "   平均速度: %.2f MB/s | 峰值速度: %.2f MB/s | %s",
-		avgSpeed, peakSpeed, etaStr)
 }
 
 // createProgressBar 创建进度条字符串
@@ -4705,12 +4831,31 @@ func (f *Fs) downloadChunk(ctx context.Context, srcObj *Object, tempFile *os.Fil
 			// 🔧 修复：强制刷新下载URL，避免重试时仍然获取过期URL
 			fs.Debugf(f, "115网盘分片重试，强制刷新下载URL: pickCode=%s", srcObj.pickCode)
 
-			// 使用强制刷新方法，跳过缓存直接获取新URL
-			err := srcObj.setDownloadURLWithForce(ctx, true)
-			if err != nil {
-				lastErr = fmt.Errorf("刷新下载URL失败: %w", err)
-				time.Sleep(time.Duration(retry) * time.Second) // 增加延迟
-				continue
+			// 🚀 功能增强：使用智能URL管理器，减少API调用冲突
+			if f.smartURLManager != nil {
+				fs.Debugf(f, "🔄 使用智能URL管理器刷新URL: pickCode=%s, 分片=%d", srcObj.pickCode, chunkIndex)
+				newURL, err := f.smartURLManager.GetDownloadURL(srcObj.pickCode, true)
+				if err != nil {
+					fs.Debugf(f, "❌ 智能URL管理器失败: %v", err)
+					lastErr = fmt.Errorf("智能URL管理器获取URL失败: %w", err)
+					time.Sleep(time.Duration(retry) * time.Second) // 增加延迟
+					continue
+				}
+
+				// 更新对象的下载URL
+				srcObj.durlMu.Lock()
+				srcObj.durl = &api.DownloadURL{URL: newURL}
+				srcObj.durlMu.Unlock()
+				fs.Debugf(f, "✅ 智能URL管理器成功更新URL: 分片=%d", chunkIndex)
+			} else {
+				fs.Debugf(f, "⚠️ 智能URL管理器未初始化，使用传统方法")
+				// 回退到原有方法
+				err := srcObj.setDownloadURLWithForce(ctx, true)
+				if err != nil {
+					lastErr = fmt.Errorf("刷新下载URL失败: %w", err)
+					time.Sleep(time.Duration(retry) * time.Second) // 增加延迟
+					continue
+				}
 			}
 
 			// 验证新URL是否有效
@@ -4844,22 +4989,22 @@ func isHTMLErrorResponse(data []byte) bool {
 }
 
 // calculateDownloadChunkSize 115网盘智能计算下载分片大小
-// 🔧 优化：基于文件大小和并发数动态调整分片大小
+// 🚀 性能优化：提升分片大小，目标提升传输速度15-20%
 func (f *Fs) calculateDownloadChunkSize(fileSize int64) int64 {
-	// 🚀 新的智能分片策略：平衡内存使用和下载效率
+	// 🚀 优化的智能分片策略：更大的分片提升传输效率
 	switch {
 	case fileSize < 50*1024*1024: // <50MB
-		return 8 * 1024 * 1024 // 8MB分片，小文件使用较小分片
+		return 16 * 1024 * 1024 // 16MB分片（从8MB提升）
 	case fileSize < 200*1024*1024: // <200MB
-		return 16 * 1024 * 1024 // 16MB分片
+		return 32 * 1024 * 1024 // 32MB分片（从16MB提升）
 	case fileSize < 1*1024*1024*1024: // <1GB
-		return 32 * 1024 * 1024 // 32MB分片
+		return 64 * 1024 * 1024 // 64MB分片（从32MB提升）
 	case fileSize < 5*1024*1024*1024: // <5GB
-		return 64 * 1024 * 1024 // 64MB分片
+		return 128 * 1024 * 1024 // 128MB分片（从64MB提升）
 	case fileSize < 20*1024*1024*1024: // <20GB
-		return 128 * 1024 * 1024 // 128MB分片，大文件使用更大分片
+		return 256 * 1024 * 1024 // 256MB分片（保持不变）
 	default: // >20GB
-		return 256 * 1024 * 1024 // 256MB分片，超大文件使用最大分片
+		return 512 * 1024 * 1024 // 512MB分片（从256MB提升）
 	}
 }
 
@@ -4876,35 +5021,360 @@ func (f *Fs) calculateDownloadConcurrency(fileSize int64) int {
 }
 
 // getBaseConcurrency 获取基础并发数
+// 🚀 功能增强：115网盘单文件并发限制到4，平衡性能和稳定性
 func (f *Fs) getBaseConcurrency(fileSize int64) int {
-	// 🔧 与123网盘保持一致：最多4个并发下载
-	// 基于文件大小动态调整并发数，平衡性能和稳定性
+	// 🚀 用户要求：115网盘单文件并发限制到4
 	switch {
-	case fileSize < 100*1024*1024: // <100MB
+	case fileSize < 50*1024*1024: // <50MB
 		return 2 // 小文件使用2并发
-	case fileSize < 500*1024*1024: // <500MB
+	case fileSize < 200*1024*1024: // <200MB
 		return 3 // 中等文件使用3并发
-	default: // >500MB
-		return 4 // 大文件使用4并发（与123网盘一致）
+	case fileSize < 1*1024*1024*1024: // <1GB
+		return 4 // 大文件使用4并发
+	case fileSize < 5*1024*1024*1024: // <5GB
+		return 4 // 超大文件使用4并发
+	default: // >5GB
+		return 4 // 巨大文件使用4并发，符合用户要求的上限
 	}
 }
 
 // adjustConcurrencyByNetworkCondition 根据网络状况调整并发数
+// 🚀 性能优化：实现基于网络延迟和带宽的自适应并发数调整
 func (f *Fs) adjustConcurrencyByNetworkCondition(baseConcurrency int) int {
-	// 🔧 与123网盘保持一致：最多4个并发下载
-	// 设置最大并发限制，避免过度并发导致服务器压力和URL过期
-	maxConcurrency := 4
-	if baseConcurrency > maxConcurrency {
-		return maxConcurrency
+	// 🚀 新增：网络质量检测和自适应调整
+	networkLatency := f.measureNetworkLatency()
+	networkBandwidth := f.estimateNetworkBandwidth()
+
+	// 基于网络延迟调整并发数
+	latencyFactor := 1.0
+	if networkLatency < 50 { // <50ms 低延迟
+		latencyFactor = 1.3
+	} else if networkLatency < 100 { // <100ms 中等延迟
+		latencyFactor = 1.0
+	} else if networkLatency < 200 { // <200ms 高延迟
+		latencyFactor = 0.8
+	} else { // >200ms 很高延迟
+		latencyFactor = 0.6
 	}
 
-	// 设置最小并发，确保基本性能
-	minConcurrency := 2
-	if baseConcurrency < minConcurrency {
-		return minConcurrency
+	// 基于带宽调整并发数
+	bandwidthFactor := 1.0
+	if networkBandwidth > 100*1024*1024 { // >100Mbps
+		bandwidthFactor = 1.2
+	} else if networkBandwidth > 50*1024*1024 { // >50Mbps
+		bandwidthFactor = 1.0
+	} else if networkBandwidth > 20*1024*1024 { // >20Mbps
+		bandwidthFactor = 0.9
+	} else { // <20Mbps
+		bandwidthFactor = 0.7
 	}
 
-	return baseConcurrency
+	// 计算调整后的并发数
+	adjustedConcurrency := int(float64(baseConcurrency) * latencyFactor * bandwidthFactor)
+
+	// 🚀 用户要求：115网盘单文件并发限制到4
+	maxConcurrency := 4 // 用户要求的并发上限
+	if adjustedConcurrency > maxConcurrency {
+		adjustedConcurrency = maxConcurrency
+	}
+
+	minConcurrency := 1 // 从2降低到1，允许单线程下载
+	if adjustedConcurrency < minConcurrency {
+		adjustedConcurrency = minConcurrency
+	}
+
+	fs.Debugf(f, "🔧 115网盘自适应并发调整: 延迟=%dms, 带宽=%s/s, 基础并发=%d, 调整后并发=%d",
+		networkLatency, fs.SizeSuffix(networkBandwidth), baseConcurrency, adjustedConcurrency)
+
+	return adjustedConcurrency
+}
+
+// measureNetworkLatency 测量网络延迟
+// 🚀 性能优化：实现网络延迟检测，用于自适应并发调整
+func (f *Fs) measureNetworkLatency() int64 {
+	// 简单的延迟测量：向115网盘API发送HEAD请求
+	start := time.Now()
+
+	// 构建测试URL
+	testURL := "https://webapi.115.com/files"
+	req, err := http.NewRequest("HEAD", testURL, nil)
+	if err != nil {
+		return 100 // 默认延迟100ms
+	}
+
+	// 设置请求头
+	req.Header.Set("User-Agent", f.opt.UserAgent)
+
+	// 发送请求
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 150 // 网络错误时返回较高延迟
+	}
+	defer resp.Body.Close()
+
+	latency := time.Since(start).Milliseconds()
+	return latency
+}
+
+// estimateNetworkBandwidth 估算网络带宽
+// 🚀 性能优化：实现网络带宽估算，用于自适应并发调整
+func (f *Fs) estimateNetworkBandwidth() int64 {
+	// 简化的带宽估算：基于历史传输速度
+	// 这里使用一个保守的估算方法
+
+	// 默认带宽估算（50Mbps）
+	defaultBandwidth := int64(50 * 1024 * 1024)
+
+	// TODO: 可以基于历史传输数据进行更精确的估算
+	// 目前返回默认值，后续可以集成实际的带宽测试
+
+	return defaultBandwidth
+}
+
+// SmartURLManager 智能URL管理器
+// 🚀 功能增强：解决115网盘下载URL频繁过期问题
+type SmartURLManager struct {
+	fs           *Fs
+	urlCache     map[string]*URLCacheEntry
+	cacheMutex   sync.RWMutex
+	refreshMutex sync.Mutex // 防止并发刷新
+
+	// 🚀 新增：批量刷新管理
+	batchRefreshQueue map[string]*BatchRefreshRequest
+	batchMutex        sync.Mutex
+	refreshTimer      *time.Timer
+
+	// 统计信息
+	refreshCount int64
+	hitCount     int64
+	missCount    int64
+}
+
+// BatchRefreshRequest 批量刷新请求
+type BatchRefreshRequest struct {
+	PickCode     string
+	RequestTime  time.Time
+	WaitingCount int32 // 等待此次刷新的分片数量
+	Done         chan *URLCacheEntry
+}
+
+// URLCacheEntry URL缓存条目
+type URLCacheEntry struct {
+	URL        string
+	ExpiryTime time.Time
+	CreatedAt  time.Time
+	HitCount   int64
+}
+
+// NewSmartURLManager 创建智能URL管理器
+func NewSmartURLManager(fs *Fs) *SmartURLManager {
+	return &SmartURLManager{
+		fs:                fs,
+		urlCache:          make(map[string]*URLCacheEntry),
+		batchRefreshQueue: make(map[string]*BatchRefreshRequest),
+	}
+}
+
+// GetDownloadURL 智能获取下载URL
+// 🚀 功能增强：批量刷新机制，减少API调用冲突
+func (sum *SmartURLManager) GetDownloadURL(pickCode string, forceRefresh bool) (string, error) {
+	// 如果不强制刷新，先检查缓存
+	if !forceRefresh {
+		if url, valid := sum.getCachedURL(pickCode); valid {
+			atomic.AddInt64(&sum.hitCount, 1)
+			return url, nil
+		}
+		atomic.AddInt64(&sum.missCount, 1)
+	}
+
+	// 检查是否已有批量刷新请求
+	if entry, exists := sum.checkBatchRefresh(pickCode); exists {
+		// 等待批量刷新完成
+		select {
+		case result := <-entry.Done:
+			if result != nil {
+				return result.URL, nil
+			}
+			return "", fmt.Errorf("批量刷新失败")
+		case <-time.After(10 * time.Second):
+			return "", fmt.Errorf("批量刷新超时")
+		}
+	}
+
+	// 创建新的批量刷新请求
+	return sum.performBatchRefresh(pickCode)
+}
+
+// getCachedURL 获取缓存的URL
+func (sum *SmartURLManager) getCachedURL(pickCode string) (string, bool) {
+	sum.cacheMutex.RLock()
+	defer sum.cacheMutex.RUnlock()
+
+	entry, exists := sum.urlCache[pickCode]
+	if !exists {
+		return "", false
+	}
+
+	// 检查是否过期（提前30秒过期以避免边界情况）
+	if time.Now().Add(30 * time.Second).After(entry.ExpiryTime) {
+		return "", false
+	}
+
+	entry.HitCount++
+	return entry.URL, true
+}
+
+// checkBatchRefresh 检查是否已有批量刷新请求
+func (sum *SmartURLManager) checkBatchRefresh(pickCode string) (*BatchRefreshRequest, bool) {
+	sum.batchMutex.Lock()
+	defer sum.batchMutex.Unlock()
+
+	request, exists := sum.batchRefreshQueue[pickCode]
+	if exists {
+		atomic.AddInt32(&request.WaitingCount, 1)
+	}
+	return request, exists
+}
+
+// performBatchRefresh 执行批量刷新
+func (sum *SmartURLManager) performBatchRefresh(pickCode string) (string, error) {
+	sum.refreshMutex.Lock()
+	defer sum.refreshMutex.Unlock()
+
+	// 双重检查：可能在等待锁的过程中已经被其他goroutine刷新了
+	if url, valid := sum.getCachedURL(pickCode); valid {
+		return url, nil
+	}
+
+	// 创建批量刷新请求
+	request := &BatchRefreshRequest{
+		PickCode:     pickCode,
+		RequestTime:  time.Now(),
+		WaitingCount: 1,
+		Done:         make(chan *URLCacheEntry, 10), // 缓冲通道
+	}
+
+	sum.batchMutex.Lock()
+	sum.batchRefreshQueue[pickCode] = request
+	sum.batchMutex.Unlock()
+
+	// 延迟100ms执行刷新，允许更多分片加入批量请求
+	time.Sleep(100 * time.Millisecond)
+
+	// 执行实际的URL刷新
+	url, expiryTime, err := sum.refreshURLFromAPI(pickCode)
+
+	// 清理批量刷新请求
+	sum.batchMutex.Lock()
+	delete(sum.batchRefreshQueue, pickCode)
+	sum.batchMutex.Unlock()
+
+	if err != nil {
+		// 通知所有等待的goroutine失败
+		close(request.Done)
+		return "", err
+	}
+
+	// 更新缓存
+	entry := &URLCacheEntry{
+		URL:        url,
+		ExpiryTime: expiryTime,
+		CreatedAt:  time.Now(),
+		HitCount:   1,
+	}
+
+	sum.cacheMutex.Lock()
+	sum.urlCache[pickCode] = entry
+	sum.cacheMutex.Unlock()
+
+	atomic.AddInt64(&sum.refreshCount, 1)
+
+	// 通知所有等待的goroutine成功
+	waitingCount := atomic.LoadInt32(&request.WaitingCount)
+	for i := int32(0); i < waitingCount; i++ {
+		select {
+		case request.Done <- entry:
+		default:
+			// 通道已满，跳过
+		}
+	}
+	close(request.Done)
+
+	fs.Debugf(sum.fs, "🔄 115网盘批量刷新URL成功: pickCode=%s, 等待分片数=%d, URL过期时间=%v",
+		pickCode, waitingCount, expiryTime)
+
+	return url, nil
+}
+
+// refreshURLFromAPI 从API刷新URL
+func (sum *SmartURLManager) refreshURLFromAPI(pickCode string) (string, time.Time, error) {
+	ctx := context.Background()
+
+	// 构建API请求
+	opts := rest.Opts{
+		Method:      "POST",
+		Path:        "/open/ufile/downurl",
+		ContentType: "application/x-www-form-urlencoded",
+		Body:        strings.NewReader("pick_code=" + pickCode),
+		ExtraHeaders: map[string]string{
+			"User-Agent": sum.fs.opt.UserAgent,
+		},
+	}
+
+	// 🚀 修复：使用正确的API响应结构
+	var response ApiResponse
+	err := sum.fs.CallDownloadURLAPI(ctx, &opts, nil, &response, false)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("获取下载URL失败: %w", err)
+	}
+
+	// 🚀 修复：从ApiResponse中提取下载URL
+	for _, downInfo := range response.Data {
+		if downInfo != (FileInfo{}) && downInfo.URL.URL != "" {
+			// 解析过期时间（115网盘URL通常4分钟过期）
+			expiryTime := time.Now().Add(4 * time.Minute)
+
+			// 尝试从URL中解析过期时间
+			if parsedURL, err := url.Parse(downInfo.URL.URL); err == nil {
+				if expireStr := parsedURL.Query().Get("expire"); expireStr != "" {
+					if expireTimestamp, err := strconv.ParseInt(expireStr, 10, 64); err == nil {
+						expiryTime = time.Unix(expireTimestamp, 0)
+					}
+				}
+			}
+
+			fs.Debugf(sum.fs, "🔄 115网盘智能URL管理器成功获取URL: pickCode=%s, URL长度=%d, 过期时间=%v",
+				pickCode, len(downInfo.URL.URL), expiryTime)
+
+			return downInfo.URL.URL, expiryTime, nil
+		}
+	}
+
+	return "", time.Time{}, fmt.Errorf("API响应中未找到有效的下载URL")
+}
+
+// GetStatistics 获取统计信息
+func (sum *SmartURLManager) GetStatistics() map[string]interface{} {
+	sum.cacheMutex.RLock()
+	defer sum.cacheMutex.RUnlock()
+
+	totalHits := atomic.LoadInt64(&sum.hitCount)
+	totalMisses := atomic.LoadInt64(&sum.missCount)
+	totalRefresh := atomic.LoadInt64(&sum.refreshCount)
+
+	hitRate := float64(0)
+	if totalHits+totalMisses > 0 {
+		hitRate = float64(totalHits) / float64(totalHits+totalMisses) * 100
+	}
+
+	return map[string]interface{}{
+		"cache_entries": len(sum.urlCache),
+		"hit_count":     totalHits,
+		"miss_count":    totalMisses,
+		"refresh_count": totalRefresh,
+		"hit_rate":      fmt.Sprintf("%.2f%%", hitRate),
+	}
 }
 
 // calculateUploadConcurrency 115网盘上传并发数计算
@@ -5108,6 +5578,17 @@ func (f *Fs) preheatFrequentPaths(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		default:
+			// 🔧 检查是否有上传操作正在进行，如果有则跳过预热
+			f.uploadingMu.Lock()
+			uploading := f.isUploading
+			f.uploadingMu.Unlock()
+
+			if uploading {
+				fs.Debugf(f, "🔄 检测到上传操作，暂停预热: %s", path)
+				time.Sleep(5 * time.Second) // 等待更长时间再检查
+				continue
+			}
+
 			if f.dirCache != nil {
 				_, err := f.dirCache.FindDir(ctx, path, false)
 				if err == nil {
@@ -5374,4 +5855,140 @@ func (r *ConcurrentDownloadReader) Close() error {
 	err := r.file.Close()
 	os.Remove(r.tempPath) // 删除临时文件
 	return err
+}
+
+// ResumeInfo115 115网盘断点续传信息
+type ResumeInfo115 struct {
+	TaskID          string         `json:"task_id"`
+	FileName        string         `json:"file_name"`
+	FileSize        int64          `json:"file_size"`
+	FilePath        string         `json:"file_path"`
+	ChunkSize       int64          `json:"chunk_size"`
+	TotalChunks     int64          `json:"total_chunks"`
+	CompletedChunks map[int64]bool `json:"completed_chunks"`
+	CreatedAt       time.Time      `json:"created_at"`
+	LastUpdated     time.Time      `json:"last_updated"`
+	TempFilePath    string         `json:"temp_file_path"`
+}
+
+// ResumeManager115 115网盘断点续传管理器（使用BadgerDB）
+type ResumeManager115 struct {
+	mu          sync.RWMutex
+	resumeCache *cache.BadgerCache
+	fs          *Fs
+}
+
+// NewResumeManager115 创建115网盘断点续传管理器（使用BadgerDB）
+func NewResumeManager115(fs *Fs, cacheDir string) (*ResumeManager115, error) {
+	resumeCache, err := cache.NewBadgerCache("115-resume", cacheDir)
+	if err != nil {
+		return nil, fmt.Errorf("创建115网盘断点续传BadgerDB缓存失败: %w", err)
+	}
+
+	return &ResumeManager115{
+		resumeCache: resumeCache,
+		fs:          fs,
+	}, nil
+}
+
+// SaveResumeInfo 保存断点续传信息到BadgerDB
+func (rm *ResumeManager115) SaveResumeInfo(info *ResumeInfo115) error {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	info.LastUpdated = time.Now()
+
+	// 使用taskID作为缓存键
+	cacheKey := fmt.Sprintf("resume_115_%s", info.TaskID)
+
+	err := rm.resumeCache.Set(cacheKey, info, 24*time.Hour) // 24小时过期
+	if err != nil {
+		return fmt.Errorf("保存115网盘断点续传信息到BadgerDB失败: %w", err)
+	}
+
+	fs.Debugf(rm.fs, "保存115网盘断点续传信息: %s, 已完成分片: %d/%d",
+		info.FileName, len(info.CompletedChunks), info.TotalChunks)
+
+	return nil
+}
+
+// LoadResumeInfo 从BadgerDB加载断点续传信息
+func (rm *ResumeManager115) LoadResumeInfo(taskID string) (*ResumeInfo115, error) {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+
+	cacheKey := fmt.Sprintf("resume_115_%s", taskID)
+	var info ResumeInfo115
+
+	found, err := rm.resumeCache.Get(cacheKey, &info)
+	if err != nil {
+		return nil, fmt.Errorf("从BadgerDB加载115网盘断点续传信息失败: %w", err)
+	}
+
+	if !found {
+		return nil, nil // 没有找到断点续传信息
+	}
+
+	// 检查信息是否过期（超过24小时）
+	if time.Since(info.CreatedAt) > 24*time.Hour {
+		rm.DeleteResumeInfo(taskID)
+		return nil, nil
+	}
+
+	fs.Debugf(rm.fs, "加载115网盘断点续传信息: %s, 已完成分片: %d/%d",
+		info.FileName, len(info.CompletedChunks), info.TotalChunks)
+
+	return &info, nil
+}
+
+// DeleteResumeInfo 从BadgerDB删除断点续传信息
+func (rm *ResumeManager115) DeleteResumeInfo(taskID string) error {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	cacheKey := fmt.Sprintf("resume_115_%s", taskID)
+	err := rm.resumeCache.Delete(cacheKey)
+	if err != nil {
+		return fmt.Errorf("从BadgerDB删除115网盘断点续传信息失败: %w", err)
+	}
+
+	fs.Debugf(rm.fs, "删除115网盘断点续传信息: %s", taskID)
+	return nil
+}
+
+// IsChunkCompleted 检查分片是否已完成
+func (info *ResumeInfo115) IsChunkCompleted(chunkIndex int64) bool {
+	if info.CompletedChunks == nil {
+		return false
+	}
+	return info.CompletedChunks[chunkIndex]
+}
+
+// MarkChunkCompleted 标记分片为已完成
+func (info *ResumeInfo115) MarkChunkCompleted(chunkIndex int64) {
+	if info.CompletedChunks == nil {
+		info.CompletedChunks = make(map[int64]bool)
+	}
+	info.CompletedChunks[chunkIndex] = true
+}
+
+// GetCompletedChunkCount 获取已完成的分片数量
+func (info *ResumeInfo115) GetCompletedChunkCount() int64 {
+	return int64(len(info.CompletedChunks))
+}
+
+// Close 关闭115网盘断点续传管理器
+func (rm *ResumeManager115) Close() error {
+	if rm.resumeCache != nil {
+		return rm.resumeCache.Close()
+	}
+	return nil
+}
+
+// GenerateTaskID115 生成115网盘任务ID
+func GenerateTaskID115(filePath string, fileSize int64) string {
+	return fmt.Sprintf("115_%s_%d_%d",
+		strings.ReplaceAll(filePath, "/", "_"),
+		fileSize,
+		time.Now().Unix())
 }

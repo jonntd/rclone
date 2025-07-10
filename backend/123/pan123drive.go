@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/sha1"
 	"encoding/json"
 	"fmt"
 	"hash"
@@ -82,9 +83,9 @@ const (
 	decayConstant = 2
 
 	// 文件上传相关常量
-	singleStepUploadLimit = 50 * 1024 * 1024  // 500MB - 单步上传API的文件大小限制
-	maxMemoryBufferSize   = 512 * 1024 * 1024 // 512MB - 内存缓冲的最大大小，防止内存不足
-	maxFileNameBytes      = 255               // 文件名的最大字节长度（UTF-8编码）
+	singleStepUploadLimit = 50 * 1024 * 1024   // 500MB - 单步上传API的文件大小限制
+	maxMemoryBufferSize   = 1024 * 1024 * 1024 // 1GB - 内存缓冲的最大大小（从512MB提升）
+	maxFileNameBytes      = 255                // 文件名的最大字节长度（UTF-8编码）
 
 	// 文件冲突处理策略常量已移除，当前使用API默认行为
 
@@ -3203,14 +3204,41 @@ type ResumeInfo struct {
 }
 
 // ResumeManager 断点续传管理器
+// 🚀 功能增强：支持跨云盘传输的智能断点续传
 type ResumeManager struct {
 	mu           sync.RWMutex
 	resumeCache  *cache.BadgerCache
 	fs           *Fs
 	cleanupTimer *time.Timer
+
+	// 🚀 新增：跨云盘传输断点续传支持
+	crossCloudResume map[string]*CrossCloudResumeInfo
+	crossCloudMutex  sync.RWMutex
+}
+
+// CrossCloudResumeInfo 跨云盘传输断点续传信息
+// 🚀 功能增强：支持跨云盘传输的断点续传
+type CrossCloudResumeInfo struct {
+	SourcePath      string         `json:"source_path"`      // 源文件路径
+	TargetPath      string         `json:"target_path"`      // 目标文件路径
+	FileSize        int64          `json:"file_size"`        // 文件总大小
+	CompletedChunks map[int64]bool `json:"completed_chunks"` // 已完成的分片
+	ChunkSize       int64          `json:"chunk_size"`       // 分片大小
+	TotalChunks     int64          `json:"total_chunks"`     // 总分片数
+	MD5Hash         string         `json:"md5_hash"`         // 文件MD5
+	SHA1Hash        string         `json:"sha1_hash"`        // 文件SHA1
+	CreatedAt       time.Time      `json:"created_at"`       // 创建时间
+	LastUpdated     time.Time      `json:"last_updated"`     // 最后更新时间
+	TempFilePath    string         `json:"temp_file_path"`   // 临时文件路径
+	SourceType      string         `json:"source_type"`      // 源类型(123/115/local)
+	TargetType      string         `json:"target_type"`      // 目标类型(123/115/local)
+	DownloadedBytes int64          `json:"downloaded_bytes"` // 已下载字节数
+	UploadedBytes   int64          `json:"uploaded_bytes"`   // 已上传字节数
+	TransferID      string         `json:"transfer_id"`      // 传输唯一标识
 }
 
 // NewResumeManager 创建断点续传管理器
+// 🚀 功能增强：支持跨云盘传输的智能断点续传
 func NewResumeManager(fs *Fs, cacheDir string) (*ResumeManager, error) {
 	resumeCache, err := cache.NewBadgerCache("resume", cacheDir)
 	if err != nil {
@@ -3218,8 +3246,9 @@ func NewResumeManager(fs *Fs, cacheDir string) (*ResumeManager, error) {
 	}
 
 	rm := &ResumeManager{
-		resumeCache: resumeCache,
-		fs:          fs,
+		resumeCache:      resumeCache,
+		fs:               fs,
+		crossCloudResume: make(map[string]*CrossCloudResumeInfo),
 	}
 
 	// 启动定期清理过期的断点续传信息
@@ -3515,6 +3544,131 @@ func (rm *ResumeManager) getAllResumeKeys() ([]string, error) {
 	return keys, nil
 }
 
+// SaveCrossCloudResumeInfo 保存跨云盘传输断点续传信息
+// 🚀 功能增强：支持跨云盘传输的智能断点续传
+func (rm *ResumeManager) SaveCrossCloudResumeInfo(info *CrossCloudResumeInfo) error {
+	rm.crossCloudMutex.Lock()
+	defer rm.crossCloudMutex.Unlock()
+
+	info.LastUpdated = time.Now()
+	cacheKey := fmt.Sprintf("crosscloud_%s", info.TransferID)
+
+	// 保存到内存缓存
+	rm.crossCloudResume[info.TransferID] = info
+
+	// 保存到持久化缓存
+	err := rm.resumeCache.Set(cacheKey, info, 48*time.Hour) // 跨云盘传输保留48小时
+	if err != nil {
+		return fmt.Errorf("保存跨云盘断点续传信息失败: %w", err)
+	}
+
+	fs.Debugf(rm.fs, "🌐 保存跨云盘断点续传信息: %s->%s, 已完成分片: %d/%d",
+		info.SourcePath, info.TargetPath, len(info.CompletedChunks), info.TotalChunks)
+
+	return nil
+}
+
+// LoadCrossCloudResumeInfo 加载跨云盘传输断点续传信息
+// 🚀 功能增强：支持跨云盘传输的智能断点续传
+func (rm *ResumeManager) LoadCrossCloudResumeInfo(transferID string) (*CrossCloudResumeInfo, error) {
+	rm.crossCloudMutex.RLock()
+	defer rm.crossCloudMutex.RUnlock()
+
+	// 先从内存缓存查找
+	if info, exists := rm.crossCloudResume[transferID]; exists {
+		// 检查是否过期
+		if time.Since(info.CreatedAt) <= 48*time.Hour {
+			return info, nil
+		}
+		// 过期则删除
+		delete(rm.crossCloudResume, transferID)
+	}
+
+	// 从持久化缓存查找
+	cacheKey := fmt.Sprintf("crosscloud_%s", transferID)
+	var info CrossCloudResumeInfo
+
+	found, err := rm.resumeCache.Get(cacheKey, &info)
+	if err != nil {
+		return nil, fmt.Errorf("加载跨云盘断点续传信息失败: %w", err)
+	}
+
+	if !found {
+		return nil, nil // 没有找到断点续传信息
+	}
+
+	// 检查信息是否过期（超过48小时）
+	if time.Since(info.CreatedAt) > 48*time.Hour {
+		rm.DeleteCrossCloudResumeInfo(transferID)
+		return nil, nil
+	}
+
+	// 加载到内存缓存
+	rm.crossCloudResume[transferID] = &info
+
+	fs.Debugf(rm.fs, "🌐 加载跨云盘断点续传信息: %s->%s, 已完成分片: %d/%d",
+		info.SourcePath, info.TargetPath, len(info.CompletedChunks), info.TotalChunks)
+
+	return &info, nil
+}
+
+// UpdateCrossCloudChunkInfo 更新跨云盘传输分片信息
+// 🚀 功能增强：支持跨云盘传输的智能断点续传
+func (rm *ResumeManager) UpdateCrossCloudChunkInfo(transferID string, chunkIndex int64, chunkSize int64) error {
+	rm.crossCloudMutex.Lock()
+	defer rm.crossCloudMutex.Unlock()
+
+	info, exists := rm.crossCloudResume[transferID]
+	if !exists {
+		// 尝试从持久化缓存加载
+		loadedInfo, err := rm.LoadCrossCloudResumeInfo(transferID)
+		if err != nil || loadedInfo == nil {
+			return fmt.Errorf("跨云盘断点续传信息不存在: %s", transferID)
+		}
+		info = loadedInfo
+	}
+
+	// 更新分片信息
+	if info.CompletedChunks == nil {
+		info.CompletedChunks = make(map[int64]bool)
+	}
+	info.CompletedChunks[chunkIndex] = true
+	info.DownloadedBytes += chunkSize
+	info.LastUpdated = time.Now()
+
+	// 保存更新后的信息
+	cacheKey := fmt.Sprintf("crosscloud_%s", transferID)
+	err := rm.resumeCache.Set(cacheKey, info, 48*time.Hour)
+	if err != nil {
+		return fmt.Errorf("更新跨云盘断点续传信息失败: %w", err)
+	}
+
+	fs.Debugf(rm.fs, "🌐 更新跨云盘分片信息: %s, 分片 %d, 进度: %d/%d",
+		info.SourcePath, chunkIndex, len(info.CompletedChunks), info.TotalChunks)
+
+	return nil
+}
+
+// DeleteCrossCloudResumeInfo 删除跨云盘传输断点续传信息
+// 🚀 功能增强：支持跨云盘传输的智能断点续传
+func (rm *ResumeManager) DeleteCrossCloudResumeInfo(transferID string) error {
+	rm.crossCloudMutex.Lock()
+	defer rm.crossCloudMutex.Unlock()
+
+	// 从内存缓存删除
+	delete(rm.crossCloudResume, transferID)
+
+	// 从持久化缓存删除
+	cacheKey := fmt.Sprintf("crosscloud_%s", transferID)
+	err := rm.resumeCache.Delete(cacheKey)
+	if err != nil {
+		return fmt.Errorf("删除跨云盘断点续传信息失败: %w", err)
+	}
+
+	fs.Debugf(rm.fs, "🌐 删除跨云盘断点续传信息: %s", transferID)
+	return nil
+}
+
 // Close 关闭断点续传管理器
 func (rm *ResumeManager) Close() error {
 	if rm.cleanupTimer != nil {
@@ -3526,6 +3680,473 @@ func (rm *ResumeManager) Close() error {
 	}
 
 	return nil
+}
+
+// FileIntegrityVerifier 文件完整性验证器
+// 🚀 功能增强：实现文件完整性验证机制
+type FileIntegrityVerifier struct {
+	fs *Fs
+}
+
+// NewFileIntegrityVerifier 创建文件完整性验证器
+func NewFileIntegrityVerifier(fs *Fs) *FileIntegrityVerifier {
+	return &FileIntegrityVerifier{fs: fs}
+}
+
+// VerifyFileIntegrity 验证文件完整性
+// 🚀 功能增强：支持多种哈希算法的文件完整性验证
+func (fiv *FileIntegrityVerifier) VerifyFileIntegrity(ctx context.Context, filePath string, expectedMD5, expectedSHA1 string, fileSize int64) (*IntegrityResult, error) {
+	result := &IntegrityResult{
+		FilePath:     filePath,
+		FileSize:     fileSize,
+		ExpectedMD5:  expectedMD5,
+		ExpectedSHA1: expectedSHA1,
+		StartTime:    time.Now(),
+	}
+
+	// 检查文件是否存在
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		result.Error = fmt.Sprintf("文件不存在: %v", err)
+		return result, err
+	}
+
+	// 验证文件大小
+	actualSize := fileInfo.Size()
+	if actualSize != fileSize {
+		result.Error = fmt.Sprintf("文件大小不匹配: 期望=%d, 实际=%d", fileSize, actualSize)
+		result.SizeMatch = false
+		return result, fmt.Errorf("文件大小验证失败")
+	}
+	result.SizeMatch = true
+
+	// 打开文件进行哈希计算
+	file, err := os.Open(filePath)
+	if err != nil {
+		result.Error = fmt.Sprintf("无法打开文件: %v", err)
+		return result, err
+	}
+	defer file.Close()
+
+	// 并行计算MD5和SHA1
+	md5Hash := md5.New()
+	sha1Hash := sha1.New()
+	multiWriter := io.MultiWriter(md5Hash, sha1Hash)
+
+	// 使用缓冲读取提高性能
+	buffer := make([]byte, 1024*1024) // 1MB缓冲区
+	_, err = io.CopyBuffer(multiWriter, file, buffer)
+	if err != nil {
+		result.Error = fmt.Sprintf("读取文件失败: %v", err)
+		return result, err
+	}
+
+	// 获取计算结果
+	result.ActualMD5 = fmt.Sprintf("%x", md5Hash.Sum(nil))
+	result.ActualSHA1 = fmt.Sprintf("%x", sha1Hash.Sum(nil))
+	result.EndTime = time.Now()
+	result.Duration = result.EndTime.Sub(result.StartTime)
+
+	// 验证MD5
+	if expectedMD5 != "" {
+		result.MD5Match = strings.EqualFold(result.ActualMD5, expectedMD5)
+		if !result.MD5Match {
+			result.Error = fmt.Sprintf("MD5不匹配: 期望=%s, 实际=%s", expectedMD5, result.ActualMD5)
+		}
+	}
+
+	// 验证SHA1
+	if expectedSHA1 != "" {
+		result.SHA1Match = strings.EqualFold(result.ActualSHA1, expectedSHA1)
+		if !result.SHA1Match {
+			if result.Error != "" {
+				result.Error += "; "
+			}
+			result.Error += fmt.Sprintf("SHA1不匹配: 期望=%s, 实际=%s", expectedSHA1, result.ActualSHA1)
+		}
+	}
+
+	// 判断整体验证结果
+	result.IsValid = result.SizeMatch &&
+		(expectedMD5 == "" || result.MD5Match) &&
+		(expectedSHA1 == "" || result.SHA1Match)
+
+	if result.IsValid {
+		fs.Debugf(fiv.fs, "✅ 文件完整性验证通过: %s (耗时: %v)", filePath, result.Duration)
+	} else {
+		fs.Debugf(fiv.fs, "❌ 文件完整性验证失败: %s - %s", filePath, result.Error)
+	}
+
+	return result, nil
+}
+
+// IntegrityResult 完整性验证结果
+type IntegrityResult struct {
+	FilePath     string        `json:"file_path"`
+	FileSize     int64         `json:"file_size"`
+	ExpectedMD5  string        `json:"expected_md5"`
+	ExpectedSHA1 string        `json:"expected_sha1"`
+	ActualMD5    string        `json:"actual_md5"`
+	ActualSHA1   string        `json:"actual_sha1"`
+	SizeMatch    bool          `json:"size_match"`
+	MD5Match     bool          `json:"md5_match"`
+	SHA1Match    bool          `json:"sha1_match"`
+	IsValid      bool          `json:"is_valid"`
+	StartTime    time.Time     `json:"start_time"`
+	EndTime      time.Time     `json:"end_time"`
+	Duration     time.Duration `json:"duration"`
+	Error        string        `json:"error,omitempty"`
+}
+
+// EnhancedErrorHandler 增强错误处理器
+// 🚀 功能增强：提供更友好和详细的错误提示信息
+type EnhancedErrorHandler struct {
+	fs *Fs
+}
+
+// NewEnhancedErrorHandler 创建增强错误处理器
+func NewEnhancedErrorHandler(fs *Fs) *EnhancedErrorHandler {
+	return &EnhancedErrorHandler{fs: fs}
+}
+
+// HandleAPIError 处理API错误，提供友好的错误信息
+// 🚀 功能增强：将技术错误转换为用户友好的提示信息
+func (eeh *EnhancedErrorHandler) HandleAPIError(err error, operation string) error {
+	if err == nil {
+		return nil
+	}
+
+	// 解析错误类型和提供相应的解决方案
+	errorMsg := err.Error()
+
+	// 网络相关错误
+	if strings.Contains(errorMsg, "timeout") || strings.Contains(errorMsg, "connection") {
+		return fmt.Errorf("🌐 网络连接问题 - %s失败\n"+
+			"💡 建议解决方案：\n"+
+			"   1. 检查网络连接是否稳定\n"+
+			"   2. 尝试重新执行操作\n"+
+			"   3. 如果问题持续，请稍后再试\n"+
+			"原始错误: %v", operation, err)
+	}
+
+	// 认证相关错误
+	if strings.Contains(errorMsg, "401") || strings.Contains(errorMsg, "token") || strings.Contains(errorMsg, "unauthorized") {
+		return fmt.Errorf("🔐 身份验证问题 - %s失败\n"+
+			"💡 建议解决方案：\n"+
+			"   1. 重新配置123网盘认证信息\n"+
+			"   2. 检查token是否已过期\n"+
+			"   3. 运行 'rclone config' 重新授权\n"+
+			"原始错误: %v", operation, err)
+	}
+
+	// 权限相关错误
+	if strings.Contains(errorMsg, "403") || strings.Contains(errorMsg, "forbidden") || strings.Contains(errorMsg, "permission") {
+		return fmt.Errorf("🚫 权限不足 - %s失败\n"+
+			"💡 建议解决方案：\n"+
+			"   1. 检查是否有足够的权限访问该文件/目录\n"+
+			"   2. 确认123网盘账户状态正常\n"+
+			"   3. 联系管理员获取必要权限\n"+
+			"原始错误: %v", operation, err)
+	}
+
+	// 文件不存在错误
+	if strings.Contains(errorMsg, "404") || strings.Contains(errorMsg, "not found") {
+		return fmt.Errorf("📁 文件或目录不存在 - %s失败\n"+
+			"💡 建议解决方案：\n"+
+			"   1. 检查文件路径是否正确\n"+
+			"   2. 确认文件是否已被移动或删除\n"+
+			"   3. 使用 'rclone ls' 查看可用文件\n"+
+			"原始错误: %v", operation, err)
+	}
+
+	// 存储空间不足错误
+	if strings.Contains(errorMsg, "space") || strings.Contains(errorMsg, "quota") || strings.Contains(errorMsg, "storage") {
+		return fmt.Errorf("💾 存储空间不足 - %s失败\n"+
+			"💡 建议解决方案：\n"+
+			"   1. 清理123网盘中的不需要文件\n"+
+			"   2. 升级存储空间套餐\n"+
+			"   3. 选择其他目标位置\n"+
+			"原始错误: %v", operation, err)
+	}
+
+	// 文件名相关错误
+	if strings.Contains(errorMsg, "filename") || strings.Contains(errorMsg, "name") {
+		return fmt.Errorf("📝 文件名问题 - %s失败\n"+
+			"💡 建议解决方案：\n"+
+			"   1. 检查文件名是否包含特殊字符\n"+
+			"   2. 确保文件名长度不超过255字符\n"+
+			"   3. 避免使用以下字符: \" \\ / : * ? | > <\n"+
+			"原始错误: %v", operation, err)
+	}
+
+	// QPS限制错误
+	if strings.Contains(errorMsg, "rate") || strings.Contains(errorMsg, "limit") || strings.Contains(errorMsg, "429") {
+		return fmt.Errorf("⏱️ 请求频率过高 - %s失败\n"+
+			"💡 建议解决方案：\n"+
+			"   1. 稍等片刻后重试\n"+
+			"   2. 减少并发传输数量\n"+
+			"   3. 使用 --transfers=1 限制并发\n"+
+			"原始错误: %v", operation, err)
+	}
+
+	// 服务器错误
+	if strings.Contains(errorMsg, "500") || strings.Contains(errorMsg, "502") || strings.Contains(errorMsg, "503") {
+		return fmt.Errorf("🔧 服务器暂时不可用 - %s失败\n"+
+			"💡 建议解决方案：\n"+
+			"   1. 稍后重试操作\n"+
+			"   2. 检查123网盘服务状态\n"+
+			"   3. 如果问题持续，请联系技术支持\n"+
+			"原始错误: %v", operation, err)
+	}
+
+	// 默认错误处理
+	return fmt.Errorf("❌ %s操作失败\n"+
+		"💡 建议解决方案：\n"+
+		"   1. 检查网络连接和认证状态\n"+
+		"   2. 重试操作或稍后再试\n"+
+		"   3. 如需帮助，请提供以下错误信息\n"+
+		"原始错误: %v", operation, err)
+}
+
+// LogOperationResult 记录操作结果，提供详细的成功/失败信息
+// 🚀 功能增强：统一的操作结果记录，便于问题诊断
+func (eeh *EnhancedErrorHandler) LogOperationResult(operation string, success bool, duration time.Duration, details map[string]interface{}) {
+	if success {
+		fs.Infof(eeh.fs, "✅ %s成功完成 (耗时: %v)", operation, duration)
+		if len(details) > 0 {
+			for key, value := range details {
+				fs.Debugf(eeh.fs, "   📊 %s: %v", key, value)
+			}
+		}
+	} else {
+		fs.Errorf(eeh.fs, "❌ %s失败 (耗时: %v)", operation, duration)
+		if len(details) > 0 {
+			for key, value := range details {
+				fs.Debugf(eeh.fs, "   🔍 %s: %v", key, value)
+			}
+		}
+	}
+}
+
+// SmartCacheManager 智能缓存管理器
+// 🚀 功能增强：实现智能缓存管理策略，优化缓存效率
+type SmartCacheManager struct {
+	fs               *Fs
+	cacheStats       map[string]*CacheStats
+	statsMutex       sync.RWMutex
+	cleanupThreshold int64         // 缓存清理阈值
+	maxCacheSize     int64         // 最大缓存大小
+	adaptiveCleanup  bool          // 自适应清理
+	lastCleanupTime  time.Time     // 上次清理时间
+	cleanupInterval  time.Duration // 清理间隔
+}
+
+// CacheStats 缓存统计信息
+type CacheStats struct {
+	HitCount    int64     `json:"hit_count"`    // 命中次数
+	MissCount   int64     `json:"miss_count"`   // 未命中次数
+	LastHit     time.Time `json:"last_hit"`     // 最后命中时间
+	CreatedAt   time.Time `json:"created_at"`   // 创建时间
+	AccessCount int64     `json:"access_count"` // 访问次数
+	DataSize    int64     `json:"data_size"`    // 数据大小
+}
+
+// NewSmartCacheManager 创建智能缓存管理器
+func NewSmartCacheManager(fs *Fs) *SmartCacheManager {
+	return &SmartCacheManager{
+		fs:               fs,
+		cacheStats:       make(map[string]*CacheStats),
+		cleanupThreshold: 1000,              // 1000个缓存项触发清理
+		maxCacheSize:     500 * 1024 * 1024, // 500MB最大缓存
+		adaptiveCleanup:  true,              // 启用自适应清理
+		cleanupInterval:  30 * time.Minute,  // 30分钟清理间隔
+		lastCleanupTime:  time.Now(),
+	}
+}
+
+// RecordCacheHit 记录缓存命中
+// 🚀 功能增强：智能缓存统计，优化缓存策略
+func (scm *SmartCacheManager) RecordCacheHit(cacheKey string, dataSize int64) {
+	scm.statsMutex.Lock()
+	defer scm.statsMutex.Unlock()
+
+	stats, exists := scm.cacheStats[cacheKey]
+	if !exists {
+		stats = &CacheStats{
+			CreatedAt: time.Now(),
+		}
+		scm.cacheStats[cacheKey] = stats
+	}
+
+	stats.HitCount++
+	stats.AccessCount++
+	stats.LastHit = time.Now()
+	stats.DataSize = dataSize
+
+	// 检查是否需要清理
+	if scm.shouldTriggerCleanup() {
+		go scm.performSmartCleanup()
+	}
+}
+
+// RecordCacheMiss 记录缓存未命中
+func (scm *SmartCacheManager) RecordCacheMiss(cacheKey string) {
+	scm.statsMutex.Lock()
+	defer scm.statsMutex.Unlock()
+
+	stats, exists := scm.cacheStats[cacheKey]
+	if !exists {
+		stats = &CacheStats{
+			CreatedAt: time.Now(),
+		}
+		scm.cacheStats[cacheKey] = stats
+	}
+
+	stats.MissCount++
+	stats.AccessCount++
+}
+
+// shouldTriggerCleanup 判断是否应该触发清理
+func (scm *SmartCacheManager) shouldTriggerCleanup() bool {
+	// 检查缓存项数量
+	if len(scm.cacheStats) > int(scm.cleanupThreshold) {
+		return true
+	}
+
+	// 检查总缓存大小
+	totalSize := scm.getTotalCacheSize()
+	if totalSize > scm.maxCacheSize {
+		return true
+	}
+
+	// 检查时间间隔
+	if time.Since(scm.lastCleanupTime) > scm.cleanupInterval {
+		return true
+	}
+
+	return false
+}
+
+// getTotalCacheSize 获取总缓存大小
+func (scm *SmartCacheManager) getTotalCacheSize() int64 {
+	var totalSize int64
+	for _, stats := range scm.cacheStats {
+		totalSize += stats.DataSize
+	}
+	return totalSize
+}
+
+// performSmartCleanup 执行智能清理
+// 🚀 功能增强：基于访问模式的智能缓存清理
+func (scm *SmartCacheManager) performSmartCleanup() {
+	scm.statsMutex.Lock()
+	defer scm.statsMutex.Unlock()
+
+	fs.Debugf(scm.fs, "🧹 开始智能缓存清理...")
+	startTime := time.Now()
+
+	// 计算清理策略
+	cleanupCandidates := scm.identifyCleanupCandidates()
+
+	cleanedCount := 0
+	for _, candidate := range cleanupCandidates {
+		// 实际清理缓存项
+		scm.cleanupCacheItem(candidate)
+		delete(scm.cacheStats, candidate)
+		cleanedCount++
+	}
+
+	scm.lastCleanupTime = time.Now()
+	duration := time.Since(startTime)
+
+	fs.Debugf(scm.fs, "✅ 智能缓存清理完成: 清理了%d个项目, 耗时: %v", cleanedCount, duration)
+}
+
+// identifyCleanupCandidates 识别清理候选项
+func (scm *SmartCacheManager) identifyCleanupCandidates() []string {
+	now := time.Now()
+	var candidates []string
+
+	// 清理策略：
+	// 1. 超过24小时未访问的项目
+	// 2. 命中率低于10%的项目
+	// 3. 最近很少访问的大文件缓存
+
+	for key, stats := range scm.cacheStats {
+		// 策略1：长时间未访问
+		if now.Sub(stats.LastHit) > 24*time.Hour {
+			candidates = append(candidates, key)
+			continue
+		}
+
+		// 策略2：命中率过低
+		if stats.AccessCount > 10 {
+			hitRate := float64(stats.HitCount) / float64(stats.AccessCount)
+			if hitRate < 0.1 {
+				candidates = append(candidates, key)
+				continue
+			}
+		}
+
+		// 策略3：大文件且访问频率低
+		if stats.DataSize > 10*1024*1024 && // 大于10MB
+			stats.AccessCount < 3 && // 访问次数少于3次
+			now.Sub(stats.CreatedAt) > 2*time.Hour { // 创建超过2小时
+			candidates = append(candidates, key)
+		}
+	}
+
+	return candidates
+}
+
+// cleanupCacheItem 清理具体的缓存项
+func (scm *SmartCacheManager) cleanupCacheItem(cacheKey string) {
+	// 这里需要根据具体的缓存类型进行清理
+	// 由于123网盘有多种缓存，需要识别缓存类型并调用相应的清理方法
+
+	if scm.fs.dirListCache != nil {
+		scm.fs.dirListCache.Delete(cacheKey)
+	}
+
+	if scm.fs.pathToIDCache != nil {
+		scm.fs.pathToIDCache.Delete(cacheKey)
+	}
+
+	if scm.fs.parentIDCache != nil {
+		scm.fs.parentIDCache.Delete(cacheKey)
+	}
+}
+
+// GetCacheStatistics 获取缓存统计信息
+// 🚀 功能增强：提供详细的缓存性能统计
+func (scm *SmartCacheManager) GetCacheStatistics() map[string]interface{} {
+	scm.statsMutex.RLock()
+	defer scm.statsMutex.RUnlock()
+
+	totalHits := int64(0)
+	totalMisses := int64(0)
+	totalSize := int64(0)
+	totalItems := len(scm.cacheStats)
+
+	for _, stats := range scm.cacheStats {
+		totalHits += stats.HitCount
+		totalMisses += stats.MissCount
+		totalSize += stats.DataSize
+	}
+
+	hitRate := float64(0)
+	if totalHits+totalMisses > 0 {
+		hitRate = float64(totalHits) / float64(totalHits+totalMisses) * 100
+	}
+
+	return map[string]interface{}{
+		"total_items":  totalItems,
+		"total_hits":   totalHits,
+		"total_misses": totalMisses,
+		"hit_rate":     fmt.Sprintf("%.2f%%", hitRate),
+		"total_size":   fs.SizeSuffix(totalSize),
+		"last_cleanup": scm.lastCleanupTime.Format("2006-01-02 15:04:05"),
+	}
 }
 
 // 🗑️ DownloadURLCacheManager 已删除 - 下载URL缓存已移除
@@ -4330,21 +4951,21 @@ func (f *Fs) completeUploadWithResultAndSize(ctx context.Context, preuploadID st
 		} `json:"data"`
 	}
 
-	// 📊 根据文件大小动态调整轮询次数（基于官方流程图优化）
-	// 基础轮询次数：20次（20秒）
-	// 大文件额外轮询：每100MB增加60次轮询（充足的校验时间）
+	// 📊 根据文件大小动态调整轮询次数（针对123网盘校验特性优化）
+	// 基础轮询次数：120次（2分钟）- 为随机数据文件提供充足校验时间
+	// 大文件额外轮询：每25MB增加60次轮询（更积极的等待策略）
 	// 最大轮询次数：600次（10分钟）- 为大文件提供充足时间
-	maxAttempts := 20
+	maxAttempts := 120 // 大幅提高基础轮询次数，适应123网盘校验特性
 	if fileSize > 0 {
 		// 计算文件大小（MB）
 		fileSizeMB := fileSize / (1024 * 1024)
-		// 每100MB增加60次轮询，为大文件提供更充足的校验时间
-		extraAttempts := int(fileSizeMB/100) * 60
-		if extraAttempts > 580 {
-			extraAttempts = 580 // 最多600次轮询（10分钟）
+		// 每25MB增加60次轮询，为中小文件也提供充足的校验时间
+		extraAttempts := int(fileSizeMB/25) * 60
+		if extraAttempts > 480 {
+			extraAttempts = 480 // 最多600次轮询（10分钟）
 		}
 		maxAttempts += extraAttempts
-		fs.Debugf(f, "📊 根据文件大小(%dMB)调整轮询策略: 基础20次 + 额外%d次 = 总计%d次轮询 (预计%d分钟)", fileSizeMB, extraAttempts, maxAttempts, maxAttempts/60+1)
+		fs.Debugf(f, "📊 根据文件大小(%dMB)调整轮询策略: 基础120次 + 额外%d次 = 总计%d次轮询 (预计%d分钟)", fileSizeMB, extraAttempts, maxAttempts, maxAttempts/60+1)
 	}
 
 	fs.Debugf(f, "🔍 DEBUG: completeUploadWithResultAndSize 开始轮询，文件大小=%d字节，最大轮询次数=%d", fileSize, maxAttempts)
@@ -4827,7 +5448,7 @@ func (f *Fs) concurrentDownloadCrossCloudTransfer(ctx context.Context, srcObj fs
 	}
 
 	numChunks := (fileSize + chunkSize - 1) / chunkSize
-	maxConcurrency := int64(4) // 最多4个并发下载
+	maxConcurrency := int64(4) // 🚀 用户要求：123网盘单文件并发限制到4
 	if numChunks < maxConcurrency {
 		maxConcurrency = numChunks
 	}
@@ -4913,6 +5534,14 @@ func (f *Fs) downloadChunksConcurrently(ctx context.Context, srcObj fs.Object, t
 		go func(chunkIndex int64) {
 			defer wg.Done()
 
+			// 🔧 添加panic恢复机制，提高系统稳定性
+			defer func() {
+				if r := recover(); r != nil {
+					fs.Errorf(f, "123网盘下载分片 %d 发生panic: %v", chunkIndex, r)
+					errChan <- fmt.Errorf("下载分片 %d panic: %v", chunkIndex, r)
+				}
+			}()
+
 			// 获取信号量
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
@@ -4979,8 +5608,17 @@ func (f *Fs) downloadChunk(ctx context.Context, srcObj fs.Object, tempFile *os.F
 		}
 
 		// 使用Range选项打开文件分片
+		// 🔧 修复无限循环：直接调用openNormal避免触发并发下载检查
 		rangeOption := &fs.RangeOption{Start: start, End: end}
-		chunkReader, err := srcObj.Open(ctx, rangeOption)
+		var chunkReader io.ReadCloser
+		var err error
+		if obj, ok := srcObj.(*Object); ok {
+			// 如果是123网盘对象，直接调用openNormal避免无限循环
+			chunkReader, err = obj.openNormal(ctx, rangeOption)
+		} else {
+			// 其他类型的对象，使用标准Open方法
+			chunkReader, err = srcObj.Open(ctx, rangeOption)
+		}
 		if err != nil {
 			lastErr = fmt.Errorf("打开分片失败: %w", err)
 			fs.Debugf(f, "123网盘分片 %d 打开失败 (重试 %d/%d): %v", chunkIndex, retry, maxRetries-1, err)
@@ -5109,8 +5747,19 @@ type CrossCloudMD5Entry struct {
 	CachedTime time.Time
 }
 
-var globalMD5Cache = &CrossCloudMD5Cache{
-	cache: make(map[string]CrossCloudMD5Entry),
+// 🔧 修复全局状态竞态条件：使用sync.Once确保线程安全初始化
+var (
+	globalMD5Cache     *CrossCloudMD5Cache
+	globalMD5CacheOnce sync.Once
+)
+
+func getGlobalMD5Cache() *CrossCloudMD5Cache {
+	globalMD5CacheOnce.Do(func() {
+		globalMD5Cache = &CrossCloudMD5Cache{
+			cache: make(map[string]CrossCloudMD5Entry),
+		}
+	})
+	return globalMD5Cache
 }
 
 // getCachedMD5 尝试从缓存获取MD5
@@ -5124,10 +5773,11 @@ func (f *Fs) getCachedMD5(src fs.ObjectInfo) (string, bool) {
 	cacheKey := fmt.Sprintf("%s:%s:%d:%d",
 		srcFs.Name(), src.Remote(), src.Size(), src.ModTime(context.Background()).Unix())
 
-	globalMD5Cache.mutex.RLock()
-	defer globalMD5Cache.mutex.RUnlock()
+	cache := getGlobalMD5Cache()
+	cache.mutex.RLock()
+	defer cache.mutex.RUnlock()
 
-	entry, exists := globalMD5Cache.cache[cacheKey]
+	entry, exists := cache.cache[cacheKey]
 	if !exists {
 		return "", false
 	}
@@ -5136,9 +5786,10 @@ func (f *Fs) getCachedMD5(src fs.ObjectInfo) (string, bool) {
 	if time.Since(entry.CachedTime) > 24*time.Hour {
 		// 异步清理过期缓存
 		go func() {
-			globalMD5Cache.mutex.Lock()
-			delete(globalMD5Cache.cache, cacheKey)
-			globalMD5Cache.mutex.Unlock()
+			cache := getGlobalMD5Cache()
+			cache.mutex.Lock()
+			delete(cache.cache, cacheKey)
+			cache.mutex.Unlock()
 		}()
 		return "", false
 	}
@@ -5169,9 +5820,10 @@ func (f *Fs) cacheMD5(src fs.ObjectInfo, md5Hash string) {
 		CachedTime: time.Now(),
 	}
 
-	globalMD5Cache.mutex.Lock()
-	globalMD5Cache.cache[cacheKey] = entry
-	globalMD5Cache.mutex.Unlock()
+	cache := getGlobalMD5Cache()
+	cache.mutex.Lock()
+	cache.cache[cacheKey] = entry
+	cache.mutex.Unlock()
 
 	fs.Debugf(f, "💾 MD5已缓存: %s -> %s", cacheKey, md5Hash)
 }
@@ -8925,7 +9577,7 @@ func NewDynamicParameterAdjuster() *DynamicParameterAdjuster {
 		adjustmentInterval:    30 * time.Second, // 每30秒调整一次
 		networkQualityHistory: make([]float64, 0),
 		maxHistorySize:        10,                // 保留最近10次质量记录
-		currentConcurrency:    4,                 // 默认并发数
+		currentConcurrency:    4,                 // 默认并发数（用户要求上限）
 		currentChunkSize:      100 * 1024 * 1024, // 默认100MB分片
 		currentTimeout:        5 * time.Minute,   // 默认5分钟超时
 	}
@@ -8994,31 +9646,31 @@ func (dpa *DynamicParameterAdjuster) AdjustParameters(fileSize int64, networkSpe
 		avgQuality = total / float64(len(dpa.networkQualityHistory))
 	}
 
-	// 基于平均网络质量调整并发数
+	// 🚀 用户要求：123网盘单文件并发限制到4
 	baseConcurrency := 4
 	if avgQuality > 0.9 { // 优秀网络
-		baseConcurrency = 8
+		baseConcurrency = 4 // 限制为4
 	} else if avgQuality > 0.7 { // 良好网络
-		baseConcurrency = 6
+		baseConcurrency = 4 // 限制为4
 	} else if avgQuality > 0.5 { // 一般网络
-		baseConcurrency = 4
+		baseConcurrency = 4 // 限制为4
 	} else { // 较差网络
 		baseConcurrency = 2
 	}
 
-	// 根据文件大小调整
+	// 根据文件大小调整（但不超过4）
 	if fileSize > 5*1024*1024*1024 { // >5GB
-		baseConcurrency = int(float64(baseConcurrency) * 1.5)
+		baseConcurrency = 4 // 限制为4
 	} else if fileSize < 500*1024*1024 { // <500MB
 		baseConcurrency = int(float64(baseConcurrency) * 0.7)
 	}
 
-	// 限制并发数范围
+	// 🚀 用户要求：123网盘单文件并发限制到4
 	if baseConcurrency < 1 {
 		baseConcurrency = 1
 	}
-	if baseConcurrency > 20 {
-		baseConcurrency = 20
+	if baseConcurrency > 4 {
+		baseConcurrency = 4 // 限制为4
 	}
 
 	dpa.currentConcurrency = baseConcurrency
@@ -9222,33 +9874,44 @@ func (f *Fs) getOptimalConcurrency(fileSize int64, networkSpeed int64) int {
 		sizeFactor = 0.5 // 很小文件使用较少并发
 	}
 
-	// 根据网络速度调整 - 更精细的网络速度分级
+	// 根据网络速度调整 - 🚀 性能优化：更精细的网络速度分级和自适应调整
 	var speedFactor float64 = 1.0
+
+	// 🚀 新增：网络质量自适应调整
+	networkLatency := f.measureNetworkLatency()
+	latencyFactor := 1.0
+	if networkLatency < 50 { // <50ms 低延迟
+		latencyFactor = 1.2
+	} else if networkLatency < 100 { // <100ms 中等延迟
+		latencyFactor = 1.0
+	} else if networkLatency < 200 { // <200ms 高延迟
+		latencyFactor = 0.8
+	} else { // >200ms 很高延迟
+		latencyFactor = 0.6
+	}
+
 	if networkSpeed > 200*1024*1024 { // >200Mbps - 超高速网络
-		speedFactor = 1.8
+		speedFactor = 2.0 * latencyFactor // 从1.8提升，结合延迟调整
 	} else if networkSpeed > 100*1024*1024 { // >100Mbps - 高速网络
-		speedFactor = 1.5
+		speedFactor = 1.7 * latencyFactor // 从1.5提升，结合延迟调整
 	} else if networkSpeed > 50*1024*1024 { // >50Mbps - 中高速网络
-		speedFactor = 1.2
+		speedFactor = 1.4 * latencyFactor // 从1.2提升，结合延迟调整
 	} else if networkSpeed > 20*1024*1024 { // >20Mbps - 中速网络
-		speedFactor = 1.0
+		speedFactor = 1.1 * latencyFactor // 从1.0提升，结合延迟调整
 	} else if networkSpeed > 10*1024*1024 { // >10Mbps - 中低速网络
-		speedFactor = 0.8
+		speedFactor = 0.9 * latencyFactor // 从0.8提升，结合延迟调整
 	} else {
-		speedFactor = 0.6 // 低速网络减少并发避免拥塞
+		speedFactor = 0.7 * latencyFactor // 从0.6提升，结合延迟调整
 	}
 
 	// 计算最优并发数
 	optimalConcurrency := int(float64(baseConcurrency) * sizeFactor * speedFactor)
 
-	// 设置合理边界 - 提升最大并发数限制
+	// 🚀 用户要求：123网盘单文件并发限制到4
 	minConcurrency := 1
-	maxConcurrency := 16 // 提升到16，支持更高并发
+	maxConcurrency := 4 // 用户要求的并发上限
 
-	// 对于超大文件，允许更高的并发数
-	if fileSize > 10*1024*1024*1024 && maxConcurrency < 20 {
-		maxConcurrency = 20
-	}
+	// 不再允许超大文件使用更高并发数，统一限制为4
 
 	if optimalConcurrency < minConcurrency {
 		optimalConcurrency = minConcurrency
@@ -9286,34 +9949,42 @@ func (f *Fs) getOptimalChunkSize(fileSize int64, networkSpeed int64) int64 {
 		baseChunk = int64(defaultChunkSize) // 100MB
 	}
 
-	// 根据网络速度调整分片大小
+	// 根据网络速度调整分片大小 - 🚀 性能优化：提升分片大小倍数
 	var speedMultiplier float64 = 1.0
 	if networkSpeed > 200*1024*1024 { // >200Mbps - 超高速网络
-		speedMultiplier = 3.0 // 300MB分片
+		speedMultiplier = 4.0 // 400MB分片（从3.0提升）
 	} else if networkSpeed > 100*1024*1024 { // >100Mbps - 高速网络
-		speedMultiplier = 2.0 // 200MB分片
+		speedMultiplier = 3.0 // 300MB分片（从2.0提升）
 	} else if networkSpeed > 50*1024*1024 { // >50Mbps - 中速网络
-		speedMultiplier = 1.5 // 150MB分片
+		speedMultiplier = 2.0 // 200MB分片（从1.5提升）
 	} else if networkSpeed > 20*1024*1024 { // >20Mbps - 普通网络
-		speedMultiplier = 1.0 // 100MB分片
+		speedMultiplier = 1.5 // 150MB分片（从1.0提升）
 	} else { // <20Mbps - 慢速网络
-		speedMultiplier = 0.5 // 50MB分片
+		speedMultiplier = 0.8 // 80MB分片（从0.5提升）
 	}
 
-	// 根据文件大小调整
+	// 根据文件大小调整 - 🚀 性能优化：更精细的文件大小分级
 	var sizeMultiplier float64 = 1.0
 	if fileSize > 50*1024*1024*1024 { // >50GB
-		sizeMultiplier = 1.5 // 大文件使用更大分片
+		sizeMultiplier = 2.0 // 大文件使用更大分片（从1.5提升）
+	} else if fileSize > 20*1024*1024*1024 { // >20GB
+		sizeMultiplier = 1.8 // 新增：超大文件分级
+	} else if fileSize > 10*1024*1024*1024 { // >10GB
+		sizeMultiplier = 1.5 // 新增：大文件分级
+	} else if fileSize > 5*1024*1024*1024 { // >5GB
+		sizeMultiplier = 1.3 // 新增：中大文件分级
+	} else if fileSize > 2*1024*1024*1024 { // >2GB
+		sizeMultiplier = 1.1 // 新增：中等文件分级
 	} else if fileSize < 500*1024*1024 { // <500MB
-		sizeMultiplier = 0.5 // 小文件使用更小分片
+		sizeMultiplier = 0.7 // 小文件使用更小分片（从0.5提升）
 	}
 
 	// 计算最优分片大小
 	optimalChunkSize := int64(float64(baseChunk) * speedMultiplier * sizeMultiplier)
 
-	// 设置合理边界
-	minChunkSize := int64(minChunkSize) // 50MB
-	maxChunkSize := int64(maxChunkSize) // 500MB
+	// 设置合理边界 - 🚀 性能优化：提升最大分片大小限制
+	minChunkSize := int64(minChunkSize)      // 50MB
+	maxChunkSize := int64(800 * 1024 * 1024) // 800MB（从500MB提升）
 
 	if optimalChunkSize < minChunkSize {
 		optimalChunkSize = minChunkSize
@@ -9329,11 +10000,42 @@ func (f *Fs) getOptimalChunkSize(fileSize int64, networkSpeed int64) int64 {
 	return optimalChunkSize
 }
 
+// measureNetworkLatency 测量网络延迟
+// 🚀 性能优化：实现网络延迟检测，用于自适应并发调整
+func (f *Fs) measureNetworkLatency() int64 {
+	// 简单的延迟测量：向123网盘API发送HEAD请求
+	start := time.Now()
+
+	// 构建测试URL
+	testURL := "https://www.123pan.com/api/v1/user/info"
+	req, err := http.NewRequest("HEAD", testURL, nil)
+	if err != nil {
+		return 100 // 默认延迟100ms
+	}
+
+	// 设置请求头
+	req.Header.Set("User-Agent", f.opt.UserAgent)
+
+	// 发送请求
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 150 // 网络错误时返回较高延迟
+	}
+	defer resp.Body.Close()
+
+	latency := time.Since(start).Milliseconds()
+	return latency
+}
+
 // ResourcePool 资源池管理器，用于优化内存使用和减少GC压力
-// 优化版本：简化实现，更多使用Go标准库的sync.Pool
+// 🚀 性能优化：增强内存池管理，减少内存分配和GC压力
 type ResourcePool struct {
-	bufferPool sync.Pool // 缓冲区池
-	hasherPool sync.Pool // MD5哈希计算器池
+	bufferPool   sync.Pool // 缓冲区池
+	hasherPool   sync.Pool // MD5哈希计算器池
+	chunkPool    sync.Pool // 分片缓冲区池（新增）
+	readerPool   sync.Pool // Reader池（新增）
+	progressPool sync.Pool // 进度跟踪器池（新增）
 
 	// 临时文件跟踪
 	tempFilesMu sync.Mutex
@@ -9509,27 +10211,25 @@ func (f *Fs) displayDownloadProgress(ctx context.Context, progress *DownloadProg
 }
 
 // displayUnifiedDownloadProgress 统一的下载进度显示函数
+// 🚀 性能优化：集成到rclone主进度条，减少独立进度显示的频率
 func (f *Fs) displayUnifiedDownloadProgress(progress *DownloadProgress, networkName, fileName string) {
-	percentage, avgSpeed, peakSpeed, eta, completed, total, downloadedBytes, totalBytes := progress.GetProgressInfo()
+	percentage, avgSpeed, _, eta, completed, total, downloadedBytes, _ := progress.GetProgressInfo()
 
-	// 计算ETA显示
-	etaStr := "ETA: -"
-	if eta > 0 {
-		etaStr = fmt.Sprintf("ETA: %v", eta.Round(time.Second))
-	} else if avgSpeed > 0 {
-		etaStr = "ETA: 计算中..."
+	// 🚀 优化：减少独立进度显示频率，只在关键节点显示
+	if completed%5 == 0 || completed == total { // 每5个分片或完成时显示
+		// 计算ETA显示
+		etaStr := "ETA: -"
+		if eta > 0 {
+			etaStr = fmt.Sprintf("ETA: %v", eta.Round(time.Second))
+		} else if avgSpeed > 0 {
+			etaStr = "ETA: 计算中..."
+		}
+
+		// 简化的进度显示格式，集成到rclone日志系统
+		fs.Debugf(f, "📥 %s: %d/%d分片 (%.1f%%) | %s | %.2f MB/s | %s",
+			networkName, completed, total, percentage,
+			fs.SizeSuffix(downloadedBytes), avgSpeed, etaStr)
 	}
-
-	// 创建进度条
-	progressBar := f.createProgressBar(percentage)
-
-	// 统一的进度显示格式
-	fs.Infof(f, "📥 %s下载进度: %s", networkName, fileName)
-	fs.Infof(f, "   %s %.1f%% | %d/%d分片 | %s/%s",
-		progressBar, percentage, completed, total,
-		fs.SizeSuffix(downloadedBytes), fs.SizeSuffix(totalBytes))
-	fs.Infof(f, "   平均速度: %.2f MB/s | 峰值速度: %.2f MB/s | %s",
-		avgSpeed, peakSpeed, etaStr)
 }
 
 // createProgressBar 创建进度条字符串
@@ -9553,7 +10253,7 @@ func (f *Fs) createProgressBar(percentage float64) string {
 }
 
 // NewResourcePool 创建新的资源池
-// 优化版本：移除复杂的临时文件池，专注于内存池管理
+// 🚀 性能优化：增强内存池管理，支持更多类型的对象复用
 func NewResourcePool() *ResourcePool {
 	return &ResourcePool{
 		bufferPool: sync.Pool{
@@ -9565,6 +10265,27 @@ func NewResourcePool() *ResourcePool {
 		hasherPool: sync.Pool{
 			New: func() interface{} {
 				return md5.New()
+			},
+		},
+		// 🚀 新增：分片缓冲区池，用于大分片的内存复用
+		chunkPool: sync.Pool{
+			New: func() interface{} {
+				return make([]byte, 100*1024*1024) // 100MB分片缓冲区
+			},
+		},
+		// 🚀 新增：Reader池，减少Reader对象的创建开销
+		readerPool: sync.Pool{
+			New: func() interface{} {
+				return &bytes.Buffer{}
+			},
+		},
+		// 🚀 新增：进度跟踪器池，复用进度对象
+		progressPool: sync.Pool{
+			New: func() interface{} {
+				return &DownloadProgress{
+					chunkSizes: make(map[int64]int64),
+					chunkTimes: make(map[int64]time.Duration),
+				}
 			},
 		},
 		tempFiles: make(map[string]bool),
@@ -10365,7 +11086,7 @@ func (epm *EnhancedPerformanceMetrics) GetOptimalParameters(fileSize int64) (opt
 
 	// 查找相似文件大小的最佳性能记录
 	var bestThroughput float64
-	var bestConcurrency int = 4                 // 默认值
+	var bestConcurrency int = 4                 // 默认值（用户要求上限）
 	var bestChunkSize int64 = 100 * 1024 * 1024 // 默认100MB
 
 	for _, metric := range epm.uploadMetrics {
@@ -12817,6 +13538,7 @@ func (f *Fs) calculateDownloadChunkSize(fileSize int64) int64 {
 }
 
 // calculateDownloadConcurrency 计算下载并发数
+// 🚀 用户要求：123网盘单文件并发限制到4
 func (f *Fs) calculateDownloadConcurrency(fileSize int64) int {
 	switch {
 	case fileSize < 500*1024*1024: // <500MB
@@ -12824,6 +13546,6 @@ func (f *Fs) calculateDownloadConcurrency(fileSize int64) int {
 	case fileSize < 2*1024*1024*1024: // <2GB
 		return 4 // 4并发
 	default: // >2GB
-		return 6 // 6并发，但不超过API限制
+		return 4 // 4并发上限，符合用户要求
 	}
 }
