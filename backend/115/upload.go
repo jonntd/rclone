@@ -596,10 +596,10 @@ func (f *Fs) initUploadOpenAPI(ctx context.Context, size int64, name, dirID, sha
 	// 🔧 修复文件名参数错误：清理文件名中的特殊字符
 	cleanName := f.opt.Enc.FromStandardName(name)
 	// 115网盘API对某些字符敏感，进行额外清理
-	cleanName = strings.ReplaceAll(cleanName, " - ", "_") // 替换 " - " 为 "_"
-	cleanName = strings.ReplaceAll(cleanName, " ", "_")   // 替换空格为下划线
-	cleanName = strings.ReplaceAll(cleanName, "(", "_")   // 替换括号
-	cleanName = strings.ReplaceAll(cleanName, ")", "_")   // 替换括号
+	// cleanName = strings.ReplaceAll(cleanName, " - ", "_") // 替换 " - " 为 "_"
+	// cleanName = strings.ReplaceAll(cleanName, " ", "_")   // 替换空格为下划线
+	// cleanName = strings.ReplaceAll(cleanName, "(", "_")   // 替换括号
+	// cleanName = strings.ReplaceAll(cleanName, ")", "_")   // 替换括号
 	fs.Debugf(f, "🔧 文件名清理: %q -> %q", name, cleanName)
 
 	form.Set("file_name", cleanName)
