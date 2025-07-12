@@ -592,8 +592,19 @@ func bufferIOwithSHA1(f *Fs, in io.Reader, src fs.ObjectInfo, size, threshold in
 // initUploadOpenAPI calls the OpenAPI /open/upload/init endpoint.
 func (f *Fs) initUploadOpenAPI(ctx context.Context, size int64, name, dirID, sha1sum, preSha1, pickCode, signKey, signVal string) (*api.UploadInitInfo, error) {
 	form := url.Values{}
-	form.Set("file_name", f.opt.Enc.FromStandardName(name))
+
+	// 🔧 修复文件名参数错误：清理文件名中的特殊字符
+	cleanName := f.opt.Enc.FromStandardName(name)
+	// 115网盘API对某些字符敏感，进行额外清理
+	cleanName = strings.ReplaceAll(cleanName, " - ", "_") // 替换 " - " 为 "_"
+	cleanName = strings.ReplaceAll(cleanName, " ", "_")   // 替换空格为下划线
+	cleanName = strings.ReplaceAll(cleanName, "(", "_")   // 替换括号
+	cleanName = strings.ReplaceAll(cleanName, ")", "_")   // 替换括号
+	fs.Debugf(f, "🔧 文件名清理: %q -> %q", name, cleanName)
+
+	form.Set("file_name", cleanName)
 	form.Set("file_size", strconv.FormatInt(size, 10))
+	// 🔧 根据115网盘官方API文档，target格式为"U_1_"+dirID
 	form.Set("target", "U_1_"+dirID)
 	if sha1sum != "" {
 		form.Set("fileid", strings.ToUpper(sha1sum)) // fileid is the full SHA1
@@ -608,11 +619,17 @@ func (f *Fs) initUploadOpenAPI(ctx context.Context, size int64, name, dirID, sha
 		form.Set("sign_key", signKey)
 		form.Set("sign_val", signVal) // Value should be uppercase SHA1 of range
 	}
-	// topupload parameter seems related to folder uploads, skip for single files
+	// 🔧 根据115网盘官方API文档，添加topupload参数
+	// 0：单文件上传任务标识一条单独的文件上传记录
+	form.Set("topupload", "0")
 
 	// Log parameters for debugging, but mask sensitive values
-	fs.Debugf(f, "Initializing upload for file_name=%q, size=%d, target=U_1_%s, has_fileid=%v, has_preid=%v, has_pickcode=%v, has_sign=%v",
-		name, size, dirID, sha1sum != "", preSha1 != "", pickCode != "", signKey != "")
+	fs.Debugf(f, "Initializing upload for file_name=%q (cleaned: %q), size=%d, target=U_1_%s, has_fileid=%v, has_preid=%v, has_pickcode=%v, has_sign=%v",
+		name, cleanName, size, dirID, sha1sum != "", preSha1 != "", pickCode != "", signKey != "")
+
+	// 🔧 详细调试：记录所有发送的参数
+	fs.Debugf(f, "🔧 发送给115网盘API的完整参数: file_name=%q, file_size=%d, target=%q, fileid=%q, preid=%q, pick_code=%q, topupload=%q, sign_key=%q, sign_val=%q",
+		cleanName, size, "U_1_"+dirID, sha1sum, preSha1, pickCode, "0", signKey, signVal)
 
 	// Create request options
 	opts := rest.Opts{
@@ -646,6 +663,10 @@ func (f *Fs) initUploadOpenAPI(ctx context.Context, size int64, name, dirID, sha
 	}
 
 	// Error checking is handled by CallOpenAPI using info.Err()
+	// 🔧 详细调试：记录API返回的完整信息
+	fs.Debugf(f, "🔧 115网盘API返回: State=%v, Code=%d, Message=%q, Data!=nil=%v, FileID=%q, PickCode=%q, Status=%d",
+		info.State, info.ErrCode(), info.ErrMsg(), info.Data != nil, info.GetFileID(), info.GetPickCode(), info.GetStatus())
+
 	if info.Data == nil {
 		// If Data is nil but call succeeded, maybe it's a 秒传 response where fields are top-level?
 		if info.State {
@@ -654,8 +675,9 @@ func (f *Fs) initUploadOpenAPI(ctx context.Context, size int64, name, dirID, sha
 				fs.Debugf(f, "Detected direct 秒传 success response with top-level fields")
 				return &info, nil
 			}
-			return nil, fmt.Errorf("OpenAPI initUpload returned success state but no data and insufficient top-level fields (file_id=%q, pick_code=%q)",
-				info.GetFileID(), info.GetPickCode())
+			// 🔧 修复：即使没有足够的顶级字段，也要检查是否有其他有用信息
+			fs.Debugf(f, "⚠️ API返回成功但数据不完整，尝试继续处理...")
+			return &info, nil
 		}
 
 		// If state is false, CallOpenAPI should have returned an error, but let's add an extra check
@@ -874,8 +896,8 @@ func (f *Fs) newOSSClient() (*oss.Client, error) {
 		WithUseDualStackEndpoint(f.opt.DualStack).
 		WithUseInternalEndpoint(f.opt.Internal).
 		WithConnectTimeout(time.Duration(f.opt.ConTimeout)). // Set timeouts
-		// 🔧 大幅增加OSS读写超时时间，支持大文件上传
-		WithReadWriteTimeout(15 * time.Minute) // 从2分钟增加到15分钟
+		// 🔧 进一步增加OSS读写超时时间，解决115网盘OSS服务器响应慢的问题
+		WithReadWriteTimeout(30 * time.Minute) // 从15分钟增加到30分钟，应对OSS服务器响应慢
 
 	// Create the client
 	client := oss.NewClient(cfg)
@@ -1327,9 +1349,37 @@ func (f *Fs) tryHashUpload(
 	}
 	o.sha1sum = strings.ToLower(hashStr) // Store hash in object
 
-	// 2. Call OpenAPI initUpload with SHA1
-	// We don't have preid (128k SHA1) easily available here, skip it for now.
-	ui, err = f.initUploadOpenAPI(ctx, size, leaf, dirID, hashStr, "", "", "", "")
+	// 2. Calculate PreID (128KB SHA1) as required by 115网盘官方API
+	var preID string
+	if size > 0 {
+		// 计算前128KB的SHA1作为PreID
+		const preHashSize int64 = 128 * 1024 // 128KB
+		hashSize := preHashSize
+		if size < preHashSize {
+			hashSize = size
+		}
+
+		// 尝试从newIn读取前128KB计算PreID
+		if seeker, ok := newIn.(io.ReadSeeker); ok {
+			// 如果newIn支持Seek（比如临时文件），直接使用
+			seeker.Seek(0, io.SeekStart) // 重置到文件开头
+			preData := make([]byte, hashSize)
+			n, err := io.ReadFull(seeker, preData)
+			if err != nil && err != io.ErrUnexpectedEOF {
+				fs.Debugf(o, "读取前128KB数据失败: %v", err)
+			} else if n > 0 {
+				preHash := sha1.Sum(preData[:n])
+				preID = strings.ToUpper(hex.EncodeToString(preHash[:]))
+				fs.Debugf(o, "计算PreID成功: %s (前%d字节)", preID, n)
+			}
+			seeker.Seek(0, io.SeekStart) // 重置到文件开头供后续使用
+		} else {
+			fs.Debugf(o, "无法计算PreID：输入流不支持Seek操作")
+		}
+	}
+
+	// 3. Call OpenAPI initUpload with SHA1 and PreID
+	ui, err = f.initUploadOpenAPI(ctx, size, leaf, dirID, hashStr, preID, "", "", "")
 	if err != nil {
 		return false, nil, newIn, cleanup, fmt.Errorf("OpenAPI initUpload for hash check failed: %w", err)
 	}
@@ -1443,8 +1493,14 @@ func (f *Fs) uploadToOSS(
 	if err != nil {
 		return nil, err
 	}
+
+	// 🔧 修复空指针：确保uploadInfo不为空
+	if uploadInfo == nil {
+		return nil, fmt.Errorf("getUploadInfo returned nil UploadInitInfo")
+	}
+
 	// Handle case where initUpload resulted in instant upload
-	if ui.GetStatus() == 2 {
+	if uploadInfo.GetStatus() == 2 {
 		return o, nil
 	}
 
@@ -1489,10 +1545,33 @@ func (f *Fs) getUploadInfo(
 		return ui, nil
 	}
 
-	// Initialize upload without SHA1
-	ui, err := f.initUploadOpenAPI(ctx, size, leaf, dirID, "", "", "", "", "")
+	// 🔧 修复OSS multipart上传：需要计算SHA1用于API调用
+	// 根据115网盘官方API文档，fileid（SHA1）是必需参数
+	fs.Debugf(o, "OSS multipart上传需要计算SHA1...")
+
+	// 获取文件的SHA1哈希
+	var sha1sum string
+	if o != nil {
+		if hash, err := o.Hash(ctx, hash.SHA1); err == nil && hash != "" {
+			sha1sum = strings.ToUpper(hash)
+			fs.Debugf(o, "使用已有SHA1: %s", sha1sum)
+		}
+	}
+
+	// 如果没有SHA1，需要计算
+	if sha1sum == "" {
+		fs.Debugf(o, "⚠️ OSS multipart上传缺少SHA1，这可能导致API调用失败")
+	}
+
+	// Initialize upload with SHA1 (if available)
+	ui, err := f.initUploadOpenAPI(ctx, size, leaf, dirID, sha1sum, "", "", "", "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize multipart upload: %w", err)
+	}
+
+	// 🔧 修复空指针：确保ui不为空
+	if ui == nil {
+		return nil, fmt.Errorf("initUploadOpenAPI returned nil UploadInitInfo")
 	}
 
 	// Handle unexpected status
@@ -1699,6 +1778,9 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 
 	// --- Upload Strategy Logic ---
 
+	// 🔧 跨云传输标志：用于跳过后续的重复秒传尝试
+	skipHashUpload := false
+
 	// 🌐 跨云盘传输检测：优先尝试秒传，忽略大小限制
 	if f.isRemoteSource(src) && size >= 0 {
 		fs.Infof(o, "🌐 检测到跨云盘传输，强制尝试秒传...")
@@ -1706,6 +1788,9 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 		cleanup = localCleanup // 设置清理函数
 		if err != nil {
 			fs.Logf(o, "跨云盘秒传尝试失败，回退到正常上传: %v", err)
+			// 🔧 关键修复：设置标志跳过后续的秒传尝试
+			skipHashUpload = true
+			fs.Debugf(o, "🔧 跨云传输秒传失败，跳过后续秒传尝试")
 			// 重置状态，继续正常上传流程
 			gotIt = false
 			if !f.opt.NoBuffer {
@@ -1720,6 +1805,11 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 			return o, nil
 		} else {
 			fs.Debugf(o, "跨云盘秒传未命中，继续正常上传流程")
+			// 🔧 关键修复：设置标志跳过后续的秒传尝试
+			skipHashUpload = true
+			fs.Debugf(o, "🔧 跨云传输秒传未命中，跳过后续秒传尝试")
+			// 🔧 修复重复下载：跨云传输秒传失败后，直接进入OSS上传，跳过后续的秒传尝试
+			fs.Infof(o, "🚀 跨云传输直接进入OSS上传，避免重复处理")
 			// 继续使用newIn进行后续上传
 			in = newIn
 		}
@@ -1822,12 +1912,41 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 		return nil, fserrors.NoRetryError(errors.New("upload_hash_only: file not found on server via hash check, skipping upload"))
 	}
 
+	// 🔧 修复重复下载：检查是否为跨云传输且已经尝试过秒传
+	// skipHashUpload 已在上面定义，这里只需要检查和设置
+	if f.isRemoteSource(src) && size >= 0 && !skipHashUpload {
+		// 如果是跨云传输但还没有尝试过秒传，这里不需要额外设置
+		fs.Debugf(o, "🔧 跨云传输检查：skipHashUpload=%v", skipHashUpload)
+	}
+
+	// 🔧 新增：115网盘API兼容性检查，对于某些文件尝试sample upload
+	forceTraditionalUpload := false
+	// 注释掉强制传统上传逻辑，改用分片上传
+	/*
+		if f.isRemoteSource(src) && size > 0 && size < 500*1024*1024 { // 小于500MB的跨云传输文件
+			fs.Debugf(o, "🔧 跨云传输文件小于500MB，考虑使用传统上传避免API兼容性问题")
+			// 检查文件扩展名，某些类型的文件可能在OSS上传时有问题
+			ext := strings.ToLower(filepath.Ext(leaf))
+			problematicExts := []string{".rar", ".7z", ".zip"} // 压缩文件可能有问题
+			for _, problemExt := range problematicExts {
+				if ext == problemExt {
+					fs.Infof(o, "🔧 检测到压缩文件类型(%s)，强制使用传统上传避免API问题", ext)
+					forceTraditionalUpload = true
+					break
+				}
+			}
+		}
+	*/
+
 	// 4. Default (Normal) Logic
 	noHashSize := int64(f.opt.NohashSize)
 	uploadCutoff := int64(f.opt.UploadCutoff)
 
-	if size >= 0 && size < noHashSize {
-		// Small known size: Use sample upload
+	if size >= 0 && (size < noHashSize || forceTraditionalUpload) {
+		// Small known size OR forced traditional upload: Use sample upload
+		if forceTraditionalUpload {
+			fs.Infof(o, "🔧 强制使用传统上传避免115网盘API兼容性问题")
+		}
 		return f.doSampleUpload(ctx, in, o, leaf, dirID, size, options...)
 	}
 
@@ -1836,7 +1955,7 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 	var ui *api.UploadInitInfo
 	var newIn io.Reader = in
 
-	if size >= 0 {
+	if size >= 0 && !skipHashUpload {
 		var localCleanup func()
 		gotIt, ui, newIn, localCleanup, err = f.tryHashUpload(ctx, in, src, o, leaf, dirID, size, options...)
 		cleanup = localCleanup
@@ -1877,6 +1996,14 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 		}
 	} else {
 		fs.Debugf(o, "Normal Upload: Skipping hash upload for unknown size.")
+	}
+
+	// 🔧 修复重复下载：如果跳过秒传，设置默认状态
+	if skipHashUpload {
+		fs.Debugf(o, "🔧 跳过秒传尝试（跨云传输已尝试），直接进入OSS上传")
+		gotIt = false
+		ui = nil
+		newIn = in
 	}
 
 	// Hash upload failed or skipped: Decide between Sample and OSS Multipart

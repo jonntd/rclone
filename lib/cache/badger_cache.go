@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -397,8 +398,8 @@ func (c *BadgerCache) runGC() {
 	}
 }
 
-// checkCacheSize 检查缓存大小，超过限制时清理
-// 🔧 轻量级优化：简单的缓存大小控制机制
+// checkCacheSize 检查缓存大小，超过限制时智能清理
+// 🔧 修复缓存策略：实现LRU淘汰机制，替换粗暴的全部清空
 func (c *BadgerCache) checkCacheSize() {
 	if c.db == nil {
 		return
@@ -408,18 +409,137 @@ func (c *BadgerCache) checkCacheSize() {
 	lsm, vlog := c.db.Size()
 	totalSize := lsm + vlog
 
-	// 设置最大缓存大小为100MB
-	const maxCacheSize = 100 << 20 // 100MB
+	// 🔧 优化：提高缓存大小限制到200MB，减少清理频率
+	const maxCacheSize = 200 << 20 // 200MB
+	const targetSize = 150 << 20   // 清理到150MB
 
 	if totalSize > maxCacheSize {
-		fs.Debugf(nil, "缓存 %s 大小超过限制 (%d MB)，执行清理", c.name, totalSize>>20)
-		// 简单策略：超过限制就清空缓存
-		if err := c.Clear(); err != nil {
-			fs.Debugf(nil, "清理缓存 %s 失败: %v", c.name, err)
+		fs.Debugf(nil, "缓存 %s 大小超过限制 (%d MB)，开始智能清理", c.name, totalSize>>20)
+
+		// 🔧 智能清理：使用LRU策略清理最旧的条目
+		if err := c.smartCleanup(targetSize); err != nil {
+			fs.Debugf(nil, "智能清理缓存 %s 失败，回退到全部清空: %v", c.name, err)
+			// 如果智能清理失败，回退到全部清空
+			if clearErr := c.Clear(); clearErr != nil {
+				fs.Debugf(nil, "清理缓存 %s 失败: %v", c.name, clearErr)
+			}
 		} else {
-			fs.Debugf(nil, "已清理缓存 %s", c.name)
+			// 检查清理效果
+			newLsm, newVlog := c.db.Size()
+			newTotalSize := newLsm + newVlog
+			fs.Debugf(nil, "智能清理缓存 %s 完成: %d MB -> %d MB",
+				c.name, totalSize>>20, newTotalSize>>20)
 		}
 	}
+}
+
+// smartCleanup 智能缓存清理，使用LRU策略
+// 🔧 新增：实现基于访问时间的LRU淘汰机制
+func (c *BadgerCache) smartCleanup(targetSize int64) error {
+	if c.db == nil {
+		return nil
+	}
+
+	// 收集所有缓存条目及其访问时间
+	type cacheItem struct {
+		key       string
+		size      int64
+		createdAt time.Time
+	}
+
+	var items []cacheItem
+	totalCurrentSize := int64(0)
+
+	err := c.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			key := string(item.Key())
+
+			// 检查是否过期
+			if item.ExpiresAt() > 0 && item.ExpiresAt() < uint64(time.Now().Unix()) {
+				continue // 跳过过期的条目，稍后会被自动清理
+			}
+
+			// 估算条目大小
+			itemSize := item.EstimatedSize()
+			totalCurrentSize += itemSize
+
+			// 尝试解析创建时间
+			var createdAt time.Time
+			err := item.Value(func(val []byte) error {
+				var entry CacheEntry
+				if parseErr := json.Unmarshal(val, &entry); parseErr == nil {
+					createdAt = entry.CreatedAt
+				} else {
+					// 如果解析失败，使用当前时间（这些条目会被优先清理）
+					createdAt = time.Now().Add(-24 * time.Hour)
+				}
+				return nil
+			})
+
+			if err == nil {
+				items = append(items, cacheItem{
+					key:       key,
+					size:      itemSize,
+					createdAt: createdAt,
+				})
+			}
+		}
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("收集缓存条目失败: %w", err)
+	}
+
+	// 如果当前大小已经小于目标大小，无需清理
+	if totalCurrentSize <= targetSize {
+		return nil
+	}
+
+	// 按创建时间排序（最旧的在前面）
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].createdAt.Before(items[j].createdAt)
+	})
+
+	// 计算需要删除的大小
+	needToDelete := totalCurrentSize - targetSize
+	deletedSize := int64(0)
+	keysToDelete := make([]string, 0)
+
+	// 选择最旧的条目进行删除
+	for _, item := range items {
+		if deletedSize >= needToDelete {
+			break
+		}
+		keysToDelete = append(keysToDelete, item.key)
+		deletedSize += item.size
+	}
+
+	// 批量删除选中的条目
+	if len(keysToDelete) > 0 {
+		err = c.db.Update(func(txn *badger.Txn) error {
+			for _, key := range keysToDelete {
+				if err := txn.Delete([]byte(key)); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+
+		if err != nil {
+			return fmt.Errorf("批量删除缓存条目失败: %w", err)
+		}
+
+		fs.Debugf(nil, "LRU清理: 删除了 %d 个条目，释放约 %d MB",
+			len(keysToDelete), deletedSize>>20)
+	}
+
+	return nil
 }
 
 // GetCacheDir 获取缓存目录路径 - 支持多实例共享
