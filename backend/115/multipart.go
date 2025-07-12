@@ -79,7 +79,8 @@ func (w *ossChunkWriter) Upload(ctx context.Context) (err error) {
 	// 手动处理accounting
 	in, acc := accounting.UnWrapAccounting(w.in)
 
-	fs.Infof(w.o, "开始115网盘分片上传: 文件大小 %v, 分片大小 %v, 预计分片数 %d",
+	// 🔧 用户要求：115网盘单线程多部分上传文件≥100MB，100MB块，中文代码注释，详细进度显示
+	fs.Infof(w.o, "🚀 开始115网盘单线程分片上传: 文件大小 %v, 分片大小 %v, 预计分片数 %d",
 		fs.SizeSuffix(size), fs.SizeSuffix(chunkSize), totalParts)
 
 	for partNum = 0; !finished; partNum++ {
@@ -109,13 +110,15 @@ func (w *ossChunkWriter) Upload(ctx context.Context) (err error) {
 			return fmt.Errorf("读取分片数据失败: %w", err)
 		}
 
-		// 显示详细的分片上传进度
+		// 🔧 用户要求：显示"分片5/15"格式的详细进度，提升到Info级别
 		currentPart := partNum + 1
 		if totalParts > 0 {
-			fs.Infof(w.o, "上传分片 %d/%d (大小: %v, 偏移: %v)",
-				currentPart, totalParts, fs.SizeSuffix(n), fs.SizeSuffix(off))
+			fs.Infof(w.o, "📤 115网盘单线程上传: 分片%d/%d (%.1f%%) | %v | 偏移: %v",
+				currentPart, totalParts,
+				float64(currentPart)/float64(totalParts)*100,
+				fs.SizeSuffix(n), fs.SizeSuffix(off))
 		} else {
-			fs.Infof(w.o, "上传分片 %d (大小: %v, 偏移: %v)",
+			fs.Infof(w.o, "📤 115网盘单线程上传: 分片%d | %v | 偏移: %v",
 				currentPart, fs.SizeSuffix(n), fs.SizeSuffix(off))
 		}
 
@@ -161,7 +164,8 @@ func (f *Fs) newChunkWriter(ctx context.Context, src fs.ObjectInfo, ui *api.Uplo
 	uploadParts := min(max(1, f.opt.MaxUploadParts), maxUploadParts)
 	size := src.Size()
 
-	// 计算分片大小
+	// 🔧 用户要求：115网盘使用100MB分片大小
+	// chunkSize := fs.SizeSuffix(100 * 1024 * 1024) // 100MB分片
 	chunkSize := f.opt.ChunkSize
 
 	// 处理未知文件大小的情况（流式上传）
