@@ -85,7 +85,7 @@ const (
 	decayConstant = 2
 
 	// 文件上传相关常量
-	singleStepUploadLimit = 50 * 1024 * 1024   // 500MB - 单步上传API的文件大小限制
+	singleStepUploadLimit = 1024 * 1024 * 1024 // 1GB - 单步上传API的文件大小限制（修复：原来错误设置为50MB）
 	maxMemoryBufferSize   = 1024 * 1024 * 1024 // 1GB - 内存缓冲的最大大小（从512MB提升）
 	maxFileNameBytes      = 255                // 文件名的最大字节长度（UTF-8编码）
 
@@ -255,6 +255,9 @@ type Fs struct {
 	parentIDCache *cache.BadgerCache // 通过cacheManager代理
 	dirListCache  *cache.BadgerCache // 通过cacheManager代理
 	pathToIDCache *cache.BadgerCache // 通过cacheManager代理
+
+	// 🔧 上传验证管理器，优化断点续传验证阶段错误处理
+	verificationManager *UploadVerificationManager
 
 	// 性能优化相关 - 优化版本：使用更标准化的并发控制
 	concurrencyManager *ConcurrencyManager         // 统一的并发控制管理器
@@ -4182,6 +4185,7 @@ func (f *Fs) getPacerForEndpoint(endpoint string) *fs.Pacer {
 
 	// 中等频率API (8-10 QPS)
 	case strings.Contains(endpoint, "/api/v1/file/move"),
+		strings.Contains(endpoint, "/api/v1/file/name"),
 		strings.Contains(endpoint, "/api/v1/file/infos"),
 		strings.Contains(endpoint, "/api/v1/user/info"):
 		return f.listPacer // ~8 QPS (官方10 QPS)
@@ -5855,8 +5859,9 @@ func (f *Fs) uploadSinglePart(ctx context.Context, preuploadID string, data []by
 		return fmt.Errorf("failed to upload part: %w", err)
 	}
 
-	// 完成上传
-	return f.completeUpload(ctx, preuploadID)
+	// 完成上传 - 🔧 使用带文件大小的版本以支持增强验证
+	_, err = f.completeUploadWithResultAndSize(ctx, preuploadID, int64(len(data)))
+	return err
 }
 
 // uploadMultiPartWithResume 多部分上传文件，支持断点续传
@@ -6002,8 +6007,8 @@ func (f *Fs) uploadMultiPartWithResume(ctx context.Context, in io.Reader, preupl
 		f.debugf(LogLevelVerbose, "已上传分片 %d/%d", partNumber, uploadNums)
 	}
 
-	// 完成上传
-	err = f.completeUpload(ctx, preuploadID)
+	// 完成上传 - 🔧 使用带文件大小的版本以支持增强验证
+	_, err = f.completeUploadWithResultAndSize(ctx, preuploadID, size)
 	if err != nil {
 		// 返回错误前保存进度
 		saveErr := f.saveUploadProgress(progress)
@@ -6111,6 +6116,213 @@ type UploadCompleteResult struct {
 	Etag   string `json:"etag"`
 }
 
+// 🔧 123网盘断点续传验证阶段错误处理优化
+// UploadVerificationManager 上传验证管理器
+type UploadVerificationManager struct {
+	fs           *Fs
+	maxRetries   int           // 最大重试次数
+	baseWaitTime time.Duration // 基础等待时间
+	maxWaitTime  time.Duration // 最大等待时间
+}
+
+// NewUploadVerificationManager 创建上传验证管理器
+func NewUploadVerificationManager(fs *Fs) *UploadVerificationManager {
+	return &UploadVerificationManager{
+		fs:           fs,
+		maxRetries:   300,             // 🔧 根据官方文档：最多重试300次（5分钟）
+		baseWaitTime: 1 * time.Second, // 🔧 根据官方文档：间隔1秒轮询
+		maxWaitTime:  1 * time.Second, // 🔧 根据官方文档：固定1秒间隔
+	}
+}
+
+// ChunkAnalysis 分片分析结果
+type ChunkAnalysis struct {
+	TotalChunks    int
+	UploadedChunks int
+	FailedChunks   int
+	MissingChunks  int
+	CanResume      bool
+}
+
+// EnhancedCompleteUploadWithResultAndSize 增强的上传完成函数，支持智能分片验证
+func (uvm *UploadVerificationManager) EnhancedCompleteUploadWithResultAndSize(
+	ctx context.Context,
+	preuploadID string,
+	fileSize int64,
+) (*UploadCompleteResult, error) {
+
+	fs.Infof(uvm.fs, "🔧 启动增强的上传验证流程: preuploadID=%s, 文件大小=%s",
+		preuploadID[:8]+"...", fs.SizeSuffix(fileSize))
+
+	// 第一阶段：尝试标准的upload_complete
+	result, err := uvm.tryStandardComplete(ctx, preuploadID, fileSize)
+	if err == nil {
+		fs.Infof(uvm.fs, "✅ 标准上传完成成功")
+		return result, nil
+	}
+
+	// 🔧 修复：检查是否需要进入智能重试
+	// 如果是20101错误或标准完成失败，都应该进入智能重试
+	if uvm.isAPI20101Error(err) {
+		fs.Infof(uvm.fs, "⚠️ 检测到API error 20101，启动官方文档标准轮询")
+	} else if strings.Contains(err.Error(), "标准上传完成失败") {
+		fs.Infof(uvm.fs, "⚠️ 标准上传完成失败，启动官方文档标准轮询")
+	} else {
+		fs.Debugf(uvm.fs, "其他错误，直接返回: %v", err)
+		return nil, err
+	}
+
+	// 第二阶段：智能重试策略
+	return uvm.intelligentRetryStrategy(ctx, preuploadID, fileSize)
+}
+
+// tryStandardComplete 尝试标准的上传完成流程
+func (uvm *UploadVerificationManager) tryStandardComplete(
+	ctx context.Context,
+	preuploadID string,
+	fileSize int64,
+) (*UploadCompleteResult, error) {
+
+	reqBody := map[string]any{
+		"preuploadID": preuploadID,
+	}
+
+	var response struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			Async     bool   `json:"async"`
+			Completed bool   `json:"completed"`
+			FileID    int64  `json:"fileID"`
+			Etag      string `json:"etag"`
+		} `json:"data"`
+	}
+
+	// 尝试3次标准完成
+	for attempt := 0; attempt < 3; attempt++ {
+		fs.Debugf(uvm.fs, "🔄 标准上传完成尝试 %d/3", attempt+1)
+
+		err := uvm.fs.makeAPICallWithRest(ctx, "/upload/v2/file/upload_complete", "POST", reqBody, &response)
+		if err != nil {
+			fs.Debugf(uvm.fs, "标准完成API调用失败: %v", err)
+			continue
+		}
+
+		if response.Code == 0 && response.Data.Completed {
+			return &UploadCompleteResult{
+				FileID: response.Data.FileID,
+				Etag:   response.Data.Etag,
+			}, nil
+		}
+
+		if response.Code == 20101 {
+			return nil, fmt.Errorf("API error 20101: %s", response.Message)
+		}
+
+		// 其他错误，等待后重试
+		time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+	}
+
+	return nil, fmt.Errorf("标准上传完成失败，准备进入智能恢复流程")
+}
+
+// intelligentRetryStrategy 智能重试策略
+func (uvm *UploadVerificationManager) intelligentRetryStrategy(
+	ctx context.Context,
+	preuploadID string,
+	fileSize int64,
+) (*UploadCompleteResult, error) {
+
+	fs.Infof(uvm.fs, "🔍 开始官方文档标准轮询策略（间隔1秒）")
+
+	reqBody := map[string]any{
+		"preuploadID": preuploadID,
+	}
+
+	var response struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			Completed bool   `json:"completed"`
+			FileID    int64  `json:"fileID"`
+			Etag      string `json:"etag"`
+		} `json:"data"`
+	}
+
+	// 使用智能等待策略和更多重试
+	consecutiveFailures := 0
+	maxConsecutiveFailures := 5
+
+	for attempt := 0; attempt < uvm.maxRetries; attempt++ {
+		fs.Debugf(uvm.fs, "🔄 官方标准轮询 %d/%d (连续失败: %d)", attempt+1, uvm.maxRetries, consecutiveFailures)
+
+		// 🔧 根据官方文档：间隔1秒轮询
+		waitTime := uvm.calculateIntelligentWaitTime(attempt, consecutiveFailures, fileSize)
+		if attempt > 0 {
+			fs.Debugf(uvm.fs, "⏰ 按官方文档要求等待 %v 后轮询", waitTime)
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("官方标准轮询被取消: %w", ctx.Err())
+			case <-time.After(waitTime):
+			}
+		}
+
+		err := uvm.fs.makeAPICallWithRest(ctx, "/upload/v2/file/upload_complete", "POST", reqBody, &response)
+		if err != nil {
+			fs.Debugf(uvm.fs, "智能重试API调用失败: %v", err)
+			consecutiveFailures++
+			if consecutiveFailures >= maxConsecutiveFailures {
+				return nil, fmt.Errorf("连续网络错误过多(%d次)，智能重试失败: %w", consecutiveFailures, err)
+			}
+			continue
+		}
+
+		// 重置连续失败计数
+		consecutiveFailures = 0
+
+		if response.Code == 0 && response.Data.Completed {
+			fs.Infof(uvm.fs, "✅ 官方标准轮询成功完成")
+			return &UploadCompleteResult{
+				FileID: response.Data.FileID,
+				Etag:   response.Data.Etag,
+			}, nil
+		}
+
+		if response.Code == 0 && !response.Data.Completed {
+			// 🔧 根据官方文档：completed=false时继续轮询
+			fs.Debugf(uvm.fs, "📋 服务器返回completed=false，按官方文档继续1秒后轮询")
+			continue
+		}
+
+		if response.Code != 20101 {
+			// 非20101错误，直接返回
+			return nil, fmt.Errorf("官方标准轮询失败: API error %d: %s", response.Code, response.Message)
+		}
+
+		// 20101错误，记录并继续重试
+		fs.Debugf(uvm.fs, "⚠️ 遇到20101错误，按官方文档继续轮询")
+	}
+
+	return nil, fmt.Errorf("官方标准轮询超时，已轮询%d次（%d分钟）", uvm.maxRetries, uvm.maxRetries/60)
+}
+
+// calculateIntelligentWaitTime 计算智能等待时间
+func (uvm *UploadVerificationManager) calculateIntelligentWaitTime(attempt, consecutiveFailures int, fileSize int64) time.Duration {
+	// 🔧 根据123网盘官方文档：completed=false时需间隔1秒继续轮询
+	// 不再使用指数退避，严格按照官方要求使用1秒间隔
+	return uvm.baseWaitTime // 固定1秒
+}
+
+// isAPI20101Error 检查是否为API error 20101
+func (uvm *UploadVerificationManager) isAPI20101Error(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "20101") ||
+		strings.Contains(errStr, "API error 20101")
+}
+
 // completeUpload 完成多部分上传
 func (f *Fs) completeUpload(ctx context.Context, preuploadID string) error {
 	_, err := f.completeUploadWithResult(ctx, preuploadID)
@@ -6124,6 +6336,19 @@ func (f *Fs) completeUploadWithResult(ctx context.Context, preuploadID string) (
 
 // completeUploadWithResultAndSize 完成多部分上传并返回结果，支持根据文件大小调整轮询次数
 func (f *Fs) completeUploadWithResultAndSize(ctx context.Context, preuploadID string, fileSize int64) (*UploadCompleteResult, error) {
+	// 🔧 优化：使用增强的上传验证管理器处理断点续传验证阶段错误
+	if f.verificationManager != nil {
+		fs.Debugf(f, "🔧 使用增强的上传验证管理器")
+		return f.verificationManager.EnhancedCompleteUploadWithResultAndSize(ctx, preuploadID, fileSize)
+	}
+
+	// 回退到原始实现（兼容性保障）
+	fs.Debugf(f, "⚠️ 验证管理器未初始化，使用原始实现")
+	return f.originalCompleteUploadWithResultAndSize(ctx, preuploadID, fileSize)
+}
+
+// originalCompleteUploadWithResultAndSize 原始的上传完成实现（作为备用）
+func (f *Fs) originalCompleteUploadWithResultAndSize(ctx context.Context, preuploadID string, fileSize int64) (*UploadCompleteResult, error) {
 	reqBody := map[string]any{
 		"preuploadID": preuploadID,
 	}
@@ -9118,7 +9343,7 @@ func (f *Fs) moveFile(ctx context.Context, fileID, toParentFileID int64) error {
 	return nil
 }
 
-// renameFile 重命名文件 - 增强版本，支持延迟和重试
+// renameFile 重命名文件 - 使用正确的123网盘重命名API
 func (f *Fs) renameFile(ctx context.Context, fileID int64, fileName string) error {
 	fs.Debugf(f, "重命名文件%d为: %s", fileID, fileName)
 
@@ -9126,10 +9351,8 @@ func (f *Fs) renameFile(ctx context.Context, fileID int64, fileName string) erro
 	if err := validateFileName(fileName); err != nil {
 		return fmt.Errorf("重命名文件名验证失败: %w", err)
 	}
-
-	// 添加短暂延迟，让123网盘系统有时间处理文件
 	time.Sleep(2 * time.Second)
-
+	// 使用正确的123网盘重命名API: PUT /api/v1/file/name
 	reqBody := map[string]any{
 		"fileId":   fileID,
 		"fileName": fileName,
@@ -9504,6 +9727,10 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	// 🗑️ 下载URL缓存管理器已删除
 
+	// 🔧 初始化上传验证管理器，优化断点续传验证阶段错误处理
+	f.verificationManager = NewUploadVerificationManager(f)
+	fs.Infof(f, "🔧 上传验证管理器初始化成功")
+
 	// 初始化API版本管理器
 	f.apiVersionManager = NewAPIVersionManager()
 	fs.Debugf(f, "API版本管理器初始化成功")
@@ -9555,7 +9782,7 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		ReadMetadata:            true,
 		WriteMetadata:           false, // Not supported
 		UserMetadata:            false, // Not supported
-		PartialUploads:          true,  // Supports multipart uploads
+		PartialUploads:          false, // 禁用.partial机制，避免重命名API问题
 		NoMultiThreading:        false, // Supports concurrent operations
 		SlowModTime:             true,  // ModTime operations are slow
 		SlowHash:                false, // Hash is available from API
@@ -12854,24 +13081,19 @@ type UploadStrategySelector struct {
 
 // SelectStrategy 选择最优上传策略
 func (uss *UploadStrategySelector) SelectStrategy() UploadStrategy {
-	// 策略选择逻辑简化和优化
+	// 策略选择逻辑优化 - 修复单步上传选择问题
 
-	// 1. 小文件且有已知MD5 -> 单步上传（利用秒传）
-	if uss.fileSize < singleStepUploadLimit && uss.hasKnownMD5 && uss.fileSize > 0 {
+	// 1. 小文件（<1GB）-> 单步上传（API限制1GB，性能更好）
+	if uss.fileSize < singleStepUploadLimit && uss.fileSize > 0 {
 		return StrategySingleStep
 	}
 
-	// 2. 大文件 -> 分片上传（支持断点续传和并发）
-	if uss.fileSize > int64(defaultUploadCutoff) {
+	// 2. 大文件（>=1GB）-> 分片上传（支持断点续传和并发）
+	if uss.fileSize >= singleStepUploadLimit {
 		return StrategyChunked
 	}
 
-	// 3. 中等文件，网络质量差 -> 分片上传（更稳定）
-	if uss.fileSize > 50*1024*1024 && uss.networkQuality < 0.5 {
-		return StrategyChunked
-	}
-
-	// 4. 其他情况 -> 流式上传（平衡性能和资源使用）
+	// 3. 其他情况（理论上不应该到达这里）-> 流式上传
 	return StrategyStreaming
 }
 
@@ -12879,12 +13101,9 @@ func (uss *UploadStrategySelector) SelectStrategy() UploadStrategy {
 func (uss *UploadStrategySelector) GetStrategyReason(strategy UploadStrategy) string {
 	switch strategy {
 	case StrategySingleStep:
-		return fmt.Sprintf("小文件(%s)且有MD5，使用单步上传利用秒传功能", fs.SizeSuffix(uss.fileSize))
+		return fmt.Sprintf("小文件(%s)，使用单步上传接口（API限制1GB）", fs.SizeSuffix(uss.fileSize))
 	case StrategyChunked:
-		if uss.fileSize > int64(defaultUploadCutoff) {
-			return fmt.Sprintf("大文件(%s)，使用分片上传支持断点续传", fs.SizeSuffix(uss.fileSize))
-		}
-		return fmt.Sprintf("网络质量差(%.2f)，使用分片上传提高稳定性", uss.networkQuality)
+		return fmt.Sprintf("大文件(%s)，使用分片上传支持断点续传", fs.SizeSuffix(uss.fileSize))
 	case StrategyStreaming:
 		return fmt.Sprintf("中等文件(%s)，使用流式上传平衡性能", fs.SizeSuffix(uss.fileSize))
 	default:
