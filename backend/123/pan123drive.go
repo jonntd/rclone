@@ -2666,9 +2666,19 @@ func (f *Fs) isRemoteSource(src fs.ObjectInfo) bool {
 
 	// 检查是否是本地文件系统
 	fsType := srcFs.Name()
-	isRemote := fsType != "local" && fsType != ""
 
-	fs.Debugf(f, "🔍 isRemoteSource检测: fsType='%s', isRemote=%v", fsType, isRemote)
+	// 🔧 修复：正确识别本地文件系统
+	// 本地文件系统的名称可能是 "local" 或 "local{suffix}"
+	isLocal := fsType == "local" || strings.HasPrefix(fsType, "local{")
+	isRemote := !isLocal && fsType != ""
+
+	fs.Debugf(f, "🔍 isRemoteSource检测: fsType='%s', isLocal=%v, isRemote=%v", fsType, isLocal, isRemote)
+
+	// 如果是本地文件系统，直接返回false
+	if isLocal {
+		fs.Debugf(f, "✅ 明确识别为本地文件系统: %s", fsType)
+		return false
+	}
 
 	// 特别检测115网盘和其他云盘
 	if strings.Contains(fsType, "115") || strings.Contains(fsType, "pan") {
@@ -6135,6 +6145,27 @@ func NewUploadVerificationManager(fs *Fs) *UploadVerificationManager {
 	}
 }
 
+// NewUploadVerificationManagerForLargeFile 为大文件创建上传验证管理器（更长超时）
+func NewUploadVerificationManagerForLargeFile(fsInstance *Fs, fileSize int64) *UploadVerificationManager {
+	maxRetries := 300 // 默认5分钟
+
+	// 🔧 针对大文件增加超时时间
+	if fileSize > 2*1024*1024*1024 { // 2GB以上
+		maxRetries = 900 // 15分钟
+		fs.Infof(fsInstance, "🔧 大文件上传验证：使用15分钟超时 (文件大小: %s)", fs.SizeSuffix(fileSize))
+	} else if fileSize > 1*1024*1024*1024 { // 1GB以上
+		maxRetries = 600 // 10分钟
+		fs.Infof(fsInstance, "🔧 中等大文件上传验证：使用10分钟超时 (文件大小: %s)", fs.SizeSuffix(fileSize))
+	}
+
+	return &UploadVerificationManager{
+		fs:           fsInstance,
+		maxRetries:   maxRetries,
+		baseWaitTime: 1 * time.Second, // 🔧 根据官方文档：间隔1秒轮询
+		maxWaitTime:  1 * time.Second, // 🔧 根据官方文档：固定1秒间隔
+	}
+}
+
 // ChunkAnalysis 分片分析结果
 type ChunkAnalysis struct {
 	TotalChunks    int
@@ -6294,13 +6325,17 @@ func (uvm *UploadVerificationManager) intelligentRetryStrategy(
 			continue
 		}
 
-		if response.Code != 20101 {
-			// 非20101错误，直接返回
+		if response.Code != 20101 && response.Code != 20103 {
+			// 非20101/20103错误，直接返回
 			return nil, fmt.Errorf("官方标准轮询失败: API error %d: %s", response.Code, response.Message)
 		}
 
-		// 20101错误，记录并继续重试
-		fs.Debugf(uvm.fs, "⚠️ 遇到20101错误，按官方文档继续轮询")
+		// 20101/20103错误，记录并继续重试
+		if response.Code == 20101 {
+			fs.Debugf(uvm.fs, "⚠️ 遇到20101错误，按官方文档继续轮询")
+		} else if response.Code == 20103 {
+			fs.Debugf(uvm.fs, "⚠️ 遇到20103错误（文件正在校验中），按官方文档继续轮询")
+		}
 	}
 
 	return nil, fmt.Errorf("官方标准轮询超时，已轮询%d次（%d分钟）", uvm.maxRetries, uvm.maxRetries/60)
@@ -6336,10 +6371,20 @@ func (f *Fs) completeUploadWithResult(ctx context.Context, preuploadID string) (
 
 // completeUploadWithResultAndSize 完成多部分上传并返回结果，支持根据文件大小调整轮询次数
 func (f *Fs) completeUploadWithResultAndSize(ctx context.Context, preuploadID string, fileSize int64) (*UploadCompleteResult, error) {
-	// 🔧 优化：使用增强的上传验证管理器处理断点续传验证阶段错误
-	if f.verificationManager != nil {
-		fs.Debugf(f, "🔧 使用增强的上传验证管理器")
-		return f.verificationManager.EnhancedCompleteUploadWithResultAndSize(ctx, preuploadID, fileSize)
+	// 🔧 优化：根据文件大小选择合适的验证管理器
+	var verificationManager *UploadVerificationManager
+
+	// 对于大文件，使用专门的长超时验证管理器
+	if fileSize > 1*1024*1024*1024 { // 1GB以上
+		verificationManager = NewUploadVerificationManagerForLargeFile(f, fileSize)
+		fs.Debugf(f, "🔧 大文件使用专用验证管理器 (文件大小: %s)", fs.SizeSuffix(fileSize))
+	} else if f.verificationManager != nil {
+		verificationManager = f.verificationManager
+		fs.Debugf(f, "🔧 使用标准验证管理器")
+	}
+
+	if verificationManager != nil {
+		return verificationManager.EnhancedCompleteUploadWithResultAndSize(ctx, preuploadID, fileSize)
 	}
 
 	// 回退到原始实现（兼容性保障）
@@ -6690,14 +6735,13 @@ func (f *Fs) streamingPut(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 		}
 	}
 
-	// 🌐 最早期跨云传输检测：在任何处理之前就检测并处理跨云传输
-	fs.Infof(f, "🚨 【重要调试】streamingPut中开始跨云传输检测...")
+	// 🌐 跨云传输检测和处理
 	isRemoteSource := f.isRemoteSource(src)
-	fs.Infof(f, "🚨 【重要调试】streamingPut跨云传输检测结果: %v", isRemoteSource)
-
 	if isRemoteSource {
-		fs.Infof(f, "🌐 【streamingPut】检测到跨云传输，使用智能重试感知的跨云传输策略")
-		return f.handleCrossCloudTransferWithRetryAwareness(ctx, src, parentFileID, fileName)
+		fs.Infof(f, "🌐 检测到跨云传输: %s → 123网盘 (大小: %s)", src.Fs().Name(), fileName, fs.SizeSuffix(src.Size()))
+		fs.Infof(f, "📤 直接使用源云盘数据流进行123网盘上传...")
+		// 🔧 关键修复：使用直接传输而不是本地化缓存，避免二次下载
+		return f.handleCrossCloudTransfer(ctx, in, src, parentFileID, fileName)
 	}
 
 	// 本地文件使用统一上传入口
@@ -8351,15 +8395,6 @@ func (f *Fs) streamingPutWithChunkedResume(ctx context.Context, in io.Reader, sr
 		fs.Infof(f, "🚀 正在初始化大文件上传 (%s) - 准备分片上传参数，请稍候...", fs.SizeSuffix(fileSize))
 	}
 
-	// 准备分片上传参数
-	params, err := f.prepareChunkedUploadParams(ctx, src)
-	if err != nil {
-		return nil, err
-	}
-
-	f.debugf(LogLevelDebug, "开始分片流式传输：文件大小 %s，动态分片大小 %s（网络速度: %s/s）",
-		fs.SizeSuffix(params.fileSize), fs.SizeSuffix(params.chunkSize), fs.SizeSuffix(params.networkSpeed))
-
 	// 验证源对象
 	srcObj, ok := src.(fs.Object)
 	if !ok {
@@ -8367,8 +8402,24 @@ func (f *Fs) streamingPutWithChunkedResume(ctx context.Context, in io.Reader, sr
 		return f.streamingPutWithTempFileForced(ctx, in, src, parentFileID, fileName)
 	}
 
-	// 创建上传会话
-	createResp, err := f.createChunkedUploadSession(ctx, parentFileID, fileName, params.fileSize)
+	fileSize = src.Size()
+
+	// 创建上传会话（先创建会话获取API要求的SliceSize）
+	createResp, err := f.createChunkedUploadSession(ctx, parentFileID, fileName, fileSize)
+	if err != nil {
+		return nil, err
+	}
+
+	// 🔧 关键修复：使用API返回的SliceSize，而不是动态计算的分片大小
+	apiSliceSize := createResp.Data.SliceSize
+	if apiSliceSize <= 0 {
+		// 如果API没有返回有效的SliceSize，使用64MB作为回退
+		f.debugf(LogLevelDebug, "⚠️ API未返回有效SliceSize(%d)，使用64MB作为回退", apiSliceSize)
+		apiSliceSize = 64 * 1024 * 1024 // 64MB回退大小
+	}
+
+	f.debugf(LogLevelDebug, "开始分片流式传输：文件大小 %s，API要求分片大小 %s",
+		fs.SizeSuffix(fileSize), fs.SizeSuffix(apiSliceSize))
 	if err != nil {
 		return nil, err
 	}
@@ -8379,8 +8430,8 @@ func (f *Fs) streamingPutWithChunkedResume(ctx context.Context, in io.Reader, sr
 		return f.streamingPutWithTempFileForced(ctx, in, src, parentFileID, fileName)
 	}
 
-	// 开始分片流式传输
-	return f.uploadFileInChunksWithResume(ctx, srcObj, createResp, params.fileSize, params.chunkSize, fileName)
+	// 开始分片流式传输，使用API要求的分片大小
+	return f.uploadFileInChunksWithResume(ctx, srcObj, createResp, fileSize, apiSliceSize, fileName)
 }
 
 // ChunkedUploadParams 分片上传参数
@@ -13081,7 +13132,19 @@ type UploadStrategySelector struct {
 
 // SelectStrategy 选择最优上传策略
 func (uss *UploadStrategySelector) SelectStrategy() UploadStrategy {
-	// 策略选择逻辑优化 - 修复单步上传选择问题
+	// 策略选择逻辑优化 - 修复单步上传选择问题，增加跨云传输特殊处理
+
+	// 🌐 跨云传输特殊处理：强制使用本地化策略
+	if uss.isRemoteSource {
+		// 🔧 重要说明：跨云传输已在crossCloudUploadWithLocalCache中强制本地化
+		// 此时到达这里的应该都是本地数据，但为了安全起见，仍然优先选择稳定策略
+		if uss.fileSize <= singleStepUploadLimit { // 1GB以下使用单步上传
+			return StrategySingleStep
+		}
+		// 🔧 关键修复：超过1GB的跨云传输使用分片上传（此时已是本地数据）
+		// 分片上传支持断点续传，更适合大文件
+		return StrategyChunked
+	}
 
 	// 1. 小文件（<1GB）-> 单步上传（API限制1GB，性能更好）
 	if uss.fileSize < singleStepUploadLimit && uss.fileSize > 0 {
@@ -13101,10 +13164,19 @@ func (uss *UploadStrategySelector) SelectStrategy() UploadStrategy {
 func (uss *UploadStrategySelector) GetStrategyReason(strategy UploadStrategy) string {
 	switch strategy {
 	case StrategySingleStep:
+		if uss.isRemoteSource {
+			return fmt.Sprintf("跨云传输文件(%s)，使用单步上传避免分片验证问题", fs.SizeSuffix(uss.fileSize))
+		}
 		return fmt.Sprintf("小文件(%s)，使用单步上传接口（API限制1GB）", fs.SizeSuffix(uss.fileSize))
 	case StrategyChunked:
+		if uss.isRemoteSource {
+			return fmt.Sprintf("大型跨云传输文件(%s)，使用分片上传避免二次下载", fs.SizeSuffix(uss.fileSize))
+		}
 		return fmt.Sprintf("大文件(%s)，使用分片上传支持断点续传", fs.SizeSuffix(uss.fileSize))
 	case StrategyStreaming:
+		if uss.isRemoteSource {
+			return fmt.Sprintf("大型跨云传输文件(%s)，使用流式上传避免分片验证问题", fs.SizeSuffix(uss.fileSize))
+		}
 		return fmt.Sprintf("中等文件(%s)，使用流式上传平衡性能", fs.SizeSuffix(uss.fileSize))
 	default:
 		return "自动选择最优策略"
@@ -13227,11 +13299,39 @@ func (f *Fs) unifiedUpload(ctx context.Context, in io.Reader, src fs.ObjectInfo,
 
 // executeSingleStepUpload 执行单步上传策略
 func (f *Fs) executeSingleStepUpload(uploadCtx *UnifiedUploadContext) (*Object, error) {
-	fs.Debugf(f, "执行单步上传策略")
+	// 检测跨云传输并记录
+	isRemoteSource := f.isRemoteSource(uploadCtx.src)
+	if isRemoteSource {
+		fs.Infof(f, "🌐 执行跨云传输单步上传策略（优化版本）")
+	} else {
+		fs.Debugf(f, "执行单步上传策略")
+	}
 
 	// 获取已知MD5
 	md5Hash, err := uploadCtx.src.Hash(uploadCtx.ctx, fshash.MD5)
 	if err != nil || md5Hash == "" {
+		if isRemoteSource {
+			// 跨云传输时，如果没有MD5，尝试计算
+			fs.Infof(f, "🌐 跨云传输无已知MD5，尝试从数据流计算")
+			data, readErr := io.ReadAll(uploadCtx.in)
+			if readErr != nil {
+				return nil, fmt.Errorf("跨云传输读取数据失败: %w", readErr)
+			}
+
+			// 计算MD5
+			hash := md5.New()
+			hash.Write(data)
+			md5Hash = hex.EncodeToString(hash.Sum(nil))
+			fs.Infof(f, "🌐 跨云传输计算MD5: %s", md5Hash)
+
+			// 验证文件大小
+			if int64(len(data)) != uploadCtx.src.Size() {
+				return nil, fmt.Errorf("跨云传输文件大小不匹配: 期望 %d, 实际 %d", uploadCtx.src.Size(), len(data))
+			}
+
+			// 执行跨云传输单步上传
+			return f.executeCrossCloudSingleStepUpload(uploadCtx, data, md5Hash)
+		}
 		return nil, fmt.Errorf("单步上传需要已知MD5，但获取失败: %w", err)
 	}
 
@@ -13280,6 +13380,38 @@ func (f *Fs) executeSingleStepUpload(uploadCtx *UnifiedUploadContext) (*Object, 
 	return result, nil
 }
 
+// executeCrossCloudSingleStepUpload 执行跨云传输单步上传（特殊优化版本）
+func (f *Fs) executeCrossCloudSingleStepUpload(uploadCtx *UnifiedUploadContext, data []byte, md5Hash string) (*Object, error) {
+	fs.Infof(f, "🌐 开始跨云传输单步上传: %s (%s)", uploadCtx.fileName, fs.SizeSuffix(int64(len(data))))
+
+	// 为跨云传输增加重试机制
+	maxRetries := 3
+	var lastErr error
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		fs.Infof(f, "🌐 跨云传输单步上传尝试 %d/%d", attempt, maxRetries)
+
+		result, err := f.singleStepUpload(uploadCtx.ctx, data, uploadCtx.parentFileID, uploadCtx.fileName, md5Hash)
+		if err == nil {
+			fs.Infof(f, "✅ 跨云传输单步上传成功: %s", uploadCtx.fileName)
+			return result, nil
+		}
+
+		lastErr = err
+		fs.Debugf(f, "🌐 跨云传输单步上传尝试 %d 失败: %v", attempt, err)
+
+		// 检查是否是可重试的错误
+		if attempt < maxRetries {
+			// 为跨云传输增加更长的等待时间
+			waitTime := time.Duration(attempt*3) * time.Second
+			fs.Infof(f, "🌐 跨云传输等待 %v 后重试", waitTime)
+			time.Sleep(waitTime)
+		}
+	}
+
+	return nil, fmt.Errorf("跨云传输单步上传失败（尝试%d次）: %w", maxRetries, lastErr)
+}
+
 // executeChunkedUpload 执行分片上传策略
 func (f *Fs) executeChunkedUpload(uploadCtx *UnifiedUploadContext) (*Object, error) {
 	fs.Infof(f, "🚨 【重要调试】进入executeChunkedUpload函数，文件: %s", uploadCtx.fileName)
@@ -13303,7 +13435,26 @@ func (f *Fs) executeChunkedUpload(uploadCtx *UnifiedUploadContext) (*Object, err
 			md5Hash = hashValue
 			fs.Infof(f, "🚀 跨云传输获取到源文件MD5: %s，将尝试秒传", md5Hash)
 		} else {
-			fs.Debugf(f, "🔍 跨云传输源文件无可用MD5，将跳过秒传检测: %v", err)
+			fs.Debugf(f, "🔍 跨云传输源文件无可用MD5，将计算MD5进行秒传检测: %v", err)
+
+			// 🔧 关键修复：为115→123跨云传输计算MD5，启用秒传功能
+			if srcObj, ok := uploadCtx.src.(fs.Object); ok {
+				fs.Infof(f, "🔧 115→123跨云传输：计算MD5以启用秒传功能")
+				md5Reader, openErr := srcObj.Open(uploadCtx.ctx)
+				if openErr != nil {
+					fs.Debugf(f, "无法打开115网盘源对象计算MD5: %v", openErr)
+				} else {
+					defer md5Reader.Close()
+					hasher := md5.New()
+					_, copyErr := io.Copy(hasher, md5Reader)
+					if copyErr != nil {
+						fs.Debugf(f, "从115网盘计算MD5失败: %v", copyErr)
+					} else {
+						md5Hash = fmt.Sprintf("%x", hasher.Sum(nil))
+						fs.Infof(f, "🎉 115→123跨云传输MD5计算成功: %s，将尝试秒传", md5Hash)
+					}
+				}
+			}
 		}
 	}
 
@@ -13748,6 +13899,13 @@ func (f *Fs) v2UploadChunksWithConcurrency(ctx context.Context, in io.Reader, sr
 	fs.Debugf(f, "v2多线程上传参数检查: preuploadID='%s', totalChunks=%d, maxConcurrency=%d", preuploadID, totalChunks, maxConcurrency)
 	if preuploadID == "" {
 		return nil, fmt.Errorf("预上传ID为空，无法进行分片上传")
+	}
+
+	// 🌐 跨云传输检测：避免115网盘Range请求并发限制
+	isRemoteSource := f.isRemoteSource(src)
+	if isRemoteSource {
+		fs.Infof(f, "🌐 检测到跨云传输，为避免115网盘Range请求限制，强制使用单线程分片上传")
+		maxConcurrency = 1 // 强制单线程
 	}
 
 	fs.Debugf(f, "开始v2多线程分片上传：%d个分片，最大并发数：%d", totalChunks, maxConcurrency)
@@ -14941,6 +15099,70 @@ func (f *Fs) copyWithChunksAndTimeout(ctx context.Context, file *os.File, hasher
 		fs.SizeSuffix(totalWritten), avgSpeed, elapsed.Round(time.Second), chunkNumber-1)
 
 	return totalWritten, nil
+}
+
+// crossCloudUploadWithLocalCache 跨云传输专用上传方法，强制下载到本地后上传
+func (f *Fs) crossCloudUploadWithLocalCache(ctx context.Context, in io.Reader, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
+	fileSize := src.Size()
+	fs.Infof(f, "🌐 开始跨云传输本地化处理: %s (大小: %s)", fileName, fs.SizeSuffix(fileSize))
+
+	// 🔧 强制下载到本地：无论文件大小，都先完整下载到本地
+	var localDataSource io.Reader
+	var cleanup func()
+	var localFileSize int64
+
+	if fileSize <= maxMemoryBufferSize {
+		// 小文件：下载到内存
+		fs.Infof(f, "📝 小文件跨云传输，下载到内存: %s", fs.SizeSuffix(fileSize))
+		data, err := f.readToMemoryWithRetry(ctx, in, fileSize, true) // 标记为跨云传输
+		if err != nil {
+			return nil, fmt.Errorf("跨云传输下载到内存失败: %w", err)
+		}
+		localDataSource = bytes.NewReader(data)
+		localFileSize = int64(len(data))
+		cleanup = func() {} // 内存数据无需清理
+		fs.Infof(f, "✅ 跨云传输内存下载完成: %s", fs.SizeSuffix(localFileSize))
+	} else {
+		// 大文件：下载到临时文件
+		fs.Infof(f, "🗂️  大文件跨云传输，下载到临时文件: %s", fs.SizeSuffix(fileSize))
+		tempFile, written, err := f.createTempFileWithRetry(ctx, in, fileSize, true, fileName) // 标记为跨云传输
+		if err != nil {
+			return nil, fmt.Errorf("跨云传输下载到临时文件失败: %w", err)
+		}
+
+		// 重置文件指针到开头
+		if _, err := tempFile.Seek(0, io.SeekStart); err != nil {
+			tempFile.Close()
+			os.Remove(tempFile.Name())
+			return nil, fmt.Errorf("重置临时文件指针失败: %w", err)
+		}
+
+		localDataSource = tempFile
+		localFileSize = written
+		cleanup = func() {
+			tempFile.Close()
+			os.Remove(tempFile.Name())
+		}
+		fs.Infof(f, "✅ 跨云传输临时文件下载完成: %s", fs.SizeSuffix(localFileSize))
+	}
+	defer cleanup()
+
+	// 验证下载完整性
+	if localFileSize != fileSize {
+		return nil, fmt.Errorf("跨云传输下载不完整: 期望%d字节，实际%d字节", fileSize, localFileSize)
+	}
+
+	// 🚀 使用本地数据进行上传，创建本地文件信息对象
+	localSrc := &localFileInfo{
+		name:    fileName,
+		size:    localFileSize,
+		modTime: src.ModTime(ctx),
+	}
+
+	fs.Infof(f, "🚀 开始从本地数据上传到123网盘: %s", fs.SizeSuffix(localFileSize))
+
+	// 使用统一上传入口，但此时源已经是本地数据
+	return f.unifiedUpload(ctx, localDataSource, localSrc, parentFileID, fileName)
 }
 
 // readToMemoryWithRetry 增强的内存读取函数，支持跨云传输重试

@@ -406,6 +406,21 @@ func (cb *CircuitBreaker) ShouldRetry() bool {
 	return true
 }
 
+// ShouldRetryForURLExpiry 针对URL过期场景的重试检查（更宽松）
+func (cb *CircuitBreaker) ShouldRetryForURLExpiry() bool {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+
+	// 🔧 URL过期场景使用更宽松的策略：更高的阈值，更短的超时
+	urlExpiryThreshold := cb.threshold * 3 // 15次失败
+	urlExpiryTimeout := 10 * time.Second   // 10秒超时
+
+	if cb.failures >= urlExpiryThreshold && time.Since(cb.lastFailure) < urlExpiryTimeout {
+		return false
+	}
+	return true
+}
+
 // RecordFailure 记录失败
 func (cb *CircuitBreaker) RecordFailure() {
 	cb.mu.Lock()
@@ -3353,6 +3368,13 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 		return nil, errors.New("unsupported operation: Put on shared filesystem")
 	}
 
+	// 🌐 跨云传输检测和本地化处理
+	if f.isRemoteSource(src) {
+		fs.Infof(f, "🌐 检测到跨云传输: %s → 115网盘 (大小: %s)", src.Fs().Name(), fs.SizeSuffix(src.Size()))
+		fs.Infof(f, "📥 强制下载到本地后上传，确保数据完整性...")
+		return f.crossCloudUploadWithLocalCache(ctx, in, src, remote, options...)
+	}
+
 	// Call the main upload function which handles different strategies
 	newObj, err := f.upload(ctx, in, src, remote, options...)
 	if err != nil {
@@ -4301,16 +4323,40 @@ func (o *Object) open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	if err != nil {
 		return nil, err
 	}
+
+	// 🔧 Range请求调试和处理
 	fs.FixRangeOption(options, o.size)
 	fs.OpenOptionAddHTTPHeaders(req.Header, options)
+
+	// 调试Range请求信息
+	if rangeHeader := req.Header.Get("Range"); rangeHeader != "" {
+		fs.Debugf(o, "🔍 115网盘Range请求: %s (文件大小: %s)", rangeHeader, fs.SizeSuffix(o.size))
+	}
+
 	if o.size == 0 {
 		// Don't supply range requests for 0 length objects as they always fail
 		delete(req.Header, "Range")
 	}
+
 	resp, err := o.fs.openAPIClient.Do(req)
 	if err != nil {
+		fs.Debugf(o, "❌ 115网盘HTTP请求失败: %v", err)
 		return nil, err
 	}
+
+	// 🔧 Range响应验证
+	if rangeHeader := req.Header.Get("Range"); rangeHeader != "" {
+		contentLength := resp.Header.Get("Content-Length")
+		contentRange := resp.Header.Get("Content-Range")
+		fs.Debugf(o, "🔍 115网盘Range响应: Status=%d, Content-Length=%s, Content-Range=%s",
+			resp.StatusCode, contentLength, contentRange)
+
+		// 检查Range请求是否被正确处理
+		if resp.StatusCode != 206 {
+			fs.Debugf(o, "⚠️ 115网盘Range请求未返回206状态码: %d", resp.StatusCode)
+		}
+	}
+
 	return resp.Body, nil
 }
 
@@ -5197,9 +5243,25 @@ func (f *Fs) downloadChunk(ctx context.Context, srcObj *Object, tempFile *os.Fil
 			return fmt.Errorf("重试超时，已重试 %v", time.Since(retryStartTime))
 		}
 
-		// 🔧 检查熔断器状态
-		if !f.circuitBreaker.ShouldRetry() {
-			fs.Errorf(f, "🚨 115网盘分片 %d 熔断器打开，跳过重试", chunkIndex)
+		// 🔧 检查熔断器状态（URL过期场景使用更宽松策略）
+		isURLExpiry := strings.Contains(fmt.Sprintf("%v", lastErr), "403") ||
+			strings.Contains(fmt.Sprintf("%v", lastErr), "URL无效") ||
+			strings.Contains(fmt.Sprintf("%v", lastErr), "过期")
+
+		var shouldRetry bool
+		if isURLExpiry {
+			shouldRetry = f.circuitBreaker.ShouldRetryForURLExpiry()
+			if !shouldRetry {
+				fs.Errorf(f, "🚨 115网盘分片 %d URL过期熔断器打开，跳过重试", chunkIndex)
+			}
+		} else {
+			shouldRetry = f.circuitBreaker.ShouldRetry()
+			if !shouldRetry {
+				fs.Errorf(f, "🚨 115网盘分片 %d 熔断器打开，跳过重试", chunkIndex)
+			}
+		}
+
+		if !shouldRetry {
 			return fmt.Errorf("熔断器打开，跳过重试")
 		}
 
@@ -6202,10 +6264,11 @@ func (o *Object) shouldUseConcurrentDownload(ctx context.Context, options []fs.O
 		return false
 	}
 
-	// 检查是否有用户指定的Range选项
-	// 智能Range检测：区分小Range请求和大Range请求（跨云传输优化）
+	// 🌐 跨云传输优化：检测Range选项，避免多重并发下载冲突
+	hasRangeOption := false
 	for _, option := range options {
 		if rangeOpt, ok := option.(*fs.RangeOption); ok {
+			hasRangeOption = true
 			// 如果Range覆盖了整个文件，则可以使用并发下载
 			if rangeOpt.Start == 0 && (rangeOpt.End == -1 || rangeOpt.End >= o.size-1) {
 				fs.Debugf(o, "检测到全文件Range选项，允许并发下载")
@@ -6214,12 +6277,12 @@ func (o *Object) shouldUseConcurrentDownload(ctx context.Context, options []fs.O
 				// 计算Range大小
 				rangeSize := rangeOpt.End - rangeOpt.Start + 1
 
-				// 🚀 跨云传输优化：如果Range足够大（>=32MB），启用并发下载
-				// 这主要针对rclone多线程传输场景，每个线程处理的数据块通常较大
+				// 🚀 跨云传输场景检测：如果是大Range请求，很可能是123网盘分片上传
+				// 为避免115并发下载与123分片上传的资源竞争，禁用115并发下载
 				if rangeSize >= 32*1024*1024 { // 32MB阈值
-					fs.Infof(o, "🚀 检测到大Range选项 (%d-%d, %s)，启用并发下载优化（跨云传输场景）",
+					fs.Infof(o, "🌐 检测到跨云传输大Range选项 (%d-%d, %s)，为避免资源竞争禁用115并发下载",
 						rangeOpt.Start, rangeOpt.End, fs.SizeSuffix(rangeSize))
-					break
+					return false // 关键修改：禁用并发下载
 				} else {
 					fs.Debugf(o, "检测到小Range选项 (%d-%d, %s)，跳过并发下载",
 						rangeOpt.Start, rangeOpt.End, fs.SizeSuffix(rangeSize))
@@ -6227,6 +6290,12 @@ func (o *Object) shouldUseConcurrentDownload(ctx context.Context, options []fs.O
 				}
 			}
 		}
+	}
+
+	// 如果没有Range选项，允许并发下载
+	if !hasRangeOption {
+		fs.Debugf(o, "无Range选项，允许并发下载")
+		return true
 	}
 
 	return true
@@ -6684,4 +6753,96 @@ func (sum *SmartURLManager) recordRefresh(pickCode string) {
 		}
 	}
 	sum.refreshHistory[pickCode] = filtered
+}
+
+// localFileInfo 本地文件信息结构，用于跨云传输
+type localFileInfo struct {
+	name    string
+	size    int64
+	modTime time.Time
+	remote  string
+}
+
+func (l *localFileInfo) String() string                        { return l.remote }
+func (l *localFileInfo) Remote() string                        { return l.remote }
+func (l *localFileInfo) ModTime(ctx context.Context) time.Time { return l.modTime }
+func (l *localFileInfo) Size() int64                           { return l.size }
+func (l *localFileInfo) Fs() fs.Info                           { return nil }
+func (l *localFileInfo) Hash(ctx context.Context, t hash.Type) (string, error) {
+	return "", hash.ErrUnsupported
+}
+func (l *localFileInfo) Storable() bool { return true }
+
+// crossCloudUploadWithLocalCache 跨云传输专用上传方法，强制下载到本地后上传
+func (f *Fs) crossCloudUploadWithLocalCache(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote string, options ...fs.OpenOption) (fs.Object, error) {
+	fileSize := src.Size()
+	fs.Infof(f, "🌐 开始跨云传输本地化处理: %s (大小: %s)", remote, fs.SizeSuffix(fileSize))
+
+	// 🔧 强制下载到本地：无论文件大小，都先完整下载到本地
+	var localDataSource io.Reader
+	var cleanup func()
+	var localFileSize int64
+
+	maxMemoryBufferSize := int64(100 * 1024 * 1024) // 100MB内存缓冲限制
+
+	if fileSize <= maxMemoryBufferSize {
+		// 小文件：下载到内存
+		fs.Infof(f, "📝 小文件跨云传输，下载到内存: %s", fs.SizeSuffix(fileSize))
+		data, err := io.ReadAll(in)
+		if err != nil {
+			return nil, fmt.Errorf("跨云传输下载到内存失败: %w", err)
+		}
+		localDataSource = bytes.NewReader(data)
+		localFileSize = int64(len(data))
+		cleanup = func() {} // 内存数据无需清理
+		fs.Infof(f, "✅ 跨云传输内存下载完成: %s", fs.SizeSuffix(localFileSize))
+	} else {
+		// 大文件：下载到临时文件
+		fs.Infof(f, "🗂️  大文件跨云传输，下载到临时文件: %s", fs.SizeSuffix(fileSize))
+		tempFile, err := os.CreateTemp("", "115_cross_cloud_*.tmp")
+		if err != nil {
+			return nil, fmt.Errorf("创建临时文件失败: %w", err)
+		}
+
+		written, err := io.Copy(tempFile, in)
+		if err != nil {
+			tempFile.Close()
+			os.Remove(tempFile.Name())
+			return nil, fmt.Errorf("跨云传输下载到临时文件失败: %w", err)
+		}
+
+		// 重置文件指针到开头
+		if _, err := tempFile.Seek(0, io.SeekStart); err != nil {
+			tempFile.Close()
+			os.Remove(tempFile.Name())
+			return nil, fmt.Errorf("重置临时文件指针失败: %w", err)
+		}
+
+		localDataSource = tempFile
+		localFileSize = written
+		cleanup = func() {
+			tempFile.Close()
+			os.Remove(tempFile.Name())
+		}
+		fs.Infof(f, "✅ 跨云传输临时文件下载完成: %s", fs.SizeSuffix(localFileSize))
+	}
+	defer cleanup()
+
+	// 验证下载完整性
+	if localFileSize != fileSize {
+		return nil, fmt.Errorf("跨云传输下载不完整: 期望%d字节，实际%d字节", fileSize, localFileSize)
+	}
+
+	// 🚀 使用本地数据进行上传，创建本地文件信息对象
+	localSrc := &localFileInfo{
+		name:    filepath.Base(remote),
+		size:    localFileSize,
+		modTime: src.ModTime(ctx),
+		remote:  remote,
+	}
+
+	fs.Infof(f, "🚀 开始从本地数据上传到115网盘: %s", fs.SizeSuffix(localFileSize))
+
+	// 使用主上传函数，但此时源已经是本地数据
+	return f.upload(ctx, localDataSource, localSrc, remote, options...)
 }
