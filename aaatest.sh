@@ -200,10 +200,25 @@ go build -o rclone_test .
 ./rclone_test copy "123:/rclone/Mukuru - character rig for maya/Mukuru - character rig for maya.rar" "115:test115/" -vv -P --transfers 1
 
 
-
-
 ./rclone copy "115:/教程/翼狐  mari全能/生物案例54-61.rar" "/Users/jonntd/rclone_mod/logs_cross_cloud/" -vv -P --transfers 1
 
+./rclone copy "115:/教程/翼狐  mari全能/生物案例54-61.rar" "123:test1/" -vv -P --transfers 1
 
+
+./rclone copy "115:/测试文件/" "123:test1/" -vv -P --transfers 1
+
+
+
+
+
+./rclone ls "115:/教程/翼狐  mari全能/" -vv
+./rclone lsd "115:/" -vv
+./rclone backend cache-info 115: -o format=tree 
+
+
+./rclone ls "123:/test1/" -vv
+./rclone lsd "123:/" -vv
+./rclone ls "123:/test1/" -vv
+./rclone backend cache-info 123: -o format=tree 
 
 

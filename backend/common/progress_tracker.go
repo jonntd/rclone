@@ -13,28 +13,28 @@ import (
 // ProgressTracker 通用进度跟踪器
 // 🔧 重构：基于115网盘的DownloadProgress，提取为可复用组件
 type ProgressTracker struct {
-	totalChunks     int64
-	completedChunks int64
-	totalBytes      int64
+	totalChunks      int64
+	completedChunks  int64
+	totalBytes       int64
 	transferredBytes int64
-	startTime       time.Time
-	lastUpdateTime  time.Time
-	chunkSizes      map[int64]int64         // 记录每个分片的大小
-	chunkTimes      map[int64]time.Duration // 记录每个分片的传输时间
-	peakSpeed       float64                 // 峰值速度 MB/s
-	mu              sync.RWMutex
+	startTime        time.Time
+	lastUpdateTime   time.Time
+	chunkSizes       map[int64]int64         // 记录每个分片的大小
+	chunkTimes       map[int64]time.Duration // 记录每个分片的传输时间
+	peakSpeed        float64                 // 峰值速度 MB/s
+	mu               sync.RWMutex
 }
 
 // NewProgressTracker 创建新的进度跟踪器
 func NewProgressTracker(totalChunks, totalBytes int64) *ProgressTracker {
 	return &ProgressTracker{
-		totalChunks:      totalChunks,
-		totalBytes:       totalBytes,
-		startTime:        time.Now(),
-		lastUpdateTime:   time.Now(),
-		chunkSizes:       make(map[int64]int64),
-		chunkTimes:       make(map[int64]time.Duration),
-		peakSpeed:        0,
+		totalChunks:    totalChunks,
+		totalBytes:     totalBytes,
+		startTime:      time.Now(),
+		lastUpdateTime: time.Now(),
+		chunkSizes:     make(map[int64]int64),
+		chunkTimes:     make(map[int64]time.Duration),
+		peakSpeed:      0,
 	}
 }
 

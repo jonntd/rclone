@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -26,6 +25,7 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/rclone/rclone/backend/115/api"
+	"github.com/rclone/rclone/backend/common"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/config"
@@ -850,10 +850,6 @@ func isAPILimitError(err error) bool {
 		strings.Contains(errStr, "已达到当前访问上限")
 }
 
-// 注意：clearCacheGradually函数已删除（未使用）
-
-// 注意：invalidateRelatedCaches115和clearAllRelatedCaches115函数已删除（未使用）
-
 // Object describes a 115 object
 type Object struct {
 	fs          *Fs
@@ -1090,33 +1086,10 @@ func (cr *Credential) UserID() string {
 }
 
 // getHTTPClient makes an http client according to the options with optimized connection pool
+// 🔧 使用公共库的优化HTTP客户端配置
 func getHTTPClient(ctx context.Context, opt *Options) *http.Client {
-	t := fshttp.NewTransportCustom(ctx, func(t *http.Transport) {
-		t.TLSHandshakeTimeout = time.Duration(opt.ConTimeout)
-		// 🔧 大幅增加响应头超时时间，支持大文件上传
-		t.ResponseHeaderTimeout = 10 * time.Minute // 从2分钟增加到10分钟
-
-		// 优化连接池配置
-		t.MaxIdleConns = 100                 // 最大空闲连接数
-		t.MaxIdleConnsPerHost = 20           // 每个主机的最大空闲连接数
-		t.MaxConnsPerHost = 50               // 每个主机的最大连接数
-		t.IdleConnTimeout = 90 * time.Second // 空闲连接超时
-		t.DisableKeepAlives = false          // 启用Keep-Alive
-		t.ForceAttemptHTTP2 = true           // 强制尝试HTTP/2
-
-		// 优化超时设置
-		t.DialContext = (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext
-		t.ExpectContinueTimeout = 1 * time.Second
-	})
-
-	return &http.Client{
-		Transport: t,
-		// 🔧 大幅增加总超时时间，支持大文件上传
-		Timeout: 15 * time.Minute, // 从3分钟增加到15分钟
-	}
+	// 使用公共库的优化HTTP客户端
+	return common.GetHTTPClient(ctx)
 }
 
 // getTradHTTPClient creates an HTTP client with traditional UserAgent

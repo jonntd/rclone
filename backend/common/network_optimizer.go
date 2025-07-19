@@ -18,16 +18,16 @@ type NetworkOptimizer struct {
 	MaxIdleConnsPerHost int
 	MaxConnsPerHost     int
 	IdleConnTimeout     time.Duration
-	
+
 	// 超时配置
 	TLSHandshakeTimeout   time.Duration
 	ResponseHeaderTimeout time.Duration
 	ExpectContinueTimeout time.Duration
-	
+
 	// TCP缓冲区配置
 	WriteBufferSize int
 	ReadBufferSize  int
-	
+
 	// 总体超时
 	ClientTimeout time.Duration
 }
@@ -41,16 +41,16 @@ func DefaultNetworkOptimizer() *NetworkOptimizer {
 		MaxIdleConnsPerHost: 100,
 		MaxConnsPerHost:     200,
 		IdleConnTimeout:     120 * time.Second,
-		
+
 		// 🚀 激进超时配置：快速响应，快速重试
 		TLSHandshakeTimeout:   5 * time.Second,
 		ResponseHeaderTimeout: 15 * time.Second,
 		ExpectContinueTimeout: 500 * time.Millisecond,
-		
+
 		// 🚀 TCP优化配置
 		WriteBufferSize: 128 * 1024, // 128KB写缓冲
 		ReadBufferSize:  128 * 1024, // 128KB读缓冲
-		
+
 		// 🚀 总体超时
 		ClientTimeout: 5 * time.Minute,
 	}
@@ -66,17 +66,17 @@ func (no *NetworkOptimizer) CreateOptimizedHTTPClient() *http.Client {
 			MaxIdleConnsPerHost: no.MaxIdleConnsPerHost,
 			MaxConnsPerHost:     no.MaxConnsPerHost,
 			IdleConnTimeout:     no.IdleConnTimeout,
-			
+
 			// 超时配置
 			TLSHandshakeTimeout:   no.TLSHandshakeTimeout,
 			ResponseHeaderTimeout: no.ResponseHeaderTimeout,
 			ExpectContinueTimeout: no.ExpectContinueTimeout,
-			
+
 			// 性能优化
 			DisableKeepAlives:  false, // 启用Keep-Alive
 			ForceAttemptHTTP2:  true,  // 强制尝试HTTP/2
 			DisableCompression: false, // 启用压缩
-			
+
 			// TCP优化配置
 			WriteBufferSize: no.WriteBufferSize,
 			ReadBufferSize:  no.ReadBufferSize,
@@ -90,7 +90,7 @@ func (no *NetworkOptimizer) CreateOptimizedHTTPClient() *http.Client {
 func (no *NetworkOptimizer) OptimizeNetworkParameters(ctx context.Context) {
 	// 🔧 网络参数调优：设置更优的HTTP客户端参数
 	ci := fs.GetConfig(ctx)
-	
+
 	// 网络参数优化建议（静默处理）
 	_ = ci.Transfers
 	_ = ci.Timeout
@@ -129,25 +129,25 @@ func EvaluatePerformance(avgSpeed float64) PerformanceLevel {
 // 🔧 重构：通用性能优化建议函数
 func SuggestOptimizations(avgSpeed float64, concurrency int, fileSize int64) []string {
 	suggestions := []string{}
-	
+
 	// 基于速度的建议
 	if avgSpeed < 15 {
 		suggestions = append(suggestions, "网络速度较慢，建议检查网络连接")
-		
+
 		if concurrency < 8 {
 			suggestions = append(suggestions, "可以尝试增加并发数以提升性能")
 		}
-		
+
 		if fileSize > 5*1024*1024*1024 { // >5GB
 			suggestions = append(suggestions, "大文件建议在网络状况良好时下载")
 		}
 	}
-	
+
 	// 基于并发数的建议
 	if concurrency < 4 && fileSize > 1*1024*1024*1024 { // >1GB
 		suggestions = append(suggestions, "大文件可以考虑增加并发数")
 	}
-	
+
 	return suggestions
 }
 
@@ -161,7 +161,7 @@ type ChunkSizeCalculator struct {
 // DefaultChunkSizeCalculator 返回默认的分片大小计算器
 func DefaultChunkSizeCalculator() *ChunkSizeCalculator {
 	return &ChunkSizeCalculator{
-		MinChunkSize: 5 * 1024 * 1024,   // 5MB
+		MinChunkSize: 5 * 1024 * 1024,        // 5MB
 		MaxChunkSize: 5 * 1024 * 1024 * 1024, // 5GB
 	}
 }
@@ -170,7 +170,7 @@ func DefaultChunkSizeCalculator() *ChunkSizeCalculator {
 // 🔧 重构：基于115网盘的超激进优化策略
 func (csc *ChunkSizeCalculator) CalculateOptimalChunkSize(fileSize int64) fs.SizeSuffix {
 	var partSize int64
-	
+
 	switch {
 	case fileSize <= 50*1024*1024: // ≤50MB
 		partSize = 25 * 1024 * 1024 // 25MB分片
@@ -181,7 +181,7 @@ func (csc *ChunkSizeCalculator) CalculateOptimalChunkSize(fileSize int64) fs.Siz
 	default:
 		partSize = 200 * 1024 * 1024 // 默认200MB分片
 	}
-	
+
 	return fs.SizeSuffix(csc.normalizeChunkSize(partSize))
 }
 

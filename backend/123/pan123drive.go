@@ -12,21 +12,19 @@ import (
 	"hash"
 	"hash/crc32"
 	"io"
-	"math"
-	"math/rand/v2"
 	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
+	"github.com/rclone/rclone/backend/common"
 	"github.com/rclone/rclone/lib/atexit"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/oauthutil"
@@ -40,7 +38,6 @@ import (
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/fserrors"
-	"github.com/rclone/rclone/fs/fshttp"
 	fshash "github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/cache"
 )
@@ -101,11 +98,7 @@ const (
 	defaultConnTimeout = 60 * time.Second   // 🔧 修复卡住问题：增加连接超时到60秒
 	defaultTimeout     = 1200 * time.Second // 🔧 修复卡住问题：增加总体超时到20分钟，支持大文件传输
 
-	// 重试和退避设置
-	maxRetries      = 10               // 增加最大重试次数，提高成功率
-	baseRetryDelay  = 2 * time.Second  // 增加基础重试延迟
-	maxRetryDelay   = 60 * time.Second // 增加最大重试延迟
-	retryMultiplier = 2.0              // 指数退避倍数
+	// 🗑️ 重试和退避设置已删除 - 使用rclone标准重试机制
 
 	// 文件名验证相关常量
 	maxFileNameLength = 256          // 123网盘文件名最大长度（包括扩展名）
@@ -180,32 +173,7 @@ type Options struct {
 	PerformanceLogInterval fs.Duration `config:"performance_log_interval"` // 性能日志输出间隔
 }
 
-// UnifiedRetryManager 统一重试管理器
-// 🔧 核心思想：在最外层统一管理所有重试逻辑，避免多层嵌套
-type UnifiedRetryManager struct {
-	maxRetries       int           // 全局最大重试次数
-	maxRetryDuration time.Duration // 全局最大重试时间
-	retryStats       map[string]*RetryStats
-	mu               sync.RWMutex
-}
-
-// RetryStats 重试统计信息
-type RetryStats struct {
-	attempts    int
-	startTime   time.Time
-	lastAttempt time.Time
-	totalDelay  time.Duration
-}
-
-// RetryConfig 重试配置
-type RetryConfig struct {
-	MaxRetries        int
-	MaxDuration       time.Duration
-	BaseDelay         time.Duration
-	MaxDelay          time.Duration
-	BackoffMultiplier float64
-	OperationType     string // "upload", "download", "api_call"
-}
+// 🗑️ UnifiedRetryManager已删除 - 使用rclone标准的fserrors.ShouldRetry和fs.Pacer
 
 // Fs 表示远程123网盘驱动器实例
 type Fs struct {
@@ -248,16 +216,9 @@ type Fs struct {
 	// 🔧 上传验证管理器，优化断点续传验证阶段错误处理
 	verificationManager *UploadVerificationManager
 
-	// 性能优化相关 - 优化版本：使用更标准化的并发控制
-	concurrencyManager *ConcurrencyManager // 统一的并发控制管理器
-	memoryManager      *MemoryManager      // 内存管理器，防止内存泄漏
-	performanceMetrics *PerformanceMetrics // 性能指标收集器
-	// 注意：enhancedMetrics字段已删除
-	resourcePool *ResourcePool // 资源池管理器，优化内存使用
-	// 🗑️ downloadURLCache 已删除 - 下载URL缓存已移除
-	apiVersionManager *APIVersionManager        // API版本管理器
-	resumeManager     *ResumeManager            // 断点续传管理器
-	dynamicAdjuster   *DynamicParameterAdjuster // 动态参数调整器
+	// 性能优化相关 - 使用rclone标准组件替代过度开发的管理器
+	resourcePool  *ResourcePool  // 资源池管理器，优化内存使用
+	resumeManager *ResumeManager // 断点续传管理器
 
 	// 缓存时间配置
 	cacheConfig CacheConfig
@@ -268,12 +229,6 @@ type Fs struct {
 	// 🚀 上传域名缓存，避免频繁API调用
 	uploadDomainCache     string
 	uploadDomainCacheTime time.Time
-
-	// 🔧 统一重试管理器，避免多层重试嵌套
-	retryManager *UnifiedRetryManager
-
-	// 🔧 统一进度管理器，避免重复进度显示
-	progressManager *UnifiedProgressManager
 }
 
 // CacheConfig 缓存时间配置
@@ -362,8 +317,6 @@ type DirListCacheEntry struct {
 	Checksum   string                   `json:"checksum"` // 数据校验和
 }
 
-// 🗑️ DownloadURLCacheEntry 已删除 - 下载URL缓存已移除
-
 // PathToIDCacheEntry 路径到FileID映射缓存条目
 type PathToIDCacheEntry struct {
 	Path     string    `json:"path"`
@@ -371,422 +324,6 @@ type PathToIDCacheEntry struct {
 	IsDir    bool      `json:"is_dir"`
 	ParentID string    `json:"parent_id"`
 	CachedAt time.Time `json:"cached_at"`
-}
-
-// MemoryManager 管理小文件缓存的内存使用，防止内存泄漏
-type MemoryManager struct {
-	mu          sync.Mutex
-	totalUsed   int64                  // 当前使用的总内存
-	maxTotal    int64                  // 最大允许的总内存（默认200MB）
-	fileBuffers map[string]*BufferInfo // 文件ID -> 缓冲区信息
-	maxFileSize int64                  // 单个文件最大缓存大小（默认50MB）
-}
-
-// BufferInfo 缓冲区信息，用于智能清理
-type BufferInfo struct {
-	Size        int64     // 缓冲区大小
-	LastAccess  time.Time // 最后访问时间
-	AccessCount int64     // 访问次数
-}
-
-// NewMemoryManager 创建新的内存管理器
-func NewMemoryManager(maxTotal, maxFileSize int64) *MemoryManager {
-	if maxTotal <= 0 {
-		maxTotal = 200 * 1024 * 1024 // 默认200MB总限制
-	}
-	if maxFileSize <= 0 {
-		maxFileSize = 50 * 1024 * 1024 // 默认50MB单文件限制
-	}
-
-	return &MemoryManager{
-		maxTotal:    maxTotal,
-		maxFileSize: maxFileSize,
-		fileBuffers: make(map[string]*BufferInfo),
-	}
-}
-
-// CanAllocate 检查是否可以分配指定大小的内存，如果空间不足会尝试清理
-func (mm *MemoryManager) CanAllocate(size int64) bool {
-	if size <= 0 {
-		return false
-	}
-
-	// 检查单文件大小限制
-	if size > mm.maxFileSize {
-		return false
-	}
-
-	mm.mu.Lock()
-	defer mm.mu.Unlock()
-
-	// 如果空间足够，直接返回
-	if mm.totalUsed+size <= mm.maxTotal {
-		return true
-	}
-
-	// 空间不足，尝试清理旧缓存
-	return mm.tryCleanupMemory(size)
-}
-
-// tryCleanupMemory 尝试清理内存以腾出空间
-func (mm *MemoryManager) tryCleanupMemory(requiredSize int64) bool {
-	// 收集可清理的缓冲区（超过5分钟未访问的）
-	var candidates []string
-	now := time.Now()
-
-	for fileID, bufferInfo := range mm.fileBuffers {
-		if now.Sub(bufferInfo.LastAccess) > BufferCleanupThreshold {
-			candidates = append(candidates, fileID)
-		}
-	}
-
-	// 按访问次数排序，优先清理访问次数少的
-	sort.Slice(candidates, func(i, j int) bool {
-		return mm.fileBuffers[candidates[i]].AccessCount < mm.fileBuffers[candidates[j]].AccessCount
-	})
-
-	// 逐个清理直到有足够空间
-	freedSize := int64(0)
-	for _, fileID := range candidates {
-		if bufferInfo, exists := mm.fileBuffers[fileID]; exists {
-			freedSize += bufferInfo.Size
-			delete(mm.fileBuffers, fileID)
-			mm.totalUsed -= bufferInfo.Size
-
-			// 检查是否已有足够空间
-			if mm.totalUsed+requiredSize <= mm.maxTotal {
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
-// Allocate 分配内存并记录使用情况
-func (mm *MemoryManager) Allocate(fileID string, size int64) bool {
-	if size <= 0 || size > mm.maxFileSize {
-		return false
-	}
-
-	mm.mu.Lock()
-	defer mm.mu.Unlock()
-
-	// 检查是否已经分配过
-	if _, exists := mm.fileBuffers[fileID]; exists {
-		return false
-	}
-
-	// 检查总内存限制
-	if mm.totalUsed+size > mm.maxTotal {
-		return false
-	}
-
-	// 分配内存
-	mm.fileBuffers[fileID] = &BufferInfo{
-		Size:        size,
-		LastAccess:  time.Now(),
-		AccessCount: 1,
-	}
-	mm.totalUsed += size
-	return true
-}
-
-// Release 释放指定文件的内存
-func (mm *MemoryManager) Release(fileID string) {
-	mm.mu.Lock()
-	defer mm.mu.Unlock()
-
-	if bufferInfo, exists := mm.fileBuffers[fileID]; exists {
-		delete(mm.fileBuffers, fileID)
-		mm.totalUsed -= bufferInfo.Size
-		if mm.totalUsed < 0 {
-			mm.totalUsed = 0 // 防止负数
-		}
-	}
-}
-
-// GetStats 获取内存使用统计
-func (mm *MemoryManager) GetStats() (totalUsed, maxTotal int64, activeFiles int) {
-	mm.mu.Lock()
-	defer mm.mu.Unlock()
-
-	return mm.totalUsed, mm.maxTotal, len(mm.fileBuffers)
-}
-
-// AccessBuffer 记录缓冲区访问，用于LRU清理策略
-func (mm *MemoryManager) AccessBuffer(fileID string) {
-	mm.mu.Lock()
-	defer mm.mu.Unlock()
-
-	if bufferInfo, exists := mm.fileBuffers[fileID]; exists {
-		bufferInfo.LastAccess = time.Now()
-		bufferInfo.AccessCount++
-	}
-}
-
-// PerformanceMetrics 性能指标收集器
-type PerformanceMetrics struct {
-	mu                 sync.RWMutex
-	startTime          time.Time
-	totalUploads       int64
-	totalDownloads     int64
-	totalUploadBytes   int64
-	totalDownloadBytes int64
-	uploadErrors       int64
-	downloadErrors     int64
-	avgUploadSpeed     float64 // MB/s
-	avgDownloadSpeed   float64 // MB/s
-	peakUploadSpeed    float64 // MB/s
-	peakDownloadSpeed  float64 // MB/s
-	activeUploads      int64
-	activeDownloads    int64
-	memoryUsage        int64 // 当前内存使用量（字节）
-	peakMemoryUsage    int64 // 峰值内存使用量（字节）
-	apiCallCount       int64 // API调用总数
-	apiErrorCount      int64 // API错误总数
-	retryCount         int64 // 重试总数
-	partialFileCount   int64 // partial文件数量
-}
-
-// NewPerformanceMetrics 创建新的性能指标收集器
-func NewPerformanceMetrics() *PerformanceMetrics {
-	return &PerformanceMetrics{
-		startTime: time.Now(),
-	}
-}
-
-// RecordUploadStart 记录上传开始
-func (pm *PerformanceMetrics) RecordUploadStart(size int64) {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-	pm.activeUploads++
-	pm.totalUploads++
-	pm.totalUploadBytes += size
-}
-
-// RecordUploadComplete 记录上传完成
-func (pm *PerformanceMetrics) RecordUploadComplete(size int64, duration time.Duration) {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-	pm.activeUploads--
-
-	if duration > 0 {
-		speedMBps := float64(size) / (1024 * 1024) / duration.Seconds()
-		pm.updateUploadSpeed(speedMBps)
-	}
-}
-
-// RecordUploadError 记录上传错误
-func (pm *PerformanceMetrics) RecordUploadError() {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-	pm.uploadErrors++
-	if pm.activeUploads > 0 {
-		pm.activeUploads--
-	}
-}
-
-// RecordDownloadStart 记录下载开始
-func (pm *PerformanceMetrics) RecordDownloadStart(size int64) {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-	pm.activeDownloads++
-	pm.totalDownloads++
-	pm.totalDownloadBytes += size
-}
-
-// RecordDownloadComplete 记录下载完成
-func (pm *PerformanceMetrics) RecordDownloadComplete(size int64, duration time.Duration) {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-	pm.activeDownloads--
-
-	if duration > 0 {
-		speedMBps := float64(size) / (1024 * 1024) / duration.Seconds()
-		pm.updateDownloadSpeed(speedMBps)
-	}
-}
-
-// RecordDownloadError 记录下载错误
-func (pm *PerformanceMetrics) RecordDownloadError() {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-	pm.downloadErrors++
-	if pm.activeDownloads > 0 {
-		pm.activeDownloads--
-	}
-}
-
-// RecordAPICall 记录API调用
-func (pm *PerformanceMetrics) RecordAPICall() {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-	pm.apiCallCount++
-}
-
-// RecordAPIError 记录API错误
-func (pm *PerformanceMetrics) RecordAPIError() {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-	pm.apiErrorCount++
-}
-
-// RecordRetry 记录重试
-func (pm *PerformanceMetrics) RecordRetry() {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-	pm.retryCount++
-}
-
-// UpdateMemoryUsage 更新内存使用情况
-func (pm *PerformanceMetrics) UpdateMemoryUsage(current int64) {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-	pm.memoryUsage = current
-	if current > pm.peakMemoryUsage {
-		pm.peakMemoryUsage = current
-	}
-}
-
-// RecordPartialFile 记录partial文件
-func (pm *PerformanceMetrics) RecordPartialFile(increment bool) {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-	if increment {
-		pm.partialFileCount++
-	} else if pm.partialFileCount > 0 {
-		pm.partialFileCount--
-	}
-}
-
-// updateUploadSpeed 更新上传速度统计 - 改进的算法
-func (pm *PerformanceMetrics) updateUploadSpeed(speedMBps float64) {
-	if speedMBps > pm.peakUploadSpeed {
-		pm.peakUploadSpeed = speedMBps
-	}
-
-	// 改进的指数加权移动平均算法
-	// 使用动态权重，新数据权重根据样本数量调整
-	alpha := pm.calculateDynamicAlpha(pm.totalUploads)
-	if pm.avgUploadSpeed == 0 {
-		pm.avgUploadSpeed = speedMBps
-	} else {
-		pm.avgUploadSpeed = pm.avgUploadSpeed*(1-alpha) + speedMBps*alpha
-	}
-}
-
-// calculateDynamicAlpha 计算动态权重系数
-func (pm *PerformanceMetrics) calculateDynamicAlpha(sampleCount int64) float64 {
-	// 根据样本数量动态调整权重
-	// 样本越多，新数据权重越小，确保稳定性
-	// 样本越少，新数据权重越大，确保快速响应
-	if sampleCount <= 1 {
-		return 1.0 // 第一个样本，完全采用新值
-	} else if sampleCount <= 10 {
-		return 0.3 // 前10个样本，较高权重
-	} else if sampleCount <= 50 {
-		return 0.15 // 中等样本数，中等权重
-	} else {
-		return 0.05 // 大量样本，较低权重，保持稳定
-	}
-}
-
-// updateDownloadSpeed 更新下载速度统计 - 改进的算法
-func (pm *PerformanceMetrics) updateDownloadSpeed(speedMBps float64) {
-	if speedMBps > pm.peakDownloadSpeed {
-		pm.peakDownloadSpeed = speedMBps
-	}
-
-	// 改进的指数加权移动平均算法
-	// 使用动态权重，新数据权重根据样本数量调整
-	alpha := pm.calculateDynamicAlpha(pm.totalDownloads)
-	if pm.avgDownloadSpeed == 0 {
-		pm.avgDownloadSpeed = speedMBps
-	} else {
-		pm.avgDownloadSpeed = pm.avgDownloadSpeed*(1-alpha) + speedMBps*alpha
-	}
-}
-
-// GetStats 获取性能统计信息 - 改进的精度和详细程度
-func (pm *PerformanceMetrics) GetStats() map[string]any {
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-
-	uptime := time.Since(pm.startTime)
-
-	// 计算更精确的错误率
-	var uploadErrorRate, downloadErrorRate, apiErrorRate float64
-	if pm.totalUploads > 0 {
-		uploadErrorRate = float64(pm.uploadErrors) / float64(pm.totalUploads)
-	}
-	if pm.totalDownloads > 0 {
-		downloadErrorRate = float64(pm.downloadErrors) / float64(pm.totalDownloads)
-	}
-	if pm.apiCallCount > 0 {
-		apiErrorRate = float64(pm.apiErrorCount) / float64(pm.apiCallCount)
-	}
-
-	// 计算吞吐量效率
-	var uploadEfficiency, downloadEfficiency float64
-	if pm.peakUploadSpeed > 0 {
-		uploadEfficiency = pm.avgUploadSpeed / pm.peakUploadSpeed
-	}
-	if pm.peakDownloadSpeed > 0 {
-		downloadEfficiency = pm.avgDownloadSpeed / pm.peakDownloadSpeed
-	}
-
-	stats := map[string]any{
-		"uptime_seconds":           uptime.Seconds(),
-		"total_uploads":            pm.totalUploads,
-		"total_downloads":          pm.totalDownloads,
-		"total_upload_bytes":       pm.totalUploadBytes,
-		"total_download_bytes":     pm.totalDownloadBytes,
-		"upload_errors":            pm.uploadErrors,
-		"download_errors":          pm.downloadErrors,
-		"active_uploads":           pm.activeUploads,
-		"active_downloads":         pm.activeDownloads,
-		"avg_upload_speed_mbps":    pm.avgUploadSpeed,
-		"avg_download_speed_mbps":  pm.avgDownloadSpeed,
-		"peak_upload_speed_mbps":   pm.peakUploadSpeed,
-		"peak_download_speed_mbps": pm.peakDownloadSpeed,
-		"memory_usage_bytes":       pm.memoryUsage,
-		"peak_memory_usage_bytes":  pm.peakMemoryUsage,
-		"api_call_count":           pm.apiCallCount,
-		"api_error_count":          pm.apiErrorCount,
-		"retry_count":              pm.retryCount,
-		"partial_file_count":       pm.partialFileCount,
-		// 新增的精确指标
-		"upload_error_rate":   uploadErrorRate,
-		"download_error_rate": downloadErrorRate,
-		"api_error_rate":      apiErrorRate,
-		"upload_efficiency":   uploadEfficiency,
-		"download_efficiency": downloadEfficiency,
-	}
-
-	return stats
-}
-
-// LogStats 记录性能统计信息到日志
-func (pm *PerformanceMetrics) LogStats(f *Fs) {
-	stats := pm.GetStats()
-
-	// 安全地获取错误率
-	var apiErrorRate float64
-	if rate, ok := stats["api_error_rate"].(float64); ok {
-		apiErrorRate = rate * 100
-	}
-
-	fs.Infof(f, "性能统计: 上传%d个文件(%.2fMB/s平均, %.2fMB/s峰值), 下载%d个文件(%.2fMB/s平均, %.2fMB/s峰值), API调用%d次, 错误率%.2f%%",
-		stats["total_uploads"],
-		stats["avg_upload_speed_mbps"],
-		stats["peak_upload_speed_mbps"],
-		stats["total_downloads"],
-		stats["avg_download_speed_mbps"],
-		stats["peak_download_speed_mbps"],
-		stats["api_call_count"],
-		apiErrorRate,
-	)
 }
 
 // ProgressReadCloser 包装ReadCloser以提供进度跟踪和资源管理
@@ -810,17 +347,8 @@ func (prc *ProgressReadCloser) Read(p []byte) (n int, err error) {
 
 // Close 实现io.Closer接口，同时清理资源
 func (prc *ProgressReadCloser) Close() error {
-	// 释放下载信号量
-	prc.fs.concurrencyManager.ReleaseDownload()
-
-	// 记录下载完成或错误
-	duration := time.Since(prc.startTime)
-	success := prc.transferredSize == prc.totalSize
-	if success {
-		prc.fs.performanceMetrics.RecordDownloadComplete(prc.transferredSize, duration)
-	} else {
-		prc.fs.performanceMetrics.RecordDownloadError()
-	}
+	// 🗑️ 并发控制已删除 - 使用rclone标准控制
+	// 🗑️ 性能指标记录已删除 - 使用rclone标准统计
 
 	// 关闭底层ReadCloser
 	return prc.ReadCloser.Close()
@@ -1322,168 +850,7 @@ func (f *Fs) asyncCleanInvalidCache(cacheKey string) {
 	}
 }
 
-// NewUnifiedRetryManager 创建统一重试管理器
-func NewUnifiedRetryManager() *UnifiedRetryManager {
-	return &UnifiedRetryManager{
-		maxRetries:       10,               // 全局最大重试次数
-		maxRetryDuration: 30 * time.Minute, // 全局最大重试时间
-		retryStats:       make(map[string]*RetryStats),
-	}
-}
-
-// ExecuteWithRetry 执行带重试的操作
-// 🔧 关键修复：统一重试入口，避免多层重试嵌套
-func (urm *UnifiedRetryManager) ExecuteWithRetry(
-	ctx context.Context,
-	operationID string,
-	config RetryConfig,
-	operation func() error,
-) error {
-	urm.mu.Lock()
-	stats, exists := urm.retryStats[operationID]
-	if !exists {
-		stats = &RetryStats{
-			startTime: time.Now(),
-		}
-		urm.retryStats[operationID] = stats
-	}
-	urm.mu.Unlock()
-
-	// 🔧 关键检查：防止超过全局限制
-	if stats.attempts >= urm.maxRetries {
-		return fmt.Errorf("操作 %s 已达到全局最大重试次数 %d", operationID, urm.maxRetries)
-	}
-
-	if time.Since(stats.startTime) >= urm.maxRetryDuration {
-		return fmt.Errorf("操作 %s 已达到全局最大重试时间 %v", operationID, urm.maxRetryDuration)
-	}
-
-	var lastErr error
-	for attempt := stats.attempts; attempt < config.MaxRetries && attempt < urm.maxRetries; attempt++ {
-		// 检查上下文取消
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		// 检查全局时间限制
-		if time.Since(stats.startTime) >= urm.maxRetryDuration {
-			break
-		}
-
-		// 更新统计信息
-		urm.mu.Lock()
-		stats.attempts = attempt + 1
-		stats.lastAttempt = time.Now()
-		urm.mu.Unlock()
-
-		// 执行操作
-		err := operation()
-		if err == nil {
-			// 成功，清理统计信息
-			urm.mu.Lock()
-			delete(urm.retryStats, operationID)
-			urm.mu.Unlock()
-			return nil
-		}
-
-		lastErr = err
-
-		// 检查是否应该重试
-		if !urm.shouldRetry(err, config.OperationType) {
-			break
-		}
-
-		// 计算重试延迟
-		delay := urm.calculateRetryDelay(attempt, config)
-
-		// 记录延迟时间
-		urm.mu.Lock()
-		stats.totalDelay += delay
-		urm.mu.Unlock()
-
-		// 等待重试
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(delay):
-		}
-	}
-
-	return fmt.Errorf("操作 %s 重试失败: %w", operationID, lastErr)
-}
-
-// shouldRetry 判断是否应该重试
-// 🔧 统一错误分类逻辑
-func (urm *UnifiedRetryManager) shouldRetry(err error, operationType string) bool {
-	if err == nil {
-		return false
-	}
-
-	errStr := err.Error()
-
-	// 致命错误，不应重试
-	fatalErrors := []string{
-		"authentication failed",
-		"permission denied",
-		"file not found",
-		"invalid parameter",
-		"quota exceeded",
-	}
-
-	for _, fatal := range fatalErrors {
-		if strings.Contains(strings.ToLower(errStr), fatal) {
-			return false
-		}
-	}
-
-	// 可重试的错误
-	retryableErrors := []string{
-		"network timeout",
-		"connection reset",
-		"server overload",
-		"rate limit",
-		"temporary failure",
-		"503",
-		"502",
-		"500",
-	}
-
-	for _, retryable := range retryableErrors {
-		if strings.Contains(strings.ToLower(errStr), retryable) {
-			return true
-		}
-	}
-
-	// 根据操作类型判断
-	switch operationType {
-	case "upload":
-		return strings.Contains(strings.ToLower(errStr), "upload") && !strings.Contains(strings.ToLower(errStr), "invalid")
-	case "download":
-		return strings.Contains(strings.ToLower(errStr), "download") && !strings.Contains(strings.ToLower(errStr), "not found")
-	default:
-		return false
-	}
-}
-
-// calculateRetryDelay 计算重试延迟
-// 🔧 智能延迟计算，避免过度重试
-func (urm *UnifiedRetryManager) calculateRetryDelay(attempt int, config RetryConfig) time.Duration {
-	delay := config.BaseDelay
-
-	// 指数退避
-	for i := 0; i < attempt; i++ {
-		delay = time.Duration(float64(delay) * config.BackoffMultiplier)
-	}
-
-	// 限制最大延迟
-	if delay > config.MaxDelay {
-		delay = config.MaxDelay
-	}
-
-	return delay
-}
+// 🗑️ UnifiedRetryManager函数已删除 - 使用rclone标准的fserrors.ShouldRetry和fs.Pacer
 
 // 注意：MultiInstanceCacheManager模块已删除，使用简化的缓存管理
 
@@ -1501,139 +868,7 @@ func (urm *UnifiedRetryManager) calculateRetryDelay(attempt int, config RetryCon
 
 // 注意：缓存访问方法已删除，现在直接使用f.parentIDCache等字段
 
-// UnifiedProgressManager 统一进度管理器
-// 🔧 核心思想：统一管理所有进度显示，避免重复和混乱
-type UnifiedProgressManager struct {
-	activeProgresses map[string]*ProgressSession
-	mu               sync.RWMutex
-}
-
-// ProgressSession 进度会话
-type ProgressSession struct {
-	ID           string
-	Type         string // "upload", "download", "cross_cloud"
-	Backend      string // "123drive", "115drive"
-	FileName     string
-	TotalSize    int64
-	CurrentSize  int64
-	TotalChunks  int
-	CurrentChunk int
-	StartTime    time.Time
-	LastUpdate   time.Time
-	Speed        float64
-	ETA          time.Duration
-}
-
-// NewUnifiedProgressManager 创建统一进度管理器
-func NewUnifiedProgressManager() *UnifiedProgressManager {
-	return &UnifiedProgressManager{
-		activeProgresses: make(map[string]*ProgressSession),
-	}
-}
-
-// StartProgress 开始进度跟踪
-// 🔧 关键修复：统一进度入口，避免重复显示
-func (upm *UnifiedProgressManager) StartProgress(id, progressType, backend, fileName string, totalSize int64, totalChunks int) {
-	upm.mu.Lock()
-	defer upm.mu.Unlock()
-
-	session := &ProgressSession{
-		ID:          id,
-		Type:        progressType,
-		Backend:     backend,
-		FileName:    fileName,
-		TotalSize:   totalSize,
-		TotalChunks: totalChunks,
-		StartTime:   time.Now(),
-		LastUpdate:  time.Now(),
-	}
-
-	upm.activeProgresses[id] = session
-}
-
-// UpdateProgress 更新进度
-// 🔧 关键修复：智能进度更新，减少冗余显示
-func (upm *UnifiedProgressManager) UpdateProgress(id string, currentSize int64, currentChunk int) {
-	upm.mu.Lock()
-	session, exists := upm.activeProgresses[id]
-	if !exists {
-		upm.mu.Unlock()
-		return
-	}
-
-	now := time.Now()
-	duration := now.Sub(session.StartTime)
-
-	// 更新会话信息
-	session.CurrentSize = currentSize
-	session.CurrentChunk = currentChunk
-	session.LastUpdate = now
-
-	// 计算速度和ETA
-	if duration > 0 {
-		session.Speed = float64(currentSize) / duration.Seconds() / (1024 * 1024) // MB/s
-		if session.Speed > 0 {
-			remainingSize := session.TotalSize - currentSize
-			session.ETA = time.Duration(float64(remainingSize)/session.Speed/1024/1024) * time.Second
-		}
-	}
-
-	upm.mu.Unlock()
-
-	// 🔧 关键修复：智能显示策略，只在关键节点显示
-	upm.displayProgressIfNeeded(session)
-}
-
-// displayProgressIfNeeded 智能进度显示
-// 🔧 关键修复：避免频繁显示，提升到Info级别让用户可见
-func (upm *UnifiedProgressManager) displayProgressIfNeeded(session *ProgressSession) {
-	// 显示条件：每5个分片、完成时、或每30秒
-	shouldDisplay := false
-
-	if session.CurrentChunk%5 == 0 || session.CurrentChunk == session.TotalChunks {
-		shouldDisplay = true
-	} else if time.Since(session.LastUpdate) > 30*time.Second {
-		shouldDisplay = true
-	}
-
-	if !shouldDisplay {
-		return
-	}
-
-	percentage := float64(session.CurrentChunk) / float64(session.TotalChunks) * 100
-
-	// ETA显示
-	etaStr := "ETA: -"
-	if session.ETA > 0 {
-		etaStr = fmt.Sprintf("ETA: %v", session.ETA.Round(time.Second))
-	}
-
-	// 🔧 关键修复：提升到Info级别，用户无需Debug模式即可看到
-	// 使用"分片5/15"格式，符合用户需求
-	fs.Infof(nil, "📊 %s %s: 分片%d/%d (%.1f%%) | %s/%s | %.2f MB/s | %s",
-		session.Backend, session.Type,
-		session.CurrentChunk, session.TotalChunks, percentage,
-		fs.SizeSuffix(session.CurrentSize), fs.SizeSuffix(session.TotalSize),
-		session.Speed, etaStr)
-}
-
-// FinishProgress 完成进度跟踪
-func (upm *UnifiedProgressManager) FinishProgress(id string) {
-	upm.mu.Lock()
-	defer upm.mu.Unlock()
-
-	if session, exists := upm.activeProgresses[id]; exists {
-		duration := time.Since(session.StartTime)
-		avgSpeed := float64(session.TotalSize) / duration.Seconds() / (1024 * 1024)
-
-		// 🔧 关键修复：完成信息提升到Info级别
-		fs.Infof(nil, "✅ %s %s完成: %s | 用时: %v | 平均速度: %.2f MB/s",
-			session.Backend, session.Type, session.FileName,
-			duration.Round(time.Second), avgSpeed)
-
-		delete(upm.activeProgresses, id)
-	}
-}
+// 🗑️ UnifiedProgressManager已删除 - 使用rclone标准的accounting.Transfer进度显示
 
 // saveDirListToCache 保存目录列表到缓存
 // 增强版本：添加并发安全保护
@@ -1647,14 +882,26 @@ func (f *Fs) saveDirListToCache(parentFileID int64, lastFileID int64, fileList [
 	defer f.cacheMu.Unlock()
 
 	cacheKey := fmt.Sprintf("dirlist_%d_%d", parentFileID, lastFileID)
+
+	// 🔧 在保存到缓存前对文件名进行URL解码
+	decodedFileList := make([]FileListInfoRespDataV2, len(fileList))
+	for i, file := range fileList {
+		decodedFile := file
+		// URL解码文件名
+		if decodedName, err := url.QueryUnescape(strings.TrimSpace(file.Filename)); err == nil {
+			decodedFile.Filename = decodedName
+		}
+		decodedFileList[i] = decodedFile
+	}
+
 	entry := DirListCacheEntry{
-		FileList:   fileList,
+		FileList:   decodedFileList, // 使用解码后的文件列表
 		LastFileID: nextLastFileID,
-		TotalCount: len(fileList),
+		TotalCount: len(decodedFileList),
 		CachedAt:   time.Now(),
 		ParentID:   parentFileID,
 		Version:    generateCacheVersion(),
-		Checksum:   calculateChecksum(fileList),
+		Checksum:   calculateChecksum(decodedFileList),
 	}
 
 	// 使用配置的目录列表缓存TTL
@@ -2130,13 +1377,12 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 		return f.getDownloadURLByUA(ctx, path, ua)
 
 	case "stats":
-		// 返回性能统计信息
-		return f.performanceMetrics.GetStats(), nil
+		// 🗑️ 性能统计已删除 - 使用rclone标准的accounting.StatsInfo
+		return "性能统计功能已简化，请使用rclone标准统计", nil
 
 	case "logstats":
-		// 记录性能统计信息到日志
-		f.performanceMetrics.LogStats(f)
-		return "性能统计已记录到日志", nil
+		// 🗑️ 性能统计已删除 - 使用rclone标准的accounting.StatsInfo
+		return "性能统计功能已简化，请使用rclone标准统计", nil
 
 	case "cache-info":
 		// 使用统一缓存查看器
@@ -2599,101 +1845,9 @@ func (f *Fs) getDownloadURLByUA(ctx context.Context, filePath string, UA string)
 	return f.getDownloadURL(ctx, fileID)
 }
 
-// isUnrecoverableError 检查错误是否为不可恢复的错误
-func isUnrecoverableError(err error) bool {
-	if err == nil {
-		return false
-	}
+// 🗑️ isUnrecoverableError函数已删除 - 未被使用
 
-	errStr := strings.ToLower(err.Error())
-	unrecoverableErrors := []string{
-		"invalid credentials",
-		"authentication failed",
-		"file not found",
-		"permission denied",
-		"quota exceeded",
-		"invalid request",
-		"bad request",
-		"forbidden",
-		"文件不存在",
-		"权限不足",
-		"配额已满",
-		"无效请求",
-	}
-
-	for _, unrecoverable := range unrecoverableErrors {
-		if strings.Contains(errStr, unrecoverable) {
-			return true
-		}
-	}
-	return false
-}
-
-// ConcurrencyManager 统一的并发控制管理器
-// 优化版本：提供更标准化的并发控制接口
-type ConcurrencyManager struct {
-	uploadSemaphore   chan struct{} // 上传并发控制信号量
-	downloadSemaphore chan struct{} // 下载并发控制信号量
-	maxUploads        int           // 最大并发上传数
-	maxDownloads      int           // 最大并发下载数
-}
-
-// NewConcurrencyManager 创建新的并发控制管理器
-func NewConcurrencyManager(maxUploads, maxDownloads int) *ConcurrencyManager {
-	return &ConcurrencyManager{
-		uploadSemaphore:   make(chan struct{}, maxUploads),
-		downloadSemaphore: make(chan struct{}, maxDownloads),
-		maxUploads:        maxUploads,
-		maxDownloads:      maxDownloads,
-	}
-}
-
-// AcquireUpload 获取上传信号量
-func (cm *ConcurrencyManager) AcquireUpload(ctx context.Context) error {
-	select {
-	case cm.uploadSemaphore <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-// ReleaseUpload 释放上传信号量
-func (cm *ConcurrencyManager) ReleaseUpload() {
-	select {
-	case <-cm.uploadSemaphore:
-		// 信号量释放成功
-	default:
-		// 信号量释放失败，记录警告
-		fs.Debugf(nil, "上传信号量释放失败")
-	}
-}
-
-// AcquireDownload 获取下载信号量
-func (cm *ConcurrencyManager) AcquireDownload(ctx context.Context) error {
-	select {
-	case cm.downloadSemaphore <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-// ReleaseDownload 释放下载信号量
-func (cm *ConcurrencyManager) ReleaseDownload() {
-	select {
-	case <-cm.downloadSemaphore:
-		// 信号量释放成功
-	default:
-		// 信号量释放失败，记录警告
-		fs.Debugf(nil, "下载信号量释放失败")
-	}
-}
-
-// GetStats 获取并发控制统计信息
-func (cm *ConcurrencyManager) GetStats() (uploadActive, downloadActive int) {
-	return cm.maxUploads - len(cm.uploadSemaphore), cm.maxDownloads - len(cm.downloadSemaphore)
-}
+// 🗑️ ConcurrencyManager已删除 - 使用rclone标准的fs.Config.Transfers和fs.Config.Checkers
 
 // validateRequired 验证必需字段不为空
 func validateRequired(fieldName, value string) error {
@@ -2941,79 +2095,7 @@ func fastValidateCacheEntry(data any) bool {
 	}
 }
 
-// APIVersionManager 管理API版本兼容性
-type APIVersionManager struct {
-	mu                sync.RWMutex
-	preferredVersions map[string]string // endpoint -> preferred version
-	failedVersions    map[string]bool   // endpoint:version -> failed
-	lastChecked       time.Time
-}
-
-// NewAPIVersionManager 创建API版本管理器
-func NewAPIVersionManager() *APIVersionManager {
-	return &APIVersionManager{
-		preferredVersions: make(map[string]string),
-		failedVersions:    make(map[string]bool),
-		lastChecked:       time.Now(),
-	}
-}
-
-// GetPreferredVersion 获取端点的首选版本
-func (avm *APIVersionManager) GetPreferredVersion(endpoint string) string {
-	avm.mu.RLock()
-	defer avm.mu.RUnlock()
-
-	// 提取端点的基础路径
-	basePath := avm.extractBasePath(endpoint)
-
-	if version, exists := avm.preferredVersions[basePath]; exists {
-		return version
-	}
-
-	// 默认优先使用v2
-	return "v2"
-}
-
-// MarkVersionFailed 标记某个版本失败
-func (avm *APIVersionManager) MarkVersionFailed(endpoint, version string) {
-	avm.mu.Lock()
-	defer avm.mu.Unlock()
-
-	basePath := avm.extractBasePath(endpoint)
-	key := fmt.Sprintf("%s:%s", basePath, version)
-	avm.failedVersions[key] = true
-
-	// 如果v2失败，切换到v1
-	if version == "v2" {
-		avm.preferredVersions[basePath] = "v1"
-	}
-}
-
-// IsVersionFailed 检查版本是否已失败
-func (avm *APIVersionManager) IsVersionFailed(endpoint, version string) bool {
-	avm.mu.RLock()
-	defer avm.mu.RUnlock()
-
-	basePath := avm.extractBasePath(endpoint)
-	key := fmt.Sprintf("%s:%s", basePath, version)
-	return avm.failedVersions[key]
-}
-
-// extractBasePath 提取API端点的基础路径
-func (avm *APIVersionManager) extractBasePath(endpoint string) string {
-	// 移除版本号，提取基础路径
-	// 例如: "/upload/v2/file/create" -> "/upload/file/create"
-	parts := strings.Split(endpoint, "/")
-	var baseParts []string
-
-	for _, part := range parts {
-		if part != "" && !strings.HasPrefix(part, "v") {
-			baseParts = append(baseParts, part)
-		}
-	}
-
-	return "/" + strings.Join(baseParts, "/")
-}
+// 🗑️ APIVersionManager已删除 - 使用简单的版本常量
 
 // shouldRetryCrossCloudTransfer 智能重试策略，专门针对跨云盘传输
 func (f *Fs) shouldRetryCrossCloudTransfer(err error, attempt int, transferredBytes int64, fileSize int64) (bool, time.Duration) {
@@ -3107,163 +2189,16 @@ func (f *Fs) buildVersionedEndpoint(baseEndpoint, version string) string {
 	return baseEndpoint
 }
 
-// UnifiedErrorClassifier123 123网盘统一错误分类器
-type UnifiedErrorClassifier123 struct {
-	// 错误分类统计
-	ServerOverloadCount int64
-	URLExpiredCount     int64
-	NetworkTimeoutCount int64
-	RateLimitCount      int64
-	UnknownErrorCount   int64
-}
-
-// ClassifyError 统一错误分类方法（123网盘版本）
-func (c *UnifiedErrorClassifier123) ClassifyError(err error) string {
-	if err == nil {
-		return "no_error"
-	}
-
-	errStr := strings.ToLower(err.Error())
-
-	// 服务器过载错误
-	if strings.Contains(errStr, "502") || strings.Contains(errStr, "bad gateway") ||
-		strings.Contains(errStr, "503") || strings.Contains(errStr, "service unavailable") ||
-		strings.Contains(errStr, "504") || strings.Contains(errStr, "gateway timeout") ||
-		strings.Contains(errStr, "internal server error") {
-		c.ServerOverloadCount++
-		return "server_overload"
-	}
-
-	// URL过期错误
-	if strings.Contains(errStr, "download url is invalid") || strings.Contains(errStr, "expired") ||
-		strings.Contains(errStr, "url过期") || strings.Contains(errStr, "链接失效") ||
-		strings.Contains(errStr, "invalid download url") {
-		c.URLExpiredCount++
-		return "url_expired"
-	}
-
-	// 网络超时错误
-	if strings.Contains(errStr, "timeout") || strings.Contains(errStr, "deadline exceeded") ||
-		strings.Contains(errStr, "context canceled") || strings.Contains(errStr, "connection reset") ||
-		strings.Contains(errStr, "client.timeout") || strings.Contains(errStr, "i/o timeout") {
-		c.NetworkTimeoutCount++
-		return "network_timeout"
-	}
-
-	// 限流错误
-	if strings.Contains(errStr, "429") || strings.Contains(errStr, "too many requests") ||
-		strings.Contains(errStr, "rate limit") || strings.Contains(errStr, "频率过高") {
-		c.RateLimitCount++
-		return "rate_limit"
-	}
-
-	// 认证错误
-	if strings.Contains(errStr, "401") || strings.Contains(errStr, "unauthorized") ||
-		strings.Contains(errStr, "token") || strings.Contains(errStr, "认证失败") {
-		return "auth_error"
-	}
-
-	// 权限错误
-	if strings.Contains(errStr, "403") || strings.Contains(errStr, "forbidden") ||
-		strings.Contains(errStr, "permission denied") {
-		return "permission_error"
-	}
-
-	// 资源不存在错误
-	if strings.Contains(errStr, "404") || strings.Contains(errStr, "not found") ||
-		strings.Contains(errStr, "file not found") {
-		return "not_found"
-	}
-
-	c.UnknownErrorCount++
-	return "unknown"
-}
+// 🗑️ UnifiedErrorClassifier123结构体和ClassifyError函数已删除 - 未被使用
 
 // shouldRetry 根据响应和错误确定是否重试API调用
-// 🔧 优化：使用统一错误分类和重试策略，与115网盘保持一致
+// 🔧 使用公共库的统一重试逻辑
 func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
-	// 使用rclone标准的上下文错误检查
-	if fserrors.ContextError(ctx, &err) {
-		return false, err
-	}
-
-	// 🔧 优化：使用统一错误分类器，与115网盘保持一致
-	classifier := &UnifiedErrorClassifier123{}
-	errorType := classifier.ClassifyError(err)
-
-	// 基于错误类型决定是否重试
-	switch errorType {
-	case "server_overload", "network_timeout":
-		// 服务器过载和网络超时错误应该重试
-		fs.Debugf(nil, "123网盘检测到%s错误，将重试", errorType)
-		return true, err
-
-	case "rate_limit":
-		// 限流错误应该重试，但使用更长的延迟
-		fs.Debugf(nil, "123网盘检测到限流错误，使用30秒延迟重试")
-		return true, fserrors.NewErrorRetryAfter(30 * time.Second)
-
-	case "url_expired":
-		// URL过期错误应该重试（会触发URL刷新）
-		fs.Debugf(nil, "123网盘检测到URL过期错误，将重试")
-		return true, err
-
-	case "auth_error":
-		// 认证错误需要刷新token后重试
-		fs.Debugf(nil, "123网盘检测到认证错误，需要刷新token")
-		return true, fserrors.NewErrorRetryAfter(1 * time.Second)
-
-	case "permission_error", "not_found":
-		// 权限错误和资源不存在错误不重试
-		fs.Debugf(nil, "123网盘检测到%s错误，不重试", errorType)
-		return false, err
-
-	default:
-		// 网络错误时重试
-		if err != nil {
-			// 检查是否为不可恢复的错误（保留123网盘特定的错误检查）
-			if isUnrecoverableError(err) {
-				return false, err
-			}
-
-			// 使用rclone标准的重试判断
-			return fserrors.ShouldRetry(err), err
-		}
-
-		// 检查HTTP状态码 - 使用rclone标准处理加上123网盘特定处理
-		if resp != nil {
-			switch resp.StatusCode {
-			case http.StatusTooManyRequests:
-				// 速率受限 - 使用较长的退避时间
-				fs.Debugf(nil, "速率受限（API错误429），将使用更长退避时间重试")
-				return true, fserrors.NewErrorRetryAfter(calculateRetryDelay(3))
-			case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-				// 服务器错误 - 使用标准重试
-				fs.Debugf(nil, "服务器错误 %d，将重试", resp.StatusCode)
-				return true, fserrors.NewErrorRetryAfter(baseRetryDelay)
-			case http.StatusUnauthorized:
-				// 令牌可能已过期 - 不重试，让调用者处理令牌刷新
-				return false, fserrors.NewErrorRetryAfter(baseRetryDelay)
-			}
-		}
-
-		return false, err
-	}
+	// 使用公共库的HTTP重试逻辑
+	return common.ShouldRetryHTTP(ctx, resp, err)
 }
 
-// calculateRetryDelay 计算指数退避的重试延迟
-func calculateRetryDelay(attempt int) time.Duration {
-	if attempt <= 0 {
-		return baseRetryDelay
-	}
-
-	delay := time.Duration(float64(baseRetryDelay) * math.Pow(retryMultiplier, float64(attempt-1)))
-	delay = min(delay, maxRetryDelay)
-
-	// 添加随机抖动以避免雷群效应
-	jitter := time.Duration(rand.Float64() * float64(delay) * 0.1) // 10%的抖动
-	return delay + jitter
-}
+// 🗑️ calculateRetryDelay函数已删除 - 未被使用
 
 // makeAPICallWithRest 使用rclone标准rest客户端进行API调用，自动集成QPS限制
 // 这是推荐的API调用方法，替代直接使用HTTP客户端
@@ -3647,18 +2582,7 @@ func (f *Fs) calculateCrossCloudTimeout(fileSize int64, transferredBytes int64) 
 		}
 	}
 
-	// 根据网络质量调整（使用基础性能指标）
-	if f.performanceMetrics != nil {
-		// 使用基础性能指标进行网络质量评估
-		stats := f.performanceMetrics.GetStats()
-		if apiErrorRate, ok := stats["api_error_rate"].(float64); ok {
-			if apiErrorRate > 0.5 { // 错误率较高，网络质量较差
-				baseTimeout = time.Duration(float64(baseTimeout) * 1.5)
-			} else if apiErrorRate < 0.1 { // 错误率较低，网络质量良好
-				baseTimeout = time.Duration(float64(baseTimeout) * 0.8)
-			}
-		}
-	}
+	// 🔧 简化网络质量调整 - 使用固定的合理超时时间
 
 	// 设置最小和最大限制
 	minTimeout := 60 * time.Second // 最少1分钟
@@ -5382,21 +4306,10 @@ func (f *Fs) uploadPartWithMultipart(ctx context.Context, preuploadID string, pa
 	fs.Debugf(f, "开始上传分片 %d，预上传ID: %s, 分片MD5: %s, 数据大小: %d 字节",
 		partNumber, preuploadID, chunkHash, len(data))
 
-	// 🔧 关键修复：使用统一重试管理器，移除 uploadPacer.Call 的重试层
-	operationID := fmt.Sprintf("upload_part_%s_%d", preuploadID, partNumber)
-
-	config := RetryConfig{
-		MaxRetries:        5,
-		MaxDuration:       10 * time.Minute,
-		BaseDelay:         1 * time.Second,
-		MaxDelay:          30 * time.Second,
-		BackoffMultiplier: 2.0,
-		OperationType:     "upload",
-	}
-
-	return f.retryManager.ExecuteWithRetry(ctx, operationID, config, func() error {
-		// 🔧 修复：直接执行上传操作，不再嵌套重试
-		return f.uploadPartDirectly(ctx, preuploadID, partNumber, chunkHash, data)
+	// 🔧 简化重试逻辑 - 使用rclone标准的fs.Pacer重试机制
+	return f.uploadPacer.Call(func() (bool, error) {
+		err := f.uploadPartDirectly(ctx, preuploadID, partNumber, chunkHash, data)
+		return fserrors.ShouldRetry(err), err
 	})
 }
 
@@ -6082,53 +4995,55 @@ func (f *Fs) streamingPut(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 	return f.unifiedUpload(ctx, in, src, parentFileID, fileName)
 }
 
-// handlePreDownloadedCrossCloudTransfer 处理已预下载的跨云传输
-// 🚀 避免重复下载：直接使用rclone已经下载的数据进行上传
-func (f *Fs) handlePreDownloadedCrossCloudTransfer(ctx context.Context, in io.Reader, src fs.ObjectInfo, parentFileID int64, fileName string, _ map[string]any) (*Object, error) {
-	fs.Infof(f, "🌐 处理预下载跨云传输: %s (大小: %s)", fileName, fs.SizeSuffix(src.Size()))
-
-	// 🚀 关键优化：直接使用传入的Reader（已经是115网盘下载的数据）
-	// 不再重复调用115网盘下载，避免双重下载问题
-	fs.Infof(f, "📤 直接使用已下载数据进行123网盘上传...")
-
-	// 尝试秒传检查（如果可能）
-	if srcObj, ok := src.(fs.Object); ok {
-		// 尝试获取MD5进行秒传
-		if srcHash, err := srcObj.Hash(ctx, fshash.MD5); err == nil && srcHash != "" {
-			fs.Infof(f, "🔍 尝试秒传检查，MD5: %s", srcHash)
-
-			// 检查123网盘是否支持此文件的秒传（简化版本）
-			fs.Debugf(f, "⚠️ 秒传功能暂未实现，继续正常上传")
-		}
-	}
-
-	// 直接使用统一上传接口，避免重复下载
-	return f.unifiedUpload(ctx, in, src, parentFileID, fileName)
-}
-
-// handleCrossCloudTransfer 处理通用跨云传输
-// 🚀 通用跨云传输处理：适用于任何云存储服务到123网盘的传输
+// handleCrossCloudTransfer 统一的跨云传输处理函数
+// 🚀 合并4个重复函数：支持预下载数据、智能重试感知、简化传输等所有场景
 func (f *Fs) handleCrossCloudTransfer(ctx context.Context, in io.Reader, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
-	fs.Infof(f, "🌐 开始处理跨云传输: %s (大小: %s)", fileName, fs.SizeSuffix(src.Size()))
+	fileSize := src.Size()
+	fs.Infof(f, "🌐 开始统一跨云传输处理: %s (%s)", fileName, fs.SizeSuffix(fileSize))
 
-	// 🚀 优化策略：直接使用传入的Reader进行上传，避免重复下载
-	// 这个Reader已经是源云盘下载的数据流
-	fs.Infof(f, "📤 直接使用源云盘数据流进行123网盘上传...")
+	// 🔧 智能重试感知：检测是否为重试情况，避免重复下载
+	if cachedMD5, found := f.getCachedMD5(src); found {
+		fs.Infof(f, "🎯 检测到重试情况，文件已下载过，直接尝试上传 (MD5: %s)", cachedMD5)
+		return f.uploadWithKnownMD5FromRetry(ctx, src, parentFileID, fileName, cachedMD5)
+	}
 
-	// 尝试秒传检查（如果源对象支持MD5）
-	if srcObj, ok := src.(fs.Object); ok {
-		// 尝试获取MD5进行秒传
-		if srcHash, err := srcObj.Hash(ctx, fshash.MD5); err == nil && srcHash != "" {
-			fs.Infof(f, "🔍 尝试秒传检查，MD5: %s", srcHash)
+	// 🚀 预下载数据处理：如果有Reader，直接使用已下载的数据
+	if in != nil {
+		fs.Infof(f, "📤 使用已下载数据进行上传，避免重复下载")
 
-			// 这里可以添加123网盘的秒传检查逻辑
-			// 暂时跳过秒传，直接上传
-			fs.Debugf(f, "⚠️ 秒传功能暂未实现，继续正常上传")
+		// 尝试秒传检查（如果源对象支持MD5）
+		if srcObj, ok := src.(fs.Object); ok {
+			if srcHash, err := srcObj.Hash(ctx, fshash.MD5); err == nil && srcHash != "" {
+				fs.Infof(f, "🔍 尝试秒传检查，MD5: %s", srcHash)
+				// 秒传功能暂未实现，继续正常上传
+			}
+		}
+
+		// 直接使用统一上传接口
+		return f.unifiedUpload(ctx, in, src, parentFileID, fileName)
+	}
+
+	// 🔧 简化传输处理：没有Reader时，需要打开源文件
+	fs.Infof(f, "🔄 执行完整跨云传输流程")
+
+	// 获取底层的fs.Object
+	var srcObj fs.Object
+	if obj, ok := src.(fs.Object); ok {
+		srcObj = obj
+	} else if overrideRemote, ok := src.(*fs.OverrideRemote); ok {
+		srcObj = overrideRemote.UnWrap()
+		if srcObj == nil {
+			return nil, fmt.Errorf("无法从fs.OverrideRemote中解包出fs.Object")
+		}
+	} else {
+		srcObj = fs.UnWrapObjectInfo(src)
+		if srcObj == nil {
+			return nil, fmt.Errorf("源对象类型 %T 无法解包为fs.Object，无法进行跨云传输", src)
 		}
 	}
 
-	// 直接使用统一上传接口
-	return f.unifiedUpload(ctx, in, src, parentFileID, fileName)
+	// 选择最优传输策略
+	return f.selectOptimalCrossCloudStrategy(ctx, srcObj, src, parentFileID, fileName)
 }
 
 // getCachedUploadDomain 获取缓存的上传域名，避免频繁API调用
@@ -6174,25 +5089,7 @@ func (f *Fs) calculateOptimalChunkSize(fileSize int64) int64 {
 	}
 }
 
-// handleCrossCloudTransferWithRetryAwareness 智能重试感知的跨云传输处理
-// 🔧 修复重复下载问题：检测重试情况，避免重复下载
-func (f *Fs) handleCrossCloudTransferWithRetryAwareness(ctx context.Context, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
-	fileSize := src.Size()
-	fs.Infof(f, "🌐 开始智能重试感知跨云传输: %s (%s)", fileName, fs.SizeSuffix(fileSize))
-
-	// 🔧 关键修复：检测是否为重试情况
-	// 通过检查全局MD5缓存来判断是否已经下载过
-	if cachedMD5, found := f.getCachedMD5(src); found {
-		fs.Infof(f, "🎯 检测到重试情况，文件已下载过，直接尝试上传 (MD5: %s)", cachedMD5)
-
-		// 尝试直接使用已知MD5进行上传，避免重新下载
-		return f.uploadWithKnownMD5FromRetry(ctx, src, parentFileID, fileName, cachedMD5)
-	}
-
-	// 首次下载，正常执行跨云传输
-	fs.Infof(f, "🔄 首次下载，执行完整跨云传输流程")
-	return f.handleCrossCloudTransferSimplified(ctx, src, parentFileID, fileName)
-}
+// 🗑️ handleCrossCloudTransferWithRetryAwareness已删除 - 功能已合并到统一的handleCrossCloudTransfer函数
 
 // uploadWithKnownMD5FromRetry 在重试情况下使用已知MD5直接上传
 // 🔧 修复重复下载：避免重新下载，直接尝试上传
@@ -6205,7 +5102,7 @@ func (f *Fs) uploadWithKnownMD5FromRetry(ctx context.Context, src fs.ObjectInfo,
 		fs.Debugf(f, "重试时创建上传会话失败: %v", err)
 		// 如果还是失败，回退到完整下载流程
 		fs.Infof(f, "⚠️ 重试上传失败，回退到完整下载流程")
-		return f.handleCrossCloudTransferSimplified(ctx, src, parentFileID, fileName)
+		return f.handleCrossCloudTransfer(ctx, nil, src, parentFileID, fileName)
 	}
 
 	// 检查是否秒传成功
@@ -6225,44 +5122,10 @@ func (f *Fs) uploadWithKnownMD5FromRetry(ctx context.Context, src fs.ObjectInfo,
 
 	// 如果不能秒传，说明需要实际上传文件，回退到完整流程
 	fs.Infof(f, "⚠️ 重试时无法秒传，需要重新下载文件进行上传")
-	return f.handleCrossCloudTransferSimplified(ctx, src, parentFileID, fileName)
+	return f.handleCrossCloudTransfer(ctx, nil, src, parentFileID, fileName)
 }
 
-// handleCrossCloudTransferSimplified 简化的跨云传输处理函数
-// 🔧 修复重复下载问题：直接选择策略，避免重复打开源文件
-func (f *Fs) handleCrossCloudTransferSimplified(ctx context.Context, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
-	fileSize := src.Size()
-	fs.Infof(f, "🌐 开始简化跨云传输: %s (%s)", fileName, fs.SizeSuffix(fileSize))
-
-	// 🔧 修复重复下载：直接根据文件大小选择策略，不预先打开文件
-	// 尝试获取底层的fs.Object
-	var srcObj fs.Object
-
-	// 首先尝试直接转换为fs.Object
-	if obj, ok := src.(fs.Object); ok {
-		srcObj = obj
-		fs.Debugf(f, "源对象是fs.Object类型，直接使用")
-	} else if overrideRemote, ok := src.(*fs.OverrideRemote); ok {
-		// 处理fs.OverrideRemote包装类型
-		fs.Debugf(f, "源对象是fs.OverrideRemote类型，尝试解包")
-		srcObj = overrideRemote.UnWrap()
-		if srcObj == nil {
-			return nil, fmt.Errorf("无法从fs.OverrideRemote中解包出fs.Object")
-		}
-		fs.Debugf(f, "成功从fs.OverrideRemote解包出fs.Object")
-	} else {
-		// 尝试使用rclone标准的UnWrapObjectInfo函数
-		fs.Debugf(f, "源对象类型 %T，尝试使用标准解包方法", src)
-		srcObj = fs.UnWrapObjectInfo(src)
-		if srcObj == nil {
-			return nil, fmt.Errorf("源对象类型 %T 无法解包为fs.Object，无法进行跨云传输", src)
-		}
-		fs.Debugf(f, "使用标准解包方法成功获取fs.Object")
-	}
-
-	// 🔧 修复重复下载：直接选择最优策略，避免重复打开文件
-	return f.selectOptimalCrossCloudStrategy(ctx, srcObj, src, parentFileID, fileName)
-}
+// 🗑️ handleCrossCloudTransferSimplified已删除 - 功能已合并到统一的handleCrossCloudTransfer函数
 
 // selectOptimalCrossCloudStrategy 选择最优的跨云传输策略
 // 🔧 修复重复下载问题：统一策略选择，避免重复打开源文件
@@ -6718,9 +5581,7 @@ func (f *Fs) downloadChunksConcurrently(ctx context.Context, srcObj fs.Object, t
 				}
 			}
 
-			// 🔧 统一进度显示：使用新的统一进度管理器
-			progressID := fmt.Sprintf("download_%s_%d", srcObj.Remote(), time.Now().Unix())
-			f.progressManager.UpdateProgress(progressID, int64(chunkIndex+1)*chunkSize, int(chunkIndex+1))
+			// 🗑️ 统一进度显示已删除 - 使用rclone标准的accounting.Transfer进度显示
 
 			fs.Debugf(f, "123网盘分片 %d 下载成功: %d-%d (%s) | 用时: %v | 速度: %.2f MB/s",
 				chunkIndex, start, end, fs.SizeSuffix(actualChunkSize), chunkDuration,
@@ -7392,21 +6253,7 @@ func (f *Fs) putSmallFileWithMD5(ctx context.Context, in io.Reader, src fs.Objec
 		return f.streamingPutWithBuffer(ctx, in, src, parentFileID, fileName)
 	}
 
-	// 检查内存管理器是否允许分配
-	fileID := fmt.Sprintf("%s_%d_%d", fileName, parentFileID, time.Now().UnixNano())
-	if !f.memoryManager.CanAllocate(fileSize) {
-		fs.Debugf(f, "内存不足，无法缓存文件（%d字节），回退到流式上传", fileSize)
-		return f.streamingPutWithBuffer(ctx, in, src, parentFileID, fileName)
-	}
-
-	// 预先分配内存跟踪
-	if !f.memoryManager.Allocate(fileID, fileSize) {
-		fs.Debugf(f, "内存分配失败，回退到流式上传")
-		return f.streamingPutWithBuffer(ctx, in, src, parentFileID, fileName)
-	}
-
-	// 确保在函数结束时释放内存
-	defer f.memoryManager.Release(fileID)
+	// 🔧 简化内存管理 - 使用Go标准库，移除过度复杂的内存跟踪
 
 	// 使用限制读取器防止读取超过预期大小的数据
 	// 这可以防止恶意或损坏的文件导致内存耗尽
@@ -7436,8 +6283,7 @@ func (f *Fs) putSmallFileWithMD5(ctx context.Context, in io.Reader, src fs.Objec
 		}
 	}
 
-	// 更新内存使用监控
-	f.performanceMetrics.UpdateMemoryUsage(actualSize)
+	// 🗑️ 内存使用监控已删除 - 使用Go标准库内存管理
 
 	// 计算MD5哈希值
 	// 这是关键步骤：先计算MD5，然后尝试秒传
@@ -8200,8 +7046,7 @@ func (f *Fs) uploadChunksWithConcurrency(ctx context.Context, srcObj fs.Object, 
 					if saveErr != nil {
 						fs.Debugf(f, "保存进度失败: %v", saveErr)
 					}
-					// 记录partial文件（用于统计）
-					f.performanceMetrics.RecordPartialFile(true)
+					// 🗑️ partial文件统计已删除
 					return nil, fmt.Errorf("分片 %d 上传失败: %w", result.chunkIndex+1, result.err)
 				}
 
@@ -8232,8 +7077,7 @@ func (f *Fs) uploadChunksWithConcurrency(ctx context.Context, srcObj fs.Object, 
 				if saveErr != nil {
 					fs.Debugf(f, "超时时保存进度失败: %v", saveErr)
 				}
-				// 记录partial文件（用于统计）
-				f.performanceMetrics.RecordPartialFile(true)
+				// 🗑️ partial文件统计已删除
 
 				if workerCtx.Err() == context.DeadlineExceeded {
 					return nil, fmt.Errorf("上传超时，已完成 %d/%d 分片", completedChunks, pendingChunks)
@@ -8907,8 +7751,8 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	normalizedRoot := normalizePath(root)
 	fs.Debugf(nil, "NewFs路径规范化: %q -> %q", root, normalizedRoot)
 
-	// 创建HTTP客户端
-	client := fshttp.NewClient(ctx)
+	// 创建HTTP客户端 - 使用公共库的优化配置
+	client := common.GetHTTPClient(ctx)
 
 	f := &Fs{
 		name:         name,
@@ -8960,15 +7804,11 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		1000.0/float64(uploadPacerSleep.Milliseconds()),
 		1000.0/float64(downloadPacerSleep.Milliseconds()))
 
-	// 初始化性能优化组件 - 使用统一的并发控制管理器
-	f.concurrencyManager = NewConcurrencyManager(opt.MaxConcurrentUploads, opt.MaxConcurrentDownloads)
+	// 🗑️ 并发控制管理器已删除 - 使用rclone标准的fs.Config.Transfers和fs.Config.Checkers
 
-	// 初始化内存管理器，防止内存泄漏 - 优化内存限制
-	// 总内存限制150MB，单文件限制30MB，减少内存压力
-	f.memoryManager = NewMemoryManager(150*1024*1024, 30*1024*1024)
+	// 🗑️ 内存管理器已删除 - 使用Go标准库内存管理
 
-	// 初始化性能指标收集器
-	f.performanceMetrics = NewPerformanceMetrics()
+	// 🗑️ 性能指标收集器已删除 - 使用rclone标准的accounting.StatsInfo
 
 	// 注意：增强性能指标收集器已删除
 
@@ -8980,11 +7820,9 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// 初始化缓存配置
 	f.cacheConfig = DefaultCacheConfig()
 
-	// 🔧 初始化统一重试管理器，避免多层重试嵌套
-	f.retryManager = NewUnifiedRetryManager()
+	// 🗑️ 统一重试管理器已删除 - 使用rclone标准的fserrors.ShouldRetry和fs.Pacer
 
-	// 🔧 初始化统一进度管理器，避免重复进度显示
-	f.progressManager = NewUnifiedProgressManager()
+	// 🗑️ 统一进度管理器已删除 - 使用rclone标准的accounting.Transfer进度显示
 
 	// 🔧 初始化简化的BadgerDB缓存（替代MultiInstanceCacheManager）
 	cacheDir := cache.GetCacheDir("123drive")
@@ -9019,9 +7857,7 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.verificationManager = NewUploadVerificationManager(f)
 	fs.Infof(f, "🔧 上传验证管理器初始化成功")
 
-	// 初始化API版本管理器
-	f.apiVersionManager = NewAPIVersionManager()
-	fs.Debugf(f, "API版本管理器初始化成功")
+	// 🗑️ API版本管理器已删除 - 使用简单的版本常量
 
 	// 初始化断点续传管理器
 	if resumeManager, err := NewResumeManager(f, cacheDir); err != nil {
@@ -9032,9 +7868,7 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		fs.Debugf(f, "断点续传管理器初始化成功")
 	}
 
-	// 初始化动态参数调整器
-	f.dynamicAdjuster = NewDynamicParameterAdjuster()
-	fs.Debugf(f, "动态参数调整器初始化成功")
+	// 🗑️ 动态参数调整器已删除 - 使用固定的优化参数
 
 	// 🛡️ 注册程序退出时的资源清理钩子
 	// 确保即使程序异常退出也能清理临时文件
@@ -9135,26 +7969,26 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		newRoot, remote := dircache.SplitPath(root)
 		// 创建新的Fs实例，避免复制锁值
 		tempF := &Fs{
-			name:               f.name,
-			root:               newRoot,
-			opt:                f.opt,
-			m:                  f.m,
-			rootFolderID:       f.rootFolderID,
-			client:             f.client,
-			listPacer:          f.listPacer,
-			strictPacer:        f.strictPacer,
-			uploadPacer:        f.uploadPacer,
-			downloadPacer:      f.downloadPacer,
-			parentIDCache:      f.parentIDCache,
-			dirListCache:       f.dirListCache,
-			pathToIDCache:      f.pathToIDCache,
-			concurrencyManager: f.concurrencyManager,
-			memoryManager:      f.memoryManager,
-			performanceMetrics: f.performanceMetrics,
-			resourcePool:       f.resourcePool,
-			apiVersionManager:  f.apiVersionManager,
-			resumeManager:      f.resumeManager,
-			cacheConfig:        f.cacheConfig,
+			name:          f.name,
+			root:          newRoot,
+			opt:           f.opt,
+			m:             f.m,
+			rootFolderID:  f.rootFolderID,
+			client:        f.client,
+			listPacer:     f.listPacer,
+			strictPacer:   f.strictPacer,
+			uploadPacer:   f.uploadPacer,
+			downloadPacer: f.downloadPacer,
+			parentIDCache: f.parentIDCache,
+			dirListCache:  f.dirListCache,
+			pathToIDCache: f.pathToIDCache,
+			// 🗑️ concurrencyManager已删除
+			// 🗑️ memoryManager已删除
+			// 🗑️ performanceMetrics已删除
+			resourcePool: f.resourcePool,
+			// 🗑️ apiVersionManager已删除
+			resumeManager: f.resumeManager,
+			cacheConfig:   f.cacheConfig,
 		}
 		tempF.dirCache = dircache.New(newRoot, f.rootFolderID, tempF)
 		// Make new Fs which is the parent
@@ -9252,16 +8086,9 @@ func (f *Fs) Precision() time.Duration {
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	fs.Debugf(f, "调用Put: %s", src.Remote())
 
-	// 记录上传开始
-	startTime := time.Now()
-	f.performanceMetrics.RecordUploadStart(src.Size())
+	// 🗑️ 性能指标记录已删除 - 使用rclone标准统计
 
-	// 并发控制：获取上传信号量
-	if err := f.concurrencyManager.AcquireUpload(ctx); err != nil {
-		return nil, fmt.Errorf("获取上传信号量失败: %w", err)
-	}
-	// 使用命名返回值确保在panic时也能释放信号量
-	defer f.concurrencyManager.ReleaseUpload()
+	// 🗑️ 并发控制已删除 - 使用rclone标准的fs.Config.Transfers控制
 
 	// 规范化远程路径
 	normalizedRemote := normalizePath(src.Remote())
@@ -9327,12 +8154,8 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	// Use streaming optimization for cross-cloud transfers
 	obj, err := f.streamingPut(ctx, in, src, parentFileID, fileName)
 
-	// 记录上传完成或错误
-	duration := time.Since(startTime)
-	if err != nil {
-		f.performanceMetrics.RecordUploadError()
-	} else {
-		f.performanceMetrics.RecordUploadComplete(src.Size(), duration)
+	// 🗑️ 性能指标记录已删除 - 使用rclone标准统计
+	if err == nil {
 		// 上传成功后，清理相关缓存
 		f.invalidateRelatedCaches(normalizedRemote, "upload")
 	}
@@ -9410,14 +8233,9 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 
 	fs.Debugf(o.fs, "🔍 DEBUG: 123网盘使用普通Open方法: %s", o.remote)
 
-	// 记录下载开始
-	o.fs.performanceMetrics.RecordDownloadStart(o.size)
+	// 🗑️ 性能指标记录已删除 - 使用rclone标准统计
 
-	// 并发控制：获取下载信号量
-	if err := o.fs.concurrencyManager.AcquireDownload(ctx); err != nil {
-		return nil, err
-	}
-	// 信号量将在ReadCloser关闭时释放
+	// 🗑️ 并发控制已删除 - 使用rclone标准的fs.Config.Checkers控制
 
 	var resp *http.Response
 	var err error
@@ -9489,8 +8307,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	})
 
 	if err != nil {
-		// 释放下载信号量
-		o.fs.concurrencyManager.ReleaseDownload()
+		// 🗑️ 并发控制已删除
 		return nil, err
 	}
 
@@ -9590,14 +8407,9 @@ func (o *Object) openWithConcurrency(ctx context.Context, options ...fs.OpenOpti
 
 // openNormal 普通的打开方法（原来的逻辑）
 func (o *Object) openNormal(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
-	// 记录下载开始
-	o.fs.performanceMetrics.RecordDownloadStart(o.size)
+	// 🗑️ 性能指标记录已删除 - 使用rclone标准统计
 
-	// 并发控制：获取下载信号量
-	if err := o.fs.concurrencyManager.AcquireDownload(ctx); err != nil {
-		return nil, err
-	}
-	// 信号量将在ReadCloser关闭时释放
+	// 🗑️ 并发控制已删除 - 使用rclone标准的fs.Config.Checkers控制
 
 	var resp *http.Response
 	var err error
@@ -9633,8 +8445,7 @@ func (o *Object) openNormal(ctx context.Context, options ...fs.OpenOption) (io.R
 	})
 
 	if err != nil {
-		// 释放下载信号量
-		o.fs.concurrencyManager.ReleaseDownload()
+		// 🗑️ 并发控制已删除
 		return nil, err
 	}
 
@@ -9653,15 +8464,10 @@ func (o *Object) openNormal(ctx context.Context, options ...fs.OpenOption) (io.R
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	fs.Debugf(o.fs, "调用Update: %s", o.remote)
 
-	// 记录上传开始
+	// 🗑️ 性能指标记录已删除 - 使用rclone标准统计
 	startTime := time.Now()
-	o.fs.performanceMetrics.RecordUploadStart(src.Size())
 
-	// 并发控制：获取上传信号量
-	if err := o.fs.concurrencyManager.AcquireUpload(ctx); err != nil {
-		return fmt.Errorf("获取上传信号量失败: %w", err)
-	}
-	defer o.fs.concurrencyManager.ReleaseUpload()
+	// 🗑️ 并发控制已删除 - 使用rclone标准的fs.Config.Transfers控制
 
 	// Use dircache to find parent directory
 	leaf, parentID, err := o.fs.dirCache.FindPath(ctx, o.remote, false)
@@ -9689,7 +8495,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	// 记录上传完成或错误
 	duration := time.Since(startTime)
 	if err != nil {
-		o.fs.performanceMetrics.RecordUploadError()
+		// 🗑️ 性能指标记录已删除 - 使用rclone标准统计
 		fs.Errorf(o.fs, "Update操作失败: %v", err)
 		return err
 	}
@@ -9700,8 +8506,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	o.modTime = newObj.modTime
 	o.id = newObj.id
 
-	// 记录上传成功
-	o.fs.performanceMetrics.RecordUploadComplete(src.Size(), duration)
+	// 🗑️ 性能指标记录已删除 - 使用rclone标准统计
 	fs.Debugf(o.fs, "Update操作成功，耗时: %v", duration)
 
 	return nil
@@ -10319,11 +9124,13 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 	// Convert to fs.DirEntries
 	for _, file := range allFiles {
-		// 🔍 调试：检查API返回的原始文件名
-		fs.Debugf(f, "🔍 API返回的原始文件名: [%s] (长度=%d, 字节=%v)", file.Filename, len(file.Filename), []byte(file.Filename))
-
-		// 🔧 修复：清理API返回的文件名，去除前后空格
+		// 🔧 修复：清理API返回的文件名，去除前后空格并进行URL解码
 		cleanedFilename := strings.TrimSpace(file.Filename)
+
+		// 🔧 URL解码文件名（处理%3A等编码）
+		if decodedName, err := url.QueryUnescape(cleanedFilename); err == nil {
+			cleanedFilename = decodedName
+		}
 		if cleanedFilename != file.Filename {
 			fs.Debugf(f, "🔧 清理文件名: [%s] -> [%s]", file.Filename, cleanedFilename)
 		}
@@ -10729,241 +9536,24 @@ func (oi *ObjectInfo) Hash(ctx context.Context, t fshash.Type) (string, error) {
 }
 
 // getHTTPClient makes an http client according to the options
-// 简化版本：直接使用rclone的标准HTTP客户端配置
+// 🔧 使用公共库的标准HTTP客户端配置
 func getHTTPClient(ctx context.Context, _ string, _ configmap.Mapper) *http.Client {
-	// rclone的fshttp.NewClient已经提供了合适的默认配置
-	// 包括超时、连接池、TLS设置等，无需额外自定义
-	return fshttp.NewClient(ctx)
+	// 使用公共库的标准HTTP客户端
+	return common.GetStandardHTTPClient(ctx)
 }
 
 // getNetworkQuality 评估当前网络质量，返回0.0-1.0的质量分数
 func (f *Fs) getNetworkQuality() float64 {
-	// 基于最近的传输统计评估网络质量
-	if f.performanceMetrics == nil {
-		return 0.8 // 默认假设网络质量良好
-	}
-
-	// 从性能指标获取实际的错误率和传输统计
-	stats := f.performanceMetrics.GetStats()
-
-	// 获取错误率
-	var errorRate float64 = 0.02 // 默认2%错误率
-	if apiErrorRate, ok := stats["api_error_rate"].(float64); ok {
-		errorRate = apiErrorRate
-	}
-
-	// 获取平均传输速度作为网络质量指标
-	var speedQuality float64 = 0.8 // 默认质量分数
-	if avgSpeed, ok := stats["average_upload_speed"].(float64); ok {
-		// 基于传输速度评估网络质量
-		if avgSpeed > 50 { // >50MB/s - 优秀网络
-			speedQuality = 0.95
-		} else if avgSpeed > 20 { // >20MB/s - 良好网络
-			speedQuality = 0.85
-		} else if avgSpeed > 10 { // >10MB/s - 一般网络
-			speedQuality = 0.7
-		} else if avgSpeed > 5 { // >5MB/s - 较差网络
-			speedQuality = 0.5
-		} else { // <5MB/s - 很差网络
-			speedQuality = 0.3
-		}
-	}
-
-	// 基于错误率调整质量分数
-	var errorQuality float64
-	if errorRate > 0.15 { // 错误率>15%
-		errorQuality = 0.2 // 网络质量很差
-	} else if errorRate > 0.10 { // 错误率>10%
-		errorQuality = 0.4 // 网络质量差
-	} else if errorRate > 0.05 { // 错误率>5%
-		errorQuality = 0.6 // 网络质量一般
-	} else if errorRate > 0.02 { // 错误率>2%
-		errorQuality = 0.8 // 网络质量良好
-	} else {
-		errorQuality = 0.95 // 网络质量优秀
-	}
-
-	// 综合速度和错误率评估（权重：速度60%，错误率40%）
-	finalQuality := speedQuality*0.6 + errorQuality*0.4
-
-	fs.Debugf(f, "网络质量评估: 错误率=%.3f, 速度质量=%.2f, 错误质量=%.2f, 最终质量=%.2f",
-		errorRate, speedQuality, errorQuality, finalQuality)
-
-	return finalQuality
+	// 🔧 简化网络质量评估 - 使用固定的良好网络质量假设
+	return 0.8 // 默认假设网络质量良好
 }
 
-// DynamicParameterAdjuster 动态参数调整器
-type DynamicParameterAdjuster struct {
-	mu                    sync.RWMutex
-	lastAdjustment        time.Time
-	adjustmentInterval    time.Duration
-	networkQualityHistory []float64
-	maxHistorySize        int
-	currentConcurrency    int
-	currentChunkSize      int64
-	currentTimeout        time.Duration
-}
+// 🗑️ DynamicParameterAdjuster已删除 - 使用固定的优化参数
 
-// NewDynamicParameterAdjuster 创建动态参数调整器
-func NewDynamicParameterAdjuster() *DynamicParameterAdjuster {
-	return &DynamicParameterAdjuster{
-		adjustmentInterval:    30 * time.Second, // 每30秒调整一次
-		networkQualityHistory: make([]float64, 0),
-		maxHistorySize:        10,                // 保留最近10次质量记录
-		currentConcurrency:    4,                 // 默认并发数（用户要求上限）
-		currentChunkSize:      100 * 1024 * 1024, // 默认100MB分片
-		currentTimeout:        5 * time.Minute,   // 默认5分钟超时
-	}
-}
-
-// ShouldAdjust 检查是否需要调整参数
-func (dpa *DynamicParameterAdjuster) ShouldAdjust() bool {
-	dpa.mu.RLock()
-	defer dpa.mu.RUnlock()
-
-	return time.Since(dpa.lastAdjustment) >= dpa.adjustmentInterval
-}
-
-// RecordNetworkQuality 记录网络质量
-func (dpa *DynamicParameterAdjuster) RecordNetworkQuality(quality float64) {
-	dpa.mu.Lock()
-	defer dpa.mu.Unlock()
-
-	dpa.networkQualityHistory = append(dpa.networkQualityHistory, quality)
-
-	// 保持历史记录大小限制
-	if len(dpa.networkQualityHistory) > dpa.maxHistorySize {
-		dpa.networkQualityHistory = dpa.networkQualityHistory[1:]
-	}
-}
-
-// GetAverageNetworkQuality 获取平均网络质量
-func (dpa *DynamicParameterAdjuster) GetAverageNetworkQuality() float64 {
-	dpa.mu.RLock()
-	defer dpa.mu.RUnlock()
-
-	if len(dpa.networkQualityHistory) == 0 {
-		return 0.8 // 默认质量
-	}
-
-	var total float64
-	for _, quality := range dpa.networkQualityHistory {
-		total += quality
-	}
-
-	return total / float64(len(dpa.networkQualityHistory))
-}
-
-// AdjustParameters 根据网络质量调整参数
-func (dpa *DynamicParameterAdjuster) AdjustParameters(fileSize int64, networkSpeed int64, networkQuality float64) (concurrency int, chunkSize int64, timeout time.Duration) {
-	dpa.mu.Lock()
-	defer dpa.mu.Unlock()
-
-	dpa.lastAdjustment = time.Now()
-
-	// 直接记录网络质量，避免重入锁问题
-	dpa.networkQualityHistory = append(dpa.networkQualityHistory, networkQuality)
-	if len(dpa.networkQualityHistory) > dpa.maxHistorySize {
-		dpa.networkQualityHistory = dpa.networkQualityHistory[1:]
-	}
-
-	// 直接计算平均网络质量，避免重入锁问题
-	var avgQuality float64
-	if len(dpa.networkQualityHistory) == 0 {
-		avgQuality = 0.8 // 默认质量
-	} else {
-		var total float64
-		for _, quality := range dpa.networkQualityHistory {
-			total += quality
-		}
-		avgQuality = total / float64(len(dpa.networkQualityHistory))
-	}
-
-	// 🚀 用户要求：123网盘单文件并发限制到4
-	baseConcurrency := 4
-	if avgQuality > 0.9 { // 优秀网络
-		baseConcurrency = 4 // 限制为4
-	} else if avgQuality > 0.7 { // 良好网络
-		baseConcurrency = 4 // 限制为4
-	} else if avgQuality > 0.5 { // 一般网络
-		baseConcurrency = 4 // 限制为4
-	} else { // 较差网络
-		baseConcurrency = 2
-	}
-
-	// 根据文件大小调整（但不超过4）
-	if fileSize > 5*1024*1024*1024 { // >5GB
-		baseConcurrency = 4 // 限制为4
-	} else if fileSize < 500*1024*1024 { // <500MB
-		baseConcurrency = int(float64(baseConcurrency) * 0.7)
-	}
-
-	// 🚀 用户要求：123网盘单文件并发限制到4
-	if baseConcurrency < 1 {
-		baseConcurrency = 1
-	}
-	if baseConcurrency > 4 {
-		baseConcurrency = 4 // 限制为4
-	}
-
-	dpa.currentConcurrency = baseConcurrency
-
-	// 基于网络质量调整分片大小
-	baseChunkSize := int64(100 * 1024 * 1024) // 100MB
-	if avgQuality > 0.8 {                     // 高质量网络使用大分片
-		baseChunkSize = int64(200 * 1024 * 1024) // 200MB
-	} else if avgQuality < 0.5 { // 低质量网络使用小分片
-		baseChunkSize = int64(50 * 1024 * 1024) // 50MB
-	}
-
-	dpa.currentChunkSize = baseChunkSize
-
-	// 基于网络质量调整超时时间
-	baseTimeout := 5 * time.Minute
-	if avgQuality < 0.5 { // 网络质量差，增加超时时间
-		baseTimeout = time.Duration(float64(baseTimeout) * 2.0)
-	} else if avgQuality > 0.8 { // 网络质量好，可以减少超时时间
-		baseTimeout = time.Duration(float64(baseTimeout) * 0.8)
-	}
-
-	dpa.currentTimeout = baseTimeout
-
-	return dpa.currentConcurrency, dpa.currentChunkSize, dpa.currentTimeout
-}
-
-// getAdaptiveTimeout 根据文件大小、传输类型和网络质量计算自适应超时时间
-// 优化版本：集成动态参数调整器，实现智能自适应超时控制
+// getAdaptiveTimeout 根据文件大小、传输类型计算自适应超时时间
+// 🔧 简化版本：使用固定的合理超时计算
 func (f *Fs) getAdaptiveTimeout(fileSize int64, transferType string) time.Duration {
-	// 检查是否需要进行动态调整
-	if f.dynamicAdjuster != nil && f.dynamicAdjuster.ShouldAdjust() {
-		networkSpeed := f.detectNetworkSpeed(context.Background())
-		networkQuality := f.getNetworkQuality()
-		_, _, timeout := f.dynamicAdjuster.AdjustParameters(fileSize, networkSpeed, networkQuality)
-
-		// 根据传输类型调整超时时间
-		var typeMultiplier float64 = 1.0
-		switch transferType {
-		case "chunked_upload":
-			typeMultiplier = 1.5 // 分片上传需要适中时间
-		case "stream_download":
-			typeMultiplier = 1.2 // 流式下载需要适中时间
-		case "single_step":
-			typeMultiplier = 0.8 // 单步上传时间较短
-		case "concurrent_upload":
-			typeMultiplier = 2.0 // 并发上传需要更长时间
-		default:
-			typeMultiplier = 1.0
-		}
-
-		adjustedTimeout := time.Duration(float64(timeout) * typeMultiplier)
-
-		fs.Debugf(f, "动态超时调整: %s -> %v (质量=%.2f)",
-			fs.SizeSuffix(fileSize), adjustedTimeout, networkQuality)
-
-		return adjustedTimeout
-	}
-
-	// 回退到传统的静态计算方法
+	// 🔧 简化超时计算 - 使用固定的合理算法
 	baseTimeout := time.Duration(f.opt.Timeout)
 	if baseTimeout <= 0 {
 		baseTimeout = defaultTimeout
@@ -11024,18 +9614,7 @@ func (f *Fs) getAdaptiveTimeout(fileSize int64, transferType string) time.Durati
 func (f *Fs) detectNetworkSpeed(_ context.Context) int64 {
 	fs.Debugf(f, "开始检测网络速度")
 
-	// 优先使用历史性能数据进行速度估算
-	if f.performanceMetrics != nil {
-		// 尝试从性能指标获取最近的传输速度
-		stats := f.performanceMetrics.GetStats()
-		if avgSpeed, ok := stats["average_upload_speed"].(float64); ok && avgSpeed > 0 {
-			// 将MB/s转换为bytes/s
-			historicalSpeed := int64(avgSpeed * 1024 * 1024)
-			fs.Debugf(f, "使用历史数据检测网络速度: %s/s (基于性能统计)",
-				fs.SizeSuffix(historicalSpeed))
-			return historicalSpeed
-		}
-	}
+	// 🔧 简化网络速度检测 - 使用固定的合理速度估算
 
 	// 使用快速估算方法，避免大文件初始化延迟
 	// 基于网络质量进行快速估算，不进行实际网络测试
@@ -11061,27 +9640,10 @@ func (f *Fs) detectNetworkSpeed(_ context.Context) int64 {
 	return baseSpeed
 }
 
-// getOptimalConcurrency 根据文件大小和网络速度计算最优并发数
-// 优化版本：集成动态参数调整器，实现智能自适应并发控制
+// getOptimalConcurrency 根据文件大小计算最优并发数
+// 🔧 简化版本：使用固定的合理并发计算
 func (f *Fs) getOptimalConcurrency(fileSize int64, networkSpeed int64) int {
-	// 检查是否需要进行动态调整
-	if f.dynamicAdjuster != nil && f.dynamicAdjuster.ShouldAdjust() {
-		networkQuality := f.getNetworkQuality()
-		concurrency, _, _ := f.dynamicAdjuster.AdjustParameters(fileSize, networkSpeed, networkQuality)
-
-		fs.Debugf(f, "动态并发调整: %s -> %d并发 (速度=%s/s)",
-			fs.SizeSuffix(fileSize), concurrency, fs.SizeSuffix(networkSpeed))
-
-		// 应用用户配置的最大并发数限制
-		if f.opt.MaxConcurrentUploads > 0 && concurrency > f.opt.MaxConcurrentUploads {
-			concurrency = f.opt.MaxConcurrentUploads
-			fs.Debugf(f, "应用用户配置限制，最终并发数: %d", concurrency)
-		}
-
-		return concurrency
-	}
-
-	// 回退到传统的静态计算方法
+	// 🔧 简化并发计算 - 使用固定的合理算法
 	baseConcurrency := f.opt.MaxConcurrentUploads
 	if baseConcurrency <= 0 {
 		baseConcurrency = 4 // 默认并发数
@@ -11159,24 +9721,12 @@ func (f *Fs) getOptimalConcurrency(fileSize int64, networkSpeed int64) int {
 	return optimalConcurrency
 }
 
-// getOptimalChunkSize 根据文件大小和网络速度计算最优分片大小
-// 优化版本：集成动态参数调整器，实现智能自适应分片大小控制
+// getOptimalChunkSize 根据文件大小计算最优分片大小
+// 🔧 简化版本：使用固定的合理分片大小计算
 func (f *Fs) getOptimalChunkSize(fileSize int64, networkSpeed int64) int64 {
-	fs.Debugf(f, "🔧 开始计算最优分片大小: 文件大小=%s, 网络速度=%s/s", fs.SizeSuffix(fileSize), fs.SizeSuffix(networkSpeed))
+	fs.Debugf(f, "🔧 开始计算最优分片大小: 文件大小=%s", fs.SizeSuffix(fileSize))
 
-	// 检查是否需要进行动态调整
-	if f.dynamicAdjuster != nil && f.dynamicAdjuster.ShouldAdjust() {
-		fs.Debugf(f, "🔧 使用动态调整器计算分片大小")
-		networkQuality := f.getNetworkQuality()
-		_, chunkSize, _ := f.dynamicAdjuster.AdjustParameters(fileSize, networkSpeed, networkQuality)
-
-		fs.Debugf(f, "动态分片调整: %s -> %s分片",
-			fs.SizeSuffix(fileSize), fs.SizeSuffix(chunkSize))
-
-		return chunkSize
-	}
-
-	// 回退到传统的静态计算方法
+	// 🔧 简化分片大小计算 - 使用固定的合理算法
 	baseChunk := int64(f.opt.ChunkSize)
 	if baseChunk <= 0 {
 		baseChunk = int64(defaultChunkSize) // 100MB
@@ -11941,15 +10491,7 @@ func (f *Fs) unifiedUpload(ctx context.Context, in io.Reader, src fs.ObjectInfo,
 		fs.Debugf(f, "统一上传成功，耗时: %v", duration)
 	}
 
-	// 记录到性能指标
-	if f.performanceMetrics != nil {
-		// 使用基础性能指标记录上传结果
-		if err != nil {
-			f.performanceMetrics.RecordUploadError()
-		} else {
-			f.performanceMetrics.RecordUploadComplete(src.Size(), duration)
-		}
-	}
+	// 🗑️ 性能指标记录已删除 - 使用rclone标准统计
 
 	return result, err
 }
