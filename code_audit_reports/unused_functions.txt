@@ -1,0 +1,13 @@
+=== 未使用函数分析 ===
+--- 123网盘可能未使用的函数 ---
+func applyStandardConfigDefaults(opt *Options) { (调用次数: 1)
+func NewFileIntegrityVerifier(fs *Fs) *FileIntegrityVerifier { (调用次数: 1)
+func NewEnhancedErrorHandler(fs *Fs) *EnhancedErrorHandler { (调用次数: 1)
+func NewSmartCacheManager(fs *Fs) *SmartCacheManager { (调用次数: 1)
+func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) { (调用次数: 1)
+func NewCrossCloudTransferProgress(fileName string, totalSize int64, account *accounting.Account) *CrossCloudTransferProgress { (调用次数: 1)
+func NewEndToEndIntegrityVerifier(fs *Fs) *EndToEndIntegrityVerifier { (调用次数: 1)
+
+--- 115网盘可能未使用的函数 ---
+func errorHandler(resp *http.Response) error { (调用次数: 1)
+func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) { (调用次数: 1)

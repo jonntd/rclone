@@ -1,0 +1,79 @@
+=== 冗余结构体字段分析 ===
+--- 123网盘Fs结构体字段 ---
+	name         string       // 此远程实例的名称
+	originalName string       // 未修改的原始配置名称
+	root         string       // 当前操作的根路径
+	opt          Options      // 解析后的配置选项
+	features     *fs.Features // 可选功能特性
+	client       *http.Client     // 用于API调用的HTTP客户端（保留用于特殊情况）
+	rst          *rest.Client     // rclone标准rest客户端（推荐使用）
+	token        string           // 缓存的访问令牌
+	tokenExpiry  time.Time        // 缓存访问令牌的过期时间
+	tokenMu      sync.Mutex       // 保护token和tokenExpiry的互斥锁
+	tokenRenewer *oauthutil.Renew // 令牌自动更新器
+	cacheMu sync.RWMutex // 保护所有缓存操作的读写锁
+	m            configmap.Mapper // 配置映射器
+	rootFolderID string           // 根文件夹的ID
+	listPacer     *fs.Pacer // 文件列表API的调速器（约2 QPS）
+	strictPacer   *fs.Pacer // 严格API（如user/info, move, delete）的调速器（1 QPS）
+	uploadPacer   *fs.Pacer // 上传API的调速器（1 QPS）
+	downloadPacer *fs.Pacer // 下载API的调速器（2 QPS）
+	dirCache *dircache.DirCache
+	parentIDCache *cache.BadgerCache // 父目录ID缓存
+	dirListCache  *cache.BadgerCache // 目录列表缓存
+	pathToIDCache *cache.BadgerCache // 路径到ID映射缓存
+	verificationManager *UploadVerificationManager
+	concurrencyManager *ConcurrencyManager // 统一的并发控制管理器
+	memoryManager      *MemoryManager      // 内存管理器，防止内存泄漏
+	performanceMetrics *PerformanceMetrics // 性能指标收集器
+	resourcePool *ResourcePool // 资源池管理器，优化内存使用
+	apiVersionManager *APIVersionManager        // API版本管理器
+	resumeManager     *ResumeManager            // 断点续传管理器
+	dynamicAdjuster   *DynamicParameterAdjuster // 动态参数调整器
+	cacheConfig CacheConfig
+	crossCloudCtx *CrossCloudContext
+	uploadDomainCache     string
+	uploadDomainCacheTime time.Time
+	retryManager *UnifiedRetryManager
+	progressManager *UnifiedProgressManager
+
+--- 115网盘Fs结构体字段 ---
+	name          string
+	originalName  string // Original config name without modifications
+	root          string
+	opt           Options
+	features      *fs.Features
+	tradClient    *rest.Client // Client for traditional (cookie, encrypted) API calls
+	openAPIClient *rest.Client // Client for OpenAPI (token) calls
+	dirCache      *dircache.DirCache
+	globalPacer   *fs.Pacer // Controls overall QPS
+	tradPacer     *fs.Pacer // Controls QPS for traditional calls only (subset of global)
+	downloadPacer *fs.Pacer // Controls QPS for download URL API calls (专门用于获取下载URL的API调用)
+	uploadPacer   *fs.Pacer // Controls QPS for upload related API calls (专门用于上传相关的API调用)
+	rootFolder    string    // path of the absolute root
+	rootFolderID  string
+	appVer        string // parsed from user-agent; used in traditional calls
+	userID        string // User ID from cookie/token
+	userkey       string // User key from traditional uploadinfo (needed for traditional upload init signature)
+	isShare       bool   // mark it is from shared or not
+	fileObj       *fs.Object
+	m             configmap.Mapper // config map for saving tokens
+	resumeManager *ResumeManager115
+	smartURLManager *SmartURLManager
+	downloadCoordinator *DownloadCoordinator
+	tokenMu      sync.Mutex
+	accessToken  string
+	refreshToken string
+	tokenExpiry  time.Time
+	codeVerifier string // For PKCE
+	tokenRenewer *oauthutil.Renew
+	loginMu      sync.Mutex
+	pathResolveCache *cache.BadgerCache // 路径解析缓存 (已实现)
+	dirListCache     *cache.BadgerCache // 目录列表缓存
+	metadataCache    *cache.BadgerCache // 文件元数据缓存
+	fileIDCache      *cache.BadgerCache // 文件ID验证缓存
+	cacheConfig CacheConfig115
+	httpClient *http.Client
+	uploadingMu sync.Mutex
+	isUploading bool
+	circuitBreaker *CircuitBreaker

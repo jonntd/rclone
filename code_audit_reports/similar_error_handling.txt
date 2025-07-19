@@ -1,0 +1,44 @@
+=== 相似错误处理分析 ===
+--- 123网盘错误处理模式 ---
+979-	exists, err := f.fileExists(ctx, parentFileID, baseName)
+980:	if err != nil {
+981-		return "", fmt.Errorf("检查文件是否存在失败: %w", err)
+982-	}
+983-
+--
+1008-		exists, err := f.fileExists(ctx, parentFileID, newName)
+1009:		if err != nil {
+1010-			return "", fmt.Errorf("检查文件是否存在失败: %w", err)
+1011-		}
+1012-
+--
+1029-	response, err := f.ListFile(ctx, int(parentFileID), 100, "", "", 0)
+1030:	if err != nil {
+1031-		return false, err
+1032-	}
+1033-
+--
+1064-	response, err := f.ListFile(ctx, int(parentFileID), 1, "", "", 0)
+1065:	if err != nil {
+
+--- 115网盘错误处理模式 ---
+571-				newFile, err := os.Open(concurrentReader.tempPath)
+572:				if err != nil {
+573-					fs.Debugf(nil, "为等待者创建新文件句柄失败: %v", err)
+574-					return DownloadResult{
+575-						Success: false,
+--
+812-
+813:		if err != nil {
+814-			// 如果API调用失败，标记所有相关结果为错误
+815-			for _, idx := range indices {
+816-				if results[idx].Error == nil { // 只设置尚未设置的错误
+--
+1000-	// 🔧 重构：优先使用rclone标准错误处理
+1001:	if err != nil && fserrors.ShouldRetry(err) {
+1002-		return true, err
+1003-	}
+1004-
+1005-	// 🔧 重构：云盘特定错误处理（仅处理特殊情况）
+1006:	if err != nil {
+1007-		errStr := strings.ToLower(err.Error())

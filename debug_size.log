@@ -1,0 +1,176 @@
+2025/07/19 14:51:22 DEBUG : rclone: Version "v1.71.0-DEV" starting with parameters ["./rclone" "ls" "115:/教程/" "-vv" "--log-file" "debug_size.log"]
+2025/07/19 14:51:22 DEBUG : Creating backend with remote "115:/教程/"
+2025/07/19 14:51:22 DEBUG : Using config file from "/Users/jonntd/.config/rclone/rclone.conf"
+2025/07/19 14:51:22 DEBUG : 115 教程: 开始初始化115drive缓存系统: /Users/jonntd/Library/Caches/rclone/115drive
+2025/07/19 14:51:22 DEBUG : BadgerDB缓存初始化成功: /Users/jonntd/Library/Caches/rclone/115drive/file_id (只读模式: false)
+2025/07/19 14:51:22 DEBUG : 115 教程: file_id缓存初始化成功
+2025/07/19 14:51:22 DEBUG : BadgerDB缓存初始化成功: /Users/jonntd/Library/Caches/rclone/115drive/path_resolve (只读模式: false)
+2025/07/19 14:51:22 DEBUG : 115 教程: path_resolve缓存初始化成功
+2025/07/19 14:51:22 DEBUG : BadgerDB缓存初始化成功: /Users/jonntd/Library/Caches/rclone/115drive/dir_list (只读模式: false)
+2025/07/19 14:51:22 DEBUG : 115 教程: dir_list缓存初始化成功
+2025/07/19 14:51:22 DEBUG : BadgerDB缓存初始化成功: /Users/jonntd/Library/Caches/rclone/115drive/metadata (只读模式: false)
+2025/07/19 14:51:22 DEBUG : 115 教程: metadata缓存初始化成功
+2025/07/19 14:51:22 DEBUG : 115 教程: 115drive缓存系统初始化完成: /Users/jonntd/Library/Caches/rclone/115drive (成功: 4/4)
+2025/07/19 14:51:22 INFO  : 115 教程: 🔧 简化缓存管理器初始化成功
+2025/07/19 14:51:22 DEBUG : BadgerDB缓存初始化成功: /Users/jonntd/Library/Caches/rclone/115drive/resume/115-resume (只读模式: false)
+2025/07/19 14:51:22 DEBUG : 115 教程: 断点续传管理器初始化成功（BadgerDB）
+2025/07/19 14:51:22 DEBUG : 115 教程: 智能URL管理器初始化成功
+2025/07/19 14:51:22 DEBUG : 115 教程: 熔断器初始化成功
+2025/07/19 14:51:22 DEBUG : 115 教程: Using App Version "27.0.7.5" from User-Agent "Mozilla/5.0 115Browser/27.0.7.5"
+2025/07/19 14:51:22 DEBUG : 115 教程: Loaded token from config file, expires at 2025-07-19 16:28:22.532673 +0800 CST
+2025/07/19 14:51:22 DEBUG : 115 教程: Token loaded from config: true (expires at 2025-07-19 16:28:22.532673 +0800 CST)
+2025/07/19 14:51:22 DEBUG : 115 教程: Setting up token renewer
+2025/07/19 14:51:22 DEBUG : 115 教程: Token renewer initialized and started with original name "115"
+2025/07/19 14:51:22 DEBUG : 115 教程: 🚀 智能NewFs: 开始处理路径: "教程"
+2025/07/19 14:51:22 DEBUG : 115 教程: 🎯 缓存命中：路径 教程 -> IsDir=true
+2025/07/19 14:51:22 DEBUG : 115 教程: 🎯 缓存命中：确认为目录，直接设置目录模式: "教程"
+2025/07/19 14:51:22 DEBUG : fs cache: renaming cache item "115:/教程/" to be canonical "115:教程"
+2025/07/19 14:51:22 DEBUG : 115 教程: List调用，目录: ""
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll开始: dirID="0", limit=1150, filesOnly=false, dirsOnly=false
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 使用OpenAPI模式
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 开始分页循环
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 处理offset=0
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 准备调用CallOpenAPI
+2025/07/19 14:51:22 DEBUG : 115 教程: 🎯 智能QPS选择: /open/ufile/files -> 使用智能调速器
+2025/07/19 14:51:22 DEBUG : 115 教程: pacer: OpenAPI call successful
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: CallOpenAPI成功，返回13个文件
+2025/07/19 14:51:22 DEBUG : 115 教程: 🎯 发现路径层次信息: 1层
+2025/07/19 14:51:22 DEBUG : 115 教程: List找到目录ID: 2113472948794657831，目录: ""
+2025/07/19 14:51:22 DEBUG : 115 教程: 从缓存获取目录列表成功: parentID=2113472948794657831, 文件数=22
+2025/07/19 14:51:22 DEBUG : 115 教程: 🎯 List缓存命中: dirID=2113472948794657831, 文件数=22
+2025/07/19 14:51:22 DEBUG : 115 教程: 🎯 List缓存返回: 22个条目
+2025/07/19 14:51:22 DEBUG : 115 教程: List调用，目录: "写实女性角色制作全流程高级案例教程"
+2025/07/19 14:51:22 DEBUG : 115 教程: List找到目录ID: 2534906693023902526，目录: "写实女性角色制作全流程高级案例教程"
+2025/07/19 14:51:22 DEBUG : 115 教程: List调用，目录: "cgcircuit_bifrost_bundle"
+2025/07/19 14:51:22 DEBUG : 115 教程: List找到目录ID: 2255115001388386346，目录: "cgcircuit_bifrost_bundle"
+2025/07/19 14:51:22 DEBUG : 115 教程: List调用，目录: "001_001"
+2025/07/19 14:51:22 DEBUG : 115 教程: List找到目录ID: 2113567804456012866，目录: "001_001"
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 List缓存未命中，调用API: dirID=2534906693023902526
+2025/07/19 14:51:22 DEBUG : 115 教程: List调用，目录: "rigging教程"
+2025/07/19 14:51:22 DEBUG : 115 教程: List调用，目录: "ctcg327创建的共享(1)"
+2025/07/19 14:51:22 DEBUG : 115 教程: List找到目录ID: 2255115158951610761，目录: "ctcg327创建的共享(1)"
+2025/07/19 14:51:22 DEBUG : 115 教程: List调用，目录: "001_xin"
+2025/07/19 14:51:22 DEBUG : 115 教程: List找到目录ID: 2113645481288372169，目录: "001_xin"
+2025/07/19 14:51:22 DEBUG : 115 教程: List调用，目录: "001_虚幻学习"
+2025/07/19 14:51:22 DEBUG : 115 教程: List找到目录ID: 2113652405002145612，目录: "001_虚幻学习"
+2025/07/19 14:51:22 DEBUG : 115 教程: List调用，目录: "unity3D教学"
+2025/07/19 14:51:22 DEBUG : 115 教程: List找到目录ID: 2255115016982808660，目录: "unity3D教学"
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 List缓存未命中，调用API: dirID=2255115001388386346
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll开始: dirID="2255115001388386346", limit=1150, filesOnly=false, dirsOnly=false
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 使用OpenAPI模式
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 开始分页循环
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 处理offset=0
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 准备调用CallOpenAPI
+2025/07/19 14:51:22 DEBUG : 115 教程: 🎯 智能QPS选择: /open/ufile/files -> 使用智能调速器
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 List缓存未命中，调用API: dirID=2113567804456012866
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll开始: dirID="2113567804456012866", limit=1150, filesOnly=false, dirsOnly=false
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 使用OpenAPI模式
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll开始: dirID="2534906693023902526", limit=1150, filesOnly=false, dirsOnly=false
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 使用OpenAPI模式
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 开始分页循环
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 处理offset=0
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 准备调用CallOpenAPI
+2025/07/19 14:51:22 DEBUG : 115 教程: 🎯 智能QPS选择: /open/ufile/files -> 使用智能调速器
+2025/07/19 14:51:22 DEBUG : 115 教程: List找到目录ID: 2113472949021150253，目录: "rigging教程"
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 List缓存未命中，调用API: dirID=2255115158951610761
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll开始: dirID="2255115158951610761", limit=1150, filesOnly=false, dirsOnly=false
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 List缓存未命中，调用API: dirID=2113645481288372169
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll开始: dirID="2113645481288372169", limit=1150, filesOnly=false, dirsOnly=false
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 使用OpenAPI模式
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 开始分页循环
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 处理offset=0
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 准备调用CallOpenAPI
+2025/07/19 14:51:22 DEBUG : 115 教程: 🎯 智能QPS选择: /open/ufile/files -> 使用智能调速器
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 List缓存未命中，调用API: dirID=2113652405002145612
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll开始: dirID="2113652405002145612", limit=1150, filesOnly=false, dirsOnly=false
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 使用OpenAPI模式
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 开始分页循环
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 处理offset=0
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 准备调用CallOpenAPI
+2025/07/19 14:51:22 DEBUG : 115 教程: 🎯 智能QPS选择: /open/ufile/files -> 使用智能调速器
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 List缓存未命中，调用API: dirID=2255115016982808660
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll开始: dirID="2255115016982808660", limit=1150, filesOnly=false, dirsOnly=false
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 使用OpenAPI模式
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 开始分页循环
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 处理offset=0
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 准备调用CallOpenAPI
+2025/07/19 14:51:22 DEBUG : 115 教程: 🎯 智能QPS选择: /open/ufile/files -> 使用智能调速器
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 开始分页循环
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 处理offset=0
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 List缓存未命中，调用API: dirID=2113472949021150253
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll开始: dirID="2113472949021150253", limit=1150, filesOnly=false, dirsOnly=false
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 使用OpenAPI模式
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 开始分页循环
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 处理offset=0
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 准备调用CallOpenAPI
+2025/07/19 14:51:22 DEBUG : 115 教程: 🎯 智能QPS选择: /open/ufile/files -> 使用智能调速器
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 使用OpenAPI模式
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 开始分页循环
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 处理offset=0
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 准备调用CallOpenAPI
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 准备调用CallOpenAPI
+2025/07/19 14:51:22 DEBUG : 115 教程: 🎯 智能QPS选择: /open/ufile/files -> 使用智能调速器
+2025/07/19 14:51:22 DEBUG : 115 教程: 🎯 智能QPS选择: /open/ufile/files -> 使用智能调速器
+2025/07/19 14:51:22 DEBUG : 115 教程: pacer: OpenAPI call successful
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: CallOpenAPI成功，返回2个文件
+2025/07/19 14:51:22 DEBUG : 115 教程: 🎯 发现路径层次信息: 3层
+2025/07/19 14:51:22 DEBUG : 115 教程: 已保存路径类型到缓存: 教程 -> 2113472948794657831 (dir: true)
+2025/07/19 14:51:22 DEBUG : 115 教程: 🎯 预填充路径缓存: 教程 -> 2113472948794657831 (parent: 0)
+2025/07/19 14:51:22 DEBUG : 115 教程: 已保存路径类型到缓存: 教程/cgcircuit_bifrost_bundle -> 2255115001388386346 (dir: true)
+2025/07/19 14:51:22 DEBUG : 115 教程: 🎯 预填充路径缓存: 教程/cgcircuit_bifrost_bundle -> 2255115001388386346 (parent: 2113472948794657831)
+2025/07/19 14:51:22 DEBUG : 115 教程: 已保存目录列表到缓存: parentID=2255115001388386346, 文件数=2, TTL=5m0s
+2025/07/19 14:51:22 DEBUG : 115 教程: 🎯 List保存到缓存: dirID=2255115001388386346, 文件数=2
+2025/07/19 14:51:22 DEBUG : 115 教程: List调用，目录: "性感女郎abcg"
+2025/07/19 14:51:22 DEBUG : 115 教程: List找到目录ID: 2534906728390273981，目录: "性感女郎abcg"
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 List缓存未命中，调用API: dirID=2534906728390273981
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll开始: dirID="2534906728390273981", limit=1150, filesOnly=false, dirsOnly=false
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 使用OpenAPI模式
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 开始分页循环
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 处理offset=0
+2025/07/19 14:51:22 DEBUG : 115 教程: 🔍 listAll: 准备调用CallOpenAPI
+2025/07/19 14:51:22 DEBUG : 115 教程: 🎯 智能QPS选择: /open/ufile/files -> 使用智能调速器
+2025/07/19 14:51:23 DEBUG : 115 教程: pacer: OpenAPI call successful
+2025/07/19 14:51:23 DEBUG : 115 教程: 🔍 listAll: CallOpenAPI成功，返回42个文件
+2025/07/19 14:51:23 DEBUG : 115 教程: 🎯 发现路径层次信息: 3层
+2025/07/19 14:51:23 DEBUG : 115 教程: 已保存路径类型到缓存: 教程 -> 2113472948794657831 (dir: true)
+2025/07/19 14:51:23 DEBUG : 115 教程: 🎯 预填充路径缓存: 教程 -> 2113472948794657831 (parent: 0)
+2025/07/19 14:51:23 DEBUG : 115 教程: 已保存路径类型到缓存: 教程/写实女性角色制作全流程高级案例教程 -> 2534906693023902526 (dir: true)
+2025/07/19 14:51:23 DEBUG : 115 教程: 🎯 预填充路径缓存: 教程/写实女性角色制作全流程高级案例教程 -> 2534906693023902526 (parent: 2113472948794657831)
+2025/07/19 14:51:23 DEBUG : 115 教程: 已保存目录列表到缓存: parentID=2534906693023902526, 文件数=42, TTL=5m0s
+2025/07/19 14:51:23 DEBUG : 115 教程: 🎯 List保存到缓存: dirID=2534906693023902526, 文件数=42
+2025/07/19 14:51:23 DEBUG : 115 教程: List调用，目录: "网游角色制作女精灵实战教学"
+2025/07/19 14:51:23 DEBUG : 115 教程: List找到目录ID: 2534910430232652105，目录: "网游角色制作女精灵实战教学"
+2025/07/19 14:51:23 DEBUG : 115 教程: 🔍 List缓存未命中，调用API: dirID=2534910430232652105
+2025/07/19 14:51:23 DEBUG : 115 教程: 🔍 listAll开始: dirID="2534910430232652105", limit=1150, filesOnly=false, dirsOnly=false
+2025/07/19 14:51:23 DEBUG : 115 教程: 🔍 listAll: 使用OpenAPI模式
+2025/07/19 14:51:23 DEBUG : 115 教程: 🔍 listAll: 开始分页循环
+2025/07/19 14:51:23 DEBUG : 115 教程: 🔍 listAll: 处理offset=0
+2025/07/19 14:51:23 DEBUG : 115 教程: 🔍 listAll: 准备调用CallOpenAPI
+2025/07/19 14:51:23 DEBUG : 115 教程: 🎯 智能QPS选择: /open/ufile/files -> 使用智能调速器
+2025/07/19 14:51:23 DEBUG : 115 教程: pacer: OpenAPI call successful
+2025/07/19 14:51:23 DEBUG : 115 教程: 🔍 listAll: CallOpenAPI成功，返回110个文件
+2025/07/19 14:51:23 DEBUG : 115 教程: 🎯 发现路径层次信息: 3层
+2025/07/19 14:51:23 DEBUG : 115 教程: 已保存路径类型到缓存: 教程 -> 2113472948794657831 (dir: true)
+2025/07/19 14:51:23 DEBUG : 115 教程: 🎯 预填充路径缓存: 教程 -> 2113472948794657831 (parent: 0)
+2025/07/19 14:51:23 DEBUG : 115 教程: 已保存路径类型到缓存: 教程/001_xin -> 2113645481288372169 (dir: true)
+2025/07/19 14:51:23 DEBUG : 115 教程: 🎯 预填充路径缓存: 教程/001_xin -> 2113645481288372169 (parent: 2113472948794657831)
+2025/07/19 14:51:23 DEBUG : 115 教程: 已保存目录列表到缓存: parentID=2113645481288372169, 文件数=110, TTL=5m0s
+2025/07/19 14:51:23 DEBUG : 115 教程: 🎯 List保存到缓存: dirID=2113645481288372169, 文件数=110
+2025/07/19 14:51:23 DEBUG : 115 教程: List调用，目录: "翼狐  mari全能"
+2025/07/19 14:51:23 DEBUG : 115 教程: List找到目录ID: 2534907254389549917，目录: "翼狐  mari全能"
+2025/07/19 14:51:23 DEBUG : 115 教程: 🔍 List缓存未命中，调用API: dirID=2534907254389549917
+2025/07/19 14:51:23 DEBUG : 115 教程: 🔍 listAll开始: dirID="2534907254389549917", limit=1150, filesOnly=false, dirsOnly=false
+2025/07/19 14:51:23 DEBUG : 115 教程: 🔍 listAll: 使用OpenAPI模式
+2025/07/19 14:51:23 DEBUG : 115 教程: 🔍 listAll: 开始分页循环
+2025/07/19 14:51:23 DEBUG : 115 教程: 🔍 listAll: 处理offset=0
+2025/07/19 14:51:23 DEBUG : 115 教程: 🔍 listAll: 准备调用CallOpenAPI
+2025/07/19 14:51:23 DEBUG : 115 教程: 🎯 智能QPS选择: /open/ufile/files -> 使用智能调速器
+2025/07/19 14:51:23 DEBUG : 115 教程: pacer: OpenAPI call successful
+2025/07/19 14:51:23 DEBUG : 115 教程: 🔍 listAll: CallOpenAPI成功，返回60个文件
+2025/07/19 14:51:23 DEBUG : 115 教程: 🎯 发现路径层次信息: 3层
+2025/07/19 14:51:23 DEBUG : 115 教程: 已保存路径类型到缓存: 教程 -> 2113472948794657831 (dir: true)
+2025/07/19 14:51:23 DEBUG : 115 教程: 🎯 预填充路径缓存: 教程 -> 2113472948794657831 (parent: 0)
+2025/07/19 14:51:23 DEBUG : 115 教程: 已保存路径类型到缓存: 教程/001_虚幻学习 -> 2113652405002145612 (dir: true)
+2025/07/19 14:51:23 DEBUG : 115 教程: 🎯 预填充路径缓存: 教程/001_虚幻学习 -> 2113652405002145612 (parent: 2113472948794657831)
+2025/07/19 14:51:23 DEBUG : 115 教程: 已保存目录列表到缓存: parentID=2113652405002145612, 文件数=60, TTL=5m0s
+2025/07/19 14:51:23 DEBUG : 115 教程: 🎯 List保存到缓存: dirID=2113652405002145612, 文件数=60

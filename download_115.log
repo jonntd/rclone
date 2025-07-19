@@ -1,0 +1,19 @@
+2025/07/19 15:34:29 INFO  : 115 测试上传下载: 🔧 简化缓存管理器初始化成功
+2025/07/19 15:34:33 INFO  : small_file.txt: Copied (new)
+2025/07/19 15:34:33 INFO  : text_file.txt: Copied (new)
+2025/07/19 15:34:37 INFO  : medium_file.bin: Copied (new)
+2025/07/19 15:34:37 INFO  : 
+已传输:   	   11.000 MiB / 11.000 MiB, 100%, 1.125 MiB/s, ETA 0s
+Checks:                 0 / 0, -, Listed 3
+已传输:            3 / 3, 100%
+耗时:         8.1s
+
+2025/07/19 15:47:58 INFO  : 115 测试上传下载: 🔧 简化缓存管理器初始化成功
+2025/07/19 15:48:00 INFO  : from_123_/text_file.txt: Copied (new)
+2025/07/19 15:48:00 INFO  : from_123_: Set directory modification time (using DirSetModTime)
+2025/07/19 15:48:00 INFO  : 
+已传输:   	         63 B / 63 B, 100%, 0 B/s, ETA -
+Checks:                 3 / 3, 100%, Listed 8
+已传输:            1 / 1, 100%
+耗时:         1.9s
+

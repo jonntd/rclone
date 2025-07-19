@@ -1,0 +1,52 @@
+=== 重复函数分析 ===
+--- 123网盘函数列表 ---
+297:func (f *Fs) setCrossCloudTransfer(transfer *accounting.Transfer) {
+307:func (f *Fs) clearCrossCloudTransfer() {
+318:func (f *Fs) getCrossCloudTransfer() *accounting.Transfer {
+329:func DefaultCacheConfig() CacheConfig {
+393:func NewMemoryManager(maxTotal, maxFileSize int64) *MemoryManager {
+409:func (mm *MemoryManager) CanAllocate(size int64) bool {
+432:func (mm *MemoryManager) tryCleanupMemory(requiredSize int64) bool {
+467:func (mm *MemoryManager) Allocate(fileID string, size int64) bool {
+496:func (mm *MemoryManager) Release(fileID string) {
+510:func (mm *MemoryManager) GetStats() (totalUsed, maxTotal int64, activeFiles int) {
+518:func (mm *MemoryManager) AccessBuffer(fileID string) {
+553:func NewPerformanceMetrics() *PerformanceMetrics {
+560:func (pm *PerformanceMetrics) RecordUploadStart(size int64) {
+569:func (pm *PerformanceMetrics) RecordUploadComplete(size int64, duration time.Duration) {
+581:func (pm *PerformanceMetrics) RecordUploadError() {
+591:func (pm *PerformanceMetrics) RecordDownloadStart(size int64) {
+600:func (pm *PerformanceMetrics) RecordDownloadComplete(size int64, duration time.Duration) {
+612:func (pm *PerformanceMetrics) RecordDownloadError() {
+622:func (pm *PerformanceMetrics) RecordAPICall() {
+629:func (pm *PerformanceMetrics) RecordAPIError() {
+
+--- 115网盘函数列表 ---
+90:func init() {
+246:func checkUploadChunkSize(cs fs.SizeSuffix) error {
+256:func checkUploadCutoff(cs fs.SizeSuffix) error {
+263:func checkUploadConcurrency(concurrency int) error {
+375:func NewCircuitBreaker(threshold int, timeout time.Duration) *CircuitBreaker {
+383:func (cb *CircuitBreaker) ShouldRetry() bool {
+395:func (cb *CircuitBreaker) ShouldRetryForURLExpiry() bool {
+410:func (cb *CircuitBreaker) RecordFailure() {
+419:func (cb *CircuitBreaker) RecordSuccess() {
+462:func NewDownloadCoordinator(maxConcurrent int) *DownloadCoordinator {
+478:func (dc *DownloadCoordinator) cleanupExpiredCache() {
+497:func (dc *DownloadCoordinator) StartDownload(fileID, fileName string, size int64) (*DownloadSession, bool) {
+564:func (dc *DownloadCoordinator) WaitForDownload(session *DownloadSession) DownloadResult {
+606:func (dc *DownloadCoordinator) CompleteDownload(fileID string, result DownloadResult) {
+646:func DefaultCacheConfig115() CacheConfig115 {
+657:func generatePathToIDCacheKey(path string) string {
+689:func (f *Fs) AsyncCacheUpdate(ctx context.Context, path, id string, isDir bool) {
+726:func (f *Fs) AsyncDirCacheUpdate(ctx context.Context, path, id string) {
+777:func (f *Fs) BatchFindLeaf(ctx context.Context, requests []BatchFindRequest) ([]BatchFindResult, error) {
+844:func isAPILimitError(err error) bool {
+
+--- 可能重复的函数名 ---
+
+NewDownloadProgress
+getHTTPClient
+init
+loadTokenFromConfig
+shouldRetry

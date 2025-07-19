@@ -15,11 +15,9 @@ require (
 	github.com/a8m/tree v0.0.0-20240104212747-2c8764a5f17e
 	github.com/aalpar/deheap v0.0.0-20210914013432-0cc84d79dec3
 	github.com/abbot/go-http-auth v0.4.0
-	github.com/aead/ecdh v0.2.0
 	github.com/aliyun/alibabacloud-oss-go-sdk-v2 v1.2.2
 	github.com/anacrolix/dms v1.7.1
 	github.com/anacrolix/log v0.16.0
-	github.com/andreburgaud/crypt2go v1.8.0
 	github.com/atotto/clipboard v0.1.4
 	github.com/aws/aws-sdk-go-v2 v1.36.3
 	github.com/aws/aws-sdk-go-v2/config v1.29.14
@@ -34,6 +32,7 @@ require (
 	github.com/colinmarc/hdfs/v2 v2.4.0
 	github.com/coreos/go-semver v0.3.1
 	github.com/coreos/go-systemd/v22 v22.5.0
+	github.com/dgraph-io/badger/v3 v3.2103.5
 	github.com/dop251/scsu v0.0.0-20220106150536-84ac88021d00
 	github.com/dropbox/dropbox-sdk-go-unofficial/v6 v6.0.5
 	github.com/gabriel-vasile/mimetype v1.4.9
@@ -61,7 +60,6 @@ require (
 	github.com/ncw/swift/v2 v2.0.4
 	github.com/oracle/oci-go-sdk/v65 v65.93.0
 	github.com/patrickmn/go-cache v2.1.0+incompatible
-	github.com/pierrec/lz4/v4 v4.1.18
 	github.com/pkg/sftp v1.13.7
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2
 	github.com/prometheus/client_golang v1.22.0
@@ -141,7 +139,6 @@ require (
 	github.com/creasty/defaults v1.8.0 // indirect
 	github.com/cronokirby/saferith v0.33.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
-	github.com/dgraph-io/badger/v3 v3.2103.5 // indirect
 	github.com/dgraph-io/ristretto v0.1.1 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/ebitengine/purego v0.8.4 // indirect
