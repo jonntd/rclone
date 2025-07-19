@@ -1,0 +1,4 @@
+go build -v --ldflags "-s -X github.com/rclone/rclone/fs.Version=v1.71.0-beta.9680.669667742.backup-before-optimization"  
+backend/common/utils.go:12:2: no required module provides package github.com/rclone/rclone/lib/fshttp; to add it:
+	go get github.com/rclone/rclone/lib/fshttp
+make: *** [rclone] Error 1

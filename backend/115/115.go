@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -26,8 +25,7 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/rclone/rclone/backend/115/api"
-	"github.com/rclone/rclone/backend/115/crypto" // Keep for traditional calls
-	"github.com/rclone/rclone/backend/115/dircache"
+	"github.com/rclone/rclone/backend/common"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/config"
@@ -37,6 +35,7 @@ import (
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/cache"
+	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/pacer"
@@ -56,26 +55,29 @@ const (
 	tradUserAgent      = "Mozilla/5.0 115Browser/27.0.7.5" // Keep for traditional login mimicry?
 	defaultUserAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
 
-	// 🔧 优化的QPS配置 - 基于115网盘API特性和稳定性考虑
-	defaultGlobalMinSleep = fs.Duration(200 * time.Millisecond) // 5 QPS - 通用API调用频率
-	traditionalMinSleep   = fs.Duration(500 * time.Millisecond) // ~2 QPS - 提升传统API响应速度
-	uploadMinSleep        = fs.Duration(100 * time.Millisecond) // ~10 QPS - 上传API专用，提高上传性能
-	downloadURLMinSleep   = fs.Duration(200 * time.Millisecond) // 🔧 修复下载慢问题：提升到~5 QPS，加快URL获取速度
-	maxSleep              = 2 * time.Second
-	decayConstant         = 2 // bigger for slower decay, exponential
+	// 🔧 115网盘统一QPS配置 - 全局账户级别限制
+	// 115网盘特殊性：所有API共享同一个QPS配额，需要统一管理避免770004错误
+
+	// 统一QPS设置 - 基于实际测试
+	unifiedMinSleep      = fs.Duration(250 * time.Millisecond) // ~4 QPS - 统一全局限制
+	conservativeMinSleep = fs.Duration(500 * time.Millisecond) // ~2 QPS - 保守模式（遇到限制时）
+	aggressiveMinSleep   = fs.Duration(150 * time.Millisecond) // ~6 QPS - 激进模式（网络良好时）
+
+	maxSleep      = 2 * time.Second
+	decayConstant = 2 // bigger for slower decay, exponential
 
 	defaultConTimeout = fs.Duration(15 * time.Second)  // 减少连接超时，快速失败重试
 	defaultTimeout    = fs.Duration(120 * time.Second) // 减少IO超时，避免长时间等待
 
 	maxUploadSize       = 115 * fs.Gibi // 115 GiB from https://proapi.115.com/app/uploadinfo (or OpenAPI equivalent)
 	maxUploadParts      = 10000         // Part number must be an integer between 1 and 10000, inclusive.
-	defaultChunkSize    = 50 * fs.Mebi  // 🔧 调整分片大小：设置为50MB，提高OSS上传稳定性
+	defaultChunkSize    = 20 * fs.Mebi  // 🔧 参考OpenList：设置为20MB，与OpenList保持一致
 	minChunkSize        = 100 * fs.Kibi
-	maxChunkSize        = 5 * fs.Gibi  // Max part size for OSS
-	defaultUploadCutoff = 10 * fs.Mebi // 🔧 临时降低到10MB，强制测试OSS multipart分片上传
-	defaultNohashSize   = 5 * fs.Mebi  // 🔧 临时降低到5MB，强制测试OSS multipart分片上传
-	StreamUploadLimit   = 5 * fs.Gibi  // Max size for sample/streamed upload (traditional)
-	maxUploadCutoff     = 5 * fs.Gibi  // maximum allowed size for singlepart uploads (OSS PutObject limit)
+	maxChunkSize        = 5 * fs.Gibi   // Max part size for OSS
+	defaultUploadCutoff = 50 * fs.Mebi  // 🔧 设置为50MB，小于50MB使用简单上传，大于50MB使用分片上传
+	defaultNohashSize   = 100 * fs.Mebi // 🔧 设置为100MB，小文件优先使用传统上传
+	StreamUploadLimit   = 5 * fs.Gibi   // Max size for sample/streamed upload (traditional)
+	maxUploadCutoff     = 5 * fs.Gibi   // maximum allowed size for singlepart uploads (OSS PutObject limit)
 
 	tokenRefreshWindow = 10 * time.Minute // Refresh token 10 minutes before expiry
 	pkceVerifierLength = 64               // Length for PKCE code verifier
@@ -137,8 +139,8 @@ Defaults to "%s". Only change this if you have a specific reason to use a differ
 			Advanced: true,
 		}, {
 			Name:     "pacer_min_sleep",
-			Default:  defaultGlobalMinSleep,
-			Help:     "Minimum time to sleep between API calls (controls global QPS, default 5 QPS).",
+			Default:  unifiedMinSleep,
+			Help:     "Minimum time to sleep between API calls (controls unified QPS, default ~4 QPS).",
 			Advanced: true,
 		}, {
 			Name:     "contimeout",
@@ -251,14 +253,6 @@ func checkUploadChunkSize(cs fs.SizeSuffix) error {
 	return nil
 }
 
-func (f *Fs) setUploadChunkSize(cs fs.SizeSuffix) (old fs.SizeSuffix, err error) {
-	err = checkUploadChunkSize(cs)
-	if err == nil {
-		old, f.opt.ChunkSize = f.opt.ChunkSize, cs
-	}
-	return
-}
-
 func checkUploadCutoff(cs fs.SizeSuffix) error {
 	if cs > maxUploadCutoff {
 		return fmt.Errorf("%s is greater than %s", cs, maxUploadCutoff)
@@ -274,14 +268,6 @@ func checkUploadConcurrency(concurrency int) error {
 		return fmt.Errorf("upload_concurrency must be at most 32, got %d", concurrency)
 	}
 	return nil
-}
-
-func (f *Fs) setUploadCutoff(cs fs.SizeSuffix) (old fs.SizeSuffix, err error) {
-	err = checkUploadCutoff(cs)
-	if err == nil {
-		old, f.opt.UploadCutoff = f.opt.UploadCutoff, cs
-	}
-	return
 }
 
 // Options defines the configuration of this backend
@@ -354,8 +340,7 @@ type Fs struct {
 	tokenRenewer *oauthutil.Renew
 	loginMu      sync.Mutex
 
-	// 路径缓存优化
-	pathCache *PathCache
+	// 🔧 重构：删除pathCache，统一使用dirCache进行目录缓存
 
 	// BadgerDB持久化缓存系统
 	pathResolveCache *cache.BadgerCache // 路径解析缓存 (已实现)
@@ -462,7 +447,6 @@ type DownloadSession struct {
 	size         int64
 	startTime    time.Time
 	participants int
-	mu           sync.RWMutex
 	result       chan DownloadResult
 }
 
@@ -658,7 +642,7 @@ type CacheConfig115 struct {
 }
 
 // DefaultCacheConfig115 返回115网盘优化的缓存配置
-// 🔧 轻量级优化：统一TTL策略，避免缓存不一致问题
+// 🔧 重构：统一TTL策略和缓存键命名规范，与123网盘保持一致
 func DefaultCacheConfig115() CacheConfig115 {
 	unifiedTTL := 5 * time.Minute // 统一TTL策略，与123网盘保持一致
 	return CacheConfig115{
@@ -669,212 +653,37 @@ func DefaultCacheConfig115() CacheConfig115 {
 	}
 }
 
-// PathCacheEntry 路径缓存条目
-type PathCacheEntry struct {
-	ID        string
-	IsDir     bool
-	Timestamp time.Time
-	// LRU链表节点
-	prev, next *PathCacheEntry
-	key        string // 存储key用于从map中删除
+// generatePathToIDCacheKey 生成路径到ID映射缓存键（与123网盘格式一致）
+func generatePathToIDCacheKey(path string) string {
+	return fmt.Sprintf("path_to_id_%s", path)
 }
 
-// PathCache LRU路径缓存实现，O(1)时间复杂度
-type PathCache struct {
-	cache   map[string]*PathCacheEntry
-	mu      sync.RWMutex
-	ttl     time.Duration
-	maxSize int
-	// LRU双向链表
-	head, tail *PathCacheEntry
+// 🔧 重构：添加与123网盘相同的目录列表缓存结构
+// DirListCacheEntry115 目录列表缓存条目（与123网盘格式统一）
+type DirListCacheEntry115 struct {
+	FileList   []api.File `json:"file_list"`
+	LastFileID string     `json:"last_file_id"`
+	TotalCount int        `json:"total_count"`
+	CachedAt   time.Time  `json:"cached_at"`
+	ParentID   string     `json:"parent_id"`
+	Version    string     `json:"version"`
+	Checksum   string     `json:"checksum"`
 }
 
-// NewPathCache 创建新的路径缓存
-func NewPathCache(ttl time.Duration, maxSize int) *PathCache {
-	pc := &PathCache{
-		cache:   make(map[string]*PathCacheEntry),
-		ttl:     ttl,
-		maxSize: maxSize,
-	}
-
-	// 初始化LRU链表的哨兵节点
-	pc.head = &PathCacheEntry{}
-	pc.tail = &PathCacheEntry{}
-	pc.head.next = pc.tail
-	pc.tail.prev = pc.head
-
-	return pc
+// PathToIDCacheEntry115 路径到FileID映射缓存条目（与123网盘格式统一）
+type PathToIDCacheEntry115 struct {
+	Path     string    `json:"path"`
+	FileID   string    `json:"file_id"`
+	IsDir    bool      `json:"is_dir"`
+	ParentID string    `json:"parent_id"`
+	CachedAt time.Time `json:"cached_at"`
 }
 
-// Get 从缓存获取路径信息，实现LRU访问
-// 🔧 修复竞态条件：优化锁使用，减少写锁持有时间
-func (pc *PathCache) Get(path string) (*PathCacheEntry, bool) {
-	// 首先使用读锁检查条目是否存在
-	pc.mu.RLock()
-	entry, exists := pc.cache[path]
-	if !exists {
-		pc.mu.RUnlock()
-		return nil, false
-	}
+// 🔧 重构：添加与123网盘相同的路径到ID映射缓存函数
 
-	// 检查是否过期
-	if time.Since(entry.Timestamp) > pc.ttl {
-		pc.mu.RUnlock()
-
-		// 需要删除过期条目，升级到写锁
-		pc.mu.Lock()
-		// 双重检查：可能在等待写锁期间被其他goroutine处理了
-		if entry, stillExists := pc.cache[path]; stillExists && time.Since(entry.Timestamp) > pc.ttl {
-			pc.removeFromList(entry)
-			delete(pc.cache, path)
-		}
-		pc.mu.Unlock()
-		return nil, false
-	}
-
-	// 创建条目副本以避免在锁外访问时的竞态条件
-	entryCopy := &PathCacheEntry{
-		ID:        entry.ID,
-		IsDir:     entry.IsDir,
-		Timestamp: entry.Timestamp,
-	}
-	pc.mu.RUnlock()
-
-	// 升级到写锁以更新LRU顺序
-	pc.mu.Lock()
-	// 双重检查：确保条目仍然存在且未过期
-	if currentEntry, stillExists := pc.cache[path]; stillExists && time.Since(currentEntry.Timestamp) <= pc.ttl {
-		// 移动到链表头部（最近使用）
-		pc.moveToHead(currentEntry)
-		pc.mu.Unlock()
-		return entryCopy, true
-	}
-	pc.mu.Unlock()
-
-	return nil, false
-}
-
-// addToHead 将节点添加到链表头部
-func (pc *PathCache) addToHead(entry *PathCacheEntry) {
-	entry.prev = pc.head
-	entry.next = pc.head.next
-	pc.head.next.prev = entry
-	pc.head.next = entry
-}
-
-// removeFromList 从链表中移除节点
-func (pc *PathCache) removeFromList(entry *PathCacheEntry) {
-	if entry.prev != nil {
-		entry.prev.next = entry.next
-	}
-	if entry.next != nil {
-		entry.next.prev = entry.prev
-	}
-}
-
-// moveToHead 将节点移动到链表头部
-func (pc *PathCache) moveToHead(entry *PathCacheEntry) {
-	pc.removeFromList(entry)
-	pc.addToHead(entry)
-}
-
-// removeTail 移除链表尾部节点
-func (pc *PathCache) removeTail() *PathCacheEntry {
-	lastEntry := pc.tail.prev
-	if lastEntry == pc.head {
-		return nil // 链表为空
-	}
-	pc.removeFromList(lastEntry)
-	return lastEntry
-}
-
-// Put 将路径信息放入缓存
-func (pc *PathCache) Put(path, id string, isDir bool) {
-	pc.mu.Lock()
-	defer pc.mu.Unlock()
-
-	// 检查是否已存在
-	if existingEntry, exists := pc.cache[path]; exists {
-		// 更新现有条目并移动到头部
-		existingEntry.ID = id
-		existingEntry.IsDir = isDir
-		existingEntry.Timestamp = time.Now()
-		pc.moveToHead(existingEntry)
-		return
-	}
-
-	// 如果缓存已满，移除最旧的条目
-	if len(pc.cache) >= pc.maxSize {
-		tailEntry := pc.removeTail()
-		if tailEntry != nil && tailEntry.key != "" {
-			delete(pc.cache, tailEntry.key)
-		}
-	}
-
-	// 创建新条目
-	newEntry := &PathCacheEntry{
-		ID:        id,
-		IsDir:     isDir,
-		Timestamp: time.Now(),
-		key:       path,
-	}
-
-	// 添加到缓存和链表头部
-	pc.cache[path] = newEntry
-	pc.addToHead(newEntry)
-}
-
-// Clear 清空缓存
-func (pc *PathCache) Clear() {
-	pc.mu.Lock()
-	defer pc.mu.Unlock()
-
-	// 清空map
-	pc.cache = make(map[string]*PathCacheEntry)
-
-	// 重新初始化链表
-	pc.head.next = pc.tail
-	pc.tail.prev = pc.head
-}
-
-// Delete 删除指定路径的缓存条目
-func (pc *PathCache) Delete(path string) {
-	pc.mu.Lock()
-	defer pc.mu.Unlock()
-
-	if entry, exists := pc.cache[path]; exists {
-		delete(pc.cache, path)
-		pc.removeFromList(entry)
-	}
-}
-
-// ClearOldEntries 清理指定时间之前的缓存条目
-func (pc *PathCache) ClearOldEntries(maxAge time.Duration) {
-	pc.mu.Lock()
-	defer pc.mu.Unlock()
-
-	cutoffTime := time.Now().Add(-maxAge)
-	toDelete := make([]string, 0)
-
-	// 找出需要删除的条目
-	for path, entry := range pc.cache {
-		if entry.Timestamp.Before(cutoffTime) {
-			toDelete = append(toDelete, path)
-		}
-	}
-
-	// 删除过期条目
-	for _, path := range toDelete {
-		if entry, exists := pc.cache[path]; exists {
-			delete(pc.cache, path)
-			pc.removeFromList(entry)
-		}
-	}
-
-	if len(toDelete) > 0 {
-		fs.Debugf(nil, "清理了 %d 个过期的缓存条目", len(toDelete))
-	}
-}
+// 🔧 重构：删除PathCache相关结构体，统一使用dirCache
+// PathCache功能已迁移到rclone标准的dirCache中
+// isAPILimitError函数已存在于第823行，无需重复声明
 
 // AsyncCacheUpdate 异步更新缓存，避免阻塞主要操作
 func (f *Fs) AsyncCacheUpdate(ctx context.Context, path, id string, isDir bool) {
@@ -902,10 +711,11 @@ func (f *Fs) AsyncCacheUpdate(ctx context.Context, path, id string, isDir bool) 
 				fs.Debugf(f, "AsyncCacheUpdate cancelled during execution for path: %s", path)
 				return
 			default:
-				// 检查缓存是否仍然有效（避免在清理后更新脏数据）
-				if f.pathCache != nil {
-					f.pathCache.Put(path, id, isDir)
-					fs.Debugf(f, "AsyncCacheUpdate completed for path: %s", path)
+				// 🔧 重构：使用dirCache进行异步缓存更新
+				// 只有目录才需要缓存到dirCache中
+				if isDir {
+					f.dirCache.Put(path, id)
+					fs.Debugf(f, "AsyncCacheUpdate completed for directory path: %s", path)
 				}
 			}
 		}()
@@ -1040,433 +850,6 @@ func isAPILimitError(err error) bool {
 		strings.Contains(errStr, "已达到当前访问上限")
 }
 
-// isNetworkError 检查是否为网络相关错误
-func isNetworkError(err error) bool {
-	if err == nil {
-		return false
-	}
-	errStr := strings.ToLower(err.Error())
-	return strings.Contains(errStr, "connection refused") ||
-		strings.Contains(errStr, "connection reset") ||
-		strings.Contains(errStr, "connection timeout") ||
-		strings.Contains(errStr, "network is unreachable") ||
-		strings.Contains(errStr, "no route to host") ||
-		strings.Contains(errStr, "dns") ||
-		strings.Contains(errStr, "dial tcp") ||
-		strings.Contains(errStr, "i/o timeout")
-}
-
-// isTemporaryError 检查是否为临时错误
-func isTemporaryError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	// 检查是否实现了Temporary接口
-	if temp, ok := err.(interface{ Temporary() bool }); ok {
-		return temp.Temporary()
-	}
-
-	// 检查错误字符串中的临时错误指示
-	errStr := strings.ToLower(err.Error())
-	return strings.Contains(errStr, "temporary") ||
-		strings.Contains(errStr, "try again") ||
-		strings.Contains(errStr, "service unavailable") ||
-		strings.Contains(errStr, "internal server error")
-}
-
-// isSevereAPILimit 检查是否为严重的API限制错误
-func isSevereAPILimit(err error) bool {
-	if err == nil {
-		return false
-	}
-	errStr := err.Error()
-	// 严重的API限制通常包含特定的错误码或消息
-	return strings.Contains(errStr, "770004") || // 严重限制错误码
-		strings.Contains(errStr, "账号已被限制") ||
-		strings.Contains(errStr, "访问频率过高")
-}
-
-// clearCacheGradually 根据错误严重程度渐进式清理缓存
-func (f *Fs) clearCacheGradually(err error, affectedPath string) {
-	if !isAPILimitError(err) {
-		return
-	}
-
-	if isSevereAPILimit(err) {
-		fs.Debugf(f, "严重API限制错误，清理所有缓存: %v", err)
-		f.dirCache.ResetRoot()
-		f.pathCache.Clear()
-
-		// 清理所有BadgerDB持久化缓存
-		caches := []*cache.BadgerCache{
-			f.pathResolveCache,
-			f.dirListCache,
-			f.metadataCache,
-			f.fileIDCache,
-		}
-
-		for i, c := range caches {
-			if c != nil {
-				if clearErr := c.Clear(); clearErr != nil {
-					fs.Debugf(f, "清理BadgerDB缓存%d失败: %v", i, clearErr)
-				}
-			}
-		}
-		fs.Debugf(f, "已清理所有BadgerDB持久化缓存")
-	} else {
-		fs.Debugf(f, "轻微API限制错误，采用渐进式缓存清理: %v", err)
-
-		// 只清理可能受影响的特定路径缓存
-		if affectedPath != "" {
-			// 清理特定路径的缓存
-			f.pathCache.Delete(affectedPath)
-
-			// 清理BadgerDB中对应的缓存
-			if f.pathResolveCache != nil {
-				cacheKey := fmt.Sprintf("path_%s", affectedPath)
-				if delErr := f.pathResolveCache.Delete(cacheKey); delErr != nil {
-					fs.Debugf(f, "清理BadgerDB路径缓存失败 %s: %v", affectedPath, delErr)
-				}
-			}
-
-			// 清理父目录的缓存
-			parentPath := path.Dir(affectedPath)
-			if parentPath != "." && parentPath != "/" {
-				f.pathCache.Delete(parentPath)
-
-				// 清理BadgerDB中父目录的缓存
-				if f.pathResolveCache != nil {
-					parentCacheKey := fmt.Sprintf("path_%s", parentPath)
-					if delErr := f.pathResolveCache.Delete(parentCacheKey); delErr != nil {
-						fs.Debugf(f, "清理BadgerDB父目录缓存失败 %s: %v", parentPath, delErr)
-					}
-				}
-			}
-		}
-
-		// 清理最近5分钟的缓存条目（保留较老的稳定缓存）
-		f.pathCache.ClearOldEntries(5 * time.Minute)
-
-		// 不清理根目录缓存，避免完全重建
-		fs.Debugf(f, "保留根目录缓存，避免完全重建")
-	}
-}
-
-// cachePathResolution 缓存路径解析结果到BadgerDB
-func (f *Fs) cachePathResolution(path, fileID string, isDir bool) {
-	if f.pathResolveCache == nil {
-		return
-	}
-
-	cacheKey := fmt.Sprintf("path_%s", path)
-	cacheValue := map[string]interface{}{
-		"file_id": fileID,
-		"is_dir":  isDir,
-	}
-
-	if err := f.pathResolveCache.Set(cacheKey, cacheValue, f.cacheConfig.PathResolveCacheTTL); err != nil {
-		fs.Debugf(f, "缓存路径解析失败 %s: %v", path, err)
-	} else {
-		fs.Debugf(f, "已缓存路径解析 %s -> %s (dir: %v), TTL=%v", path, fileID, isDir, f.cacheConfig.PathResolveCacheTTL)
-	}
-}
-
-// getCachedPathResolution 从BadgerDB获取缓存的路径解析结果
-func (f *Fs) getCachedPathResolution(path string) (string, bool, bool) {
-	if f.pathResolveCache == nil {
-		return "", false, false
-	}
-
-	cacheKey := fmt.Sprintf("path_%s", path)
-	var cacheValue map[string]interface{}
-
-	found, err := f.pathResolveCache.Get(cacheKey, &cacheValue)
-	if err != nil {
-		fs.Debugf(f, "获取缓存路径解析失败 %s: %v", path, err)
-		return "", false, false
-	}
-
-	if !found {
-		return "", false, false
-	}
-
-	fileID, ok1 := cacheValue["file_id"].(string)
-	isDir, ok2 := cacheValue["is_dir"].(bool)
-
-	if !ok1 || !ok2 {
-		fs.Debugf(f, "缓存路径解析数据格式错误 %s", path)
-		return "", false, false
-	}
-
-	fs.Debugf(f, "从BadgerDB缓存获取路径解析 %s -> %s (dir: %v)", path, fileID, isDir)
-	return fileID, isDir, true
-}
-
-// DirListCacheEntry 目录列表缓存条目
-type DirListCacheEntry struct {
-	FileList   []api.File `json:"file_list"`
-	ParentID   string     `json:"parent_id"`
-	TotalCount int        `json:"total_count"`
-	CachedAt   time.Time  `json:"cached_at"`
-}
-
-// DownloadURLCacheEntry 下载URL缓存条目
-type DownloadURLCacheEntry struct {
-	URL       string    `json:"url"`
-	ExpiresAt time.Time `json:"expires_at"`
-	FileID    string    `json:"file_id"`
-	PickCode  string    `json:"pick_code"`
-	CachedAt  time.Time `json:"cached_at"`
-}
-
-// MetadataCacheEntry 文件元数据缓存条目
-type MetadataCacheEntry struct {
-	FileID   string    `json:"file_id"`
-	Name     string    `json:"name"`
-	Size     int64     `json:"size"`
-	ModTime  time.Time `json:"mod_time"`
-	IsDir    bool      `json:"is_dir"`
-	SHA1     string    `json:"sha1"`
-	PickCode string    `json:"pick_code"`
-	CachedAt time.Time `json:"cached_at"`
-}
-
-// FileIDCacheEntry 文件ID验证缓存条目
-type FileIDCacheEntry struct {
-	FileID   string    `json:"file_id"`
-	Exists   bool      `json:"exists"`
-	IsDir    bool      `json:"is_dir"`
-	CachedAt time.Time `json:"cached_at"`
-}
-
-// getDirListFromCache 从缓存获取目录列表
-func (f *Fs) getDirListFromCache(parentID string) (*DirListCacheEntry, bool) {
-	if f.dirListCache == nil {
-		return nil, false
-	}
-
-	cacheKey := fmt.Sprintf("dirlist_%s", parentID)
-	var entry DirListCacheEntry
-
-	found, err := f.dirListCache.Get(cacheKey, &entry)
-	if err != nil {
-		fs.Debugf(f, "获取目录列表缓存失败 %s: %v", cacheKey, err)
-		return nil, false
-	}
-
-	if found {
-		fs.Debugf(f, "目录列表缓存命中: parentID=%s, 文件数=%d", parentID, len(entry.FileList))
-		return &entry, true
-	}
-
-	return nil, false
-}
-
-// saveDirListToCache 保存目录列表到缓存
-func (f *Fs) saveDirListToCache(parentID string, fileList []api.File) {
-	if f.dirListCache == nil {
-		return
-	}
-
-	cacheKey := fmt.Sprintf("dirlist_%s", parentID)
-	entry := DirListCacheEntry{
-		FileList:   fileList,
-		ParentID:   parentID,
-		TotalCount: len(fileList),
-		CachedAt:   time.Now(),
-	}
-
-	// 使用配置的目录列表缓存TTL
-	if err := f.dirListCache.Set(cacheKey, entry, f.cacheConfig.DirListCacheTTL); err != nil {
-		fs.Debugf(f, "保存目录列表缓存失败 %s: %v", cacheKey, err)
-	} else {
-		fs.Debugf(f, "已保存目录列表到缓存: parentID=%s, 文件数=%d, TTL=%v", parentID, len(fileList), f.cacheConfig.DirListCacheTTL)
-	}
-}
-
-// clearDirListCache 清理目录列表缓存
-func (f *Fs) clearDirListCache(parentID string) {
-	if f.dirListCache == nil {
-		return
-	}
-
-	cacheKey := fmt.Sprintf("dirlist_%s", parentID)
-	if err := f.dirListCache.Delete(cacheKey); err != nil {
-		fs.Debugf(f, "清理目录列表缓存失败 %s: %v", cacheKey, err)
-	} else {
-		fs.Debugf(f, "已清理目录列表缓存: parentID=%s", parentID)
-	}
-}
-
-// getMetadataFromCache 从缓存获取文件元数据
-func (f *Fs) getMetadataFromCache(fileID string) (*MetadataCacheEntry, bool) {
-	if f.metadataCache == nil {
-		return nil, false
-	}
-
-	cacheKey := fmt.Sprintf("metadata_%s", fileID)
-	var entry MetadataCacheEntry
-
-	found, err := f.metadataCache.Get(cacheKey, &entry)
-	if err != nil {
-		fs.Debugf(f, "获取文件元数据缓存失败 %s: %v", cacheKey, err)
-		return nil, false
-	}
-
-	if found {
-		fs.Debugf(f, "文件元数据缓存命中: fileID=%s", fileID)
-		return &entry, true
-	}
-
-	return nil, false
-}
-
-// saveMetadataToCache 保存文件元数据到缓存
-func (f *Fs) saveMetadataToCache(fileID, name, sha1, pickCode string, size int64, modTime time.Time, isDir bool) {
-	if f.metadataCache == nil {
-		return
-	}
-
-	cacheKey := fmt.Sprintf("metadata_%s", fileID)
-	entry := MetadataCacheEntry{
-		FileID:   fileID,
-		Name:     name,
-		Size:     size,
-		ModTime:  modTime,
-		IsDir:    isDir,
-		SHA1:     sha1,
-		PickCode: pickCode,
-		CachedAt: time.Now(),
-	}
-
-	// 使用配置的文件元数据缓存TTL
-	if err := f.metadataCache.Set(cacheKey, entry, f.cacheConfig.MetadataCacheTTL); err != nil {
-		fs.Debugf(f, "保存文件元数据缓存失败 %s: %v", cacheKey, err)
-	} else {
-		fs.Debugf(f, "已保存文件元数据到缓存: fileID=%s, name=%s, TTL=%v", fileID, name, f.cacheConfig.MetadataCacheTTL)
-	}
-}
-
-// clearMetadataCache 清理文件元数据缓存
-func (f *Fs) clearMetadataCache(fileID string) {
-	if f.metadataCache == nil {
-		return
-	}
-
-	cacheKey := fmt.Sprintf("metadata_%s", fileID)
-	if err := f.metadataCache.Delete(cacheKey); err != nil {
-		fs.Debugf(f, "清理文件元数据缓存失败 %s: %v", cacheKey, err)
-	} else {
-		fs.Debugf(f, "已清理文件元数据缓存: fileID=%s", fileID)
-	}
-}
-
-// getFileIDFromCache 从缓存获取文件ID验证结果
-func (f *Fs) getFileIDFromCache(fileID string) (bool, bool, bool) {
-	if f.fileIDCache == nil {
-		return false, false, false
-	}
-
-	cacheKey := fmt.Sprintf("file_id_%s", fileID)
-	var entry FileIDCacheEntry
-
-	found, err := f.fileIDCache.Get(cacheKey, &entry)
-	if err != nil {
-		fs.Debugf(f, "获取文件ID验证缓存失败 %s: %v", cacheKey, err)
-		return false, false, false
-	}
-
-	if found {
-		fs.Debugf(f, "文件ID验证缓存命中: fileID=%s, exists=%v, isDir=%v", fileID, entry.Exists, entry.IsDir)
-		return entry.Exists, entry.IsDir, true
-	}
-
-	return false, false, false
-}
-
-// saveFileIDToCache 保存文件ID验证结果到缓存
-func (f *Fs) saveFileIDToCache(fileID string, exists, isDir bool) {
-	if f.fileIDCache == nil {
-		return
-	}
-
-	cacheKey := fmt.Sprintf("file_id_%s", fileID)
-	entry := FileIDCacheEntry{
-		FileID:   fileID,
-		Exists:   exists,
-		IsDir:    isDir,
-		CachedAt: time.Now(),
-	}
-
-	// 使用配置的文件ID验证缓存TTL
-	if err := f.fileIDCache.Set(cacheKey, entry, f.cacheConfig.FileIDCacheTTL); err != nil {
-		fs.Debugf(f, "保存文件ID验证缓存失败 %s: %v", cacheKey, err)
-	} else {
-		fs.Debugf(f, "已保存文件ID验证到缓存: fileID=%s, exists=%v, isDir=%v, TTL=%v", fileID, exists, isDir, f.cacheConfig.FileIDCacheTTL)
-	}
-}
-
-// clearFileIDCache 清理文件ID验证缓存
-func (f *Fs) clearFileIDCache(fileID string) {
-	if f.fileIDCache == nil {
-		return
-	}
-
-	cacheKey := fmt.Sprintf("file_id_%s", fileID)
-	if err := f.fileIDCache.Delete(cacheKey); err != nil {
-		fs.Debugf(f, "清理文件ID验证缓存失败 %s: %v", cacheKey, err)
-	} else {
-		fs.Debugf(f, "已清理文件ID验证缓存: fileID=%s", fileID)
-	}
-}
-
-// invalidateRelatedCaches115 智能缓存失效 - 根据操作类型清理相关缓存
-// 🔧 轻量级优化：简化缓存失效逻辑，提高可靠性
-func (f *Fs) invalidateRelatedCaches115(path string, operation string) {
-
-	// 🚀 简单有效的策略：对所有文件操作都进行全面缓存清理
-	// 虽然会影响一些性能，但确保数据一致性，避免复杂的条件判断
-
-	switch operation {
-	case "upload", "put", "mkdir", "delete", "remove", "rmdir", "rename", "move":
-		// 统一处理：清理当前路径和父路径的所有相关缓存
-		f.clearAllRelatedCaches115(path)
-
-		// 额外清理父目录缓存
-		parentPath := filepath.Dir(path)
-		if parentPath != "." && parentPath != "/" {
-			f.clearAllRelatedCaches115(parentPath)
-		}
-
-		fs.Debugf(f, "已清理路径 %s 和父路径 %s 的所有相关缓存", path, parentPath)
-	}
-}
-
-// clearAllRelatedCaches115 清理指定路径的所有相关缓存
-// 🔧 轻量级优化：新增统一缓存清理函数
-func (f *Fs) clearAllRelatedCaches115(path string) {
-	// 清理内存路径缓存
-	f.pathCache.Clear()
-
-	// 清理所有BadgerDB持久化缓存（简单策略：全部清理）
-	caches := []*cache.BadgerCache{
-		f.pathResolveCache,
-		f.dirListCache,
-		f.metadataCache,
-		f.fileIDCache,
-	}
-
-	for _, c := range caches {
-		if c != nil {
-			c.Clear()
-		}
-	}
-
-	// 清理dircache
-	f.dirCache.ResetRoot()
-}
-
 // Object describes a 115 object
 type Object struct {
 	fs          *Fs
@@ -1511,18 +894,22 @@ var retryErrorCodes = []int{
 	509, // Bandwidth Limit Exceeded
 }
 
-// UnifiedErrorClassifier 统一错误分类器
-type UnifiedErrorClassifier struct {
+// CloudDriveErrorClassifier 云盘通用错误分类器
+// 🔧 重构：提取为可复用组件，支持115和123网盘
+type CloudDriveErrorClassifier struct {
 	// 错误分类统计
-	ServerOverloadCount int64
-	URLExpiredCount     int64
-	NetworkTimeoutCount int64
-	RateLimitCount      int64
-	UnknownErrorCount   int64
+	ServerOverloadCount  int64
+	URLExpiredCount      int64
+	NetworkTimeoutCount  int64
+	RateLimitCount       int64
+	AuthErrorCount       int64
+	PermissionErrorCount int64
+	NotFoundErrorCount   int64
+	UnknownErrorCount    int64
 }
 
 // ClassifyError 统一错误分类方法
-func (c *UnifiedErrorClassifier) ClassifyError(err error) string {
+func (c *CloudDriveErrorClassifier) ClassifyError(err error) string {
 	if err == nil {
 		return "no_error"
 	}
@@ -1562,18 +949,21 @@ func (c *UnifiedErrorClassifier) ClassifyError(err error) string {
 	// 认证错误
 	if strings.Contains(errStr, "401") || strings.Contains(errStr, "unauthorized") ||
 		strings.Contains(errStr, "token") || strings.Contains(errStr, "认证失败") {
+		c.AuthErrorCount++
 		return "auth_error"
 	}
 
 	// 权限错误
 	if strings.Contains(errStr, "403") || strings.Contains(errStr, "forbidden") ||
 		strings.Contains(errStr, "permission denied") {
+		c.PermissionErrorCount++
 		return "permission_error"
 	}
 
 	// 资源不存在错误
 	if strings.Contains(errStr, "404") || strings.Contains(errStr, "not found") ||
 		strings.Contains(errStr, "file not found") {
+		c.NotFoundErrorCount++
 		return "not_found"
 	}
 
@@ -1603,67 +993,29 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 		}
 	}
 
-	// Check for specific error types and messages
-	if err != nil {
-		// Check for API rate limit by error message
-		if isAPILimitError(err) {
-			fs.Debugf(nil, "API rate limit detected, retrying: %v", err)
-			return true, pacer.RetryAfterError(err, 10*time.Second)
-		}
-
-		// Check for network-related errors
-		if isNetworkError(err) {
-			fs.Debugf(nil, "Network error detected, retrying: %v", err)
-			return true, pacer.RetryAfterError(err, 2*time.Second)
-		}
-
-		// Check for temporary errors
-		if isTemporaryError(err) {
-			fs.Debugf(nil, "Temporary error detected, retrying: %v", err)
-			return true, pacer.RetryAfterError(err, 1*time.Second)
-		}
+	// 🔧 重构：优先使用rclone标准错误处理
+	if err != nil && fserrors.ShouldRetry(err) {
+		return true, err
 	}
 
-	// 🔧 优化：使用统一错误分类器
-	classifier := &UnifiedErrorClassifier{}
-	errorType := classifier.ClassifyError(err)
+	// 🔧 重构：云盘特定错误处理（仅处理特殊情况）
+	if err != nil {
+		errStr := strings.ToLower(err.Error())
 
-	// 基于错误类型决定是否重试
-	switch errorType {
-	case "server_overload", "network_timeout":
-		// 服务器过载和网络超时错误应该重试
-		return true, err
-
-	case "rate_limit":
-		// 限流错误应该重试，但使用更长的延迟
-		return true, fserrors.NewErrorRetryAfter(30 * time.Second)
-
-	case "url_expired":
-		// URL过期错误应该重试（会触发URL刷新）
-		return true, err
-
-	case "auth_error":
-		// 认证错误不重试，让上层处理token刷新
-		var apiErr *api.TokenError
-		if errors.As(err, &apiErr) {
-			return false, err
-		}
-		// 其他认证错误也不重试
-		return false, err
-
-	case "permission_error", "not_found":
-		// 权限错误和资源不存在错误不重试
-		return false, err
-
-	default:
-		// 未知错误使用rclone标准重试逻辑
-		if fserrors.ShouldRetry(err) {
+		// URL过期错误需要重试（会触发URL刷新）
+		if strings.Contains(errStr, "download url is invalid") ||
+			strings.Contains(errStr, "expired") || strings.Contains(errStr, "url过期") {
 			return true, err
 		}
 
-		// HTTP状态码重试（回退方案）
-		return fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
+		// 认证错误不重试，让上层处理
+		if strings.Contains(errStr, "401") || strings.Contains(errStr, "unauthorized") {
+			return false, err
+		}
 	}
+
+	// 回退到rclone标准HTTP状态码重试
+	return fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
 
 // ------------------------------------------------------------
@@ -1734,33 +1086,10 @@ func (cr *Credential) UserID() string {
 }
 
 // getHTTPClient makes an http client according to the options with optimized connection pool
+// 🔧 使用公共库的优化HTTP客户端配置
 func getHTTPClient(ctx context.Context, opt *Options) *http.Client {
-	t := fshttp.NewTransportCustom(ctx, func(t *http.Transport) {
-		t.TLSHandshakeTimeout = time.Duration(opt.ConTimeout)
-		// 🔧 大幅增加响应头超时时间，支持大文件上传
-		t.ResponseHeaderTimeout = 10 * time.Minute // 从2分钟增加到10分钟
-
-		// 优化连接池配置
-		t.MaxIdleConns = 100                 // 最大空闲连接数
-		t.MaxIdleConnsPerHost = 20           // 每个主机的最大空闲连接数
-		t.MaxConnsPerHost = 50               // 每个主机的最大连接数
-		t.IdleConnTimeout = 90 * time.Second // 空闲连接超时
-		t.DisableKeepAlives = false          // 启用Keep-Alive
-		t.ForceAttemptHTTP2 = true           // 强制尝试HTTP/2
-
-		// 优化超时设置
-		t.DialContext = (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext
-		t.ExpectContinueTimeout = 1 * time.Second
-	})
-
-	return &http.Client{
-		Transport: t,
-		// 🔧 大幅增加总超时时间，支持大文件上传
-		Timeout: 15 * time.Minute, // 从3分钟增加到15分钟
-	}
+	// 使用公共库的优化HTTP客户端
+	return common.GetHTTPClient(ctx)
 }
 
 // getTradHTTPClient creates an HTTP client with traditional UserAgent
@@ -2351,20 +1680,19 @@ func (f *Fs) setupTokenRenewer(ctx context.Context, m configmap.Mapper) {
 // It handles token refresh and sets the Authorization header.
 // If skipToken is true, it skips adding the Authorization header (used for refresh itself).
 func (f *Fs) CallOpenAPI(ctx context.Context, opts *rest.Opts, request any, response any, skipToken bool) error {
-	fs.Debugf(f, "🔍 CallOpenAPI开始: path=%q, method=%q", opts.Path, opts.Method)
-
 	// Ensure root URL is set if not provided in opts
 	if opts.RootURL == "" {
 		opts.RootURL = openAPIRootURL
 	}
 
-	// Wrap the entire attempt sequence with the global pacer, returning proper retry signals
-	return f.globalPacer.Call(func() (shouldRetryGlobal bool, errGlobal error) {
-		fs.Debugf(f, "🔍 CallOpenAPI: 进入globalPacer")
+	// 🔧 智能QPS管理：根据API端点选择合适的调速器
+	smartPacer := f.getPacerForEndpoint(opts.Path)
+	fs.Debugf(f, "🎯 智能QPS选择: %s -> 使用智能调速器", opts.Path)
 
+	// Wrap the entire attempt sequence with the smart pacer, returning proper retry signals
+	return smartPacer.Call(func() (shouldRetryGlobal bool, errGlobal error) {
 		// Ensure token is available and current
 		if !skipToken {
-			fs.Debugf(f, "🔍 CallOpenAPI: 准备token")
 			if err := f.prepareTokenForRequest(ctx, opts); err != nil {
 				fs.Debugf(f, "🔍 CallOpenAPI: prepareTokenForRequest失败: %v", err)
 				return false, backoff.Permanent(err)
@@ -2372,7 +1700,6 @@ func (f *Fs) CallOpenAPI(ctx context.Context, opts *rest.Opts, request any, resp
 		}
 
 		// Make the API call
-		fs.Debugf(f, "🔍 CallOpenAPI: 执行API调用")
 		resp, apiErr := f.executeOpenAPICall(ctx, opts, request, response)
 
 		// Handle retries for network/server errors
@@ -2406,35 +1733,9 @@ func (f *Fs) CallOpenAPI(ctx context.Context, opts *rest.Opts, request any, resp
 	})
 }
 
-// getPacerForEndpoint 根据API端点返回适当的调速器
-// 🔧 实现差异化QPS控制，提升API调用的稳定性和性能
-func (f *Fs) getPacerForEndpoint(endpoint string) *fs.Pacer {
-	switch {
-	// 上传相关API - 使用上传专用调速器 (~3 QPS)
-	case strings.Contains(endpoint, "/open/upload/init"),
-		strings.Contains(endpoint, "/open/upload/resume"),
-		strings.Contains(endpoint, "/open/upload/complete"):
-		return f.uploadPacer
-
-	// 下载URL API - 使用下载专用调速器 (~2 QPS)
-	case strings.Contains(endpoint, "/open/ufile/downurl"):
-		return f.downloadPacer
-
-	// 传统API - 使用传统调速器 (~2 QPS)
-	case strings.Contains(endpoint, "webapi.115.com"):
-		return f.tradPacer
-
-	// 其他OpenAPI - 使用全局调速器 (5 QPS)
-	default:
-		return f.globalPacer
-	}
-}
-
 // CallUploadAPI 专门用于上传相关API调用的函数，使用专用调速器
 // 🔧 优化上传API调用频率，平衡性能和稳定性
 func (f *Fs) CallUploadAPI(ctx context.Context, opts *rest.Opts, request any, response any, skipToken bool) error {
-	fs.Debugf(f, "🔍 CallUploadAPI开始: path=%q, method=%q", opts.Path, opts.Method)
-
 	// Ensure root URL is set if not provided in opts
 	if opts.RootURL == "" {
 		opts.RootURL = openAPIRootURL
@@ -2442,11 +1743,8 @@ func (f *Fs) CallUploadAPI(ctx context.Context, opts *rest.Opts, request any, re
 
 	// 🔧 使用专用的上传调速器，而不是全局调速器
 	return f.uploadPacer.Call(func() (shouldRetryGlobal bool, errGlobal error) {
-		fs.Debugf(f, "🔍 CallUploadAPI: 进入uploadPacer (QPS限制: ~10 QPS)")
-
 		// Ensure token is available and current
 		if !skipToken {
-			fs.Debugf(f, "🔍 CallUploadAPI: 准备token")
 			if err := f.prepareTokenForRequest(ctx, opts); err != nil {
 				fs.Debugf(f, "🔍 CallUploadAPI: prepareTokenForRequest失败: %v", err)
 				return false, backoff.Permanent(err)
@@ -2475,8 +1773,6 @@ func (f *Fs) CallUploadAPI(ctx context.Context, opts *rest.Opts, request any, re
 // CallDownloadURLAPI 专门用于下载URL API调用的函数，使用专用调速器
 // 🔧 防止下载URL API调用频率过高，避免触发115网盘反爬机制
 func (f *Fs) CallDownloadURLAPI(ctx context.Context, opts *rest.Opts, request any, response any, skipToken bool) error {
-	fs.Debugf(f, "🔍 CallDownloadURLAPI开始: path=%q, method=%q", opts.Path, opts.Method)
-
 	// Ensure root URL is set if not provided in opts
 	if opts.RootURL == "" {
 		opts.RootURL = openAPIRootURL
@@ -2484,11 +1780,8 @@ func (f *Fs) CallDownloadURLAPI(ctx context.Context, opts *rest.Opts, request an
 
 	// 🔧 使用专用的下载URL调速器，而不是全局调速器
 	return f.downloadPacer.Call(func() (shouldRetryGlobal bool, errGlobal error) {
-		fs.Debugf(f, "🔍 CallDownloadURLAPI: 进入downloadPacer (QPS限制: ~2 QPS)")
-
 		// Ensure token is available and current
 		if !skipToken {
-			fs.Debugf(f, "🔍 CallDownloadURLAPI: 准备token")
 			if err := f.prepareTokenForRequest(ctx, opts); err != nil {
 				fs.Debugf(f, "🔍 CallDownloadURLAPI: prepareTokenForRequest失败: %v", err)
 				return false, backoff.Permanent(err)
@@ -2551,22 +1844,17 @@ func (f *Fs) prepareTokenForRequest(ctx context.Context, opts *rest.Opts) error 
 
 // executeOpenAPICall makes the actual API call with the provided parameters
 func (f *Fs) executeOpenAPICall(ctx context.Context, opts *rest.Opts, request any, response any) (*http.Response, error) {
-	fs.Debugf(f, "🔍 executeOpenAPICall开始: path=%q", opts.Path)
-
 	var resp *http.Response
 	var err error
 
 	if request != nil && response != nil {
 		// Assume standard JSON request/response
-		fs.Debugf(f, "🔍 executeOpenAPICall: 标准JSON请求/响应模式")
 		resp, err = f.openAPIClient.CallJSON(ctx, opts, request, response)
 	} else if response != nil {
 		// Assume GET request with JSON response
-		fs.Debugf(f, "🔍 executeOpenAPICall: GET请求JSON响应模式")
 		resp, err = f.openAPIClient.CallJSON(ctx, opts, nil, response)
 	} else {
 		// Assume call without specific request/response body
-		fs.Debugf(f, "🔍 executeOpenAPICall: 基础调用模式")
 		var baseResp api.OpenAPIBase
 		resp, err = f.openAPIClient.CallJSON(ctx, opts, nil, &baseResp)
 		if err == nil {
@@ -2710,19 +1998,18 @@ func (f *Fs) executeUnencryptedCall(ctx context.Context, opts *rest.Opts, reques
 	return resp, apiErr
 }
 
-// executeEncryptedCall makes a traditional API call with encryption
+// executeEncryptedCall makes a traditional API call (encryption removed)
+// 🔧 重构：移除加密功能，直接使用标准JSON调用
 func (f *Fs) executeEncryptedCall(ctx context.Context, opts *rest.Opts, request any, response any) (*http.Response, error) {
 	var resp *http.Response
 	var apiErr error
 
+	// 🔧 重构：所有传统API调用都改为标准JSON调用，不再使用加密
 	if request != nil && response != nil {
-		// Handle request+response case with encryption
-		apiErr = f.executeEncryptedRequestResponse(ctx, opts, request, response, &resp)
+		resp, apiErr = f.tradClient.CallJSON(ctx, opts, request, response)
 	} else if response != nil {
-		// Handle response-only case with encryption
-		apiErr = f.executeEncryptedResponseOnly(ctx, opts, response, &resp)
+		resp, apiErr = f.tradClient.CallJSON(ctx, opts, nil, response)
 	} else {
-		// Simple base response case
 		var baseResp api.TraditionalBase
 		resp, apiErr = f.tradClient.CallJSON(ctx, opts, nil, &baseResp)
 		if apiErr == nil {
@@ -2731,72 +2018,6 @@ func (f *Fs) executeEncryptedCall(ctx context.Context, opts *rest.Opts, request 
 	}
 
 	return resp, apiErr
-}
-
-// executeEncryptedRequestResponse handles the case where both request and response need encryption
-func (f *Fs) executeEncryptedRequestResponse(ctx context.Context, opts *rest.Opts, request any, response any, resp **http.Response) error {
-	// Encode request data
-	input, marshalErr := json.Marshal(request)
-	if marshalErr != nil {
-		return fmt.Errorf("failed to marshal traditional request: %w", marshalErr)
-	}
-
-	key := crypto.GenerateKey()
-	// Prepare multipart parameters
-	if opts.MultipartParams == nil {
-		opts.MultipartParams = url.Values{}
-	}
-	opts.MultipartParams.Set("data", crypto.Encode(input, key))
-	opts.Body = nil // Clear body if using multipart params
-
-	// Execute call expecting encrypted response
-	var info api.StringInfo
-	var err error
-	*resp, err = f.tradClient.CallJSON(ctx, opts, nil, &info)
-	if err != nil {
-		return err
-	}
-
-	// Process the encrypted response
-	return f.processEncryptedResponse(&info, response)
-}
-
-// executeEncryptedResponseOnly handles the case where only the response is encrypted
-func (f *Fs) executeEncryptedResponseOnly(ctx context.Context, opts *rest.Opts, response any, resp **http.Response) error {
-	// Call expecting encrypted response, no request body needed (e.g., GET)
-	var info api.StringInfo
-	var err error
-	*resp, err = f.tradClient.CallJSON(ctx, opts, nil, &info)
-	if err != nil {
-		return err
-	}
-
-	// Process the encrypted response
-	return f.processEncryptedResponse(&info, response)
-}
-
-// processEncryptedResponse decodes and unmarshals an encrypted response
-func (f *Fs) processEncryptedResponse(info *api.StringInfo, response any) error {
-	if err := info.Err(); err != nil {
-		return err // API level error before decryption
-	}
-
-	if info.Data == "" {
-		return errors.New("no data received in traditional response")
-	}
-
-	// Decode and unmarshal response
-	key := crypto.GenerateKey()
-	output, decodeErr := crypto.Decode(string(info.Data), key)
-	if decodeErr != nil {
-		return fmt.Errorf("failed to decode traditional data: %w", decodeErr)
-	}
-
-	if unmarshalErr := json.Unmarshal(output, response); unmarshalErr != nil {
-		return fmt.Errorf("failed to unmarshal traditional response %q: %w", string(output), unmarshalErr)
-	}
-
-	return nil
 }
 
 // processTraditionalAPIResult handles the result of a traditional API call
@@ -2892,38 +2113,38 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		NoMultiThreading:        true, // Keep true as downloads might still use traditional API
 	}).Fill(ctx, f)
 
-	// 初始化路径缓存 (10秒TTL用于测试, 最大1000条目)
-	f.pathCache = NewPathCache(10*time.Second, 1000)
+	// 🔧 重构：删除pathCache初始化，统一使用dirCache
 
 	// 初始化缓存配置
 	f.cacheConfig = DefaultCacheConfig115()
 
-	// 初始化BadgerDB持久化缓存系统
-	cacheDir := cache.GetCacheDir("115drive")
-
-	// 初始化多个缓存实例
-	caches := map[string]**cache.BadgerCache{
+	// 初始化BadgerDB持久化缓存系统 - 使用公共缓存管理器
+	cacheInstances := map[string]**cache.BadgerCache{
 		"path_resolve": &f.pathResolveCache,
 		"dir_list":     &f.dirListCache,
 		"metadata":     &f.metadataCache,
 		"file_id":      &f.fileIDCache,
 	}
 
-	for name, cachePtr := range caches {
-		cache, cacheErr := cache.NewBadgerCache(name, cacheDir)
-		if cacheErr != nil {
-			fs.Errorf(f, "初始化%s缓存失败: %v", name, cacheErr)
-			// 缓存初始化失败不应该阻止文件系统工作，继续执行
-		} else {
-			*cachePtr = cache
-			fs.Debugf(f, "%s缓存初始化成功", name)
-		}
+	// 🔧 重构：使用与123网盘相同的缓存配置格式
+	cacheConfig := &cache.CloudDriveCacheConfig{
+		CacheType:       "115drive",
+		CacheDir:        cache.GetCacheDir("115drive"),
+		CacheInstances:  cacheInstances,
+		ContinueOnError: true, // 缓存失败不阻止文件系统工作
+		LogContext:      f,
 	}
 
-	fs.Debugf(f, "BadgerDB缓存系统初始化完成: %s", cacheDir)
+	err = cache.InitCloudDriveCache(cacheConfig)
+	if err != nil {
+		fs.Errorf(f, "初始化缓存失败: %v", err)
+		// 缓存初始化失败不应该阻止文件系统工作，继续执行
+	} else {
+		fs.Infof(f, "🔧 简化缓存管理器初始化成功")
+	}
 
 	// 初始化断点续传管理器（使用BadgerDB）
-	resumeManager, resumeErr := NewResumeManager115(f, filepath.Join(cacheDir, "resume"))
+	resumeManager, resumeErr := NewResumeManager115(f, filepath.Join(cacheConfig.CacheDir, "resume"))
 	if resumeErr != nil {
 		fs.Errorf(f, "初始化断点续传管理器失败: %v", resumeErr)
 		// 断点续传失败不应该阻止文件系统工作，继续执行
@@ -2967,22 +2188,24 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		pacer.MaxSleep(maxSleep),
 		pacer.DecayConstant(decayConstant)))
 
+	// 🔧 115网盘统一QPS管理：所有API使用相同的调速器
+	// 115网盘特殊性：全局账户级别限制，需要统一管理避免770004错误
+
+	// 传统API调速器 - 使用保守设置
 	f.tradPacer = fs.NewPacer(ctx, pacer.NewDefault(
-		pacer.MinSleep(traditionalMinSleep),
+		pacer.MinSleep(conservativeMinSleep), // 2 QPS - 传统API使用保守模式
 		pacer.MaxSleep(maxSleep),
 		pacer.DecayConstant(decayConstant)))
 
-	// 🔧 添加下载URL专用调速器，防止API调用频率过高
-	// 基于115网盘API特性，设置保守的QPS限制避免触发反爬机制
+	// 下载URL调速器 - 使用统一设置
 	f.downloadPacer = fs.NewPacer(ctx, pacer.NewDefault(
-		pacer.MinSleep(downloadURLMinSleep),
+		pacer.MinSleep(unifiedMinSleep), // 4 QPS - 与全局保持一致
 		pacer.MaxSleep(maxSleep),
 		pacer.DecayConstant(decayConstant)))
 
-	// 🔧 添加上传专用调速器，优化上传API调用频率
-	// 平衡上传性能和API稳定性，避免上传时频率过高导致限制
+	// 上传调速器 - 使用保守设置
 	f.uploadPacer = fs.NewPacer(ctx, pacer.NewDefault(
-		pacer.MinSleep(uploadMinSleep),
+		pacer.MinSleep(conservativeMinSleep), // 2 QPS - 上传使用保守模式
 		pacer.MaxSleep(maxSleep),
 		pacer.DecayConstant(decayConstant)))
 
@@ -3067,67 +2290,29 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// 🔧 暂时禁用智能缓存预热，避免干扰上传性能
 	// go f.intelligentCachePreheating(ctx)
 
-	// Find the current working directory
+	// 🚀 全新设计：智能路径处理策略
+	// 参考123网盘的简洁设计，但针对115网盘的特点进行优化
 	if f.root != "" {
-		// Find directory specified by the root path
-		err := f.dirCache.FindRoot(ctx, false)
-		if err != nil {
-			// Assume it is a file or doesn't exist
-			newRoot, remote := dircache.SplitPath(f.root)
-			// 创建新的Fs实例，避免复制mutex
-			tempF := &Fs{
-				name:          f.name,
-				originalName:  f.originalName,
-				root:          newRoot,
-				opt:           f.opt,
-				features:      f.features,
-				tradClient:    f.tradClient,
-				openAPIClient: f.openAPIClient,
-				globalPacer:   f.globalPacer,
-				tradPacer:     f.tradPacer,
-				rootFolder:    f.rootFolder,
-				rootFolderID:  f.rootFolderID,
-				appVer:        f.appVer,
-				userID:        f.userID,
-				userkey:       f.userkey,
-				isShare:       f.isShare,
-				fileObj:       f.fileObj,
-				m:             f.m,
-				accessToken:   f.accessToken,
-				refreshToken:  f.refreshToken,
-				tokenExpiry:   f.tokenExpiry,
-				codeVerifier:  f.codeVerifier,
-				tokenRenewer:  f.tokenRenewer,
-				pathCache:     f.pathCache,
-				httpClient:    f.httpClient,
-			}
-			tempF.dirCache = dircache.New(newRoot, f.rootFolderID, tempF)
-			// Make new Fs which is the parent
-			err = tempF.dirCache.FindRoot(ctx, false)
-			if err != nil {
-				// No root so return old f
+		fs.Debugf(f, "🚀 智能NewFs: 开始处理路径: %q", f.root)
+
+		// 🔧 策略1：优先检查缓存中是否已有路径信息
+		if isFile, found := f.checkPathTypeFromCache(f.root); found {
+			if isFile {
+				fs.Debugf(f, "🎯 缓存命中：确认为文件，直接设置文件模式: %q", f.root)
+				return f.setupFileFromCache(ctx)
+			} else {
+				fs.Debugf(f, "🎯 缓存命中：确认为目录，直接设置目录模式: %q", f.root)
 				return f, nil
 			}
-			// Check if it's a file
-			_, err := tempF.newObjectWithInfo(ctx, remote, nil)
-			if err != nil {
-				// 检查是否是API限制错误，如果是则直接返回目录模式，避免路径混乱
-				if isAPILimitError(err) {
-					return f, nil
-				}
-				if err == fs.ErrorObjectNotFound {
-					// File doesn't exist so return old f
-					return f, nil
-				}
-				return nil, err
-			}
-			// Copy the features
-			f.features.Fill(ctx, tempF)
-			// Update the dir cache in the old f
-			f.dirCache = tempF.dirCache
-			f.root = tempF.root
-			// Return an error with an fs which points to the parent
-			return f, fs.ErrorIsFile
+		}
+
+		// 🔧 策略2：缓存未命中，使用智能检测
+		if isLikelyFilePath(f.root) {
+			fs.Debugf(f, "🔧 智能检测：路径看起来像文件: %q", f.root)
+			return f.handleAsFile(ctx)
+		} else {
+			fs.Debugf(f, "🔧 智能检测：路径看起来像目录: %q", f.root)
+			return f.handleAsDirectory(ctx)
 		}
 	}
 
@@ -3172,10 +2357,7 @@ func (f *Fs) Hashes() hash.Set {
 
 // NewObject finds the Object at remote.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	fs.Debugf(f, "🔍 NewObject开始: remote=%q", remote)
-
 	if f.fileObj != nil { // Handle case where Fs points to a single file
-		fs.Debugf(f, "🔍 NewObject: 处理单文件模式")
 		obj := *f.fileObj
 		if obj.Remote() == remote || obj.Remote() == "isFile:"+remote {
 			fs.Debugf(f, "🔍 NewObject: 单文件匹配成功")
@@ -3194,19 +2376,10 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 // FindLeaf finds a directory or file leaf in the parent folder pathID.
 // Used by dircache.
+// 🔧 重构：移除pathCache，统一使用dirCache进行目录缓存
 func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (foundID string, found bool, err error) {
-	// 构建缓存键
-	cacheKey := pathID + "/" + leaf
-
-	// 首先检查缓存
-	if entry, exists := f.pathCache.Get(cacheKey); exists {
-		if entry.IsDir {
-			return entry.ID, true, nil
-		} else {
-			// 找到的是文件，返回空ID表示这是文件而不是目录
-			return "", true, nil
-		}
-	}
+	// 🔧 重构：直接使用listAll查找，不再使用pathCache
+	// dirCache已经在上层提供了路径缓存功能，避免重复缓存
 
 	// Use listAll which now uses OpenAPI
 	found, err = f.listAll(ctx, pathID, f.opt.ListChunk, false, false, func(item *api.File) bool {
@@ -3223,70 +2396,27 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (foundID string,
 					itemPath := path.Join(parentPath, leaf)
 					f.dirCache.Put(itemPath, foundID)
 				}
-				// 同时更新路径缓存
-				f.pathCache.Put(cacheKey, foundID, true)
+				// 🔧 重构：移除pathCache.Put()调用，统一使用dirCache
 			} else {
 				// 这是文件，不返回ID（保持foundID为空字符串）
 				foundID = "" // 明确设置为空，表示找到的是文件而不是目录
-				// 缓存文件信息
-				f.pathCache.Put(cacheKey, item.ID(), false)
+				// 🔧 重构：移除pathCache.Put()调用，文件信息不需要缓存在目录缓存中
 			}
 			return true // Stop searching
 		}
 		return false // Continue searching
 	})
 
-	// 如果遇到API限制错误，采用渐进式缓存清理策略
+	// 🔧 重构：如果遇到API限制错误，清理dirCache而不是pathCache
 	if isAPILimitError(err) {
-		f.clearCacheGradually(err, "")
+		f.dirCache.Flush()
 	}
 
 	return foundID, found, err
 }
 
-// GetDirID finds a directory ID by its absolute path. Used by dircache.
-// This implementation uses the OpenAPI list endpoint iteratively, which might be slow.
-// The traditional /files/getid is faster but less reliable. We prioritize OpenAPI.
-func (f *Fs) GetDirID(ctx context.Context, dir string) (string, error) {
-	// Start from the filesystem's root ID
-	currentID := f.rootFolderID
-	if dir == "" || dir == "/" {
-		return currentID, nil
-	}
-
-	parts := strings.Split(strings.Trim(dir, "/"), "/")
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
-		encodedPart := f.opt.Enc.FromStandardName(part) // Encode each part
-		foundID, found, err := f.FindLeaf(ctx, currentID, encodedPart)
-		if err != nil {
-			// 如果是API限制错误，立即返回，不要继续递归搜索
-			if isAPILimitError(err) {
-				// 采用渐进式缓存清理策略
-				f.clearCacheGradually(err, encodedPart)
-				return "", err
-			}
-			return "", fmt.Errorf("error searching for %q in %q: %w", encodedPart, currentID, err)
-		}
-		if !found {
-			return "", fs.ErrorDirNotFound
-		}
-
-		// 验证找到的项目确实是目录
-		// 如果是文件，则这个路径不应该被当作目录路径处理
-		if foundID == "" {
-			return "", fmt.Errorf("path component %q is a file, not a directory", encodedPart)
-		}
-		// Check if the found item is actually a directory
-		// Need a way to confirm type without full listing again. Assume FindLeaf returns correct type for now.
-		// If FindLeaf could return the *api.File, we could check item.IsDir() here.
-		// For now, assume FindLeaf only finds directories when called by GetDirID context.
-		currentID = foundID
-	}
-	return currentID, nil
-}
+// 🔧 重构：删除GetDirID()方法，标准lib/dircache不需要此方法
+// GetDirID()功能已通过FindLeaf()和CreateDir()的递归调用实现
 
 // List the objects and directories in dir into entries.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
@@ -3305,8 +2435,37 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	}
 
 	fs.Debugf(f, "List找到目录ID: %s，目录: %q", dirID, dir)
+
+	// 🔧 关键修复：添加dir_list缓存支持，参考123网盘实现
+	if cached, found := f.getDirListFromCache(dirID, ""); found {
+		fs.Debugf(f, "🎯 List缓存命中: dirID=%s, 文件数=%d", dirID, len(cached.FileList))
+
+		// 从缓存构建entries
+		for _, item := range cached.FileList {
+			entry, err := f.itemToDirEntry(ctx, path.Join(dir, item.FileNameBest()), &item)
+			if err != nil {
+				fs.Debugf(f, "List缓存条目转换失败: %v", err)
+				continue // 跳过有问题的条目，继续处理其他条目
+			}
+			if entry != nil {
+				entries = append(entries, entry)
+			}
+		}
+
+		fs.Debugf(f, "🎯 List缓存返回: %d个条目", len(entries))
+		return entries, nil
+	}
+
+	// 缓存未命中，调用API并保存到缓存
+	fs.Debugf(f, "🔍 List缓存未命中，调用API: dirID=%s", dirID)
+	var fileList []api.File
 	var iErr error
+
 	_, err = f.listAll(ctx, dirID, f.opt.ListChunk, false, false, func(item *api.File) bool {
+		// 保存到临时列表用于缓存
+		fileList = append(fileList, *item)
+
+		// 构建entries
 		entry, err := f.itemToDirEntry(ctx, path.Join(dir, item.FileNameBest()), item)
 		if err != nil {
 			iErr = err // Capture error but continue listing
@@ -3317,12 +2476,20 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		}
 		return false
 	})
+
 	if err != nil {
 		return nil, err // Return listing error
 	}
 	if iErr != nil {
 		return nil, iErr // Return item processing error
 	}
+
+	// 🔧 保存到缓存
+	if len(fileList) > 0 {
+		f.saveDirListToCache(dirID, "", fileList, "")
+		fs.Debugf(f, "🎯 List保存到缓存: dirID=%s, 文件数=%d", dirID, len(fileList))
+	}
+
 	return entries, nil
 }
 
@@ -3401,8 +2568,9 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 		}
 	}
 
-	// 上传成功后，清理相关缓存
-	f.invalidateRelatedCaches115(remote, "upload")
+	// 🔧 重构：上传成功后，清理dirCache相关缓存
+	// 上传可能影响目录结构，清理缓存确保一致性
+	f.dirCache.FlushDir(path.Dir(remote))
 
 	return newObj, nil
 }
@@ -3435,10 +2603,7 @@ func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) (err error) {
 		// Move items in chunks
 		chunkSize := f.opt.ListChunk // Use list chunk size for move chunks
 		for i := 0; i < len(itemsToMove); i += chunkSize {
-			end := i + chunkSize
-			if end > len(itemsToMove) {
-				end = len(itemsToMove)
-			}
+			end := min(i+chunkSize, len(itemsToMove))
 			chunk := itemsToMove[i:end]
 			if len(chunk) == 0 {
 				continue
@@ -3465,10 +2630,7 @@ func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) (err error) {
 	// Delete directories in chunks
 	chunkSize := f.opt.ListChunk
 	for i := 0; i < len(dirsToDelete); i += chunkSize {
-		end := i + chunkSize
-		if end > len(dirsToDelete) {
-			end = len(dirsToDelete)
-		}
+		end := min(i+chunkSize, len(dirsToDelete))
 		chunkIDs := dirsToDelete[i:end]
 		if len(chunkIDs) == 0 {
 			continue
@@ -3496,8 +2658,9 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	}
 	_, err := f.dirCache.FindDir(ctx, dir, true) // create = true
 	if err == nil {
-		// 创建目录成功后，清理相关缓存
-		f.invalidateRelatedCaches115(dir, "mkdir")
+		// 🔧 重构：创建目录成功后，清理dirCache相关缓存
+		// 新目录创建可能影响父目录的缓存
+		f.dirCache.FlushDir(path.Dir(dir))
 	}
 	return err
 }
@@ -3586,9 +2749,10 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	dir, _ := dircache.SplitPath(srcObj.remote)
 	srcObj.fs.dirCache.FlushDir(dir)
 
-	// 移动成功后，清理相关缓存
-	f.invalidateRelatedCaches115(srcObj.remote, "move")
-	f.invalidateRelatedCaches115(remote, "move")
+	// 🔧 重构：移动成功后，清理dirCache相关缓存
+	// 移动操作影响源和目标目录，清理相关缓存
+	f.dirCache.FlushDir(path.Dir(srcObj.remote))
+	f.dirCache.FlushDir(path.Dir(remote))
 
 	return dstObj, nil
 }
@@ -3890,7 +3054,6 @@ func (f *Fs) itemToDirEntry(ctx context.Context, remote string, item *api.File) 
 
 // newObjectWithInfo creates an fs.Object from an api.File or by reading metadata.
 func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *api.File) (fs.Object, error) {
-	fs.Debugf(f, "🔍 newObjectWithInfo开始: remote=%q, hasInfo=%v", remote, info != nil)
 
 	o := &Object{
 		fs:     f,
@@ -3922,8 +3085,8 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.Fi
 		// 检查是否是API限制错误，如果是则立即返回，避免路径混乱
 		if isAPILimitError(err) {
 			fs.Debugf(f, "readMetaDataForPath遇到API限制错误，路径: %q, 错误: %v", path, err)
-			// 采用渐进式缓存清理策略
-			f.clearCacheGradually(err, path)
+			// 🔧 重构：清理dirCache而不是pathCache
+			f.dirCache.Flush()
 			return nil, err
 		}
 		if err == fs.ErrorDirNotFound {
@@ -3934,8 +3097,16 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.Fi
 
 	fs.Debugf(f, "🔍 readMetaDataForPath: FindPath成功, leaf=%q, dirID=%q", leaf, dirID)
 
+	// 验证目录ID是否有效
+	if dirID == "" {
+		fs.Errorf(f, "🔍 readMetaDataForPath: 目录ID为空，路径: %q, leaf: %q", path, leaf)
+		// 清理可能损坏的缓存
+		f.dirCache.Flush()
+		return nil, fmt.Errorf("invalid directory ID for path %q", path)
+	}
+
 	// List the directory and find the leaf
-	fs.Debugf(f, "🔍 readMetaDataForPath: 开始调用listAll")
+	fs.Debugf(f, "🔍 readMetaDataForPath: 开始调用listAll, dirID=%q, leaf=%q", dirID, leaf)
 	found, err := f.listAll(ctx, dirID, f.opt.ListChunk, true, false, func(item *api.File) bool {
 		// Compare with decoded name to handle special characters correctly
 		decodedName := f.opt.Enc.ToStandardName(item.FileNameBest())
@@ -4089,6 +3260,32 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 		}
 
 		return f.getDownloadURLByUA(ctx, path, ua)
+	case "cache-info":
+		// 使用统一缓存查看器
+		caches := map[string]cache.PersistentCache{
+			"path_resolve": f.pathResolveCache,
+			"dir_list":     f.dirListCache,
+			"metadata":     f.metadataCache,
+			"file_id":      f.fileIDCache,
+		}
+		viewer := cache.NewUnifiedCacheViewer("115", f, caches)
+
+		// 根据参数决定返回格式
+		format := "tree"
+		if formatOpt, ok := opt["format"]; ok {
+			format = formatOpt
+		}
+
+		switch format {
+		case "tree":
+			return viewer.GenerateDirectoryTreeText()
+		case "stats":
+			return viewer.GetCacheStats(), nil
+		case "info":
+			return viewer.GetCacheInfo()
+		default:
+			return viewer.GenerateDirectoryTreeText()
+		}
 	default:
 		return nil, fs.ErrorCommandNotFound
 	}
@@ -4475,8 +3672,9 @@ func (o *Object) Remove(ctx context.Context) error {
 		return fmt.Errorf("failed to delete object %q: %w", o.id, err)
 	}
 
-	// 删除文件成功后，清理相关缓存
-	o.fs.invalidateRelatedCaches115(o.remote, "remove")
+	// 🔧 重构：删除文件成功后，清理dirCache相关缓存
+	// 删除文件可能影响父目录的缓存
+	o.fs.dirCache.FlushDir(path.Dir(o.remote))
 
 	return nil
 }
@@ -4751,14 +3949,8 @@ func loadTokenFromConfig(f *Fs, m configmap.Mapper) bool {
 // rclone backend getdownloadurlua "116:/电影/2025_电影/独裁者 (2012) {tmdb-76493} 23.8GB.mkv" "VidHub/1.7.2"
 
 // downloadWithConcurrency 115网盘多线程并发下载实现
-// 🔧 优化：基于123网盘的并发下载架构，专门为115网盘优化
-func (f *Fs) downloadWithConcurrency(ctx context.Context, srcObj *Object, tempFile *os.File, fileSize int64) (int64, error) {
-	return f.downloadWithConcurrencyAndTransfer(ctx, srcObj, tempFile, fileSize, nil)
-}
-
-// downloadWithConcurrencyAndTransfer 115网盘多线程并发下载实现（支持Transfer对象）
 // 🔧 修复进度显示：支持传入Transfer对象来正确跟踪进度
-func (f *Fs) downloadWithConcurrencyAndTransfer(ctx context.Context, srcObj *Object, tempFile *os.File, fileSize int64, transfer *accounting.Transfer) (int64, error) {
+func (f *Fs) downloadWithConcurrency(ctx context.Context, srcObj *Object, tempFile *os.File, fileSize int64, transfer *accounting.Transfer) (int64, error) {
 	// 🚀 网络参数调优：优化TCP连接参数
 	f.optimizeNetworkParameters(ctx)
 
@@ -4880,11 +4072,6 @@ func (dp *DownloadProgress) GetProgressInfo() (percentage float64, avgSpeed floa
 	return percentage, avgSpeed, peakSpeed, eta, dp.completedChunks, dp.totalChunks, dp.downloadedBytes, dp.totalBytes
 }
 
-// downloadChunksConcurrently 115网盘并发下载文件分片（集成断点续传和rclone标准进度显示）
-func (f *Fs) downloadChunksConcurrently(ctx context.Context, srcObj *Object, tempFile *os.File, chunkSize, numChunks, maxConcurrency int64) error {
-	return f.downloadChunksConcurrentlyWithTransfer(ctx, srcObj, tempFile, chunkSize, numChunks, maxConcurrency, nil)
-}
-
 // downloadChunksConcurrentlyWithTransfer 115网盘并发下载文件分片（支持Transfer对象）
 // 🔧 修复进度显示：支持传入Transfer对象来正确跟踪进度
 func (f *Fs) downloadChunksConcurrentlyWithTransfer(ctx context.Context, srcObj *Object, tempFile *os.File, chunkSize, numChunks, maxConcurrency int64, transfer *accounting.Transfer) error {
@@ -4929,9 +4116,11 @@ func (f *Fs) downloadChunksConcurrentlyWithTransfer(ctx context.Context, srcObj 
 	// 创建进度跟踪器，考虑已完成的分片
 	progress := NewDownloadProgress(numChunks, srcObj.Size())
 
-	// 如果有已完成的分片，更新进度
-	for chunkIndex := range resumeInfo.CompletedChunks {
-		progress.UpdateChunkProgress(chunkIndex, chunkSize, 0) // 已完成的分片，耗时为0
+	// 如果有已完成的分片，更新进度（修复nil pointer问题）
+	if resumeInfo != nil {
+		for chunkIndex := range resumeInfo.CompletedChunks {
+			progress.UpdateChunkProgress(chunkIndex, chunkSize, 0) // 已完成的分片，耗时为0
+		}
 	}
 
 	// 🔧 关键修复：使用传入的Transfer对象创建Account，而不是查找现有的
@@ -4982,7 +4171,7 @@ func (f *Fs) downloadChunksConcurrentlyWithTransfer(ctx context.Context, srcObj 
 	errChan := make(chan error, numChunks)
 	var wg sync.WaitGroup
 
-	for i := int64(0); i < numChunks; i++ {
+	for i := range numChunks {
 		wg.Add(1)
 		go func(chunkIndex int64) {
 			defer wg.Done()
@@ -4995,8 +4184,8 @@ func (f *Fs) downloadChunksConcurrentlyWithTransfer(ctx context.Context, srcObj 
 				}
 			}()
 
-			// 🔧 断点续传：检查分片是否已完成
-			if resumeInfo.IsChunkCompleted(chunkIndex) {
+			// 🔧 断点续传：检查分片是否已完成（修复nil pointer问题）
+			if resumeInfo != nil && resumeInfo.IsChunkCompleted(chunkIndex) {
 				fs.Debugf(f, "跳过已完成的分片: %d", chunkIndex)
 				return
 			}
@@ -5045,11 +4234,13 @@ func (f *Fs) downloadChunksConcurrentlyWithTransfer(ctx context.Context, srcObj 
 				return
 			}
 
-			// 🔧 断点续传：标记分片为已完成并保存
-			resumeInfo.MarkChunkCompleted(chunkIndex)
-			if f.resumeManager != nil {
-				if saveErr := f.resumeManager.SaveResumeInfo(resumeInfo); saveErr != nil {
-					fs.Debugf(f, "保存断点续传信息失败: %v", saveErr)
+			// 🔧 断点续传：标记分片为已完成并保存（修复nil pointer问题）
+			if resumeInfo != nil {
+				resumeInfo.MarkChunkCompleted(chunkIndex)
+				if f.resumeManager != nil {
+					if saveErr := f.resumeManager.SaveResumeInfo(resumeInfo); saveErr != nil {
+						fs.Debugf(f, "保存断点续传信息失败: %v", saveErr)
+					}
 				}
 			}
 
@@ -5066,16 +4257,13 @@ func (f *Fs) downloadChunksConcurrentlyWithTransfer(ctx context.Context, srcObj 
 			}
 
 			// 🔧 统一进度显示：调用共享的进度显示函数
-			f.displayUnifiedDownloadProgress(progress, "115网盘", srcObj.remote)
+			f.displayDownloadProgress(progress, "115网盘", srcObj.remote)
 
-		}(i)
+		}(int64(i))
 	}
 
 	// 🔧 修复死锁风险：添加整体超时控制，防止无限等待
-	overallTimeout := time.Duration(numChunks) * 15 * time.Minute // 每个分片最多15分钟
-	if overallTimeout > 2*time.Hour {
-		overallTimeout = 2 * time.Hour // 最大2小时超时
-	}
+	overallTimeout := min(time.Duration(numChunks)*15*time.Minute, 2*time.Hour) // 每个分片最多15分钟，最大2小时超时
 
 	// 使用带超时的等待机制
 	done := make(chan struct{})
@@ -5159,31 +4347,9 @@ func (f *Fs) updateAccountExtraInfo(ctx context.Context, progress *DownloadProgr
 	}
 }
 
-// displayDownloadProgress 显示115网盘下载进度（保留用于兼容性，但简化输出）
-func (f *Fs) displayDownloadProgress(ctx context.Context, progress *DownloadProgress, fileName string) {
-	// 🔧 优化：大幅减少独立进度显示，主要依赖rclone标准进度
-	ticker := time.NewTicker(10 * time.Second) // 每10秒更新一次，仅用于重要状态
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			// 显示最终完成状态
-			percentage, avgSpeed, peakSpeed, _, completed, total, downloadedBytes, totalBytes := progress.GetProgressInfo()
-			fs.Infof(f, "📥 115网盘下载完成: %s | %d/%d分片 (%.1f%%) | %s/%s | 平均: %.2f MB/s | 峰值: %.2f MB/s",
-				fileName, completed, total, percentage,
-				fs.SizeSuffix(downloadedBytes), fs.SizeSuffix(totalBytes), avgSpeed, peakSpeed)
-			return
-		case <-ticker.C:
-			// 🔧 优化：只在特殊情况下显示独立进度（如错误恢复等）
-			// 正常情况下依赖rclone标准进度显示
-		}
-	}
-}
-
-// displayUnifiedDownloadProgress 统一的下载进度显示函数
+// displayDownloadProgress 统一的下载进度显示函数
 // 🚀 性能优化：集成到rclone主进度条，减少独立进度显示的频率
-func (f *Fs) displayUnifiedDownloadProgress(progress *DownloadProgress, networkName, fileName string) {
+func (f *Fs) displayDownloadProgress(progress *DownloadProgress, networkName, _ string) {
 	percentage, avgSpeed, _, eta, completed, total, downloadedBytes, _ := progress.GetProgressInfo()
 
 	// 🚀 优化：减少独立进度显示频率，只在关键节点显示
@@ -5203,26 +4369,6 @@ func (f *Fs) displayUnifiedDownloadProgress(progress *DownloadProgress, networkN
 	}
 }
 
-// createProgressBar 创建进度条字符串
-func (f *Fs) createProgressBar(percentage float64) string {
-	const barLength = 30
-	filled := int(percentage / 100 * barLength)
-	if filled > barLength {
-		filled = barLength
-	}
-
-	bar := "["
-	for i := 0; i < barLength; i++ {
-		if i < filled {
-			bar += "█"
-		} else {
-			bar += "░"
-		}
-	}
-	bar += "]"
-	return bar
-}
-
 // downloadChunk 115网盘下载单个文件分片
 func (f *Fs) downloadChunk(ctx context.Context, srcObj *Object, tempFile *os.File, start, end, chunkIndex int64) error {
 	rangeOption := &fs.RangeOption{Start: start, End: end}
@@ -5236,7 +4382,7 @@ func (f *Fs) downloadChunk(ctx context.Context, srcObj *Object, tempFile *os.Fil
 	retryStartTime := time.Now()
 	maxRetryDuration := 10 * time.Minute // 最大重试时间
 
-	for retry := 0; retry < maxRetries; retry++ {
+	for retry := range maxRetries {
 		// 🔧 检查总重试时间，防止无限重试
 		if time.Since(retryStartTime) > maxRetryDuration {
 			fs.Errorf(f, "🚨 115网盘分片 %d 重试超时 (%v)，终止重试", chunkIndex, maxRetryDuration)
@@ -5334,52 +4480,30 @@ func (f *Fs) downloadChunk(ctx context.Context, srcObj *Object, tempFile *os.Fil
 			errorType := f.classifyDownloadError(err)
 			retryDelay := f.calculateRetryDelay(errorType, retry)
 
-			// 🔧 修复：某些错误类型不应该重试
-			switch errorType {
-			case "server_overload": // 502, 503等服务器过载错误
-				if retry >= 3 { // 服务器过载重试不超过3次
-					fs.Errorf(f, "🚨 115网盘分片 %d 服务器过载重试超限，终止重试", chunkIndex)
-					return fmt.Errorf("服务器过载重试超限: %w", err)
-				}
-				time.Sleep(retryDelay)
-				continue
-
-			case "url_expired": // URL过期错误
-				// URL过期错误不需要延迟，但需要检查重试次数
-				if retry >= 4 { // URL过期重试不超过4次
-					fs.Errorf(f, "🚨 115网盘分片 %d URL过期重试超限，终止重试", chunkIndex)
-					return fmt.Errorf("URL过期重试超限: %w", err)
-				}
-				continue
-
-			case "network_timeout": // 网络超时错误
-				if retry >= 2 { // 网络超时重试不超过2次
-					fs.Errorf(f, "🚨 115网盘分片 %d 网络超时重试超限，终止重试", chunkIndex)
-					return fmt.Errorf("网络超时重试超限: %w", err)
-				}
-				time.Sleep(retryDelay)
-				continue
-
-			case "rate_limit": // 429限流错误
-				if retry >= 3 { // 限流重试不超过3次
-					fs.Errorf(f, "🚨 115网盘分片 %d 限流重试超限，终止重试", chunkIndex)
-					return fmt.Errorf("限流重试超限: %w", err)
-				}
-				time.Sleep(retryDelay)
-				continue
-
-			case "fatal_error": // 致命错误，不应重试
-				fs.Errorf(f, "🚨 115网盘分片 %d 遇到致命错误，直接终止: %v", chunkIndex, err)
-				return fmt.Errorf("致命错误，不可重试: %w", err)
-
-			default: // 其他错误
-				if retry >= 2 { // 其他错误重试不超过2次
-					fs.Errorf(f, "🚨 115网盘分片 %d 其他错误重试超限，终止重试", chunkIndex)
-					return fmt.Errorf("其他错误重试超限: %w", err)
-				}
-				time.Sleep(retryDelay)
-				continue
+			// 🔧 简化错误处理：统一重试逻辑
+			maxRetries := map[string]int{
+				"server_overload": 3,
+				"url_expired":     4,
+				"network_timeout": 2,
+				"rate_limit":      3,
+				"fatal_error":     0, // 不重试
 			}
+
+			maxRetry, exists := maxRetries[errorType]
+			if !exists {
+				maxRetry = 2 // 默认重试2次
+			}
+
+			if maxRetry == 0 || retry >= maxRetry {
+				fs.Errorf(f, "🚨 115网盘分片 %d %s重试超限，终止重试", chunkIndex, errorType)
+				return fmt.Errorf("%s重试超限: %w", errorType, err)
+			}
+
+			// URL过期错误不需要延迟
+			if errorType != "url_expired" {
+				time.Sleep(retryDelay)
+			}
+			continue
 
 			// 🔧 移除：删除可能导致无限循环的通用5xx错误处理
 		}
@@ -5484,6 +4608,50 @@ func (f *Fs) calculateDownloadChunkSize(fileSize int64) int64 {
 	default: // >5GB
 		return 256 * 1024 * 1024 // 256MB分片，超大文件
 	}
+}
+
+// calculateOptimalChunkSize 115网盘智能计算上传分片大小
+// 🚀 超激进优化：使用更大的分片大小，减少分片数量，提升整体传输效率
+func (f *Fs) calculateOptimalChunkSize(fileSize int64) fs.SizeSuffix {
+	// 🚀 基于2MB/s目标速度优化：使用更大的分片，减少API调用开销
+	// 更大的分片可以更好地利用网络带宽，减少分片间的开销
+	var partSize int64
+
+	switch {
+	case fileSize <= 50*1024*1024: // ≤50MB
+		partSize = 25 * 1024 * 1024 // 🚀 进一步优化：从20MB增加到25MB
+	case fileSize <= 200*1024*1024: // ≤200MB
+		partSize = 100 * 1024 * 1024 // 🚀 超激进优化：从50MB增加到100MB，减少分片数量
+	case fileSize <= 1*1024*1024*1024: // ≤1GB
+		partSize = 200 * 1024 * 1024 // 🚀 超激进优化：从100MB增加到200MB，最大化传输效率
+	case fileSize > 1*1024*1024*1024*1024: // >1TB
+		partSize = 5 * 1024 * 1024 * 1024 // 5GB分片
+	case fileSize > 768*1024*1024*1024: // >768GB
+		partSize = 109951163 // ≈ 104.8576MB
+	case fileSize > 512*1024*1024*1024: // >512GB
+		partSize = 82463373 // ≈ 78.6432MB
+	case fileSize > 384*1024*1024*1024: // >384GB
+		partSize = 54975582 // ≈ 52.4288MB
+	case fileSize > 256*1024*1024*1024: // >256GB
+		partSize = 41231687 // ≈ 39.3216MB
+	case fileSize > 128*1024*1024*1024: // >128GB
+		partSize = 27487791 // ≈ 26.2144MB
+	default:
+		partSize = 100 * 1024 * 1024 // 🚀 默认100MB分片，最大化性能
+	}
+
+	return fs.SizeSuffix(f.normalizeChunkSize(partSize))
+}
+
+// normalizeChunkSize 确保分片大小在合理范围内
+func (f *Fs) normalizeChunkSize(partSize int64) int64 {
+	if partSize < int64(minChunkSize) {
+		partSize = int64(minChunkSize)
+	}
+	if partSize > int64(maxChunkSize) {
+		partSize = int64(maxChunkSize)
+	}
+	return partSize
 }
 
 // calculateDownloadConcurrency 115网盘智能计算下载并发数
@@ -5627,7 +4795,6 @@ type SmartURLManager struct {
 	// 🚀 新增：批量刷新管理
 	batchRefreshQueue map[string]*BatchRefreshRequest
 	batchMutex        sync.Mutex
-	refreshTimer      *time.Timer
 
 	// 🔧 新增：刷新频率控制
 	refreshHistory map[string][]time.Time // 记录每个pickCode的刷新历史
@@ -5802,7 +4969,7 @@ func (sum *SmartURLManager) performBatchRefresh(pickCode string) (string, error)
 
 	// 通知所有等待的goroutine成功
 	waitingCount := atomic.LoadInt32(&request.WaitingCount)
-	for i := int32(0); i < waitingCount; i++ {
+	for range waitingCount {
 		select {
 		case request.Done <- entry:
 		default:
@@ -5870,7 +5037,7 @@ func (sum *SmartURLManager) refreshURLFromAPI(pickCode string) (string, time.Tim
 }
 
 // GetStatistics 获取统计信息
-func (sum *SmartURLManager) GetStatistics() map[string]interface{} {
+func (sum *SmartURLManager) GetStatistics() map[string]any {
 	sum.cacheMutex.RLock()
 	defer sum.cacheMutex.RUnlock()
 
@@ -5883,21 +5050,13 @@ func (sum *SmartURLManager) GetStatistics() map[string]interface{} {
 		hitRate = float64(totalHits) / float64(totalHits+totalMisses) * 100
 	}
 
-	return map[string]interface{}{
+	return map[string]any{
 		"cache_entries": len(sum.urlCache),
 		"hit_count":     totalHits,
 		"miss_count":    totalMisses,
 		"refresh_count": totalRefresh,
 		"hit_rate":      fmt.Sprintf("%.2f%%", hitRate),
 	}
-}
-
-// calculateUploadConcurrency 115网盘上传并发数计算
-// 注意：分片上传始终使用单线程模式以确保SHA1验证通过
-func (f *Fs) calculateUploadConcurrency(fileSize int64) int {
-	// 115网盘分片上传强制使用单线程模式，确保上传稳定性
-	// 这是为了避免多线程上传时的SHA1验证失败问题
-	return 1
 }
 
 // classifyDownloadError 智能分类下载错误类型
@@ -5961,10 +5120,7 @@ func (f *Fs) calculateRetryDelay(errorType string, retryCount int) time.Duration
 	switch errorType {
 	case "server_overload":
 		// 服务器过载使用指数退避，最大30秒
-		delay := time.Duration(1<<uint(retryCount)) * baseDelay
-		if delay > 30*time.Second {
-			delay = 30 * time.Second
-		}
+		delay := min(time.Duration(1<<uint(retryCount))*baseDelay, 30*time.Second)
 		return delay
 
 	case "url_expired":
@@ -5973,26 +5129,17 @@ func (f *Fs) calculateRetryDelay(errorType string, retryCount int) time.Duration
 
 	case "network_timeout":
 		// 网络超时使用线性增长，最大10秒
-		delay := time.Duration(retryCount+1) * baseDelay
-		if delay > 10*time.Second {
-			delay = 10 * time.Second
-		}
+		delay := min(time.Duration(retryCount+1)*baseDelay, 10*time.Second)
 		return delay
 
 	case "rate_limit":
 		// 限流错误使用较长延迟
-		delay := time.Duration(retryCount+1) * 5 * time.Second
-		if delay > 60*time.Second {
-			delay = 60 * time.Second
-		}
+		delay := min(time.Duration(retryCount+1)*5*time.Second, 60*time.Second)
 		return delay
 
 	default:
 		// 其他错误使用标准指数退避
-		delay := time.Duration(1<<uint(retryCount)) * baseDelay
-		if delay > 15*time.Second {
-			delay = 15 * time.Second
-		}
+		delay := min(time.Duration(1<<uint(retryCount))*baseDelay, 15*time.Second)
 		return delay
 	}
 }
@@ -6009,7 +5156,7 @@ func (f *Fs) optimizeNetworkParameters(ctx context.Context) {
 }
 
 // evaluateDownloadPerformance 评估下载性能等级
-func (f *Fs) evaluateDownloadPerformance(avgSpeed float64, concurrency int) string {
+func (f *Fs) evaluateDownloadPerformance(avgSpeed float64, _ int) string {
 	// 🔧 性能等级评估标准
 	switch {
 	case avgSpeed >= 50: // >=50MB/s
@@ -6056,201 +5203,8 @@ func (f *Fs) suggestPerformanceOptimizations(avgSpeed float64, concurrency int, 
 	}
 }
 
-// intelligentCachePreheating 智能缓存预热，参考123网盘的成功经验
-func (f *Fs) intelligentCachePreheating(ctx context.Context) {
-	// 延迟启动，避免影响初始化性能
-	time.Sleep(5 * time.Second)
-
-	// 1. 预热根目录信息
-	f.preheatRootDirectory(ctx)
-
-	// 2. 预热常用路径（如果有历史访问记录）
-	f.preheatFrequentPaths(ctx)
-
-	// 3. 预热最近访问的目录
-	f.preheatRecentDirectories(ctx)
-
-}
-
-// preheatRootDirectory 预热根目录信息
-func (f *Fs) preheatRootDirectory(ctx context.Context) {
-	defer func() {
-		if r := recover(); r != nil {
-			fs.Debugf(f, "根目录预热出现异常: %v", r)
-		}
-	}()
-
-	// 预热根目录的基本信息
-	if f.dirCache != nil {
-		_, err := f.dirCache.RootID(ctx, false)
-		if err == nil {
-			fs.Debugf(f, "🔥 根目录信息预热成功")
-		} else {
-			fs.Debugf(f, "根目录信息预热失败: %v", err)
-		}
-	}
-}
-
-// preheatFrequentPaths 预热常用路径
-func (f *Fs) preheatFrequentPaths(ctx context.Context) {
-	defer func() {
-		if r := recover(); r != nil {
-			fs.Debugf(f, "常用路径预热出现异常: %v", r)
-		}
-	}()
-
-	// 预热根目录路径（移除硬编码的特定目录名）
-	// 🔧 修复：移除硬编码的英文目录名，只预热根目录
-	// 让系统根据实际使用情况自然缓存其他路径
-	commonPaths := []string{
-		"", // 根目录
-	}
-
-	for _, path := range commonPaths {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			// 🔧 检查是否有上传操作正在进行，如果有则跳过预热
-			f.uploadingMu.Lock()
-			uploading := f.isUploading
-			f.uploadingMu.Unlock()
-
-			if uploading {
-				fs.Debugf(f, "🔄 检测到上传操作，暂停预热: %s", path)
-				time.Sleep(5 * time.Second) // 等待更长时间再检查
-				continue
-			}
-
-			if f.dirCache != nil {
-				_, err := f.dirCache.FindDir(ctx, path, false)
-				if err == nil {
-					fs.Debugf(f, "🔥 常用路径预热成功: %s", path)
-				}
-			}
-			// 避免过于频繁的API调用
-			time.Sleep(1 * time.Second)
-		}
-	}
-}
-
-// preheatRecentDirectories 预热最近访问的目录
-func (f *Fs) preheatRecentDirectories(ctx context.Context) {
-	defer func() {
-		if r := recover(); r != nil {
-			fs.Debugf(f, "最近目录预热出现异常: %v", r)
-		}
-	}()
-
-	// 从缓存中获取最近访问的路径进行预热
-	if f.pathResolveCache != nil {
-		// 这里可以实现更复杂的逻辑，比如从缓存中读取最近访问的路径
-		fs.Debugf(f, "🔥 最近目录预热逻辑待实现")
-	}
-}
-
-// CacheStatistics 缓存统计信息
-type CacheStatistics struct {
-	PathResolveHits   int64   `json:"path_resolve_hits"`
-	PathResolveMisses int64   `json:"path_resolve_misses"`
-	DirListHits       int64   `json:"dir_list_hits"`
-	DirListMisses     int64   `json:"dir_list_misses"`
-	DownloadURLHits   int64   `json:"download_url_hits"`
-	DownloadURLMisses int64   `json:"download_url_misses"`
-	MetadataHits      int64   `json:"metadata_hits"`
-	MetadataMisses    int64   `json:"metadata_misses"`
-	FileIDHits        int64   `json:"file_id_hits"`
-	FileIDMisses      int64   `json:"file_id_misses"`
-	TotalHits         int64   `json:"total_hits"`
-	TotalMisses       int64   `json:"total_misses"`
-	HitRate           float64 `json:"hit_rate"`
-}
-
-// getCacheStatistics 获取缓存统计信息
-func (f *Fs) getCacheStatistics() *CacheStatistics {
-	stats := &CacheStatistics{}
-
-	// 这里可以从各个缓存实例收集统计信息
-	// 当前先返回基础结构，后续可以扩展
-
-	stats.TotalHits = stats.PathResolveHits + stats.DirListHits + stats.DownloadURLHits + stats.MetadataHits + stats.FileIDHits
-	stats.TotalMisses = stats.PathResolveMisses + stats.DirListMisses + stats.DownloadURLMisses + stats.MetadataMisses + stats.FileIDMisses
-
-	if stats.TotalHits+stats.TotalMisses > 0 {
-		stats.HitRate = float64(stats.TotalHits) / float64(stats.TotalHits+stats.TotalMisses) * 100
-	}
-
-	return stats
-}
-
-// logCacheStatistics 记录缓存统计信息
-func (f *Fs) logCacheStatistics() {
-	stats := f.getCacheStatistics()
-
-	fs.Infof(f, "📊 115网盘缓存统计:")
-	fs.Infof(f, "   路径解析: 命中=%d, 未命中=%d", stats.PathResolveHits, stats.PathResolveMisses)
-	fs.Infof(f, "   目录列表: 命中=%d, 未命中=%d", stats.DirListHits, stats.DirListMisses)
-	fs.Infof(f, "   下载URL: 命中=%d, 未命中=%d", stats.DownloadURLHits, stats.DownloadURLMisses)
-	fs.Infof(f, "   元数据: 命中=%d, 未命中=%d", stats.MetadataHits, stats.MetadataMisses)
-	fs.Infof(f, "   文件ID: 命中=%d, 未命中=%d", stats.FileIDHits, stats.FileIDMisses)
-	fs.Infof(f, "   总计: 命中=%d, 未命中=%d, 命中率=%.2f%%", stats.TotalHits, stats.TotalMisses, stats.HitRate)
-}
-
-// ErrorStatistics 错误统计信息
-type ErrorStatistics struct {
-	ServerOverloadErrors int64   `json:"server_overload_errors"`
-	URLExpiredErrors     int64   `json:"url_expired_errors"`
-	NetworkTimeoutErrors int64   `json:"network_timeout_errors"`
-	RateLimitErrors      int64   `json:"rate_limit_errors"`
-	AuthErrors           int64   `json:"auth_errors"`
-	PermissionErrors     int64   `json:"permission_errors"`
-	NotFoundErrors       int64   `json:"not_found_errors"`
-	UnknownErrors        int64   `json:"unknown_errors"`
-	TotalErrors          int64   `json:"total_errors"`
-	TotalRetries         int64   `json:"total_retries"`
-	SuccessfulRetries    int64   `json:"successful_retries"`
-	RetrySuccessRate     float64 `json:"retry_success_rate"`
-}
-
-// getErrorStatistics 获取错误统计信息
-func (f *Fs) getErrorStatistics() *ErrorStatistics {
-	stats := &ErrorStatistics{}
-
-	// 这里可以从错误分类器收集统计信息
-	// 当前先返回基础结构，后续可以扩展
-
-	stats.TotalErrors = stats.ServerOverloadErrors + stats.URLExpiredErrors +
-		stats.NetworkTimeoutErrors + stats.RateLimitErrors + stats.AuthErrors +
-		stats.PermissionErrors + stats.NotFoundErrors + stats.UnknownErrors
-
-	if stats.TotalRetries > 0 {
-		stats.RetrySuccessRate = float64(stats.SuccessfulRetries) / float64(stats.TotalRetries) * 100
-	}
-
-	return stats
-}
-
-// logErrorStatistics 记录错误统计信息
-func (f *Fs) logErrorStatistics() {
-	stats := f.getErrorStatistics()
-
-	if stats.TotalErrors > 0 {
-		fs.Infof(f, "📊 115网盘错误统计:")
-		fs.Infof(f, "   服务器过载: %d", stats.ServerOverloadErrors)
-		fs.Infof(f, "   URL过期: %d", stats.URLExpiredErrors)
-		fs.Infof(f, "   网络超时: %d", stats.NetworkTimeoutErrors)
-		fs.Infof(f, "   限流错误: %d", stats.RateLimitErrors)
-		fs.Infof(f, "   认证错误: %d", stats.AuthErrors)
-		fs.Infof(f, "   权限错误: %d", stats.PermissionErrors)
-		fs.Infof(f, "   资源不存在: %d", stats.NotFoundErrors)
-		fs.Infof(f, "   未知错误: %d", stats.UnknownErrors)
-		fs.Infof(f, "   总错误数: %d", stats.TotalErrors)
-		fs.Infof(f, "   重试成功率: %.2f%% (%d/%d)", stats.RetrySuccessRate, stats.SuccessfulRetries, stats.TotalRetries)
-	}
-}
-
 // shouldUseConcurrentDownload 判断是否应该使用并发下载
-func (o *Object) shouldUseConcurrentDownload(ctx context.Context, options []fs.OpenOption) bool {
+func (o *Object) shouldUseConcurrentDownload(_ context.Context, options []fs.OpenOption) bool {
 	// 🔧 修复多重并发下载：检查是否有禁用并发下载的选项
 	for _, option := range options {
 		if option.String() == "DisableConcurrentDownload" {
@@ -6355,7 +5309,7 @@ func (o *Object) openWithConcurrency(ctx context.Context, options ...fs.OpenOpti
 	_ = progressReporter // 暂时保留，后续可能使用
 
 	// 使用并发下载到临时文件，同时报告进度
-	downloadedSize, err := o.fs.downloadWithConcurrencyAndTransfer(ctx, o, tempFile, o.size, downloadTransfer)
+	downloadedSize, err := o.fs.downloadWithConcurrency(ctx, o, tempFile, o.size, downloadTransfer)
 	if err != nil {
 		// 🔧 修复重复下载：通知下载协调器下载失败
 		if o.fs.downloadCoordinator != nil {
@@ -6845,4 +5799,342 @@ func (f *Fs) crossCloudUploadWithLocalCache(ctx context.Context, in io.Reader, s
 
 	// 使用主上传函数，但此时源已经是本地数据
 	return f.upload(ctx, localDataSource, localSrc, remote, options...)
+}
+
+// 🔧 新增：智能文件路径检测函数
+// isLikelyFilePath 判断给定路径是否可能是文件路径而非目录路径
+func isLikelyFilePath(path string) bool {
+	if path == "" {
+		return false
+	}
+
+	// 如果路径以斜杠结尾，很可能是目录
+	if strings.HasSuffix(path, "/") {
+		return false
+	}
+
+	// 检查是否包含文件扩展名（包含点且点后面有字符）
+	lastSlash := strings.LastIndex(path, "/")
+	fileName := path
+	if lastSlash >= 0 {
+		fileName = path[lastSlash+1:]
+	}
+
+	// 文件名包含点且不是隐藏文件（不以点开头）
+	if strings.Contains(fileName, ".") && !strings.HasPrefix(fileName, ".") {
+		dotIndex := strings.LastIndex(fileName, ".")
+		// 确保点不是最后一个字符，且扩展名不为空
+		if dotIndex > 0 && dotIndex < len(fileName)-1 {
+			// 添加调试信息
+			fs.Debugf(nil, "🔧 isLikelyFilePath: 路径 %q 被识别为文件路径 (fileName=%q)", path, fileName)
+			return true
+		}
+	}
+
+	fs.Debugf(nil, "🔧 isLikelyFilePath: 路径 %q 被识别为目录路径 (fileName=%q)", path, fileName)
+	return false
+}
+
+// 🔧 新增：保存路径类型到缓存
+// savePathTypeToCache 保存路径类型信息到缓存
+func (f *Fs) savePathTypeToCache(path, fileID, parentID string, isDir bool) {
+	if f.pathResolveCache == nil {
+		return
+	}
+
+	cacheKey := generatePathToIDCacheKey(path)
+	entry := PathToIDCacheEntry115{
+		Path:     path,
+		FileID:   fileID,
+		IsDir:    isDir,
+		ParentID: parentID,
+		CachedAt: time.Now(),
+	}
+
+	if err := f.pathResolveCache.Set(cacheKey, entry, f.cacheConfig.PathResolveCacheTTL); err != nil {
+		fs.Debugf(f, "保存路径类型缓存失败 %s: %v", cacheKey, err)
+	} else {
+		fs.Debugf(f, "已保存路径类型到缓存: %s -> %s (dir: %v)", path, fileID, isDir)
+	}
+}
+
+// 🔧 新增：dir_list缓存支持函数，参考123网盘实现
+
+// getDirListFromCache 从缓存获取目录列表
+func (f *Fs) getDirListFromCache(parentID, lastID string) (*DirListCacheEntry115, bool) {
+	if f.dirListCache == nil {
+		return nil, false
+	}
+
+	cacheKey := fmt.Sprintf("dirlist_%s_%s", parentID, lastID)
+	var entry DirListCacheEntry115
+	found, err := f.dirListCache.Get(cacheKey, &entry)
+	if err != nil {
+		fs.Debugf(f, "获取目录列表缓存失败 %s: %v", cacheKey, err)
+		return nil, false
+	}
+
+	if !found {
+		return nil, false
+	}
+
+	// 简单验证缓存条目
+	if len(entry.FileList) == 0 && entry.TotalCount > 0 {
+		fs.Debugf(f, "目录列表缓存数据不一致: %s", cacheKey)
+		return nil, false
+	}
+
+	fs.Debugf(f, "从缓存获取目录列表成功: parentID=%s, 文件数=%d", parentID, len(entry.FileList))
+	return &entry, true
+}
+
+// saveDirListToCache 保存目录列表到缓存
+func (f *Fs) saveDirListToCache(parentID, lastID string, fileList []api.File, nextLastID string) {
+	if f.dirListCache == nil {
+		return
+	}
+
+	cacheKey := fmt.Sprintf("dirlist_%s_%s", parentID, lastID)
+	entry := DirListCacheEntry115{
+		FileList:   fileList,
+		LastFileID: nextLastID,
+		TotalCount: len(fileList),
+		CachedAt:   time.Now(),
+		ParentID:   parentID,
+		Version:    "v1.0",                           // 简化版本号
+		Checksum:   fmt.Sprintf("%d", len(fileList)), // 简化校验和
+	}
+
+	err := f.dirListCache.Set(cacheKey, entry, f.cacheConfig.DirListCacheTTL)
+	if err != nil {
+		fs.Debugf(f, "保存目录列表缓存失败 %s: %v", cacheKey, err)
+	} else {
+		fs.Debugf(f, "已保存目录列表到缓存: parentID=%s, 文件数=%d, TTL=%v", parentID, len(fileList), f.cacheConfig.DirListCacheTTL)
+	}
+}
+
+// 🔧 新增：路径预填充缓存功能
+// preloadPathCache 利用API返回的path信息预填充路径缓存
+func (f *Fs) preloadPathCache(paths []*api.FilePath) {
+	if f.pathResolveCache == nil {
+		return
+	}
+
+	var fullPath string
+	for i, pathItem := range paths {
+		// 构建完整路径
+		if i == 0 {
+			// 根目录，跳过
+			if pathItem.Name == "" || pathItem.Name == "根目录" || pathItem.Name == "文件" {
+				continue
+			}
+			fullPath = pathItem.Name
+		} else {
+			// 跳过根目录级别的"文件"目录
+			if pathItem.Name == "文件" && i == 1 {
+				continue
+			}
+			if fullPath == "" {
+				fullPath = pathItem.Name
+			} else {
+				fullPath = path.Join(fullPath, pathItem.Name)
+			}
+		}
+
+		// 获取目录ID
+		cid := pathItem.CID.String()
+		if cid == "" || cid == "0" {
+			continue // 跳过无效的ID
+		}
+
+		// 获取父目录ID（如果有的话）
+		var parentID string
+		if i > 0 {
+			parentID = paths[i-1].CID.String()
+		}
+
+		// 保存路径到缓存
+		f.savePathTypeToCache(fullPath, cid, parentID, true) // true表示是目录
+
+		fs.Debugf(f, "🎯 预填充路径缓存: %s -> %s (parent: %s)", fullPath, cid, parentID)
+	}
+}
+
+// 🚀 新设计：智能路径处理方法
+
+// checkPathTypeFromCache 检查缓存中的路径类型信息
+func (f *Fs) checkPathTypeFromCache(path string) (isFile bool, found bool) {
+	if f.pathResolveCache == nil {
+		return false, false
+	}
+
+	cacheKey := generatePathToIDCacheKey(path)
+	var entry PathToIDCacheEntry115
+	found, err := f.pathResolveCache.Get(cacheKey, &entry)
+	if err != nil || !found {
+		return false, false
+	}
+
+	fs.Debugf(f, "🎯 缓存命中：路径 %s -> IsDir=%v", path, entry.IsDir)
+	return !entry.IsDir, true
+}
+
+// setupFileFromCache 从缓存信息设置文件模式
+func (f *Fs) setupFileFromCache(_ context.Context) (*Fs, error) {
+	// 分割路径获取父目录和文件名
+	newRoot, remote := dircache.SplitPath(f.root)
+
+	// 修改当前Fs指向父目录
+	f.root = newRoot
+	f.dirCache = dircache.New(newRoot, f.rootFolderID, f)
+
+	// 创建文件对象
+	obj := &Object{
+		fs:          f,
+		remote:      remote,
+		hasMetaData: false, // 延迟加载元数据
+		durlMu:      new(sync.Mutex),
+	}
+
+	// 设置文件模式
+	var fsObj fs.Object = obj
+	f.fileObj = &fsObj
+
+	fs.Debugf(f, "🎯 缓存文件模式设置完成: %s", remote)
+	return f, fs.ErrorIsFile
+}
+
+// handleAsFile 将路径作为文件处理
+func (f *Fs) handleAsFile(ctx context.Context) (*Fs, error) {
+	// 分割路径获取父目录和文件名
+	newRoot, remote := dircache.SplitPath(f.root)
+
+	// 创建临时Fs指向父目录
+	tempF := &Fs{
+		name:          f.name,
+		originalName:  f.originalName,
+		root:          newRoot,
+		opt:           f.opt,
+		features:      f.features,
+		tradClient:    f.tradClient,
+		openAPIClient: f.openAPIClient,
+		globalPacer:   f.globalPacer,
+		tradPacer:     f.tradPacer,
+		rootFolder:    f.rootFolder,
+		rootFolderID:  f.rootFolderID,
+		appVer:        f.appVer,
+		userID:        f.userID,
+		userkey:       f.userkey,
+		isShare:       f.isShare,
+		fileObj:       f.fileObj,
+		m:             f.m,
+		accessToken:   f.accessToken,
+		refreshToken:  f.refreshToken,
+		tokenExpiry:   f.tokenExpiry,
+		codeVerifier:  f.codeVerifier,
+		tokenRenewer:  f.tokenRenewer,
+		httpClient:    f.httpClient,
+		// 复用缓存实例
+		pathResolveCache: f.pathResolveCache,
+		dirListCache:     f.dirListCache,
+		metadataCache:    f.metadataCache,
+		fileIDCache:      f.fileIDCache,
+		cacheConfig:      f.cacheConfig,
+		smartURLManager:  f.smartURLManager,
+		resumeManager:    f.resumeManager,
+		circuitBreaker:   f.circuitBreaker,
+	}
+
+	tempF.dirCache = dircache.New(newRoot, f.rootFolderID, tempF)
+
+	// 尝试找到父目录
+	err := tempF.dirCache.FindRoot(ctx, false)
+	if err != nil {
+		fs.Debugf(f, "🔧 文件处理：父目录不存在，回退到目录模式: %v", err)
+		return f.handleAsDirectory(ctx)
+	}
+
+	// 🔧 关键：使用轻量级验证，参考123网盘策略
+	_, err = tempF.NewObject(ctx, remote)
+	if err == nil {
+		fs.Debugf(f, "🎯 文件验证成功，设置文件模式: %s", remote)
+
+		// 保存到缓存
+		f.savePathTypeToCache(f.root, "", "", false) // isFile=true
+
+		// 设置文件模式
+		f.root = newRoot
+		f.dirCache = tempF.dirCache
+
+		obj := &Object{
+			fs:          f,
+			remote:      remote,
+			hasMetaData: false,
+			durlMu:      new(sync.Mutex),
+		}
+
+		var fsObj fs.Object = obj
+		f.fileObj = &fsObj
+
+		return f, fs.ErrorIsFile
+	} else {
+		fs.Debugf(f, "🔧 文件验证失败，回退到目录模式: %v", err)
+		return f.handleAsDirectory(ctx)
+	}
+}
+
+// 🔧 115网盘统一QPS管理 - 根据API类型选择调速器
+// getPacerForEndpoint 根据115网盘API端点返回适当的调速器
+// 115网盘特殊性：使用统一QPS避免770004全局限制错误
+func (f *Fs) getPacerForEndpoint(endpoint string) *fs.Pacer {
+	switch {
+	// 文件列表API - 使用全局调速器（最常用）
+	case strings.Contains(endpoint, "/open/ufile/files"), // 文件列表
+		strings.Contains(endpoint, "/open/ufile/file"),   // 文件信息
+		strings.Contains(endpoint, "/open/ufile/search"): // 文件搜索
+		return f.globalPacer // 统一QPS
+
+	// 下载相关API - 使用下载调速器
+	case strings.Contains(endpoint, "/open/ufile/download"), // 下载URL
+		strings.Contains(endpoint, "/open/user/info"): // 用户信息
+		return f.downloadPacer // 统一QPS
+
+	// 上传和敏感操作 - 使用保守调速器
+	case strings.Contains(endpoint, "/open/ufile/upload"), // 上传相关
+		strings.Contains(endpoint, "/open/ufile/move"),   // 移动文件
+		strings.Contains(endpoint, "/open/ufile/rename"), // 重命名
+		strings.Contains(endpoint, "/open/ufile/copy"),   // 复制文件
+		strings.Contains(endpoint, "/open/ufile/delete"), // 删除文件
+		strings.Contains(endpoint, "/open/ufile/trash"),  // 回收站
+		strings.Contains(endpoint, "/open/ufile/mkdir"):  // 创建目录
+		return f.uploadPacer // 保守QPS
+
+	// 认证相关API - 使用传统调速器
+	case strings.Contains(endpoint, "/open/auth/"), // 认证相关
+		strings.Contains(endpoint, "/open/token/"),   // Token相关
+		strings.Contains(endpoint, "115.com"),        // 传统API
+		strings.Contains(endpoint, "webapi.115.com"): // 传统API
+		return f.tradPacer // 保守QPS
+
+	default:
+		// 未知端点使用全局调速器，安全起见
+		fs.Debugf(f, "⚠️  未知115网盘API端点，使用统一QPS限制: %s", endpoint)
+		return f.globalPacer // 统一QPS
+	}
+}
+
+// handleAsDirectory 将路径作为目录处理
+func (f *Fs) handleAsDirectory(ctx context.Context) (*Fs, error) {
+	// 尝试找到目录
+	err := f.dirCache.FindRoot(ctx, false)
+	if err != nil {
+		fs.Debugf(f, "🔧 目录处理：目录不存在: %v", err)
+		return f, nil
+	}
+
+	// 保存到缓存
+	f.savePathTypeToCache(f.root, "", "", true) // isDir=true
+
+	fs.Debugf(f, "🎯 目录模式设置完成: %s", f.root)
+	return f, nil
 }

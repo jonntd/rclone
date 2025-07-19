@@ -23,6 +23,12 @@ type listAllFn func(*api.File) bool
 func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly, dirsOnly bool, fn listAllFn) (found bool, err error) {
 	fs.Debugf(f, "🔍 listAll开始: dirID=%q, limit=%d, filesOnly=%v, dirsOnly=%v", dirID, limit, filesOnly, dirsOnly)
 
+	// 验证目录ID
+	if dirID == "" {
+		fs.Errorf(f, "🔍 listAll: 目录ID为空，这可能导致查询根目录")
+		// 不要直接返回错误，而是记录警告并继续，因为根目录查询可能是合法的
+	}
+
 	if f.isShare {
 		// Use traditional share listing API
 		fs.Debugf(f, "🔍 listAll: 使用share模式")
@@ -42,7 +48,6 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly, di
 	params.Set("asc", "0")        // Default sort: descending
 
 	offset := 0
-	var allFiles []api.File // 收集所有文件用于缓存
 
 	fs.Debugf(f, "🔍 listAll: 开始分页循环")
 	for {
@@ -59,22 +64,25 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly, di
 		err = f.CallOpenAPI(ctx, &opts, nil, &info, false) // Use OpenAPI call
 		if err != nil {
 			fs.Debugf(f, "🔍 listAll: CallOpenAPI失败: %v", err)
-
 			// 检查是否是API限制错误
 			if strings.Contains(err.Error(), "770004") || strings.Contains(err.Error(), "已达到当前访问上限") {
-				fs.Infof(f, "⚠️  遇到115网盘API限制，等待30秒后重试...")
+				fs.Infof(f, "⚠️  遇到115网盘API限制(770004)，使用统一等待策略...")
+
+				// 🔧 115网盘统一QPS管理：使用固定等待时间避免复杂性
+				waitTime := 30 * time.Second // 统一等待30秒
+				fs.Infof(f, "⏰ API限制等待 %v 后重试...", waitTime)
 
 				// 创建带超时的等待
 				select {
-				case <-time.After(30 * time.Second):
-					fs.Debugf(f, "🔍 listAll: API限制等待完成，重试调用")
+				case <-time.After(waitTime):
 					// 重试一次
+					fs.Debugf(f, "🔄 API限制重试...")
 					err = f.CallOpenAPI(ctx, &opts, nil, &info, false)
 					if err != nil {
-						fs.Debugf(f, "🔍 listAll: 重试后仍然失败: %v", err)
-						return found, fmt.Errorf("OpenAPI list failed for dir %s after retry: %w", dirID, err)
+						return found, fmt.Errorf("OpenAPI list failed for dir %s after QPS retry: %w", dirID, err)
+					} else {
+						fs.Debugf(f, "✅ API限制重试成功")
 					}
-					fs.Debugf(f, "🔍 listAll: 重试成功，返回%d个文件", len(info.Files))
 				case <-ctx.Done():
 					return found, fmt.Errorf("context cancelled while waiting for API limit: %w", ctx.Err())
 				}
@@ -83,6 +91,12 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly, di
 			}
 		} else {
 			fs.Debugf(f, "🔍 listAll: CallOpenAPI成功，返回%d个文件", len(info.Files))
+
+			// 🔧 新增：利用API返回的path信息预填充缓存
+			if len(info.Path) > 0 {
+				fs.Debugf(f, "🎯 发现路径层次信息: %d层", len(info.Path))
+				f.preloadPathCache(info.Path)
+			}
 		}
 
 		if len(info.Files) == 0 {
@@ -104,13 +118,8 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly, di
 			// Decode name
 			item.FileName = f.opt.Enc.ToStandardName(item.FileNameBest()) // Use best name getter
 
-			// 收集文件用于缓存
-			allFiles = append(allFiles, *item)
-
 			if fn(item) {
 				found = true
-				// 在早期退出前也保存缓存
-				f.saveDirListToCache(dirID, allFiles)
 				return found, nil // Early exit
 			}
 		}
@@ -125,10 +134,6 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly, di
 		}
 	}
 
-	// 保存完整的目录列表到缓存
-	if len(allFiles) > 0 {
-		f.saveDirListToCache(dirID, allFiles)
-	}
 	return found, nil
 }
 
@@ -369,11 +374,8 @@ func (f *Fs) getDownloadURLWithForce(ctx context.Context, pickCode string, force
 	fs.Debugf(f, "115网盘成功获取下载URL: pickCode=%s, fileName=%s, fileSize=%d",
 		pickCode, downInfo.FileName, int64(downInfo.FileSize))
 
-	// 从URL中解析真实的过期时间
-	realExpiresAt := f.parseURLExpiry(downInfo.URL.URL)
-	if realExpiresAt.IsZero() {
-		// 如果无法解析过期时间，使用默认的1小时
-		realExpiresAt = time.Now().Add(1 * time.Hour)
+	// 从URL中解析真实的过期时间（仅用于日志记录）
+	if realExpiresAt := f.parseURLExpiry(downInfo.URL.URL); realExpiresAt.IsZero() {
 		fs.Debugf(f, "115网盘无法解析URL过期时间，使用默认1小时: pickCode=%s", pickCode)
 	} else {
 		fs.Debugf(f, "115网盘解析到URL过期时间: pickCode=%s, 过期时间=%v", pickCode, realExpiresAt)
@@ -409,46 +411,10 @@ func (f *Fs) parseURLExpiry(urlStr string) time.Time {
 // Traditional API Helpers (Sharing, Offline Download)
 // ------------------------------------------------------------
 
-// addURLs adds offline download tasks (Traditional API).
-func (f *Fs) addURLs(ctx context.Context, dir string, urls []string) (info *api.NewURL, err error) {
-	if f.userID == "" {
-		return nil, errors.New("cannot add URLs without userID (login required)")
-	}
-	parentID := "0" // Default parent
-	if dir != "" {
-		foundID, findErr := f.dirCache.FindDir(ctx, dir, false) // Find target dir ID
-		if findErr != nil {
-			fs.Logf(f, "Target directory %q not found for addURLs, using default: %v", dir, findErr)
-		} else {
-			parentID = foundID
-		}
-	}
-
-	payload := map[string]string{
-		"ac":         "add_task_urls",
-		"app_ver":    f.appVer, // Use parsed app version
-		"uid":        f.userID,
-		"wp_path_id": parentID,
-	}
-	for ind, url := range urls {
-		payload[fmt.Sprintf("url[%d]", ind)] = url
-	}
-
-	opts := rest.Opts{
-		Method:     "POST",
-		RootURL:    "https://lixian.115.com/lixianssp/", // Traditional endpoint
-		Parameters: url.Values{"ac": {"add_task_urls"}}, // Query param seems redundant but keep for safety
-	}
-
-	info = new(api.NewURL)
-	// Use traditional API call with encryption
-	err = f.CallTraditionalAPI(ctx, &opts, payload, info, false) // Pass payload for encryption
-	// Don't return error from CallTraditionalAPI directly, check info struct
-	if err != nil {
-		fs.Errorf(f, "addURLs API call failed: %v", err)
-		// Return the info struct anyway, as it might contain partial results/errors
-	}
-	return info, nil // Command expects nil error, user checks output
+// addURLs 功能已删除 - 需要加密的传统API功能
+// 🔧 重构：删除需要crypto加密的分享功能
+func (f *Fs) addURLs(_ context.Context, _ string, _ []string) (info *api.NewURL, err error) {
+	return nil, errors.New("addURLs功能已删除：此功能需要传统API加密支持")
 }
 
 // listShare lists shared files (Traditional API).
@@ -509,61 +475,16 @@ OUTER:
 }
 
 // copyFromShare copies from a share link (Traditional API).
-func (f *Fs) copyFromShare(ctx context.Context, shareCode, receiveCode, fid, cid string) (err error) {
-	if f.userID == "" {
-		return errors.New("cannot copy from share without userID (login required)")
-	}
-	form := url.Values{}
-	form.Set("share_code", shareCode)
-	form.Set("receive_code", receiveCode)
-	form.Set("file_id", fid)      // Source file/folder ID within share ("0" for all)
-	form.Set("cid", cid)          // Destination folder ID in user's drive
-	form.Set("user_id", f.userID) // User ID of the destination owner
-
-	opts := rest.Opts{
-		Method:          "POST",
-		Path:            "/share/receive", // Traditional endpoint
-		MultipartParams: form,
-	}
-
-	var baseResp api.TraditionalBase
-	// Use traditional API call (requires cookie, assume encryption needed for POST)
-	err = f.CallTraditionalAPI(ctx, &opts, nil, &baseResp, false) // No skipEncrypt
-	if err != nil {
-		return fmt.Errorf("traditional copyFromShare failed: %w", err)
-	}
-	return nil
+// copyFromShare 功能已删除 - 需要加密的传统API功能
+// 🔧 重构：删除需要crypto加密的分享功能
+func (f *Fs) copyFromShare(_ context.Context, _, _, _, _ string) (err error) {
+	return errors.New("copyFromShare功能已删除：此功能需要传统API加密支持")
 }
 
-// getDownloadURLFromShare gets download URL from share (Traditional API).
-func (f *Fs) getDownloadURLFromShare(ctx context.Context, fid string) (durl *api.DownloadURL, err error) {
-	req := map[string]string{
-		"share_code":   f.opt.ShareCode,
-		"receive_code": f.opt.ReceiveCode,
-		"file_id":      fid,
-	}
-	t := strconv.FormatInt(time.Now().Unix(), 10)
-	opts := rest.Opts{
-		Method:     "POST",
-		RootURL:    "https://proapi.115.com/app/share/downurl", // Traditional endpoint
-		Parameters: url.Values{"t": {t}},                       // Timestamp param
-	}
-
-	downInfo := api.ShareDownloadInfo{}
-	// Use traditional API call with encryption
-	resp, err := f.CallTraditionalAPIWithResp(ctx, &opts, req, &downInfo, false) // Get response for cookies
-	if err != nil {
-		return nil, fmt.Errorf("traditional getDownloadURLFromShare failed: %w", err)
-	}
-	if downInfo.URL.URL == "" {
-		return nil, errors.New("traditional getDownloadURLFromShare returned empty URL")
-	}
-
-	durl = &downInfo.URL
-	if resp != nil {
-		durl.Cookies = resp.Cookies() // Attach cookies from response
-	}
-	return durl, nil
+// getDownloadURLFromShare 功能已删除 - 需要加密的传统API功能
+// 🔧 重构：删除需要crypto加密的分享功能
+func (f *Fs) getDownloadURLFromShare(_ context.Context, _ string) (durl *api.DownloadURL, err error) {
+	return nil, errors.New("getDownloadURLFromShare功能已删除：此功能需要传统API加密支持")
 }
 
 // CallTraditionalAPIWithResp is a variant that returns the http.Response for cookie access.

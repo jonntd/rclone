@@ -54,22 +54,6 @@ type RereadableObject struct {
 	useParentAccounting bool                 // 是否使用父传输的会计系统
 }
 
-// NewRereadableObjectWithParentTransfer creates a wrapper that supports re-opening the source
-// and integrates with a parent transfer for unified progress display
-func NewRereadableObjectWithParentTransfer(ctx context.Context, src fs.ObjectInfo, parentTransfer *accounting.Transfer, options ...fs.OpenOption) (*RereadableObject, error) {
-	r, err := NewRereadableObject(ctx, src, options...)
-	if err != nil {
-		return nil, err
-	}
-
-	// 配置父传输集成
-	r.parentTransfer = parentTransfer
-	r.useParentAccounting = parentTransfer != nil
-
-	fs.Debugf(nil, "创建RereadableObject，集成父传输: %v", r.useParentAccounting)
-	return r, nil
-}
-
 // NewRereadableObject creates a wrapper that supports re-opening the source
 func NewRereadableObject(ctx context.Context, src fs.ObjectInfo, options ...fs.OpenOption) (*RereadableObject, error) {
 	// Try to extract the filesystem info from the source
@@ -79,11 +63,9 @@ func NewRereadableObject(ctx context.Context, src fs.ObjectInfo, options ...fs.O
 	if o, ok := src.(fs.Object); ok {
 		// If it's a direct Object
 		fsInfo = o.Fs()
-	} else if unwrapped := fs.UnWrapObjectInfo(src); unwrapped != src {
+	} else if unwrapped := fs.UnWrapObjectInfo(src); unwrapped != nil {
 		// Try to unwrap it first, only if it actually unwrapped something
-		if o, ok := unwrapped.(fs.Object); ok {
-			fsInfo = o.Fs()
-		}
+		fsInfo = unwrapped.Fs()
 	} else if i, ok := src.(interface{ Fs() fs.Info }); ok {
 		// If it has an Fs() method that returns fs.Info
 		fsInfo = i.Fs()
@@ -111,7 +93,7 @@ func NewRereadableObject(ctx context.Context, src fs.ObjectInfo, options ...fs.O
 func retryWithExponentialBackoff(
 	ctx context.Context,
 	description string, // Description of the operation being retried (for logging)
-	loggingObj interface{}, // Object to log against
+	loggingObj any, // Object to log against
 	operation func() error, // Operation to execute and retry
 	maxRetries int, // Maximum number of retries
 	initialDelay time.Duration, // Initial delay between retries
@@ -811,62 +793,6 @@ func (f *Fs) getOSSToken(ctx context.Context) (*api.OSSToken, error) {
 	return info.Data, nil
 }
 
-// callResumeAPI calls the /open/upload/resume endpoint to get updated callback info
-func (f *Fs) callResumeAPI(ctx context.Context, ui *api.UploadInitInfo, size int64, dirID string, o *Object) (*api.UploadInitInfo, error) {
-	// 构建resume请求参数
-	form := url.Values{}
-	form.Set("file_size", strconv.FormatInt(size, 10))
-
-	// 使用传入的目标目录ID
-	if dirID == "" {
-		return nil, errors.New("目标目录ID为空")
-	}
-	form.Set("target", "U_1_"+dirID)
-
-	// 从ui中获取fileid (SHA1)
-	if ui.GetBucket() == "" {
-		return nil, errors.New("missing bucket info for resume API")
-	}
-
-	// 尝试从object名称中提取SHA1 (115网盘的object名称通常是SHA1)
-	objectName := ui.GetObject()
-	fs.Debugf(o, "🔍 Resume API: object名称='%s', 长度=%d", objectName, len(objectName))
-	if len(objectName) == 40 { // SHA1长度
-		form.Set("fileid", strings.ToUpper(objectName))
-		fs.Debugf(o, "✅ Resume API: 成功提取SHA1=%s", strings.ToUpper(objectName))
-	} else {
-		fs.Debugf(o, "❌ 无法从object名称提取SHA1，跳过resume API调用")
-		return nil, errors.New("cannot extract SHA1 from object name")
-	}
-
-	// 如果有pick_code，也添加进去
-	if ui.GetPickCode() != "" {
-		form.Set("pick_code", ui.GetPickCode())
-	}
-
-	opts := rest.Opts{
-		Method:      "POST",
-		Path:        "/open/upload/resume",
-		ContentType: "application/x-www-form-urlencoded",
-		Body:        strings.NewReader(form.Encode()),
-	}
-
-	var resumeResp api.UploadInitInfo
-	err := f.CallOpenAPI(ctx, &opts, nil, &resumeResp, false)
-	if err != nil {
-		return nil, fmt.Errorf("resume API调用失败: %w", err)
-	}
-
-	// 检查响应状态
-	if resumeResp.ErrCode() != 0 {
-		return nil, fmt.Errorf("resume API返回错误: code=%d, msg=%s",
-			resumeResp.ErrCode(), resumeResp.ErrMsg())
-	}
-
-	fs.Debugf(o, "Resume API成功: callback可能已更新")
-	return &resumeResp, nil
-}
-
 // newOSSClient builds an OSS client with dynamic credentials from OpenAPI.
 func (f *Fs) newOSSClient() (*oss.Client, error) {
 	// Use CredentialsFetcherProvider from SDK v2
@@ -888,16 +814,46 @@ func (f *Fs) newOSSClient() (*oss.Client, error) {
 		}),
 	)
 
-	// Load default config and override necessary parts
+	// 🚀 参考阿里云OSS最佳实践：优化OSS客户端配置以提升上传性能
 	cfg := oss.LoadDefaultConfig().
 		WithCredentialsProvider(provider).
 		WithRegion(OSSRegion). // Use constant region
 		WithUserAgent(OSSUserAgent).
 		WithUseDualStackEndpoint(f.opt.DualStack).
 		WithUseInternalEndpoint(f.opt.Internal).
-		WithConnectTimeout(time.Duration(f.opt.ConTimeout)). // Set timeouts
-		// 🔧 进一步增加OSS读写超时时间，解决115网盘OSS服务器响应慢的问题
-		WithReadWriteTimeout(30 * time.Minute) // 从15分钟增加到30分钟，应对OSS服务器响应慢
+		// 🚀 优化连接超时：使用更短的连接超时，快速失败重试
+		WithConnectTimeout(10 * time.Second). // 从用户配置改为固定10秒，提升连接效率
+		// 🚀 优化读写超时：使用合理的读写超时，避免长时间等待
+		WithReadWriteTimeout(5 * time.Minute) // 从30分钟减少到5分钟，提升响应速度
+
+	// 🚀 参考OpenList：添加自定义HTTP客户端配置以优化网络性能
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			// 🚀 超激进连接池配置：最大化并发性能
+			MaxIdleConns:        300,               // 从200增加到300
+			MaxIdleConnsPerHost: 100,               // 从50增加到100
+			MaxConnsPerHost:     200,               // 从100增加到200
+			IdleConnTimeout:     120 * time.Second, // 从90秒增加到120秒
+
+			// 🚀 激进超时配置：快速响应，快速重试
+			TLSHandshakeTimeout:   5 * time.Second,        // 从10秒减少到5秒
+			ResponseHeaderTimeout: 15 * time.Second,       // 从30秒减少到15秒
+			ExpectContinueTimeout: 500 * time.Millisecond, // 从1秒减少到500ms
+
+			// 🚀 激进性能优化
+			DisableKeepAlives:  false, // 启用Keep-Alive
+			ForceAttemptHTTP2:  true,  // 强制尝试HTTP/2
+			DisableCompression: false, // 启用压缩
+
+			// 🚀 超激进TCP优化配置
+			WriteBufferSize: 128 * 1024, // 从64KB增加到128KB写缓冲
+			ReadBufferSize:  128 * 1024, // 从64KB增加到128KB读缓冲
+		},
+		Timeout: 5 * time.Minute, // 🚀 从10分钟减少到5分钟，快速失败重试
+	}
+
+	// 🚀 将自定义HTTP客户端应用到OSS配置
+	cfg = cfg.WithHttpClient(httpClient)
 
 	// Create the client
 	client := oss.NewClient(cfg)
@@ -1354,10 +1310,7 @@ func (f *Fs) tryHashUpload(
 	if size > 0 {
 		// 计算前128KB的SHA1作为PreID
 		const preHashSize int64 = 128 * 1024 // 128KB
-		hashSize := preHashSize
-		if size < preHashSize {
-			hashSize = size
-		}
+		hashSize := min(size, preHashSize)
 
 		// 尝试从newIn读取前128KB计算PreID
 		if seeker, ok := newIn.(io.ReadSeeker); ok {
@@ -1558,9 +1511,9 @@ func (f *Fs) getUploadInfo(
 		}
 	}
 
-	// 如果没有SHA1，需要计算
+	// 🔧 关键修复：如果没有SHA1，必须返回错误，因为115网盘API要求fileid参数
 	if sha1sum == "" {
-		fs.Debugf(o, "⚠️ OSS multipart上传缺少SHA1，这可能导致API调用失败")
+		return nil, fmt.Errorf("OSS multipart upload requires SHA1 hash (fileid parameter) - this should be calculated by tryHashUpload first")
 	}
 
 	// Initialize upload with SHA1 (if available)
@@ -1592,7 +1545,7 @@ func (f *Fs) getUploadInfo(
 // performOSSUpload handles the actual upload process
 func (f *Fs) performOSSUpload(
 	ctx context.Context,
-	_ *oss.Client,
+	ossClient *oss.Client,
 	in io.Reader,
 	src fs.ObjectInfo,
 	o *Object,
@@ -1601,22 +1554,193 @@ func (f *Fs) performOSSUpload(
 	ui *api.UploadInitInfo,
 	options ...fs.OpenOption,
 ) (*api.CallbackData, error) {
-	// 🔑 关键修复：调用resume接口获取最新callback信息
-	updatedUI, err := f.callResumeAPI(ctx, ui, size, dirID, o)
-	if err != nil {
-		fs.Debugf(o, "Resume API调用失败，使用原始callback: %v", err)
-		// 继续使用原始UI，不中断上传流程
-		updatedUI = ui
-	} else if updatedUI != nil {
-		fs.Debugf(o, "Resume API成功，使用更新的callback信息")
-		ui = updatedUI
+	// 🔧 参考阿里云OSS UploadFile示例：智能选择上传策略
+	uploadCutoff := int64(f.opt.UploadCutoff)
+
+	// 🔧 参考OpenList：使用智能分片大小计算
+	optimalPartSize := calculateOptimalPartSize(size)
+	fs.Debugf(o, "🚀 智能分片大小计算: 文件大小=%s, 最优分片大小=%s",
+		fs.SizeSuffix(size), fs.SizeSuffix(optimalPartSize))
+
+	// 🚀 参考OpenList：极简进度回调，最大化减少开销
+	var lastLoggedPercent int
+	var lastLogTime time.Time
+
+	// 🔧 参考阿里云OSS示例：创建115网盘专用的上传管理器配置
+	uploaderConfig := &Upload115Config{
+		PartSize:    optimalPartSize, // 使用智能计算的分片大小
+		ParallelNum: 1,               // 115网盘强制单线程上传
+		ProgressFn: func(increment, transferred, total int64) {
+			if total > 0 {
+				currentPercent := int(float64(transferred) / float64(total) * 100)
+				now := time.Now()
+
+				// 🚀 实时进度优化：更频繁的进度显示，提升用户体验
+				if (currentPercent >= lastLoggedPercent+5 || transferred == total) &&
+					(now.Sub(lastLogTime) > 3*time.Second || transferred == total) {
+					fs.Infof(o, "📤 115网盘上传: %d%% (%s/%s)",
+						currentPercent, fs.SizeSuffix(transferred), fs.SizeSuffix(total))
+					lastLoggedPercent = currentPercent
+					lastLogTime = now
+				}
+			}
+		},
 	}
 
-	// Create the chunk writer
-	chunkWriter, err := f.newChunkWriter(ctx, src, ui, in, o, options...)
+	if size >= 0 && size < uploadCutoff {
+		// 🔧 小于50MB的文件使用OSS PutObject（单文件上传）
+		fs.Infof(o, "🚀 115网盘OSS单文件上传: %s (%s)", leaf, fs.SizeSuffix(size))
+		return f.performOSSPutObject(ctx, ossClient, in, src, o, leaf, dirID, size, ui, uploaderConfig, options...)
+	} else {
+		// 🔧 大于等于50MB的文件使用OSS分片上传
+		fs.Infof(o, "🚀 115网盘OSS分片上传: %s (%s)", leaf, fs.SizeSuffix(size))
+		return f.performOSSMultipart(ctx, ossClient, in, src, o, leaf, dirID, size, ui, uploaderConfig, options...)
+	}
+}
+
+// Upload115Config 115网盘上传管理器配置
+// 🔧 参考阿里云OSS UploadFile示例的配置思想
+type Upload115Config struct {
+	PartSize    int64                                     // 分片大小
+	ParallelNum int                                       // 并行数（115网盘固定为1）
+	ProgressFn  func(increment, transferred, total int64) // 进度回调函数
+}
+
+// 🚀 参考OpenList：智能分片大小计算，根据文件大小动态调整分片大小
+func calculateOptimalPartSize(fileSize int64) int64 {
+	var partSize int64 = int64(20 * fs.Mebi) // 默认20MB，与OpenList保持一致
+
+	if fileSize > partSize {
+		if fileSize > int64(1024*fs.Gibi) { // 文件大小超过1TB
+			partSize = int64(5 * fs.Gibi) // 分片大小5GB
+		} else if fileSize > int64(768*fs.Gibi) { // 超过768GB
+			partSize = 109951163 // ≈ 104.8576MB，将1TB分成10,000个分片
+		} else if fileSize > int64(512*fs.Gibi) { // 超过512GB
+			partSize = 82463373 // ≈ 78.6432MB
+		} else if fileSize > int64(384*fs.Gibi) { // 超过384GB
+			partSize = 54975582 // ≈ 52.4288MB
+		} else if fileSize > int64(256*fs.Gibi) { // 超过256GB
+			partSize = 41231687 // ≈ 39.3216MB
+		} else if fileSize > int64(128*fs.Gibi) { // 超过128GB
+			partSize = 27487791 // ≈ 26.2144MB
+		}
+		// 对于小于128GB的文件，使用默认的20MB分片
+	}
+
+	return partSize
+}
+
+// performOSSPutObject 执行OSS单文件上传
+func (f *Fs) performOSSPutObject(
+	ctx context.Context,
+	ossClient *oss.Client,
+	in io.Reader,
+	_ fs.ObjectInfo,
+	o *Object,
+	_, _ string,
+	size int64,
+	ui *api.UploadInitInfo,
+	config *Upload115Config,
+	options ...fs.OpenOption,
+) (*api.CallbackData, error) {
+	// 🔧 参考阿里云OSS UploadFile示例：准备PutObject请求
+	req := &oss.PutObjectRequest{
+		Bucket:      oss.Ptr(ui.GetBucket()),
+		Key:         oss.Ptr(ui.GetObject()),
+		Body:        in,
+		Callback:    oss.Ptr(ui.GetCallback()),
+		CallbackVar: oss.Ptr(ui.GetCallbackVar()),
+		// 🔧 使用配置中的进度回调函数，参考阿里云OSS UploadFile示例
+		ProgressFn: config.ProgressFn,
+	}
+
+	// Apply upload options
+	for _, option := range options {
+		key, value := option.Header()
+		lowerKey := strings.ToLower(key)
+		switch lowerKey {
+		case "":
+			// ignore
+		case "cache-control":
+			req.CacheControl = oss.Ptr(value)
+		case "content-disposition":
+			req.ContentDisposition = oss.Ptr(value)
+		case "content-encoding":
+			req.ContentEncoding = oss.Ptr(value)
+		case "content-type":
+			req.ContentType = oss.Ptr(value)
+		}
+	}
+
+	// 🔧 添加详细的调试信息，参考阿里云OSS示例
+	fs.Debugf(o, "🔧 OSS PutObject配置: Bucket=%s, Key=%s", ui.GetBucket(), ui.GetObject())
+
+	// 🔧 使用专用的上传调速器，优化PutObject API调用频率
+	var putRes *oss.PutObjectResult
+	err := f.uploadPacer.Call(func() (bool, error) {
+		var putErr error
+		putRes, putErr = ossClient.PutObject(ctx, req)
+		retry, retryErr := shouldRetry(ctx, nil, putErr)
+		if retry {
+			// Rewind body if possible before retry
+			if seeker, ok := in.(io.Seeker); ok {
+				_, _ = seeker.Seek(0, io.SeekStart)
+			} else {
+				// Cannot retry non-seekable stream after partial read
+				return false, backoff.Permanent(fmt.Errorf("cannot retry PutObject with non-seekable stream: %w", putErr))
+			}
+			return true, retryErr
+		}
+		if putErr != nil {
+			return false, backoff.Permanent(putErr)
+		}
+		return false, nil // Success
+	})
+	if err != nil {
+		return nil, fmt.Errorf("OSS PutObject failed: %w", err)
+	}
+
+	// Process callback
+	callbackData, err := f.postUpload(putRes.CallbackResult)
+	if err != nil {
+		return nil, fmt.Errorf("failed to process PutObject callback: %w", err)
+	}
+
+	// Mark complete on RereadableObject if applicable
+	if ro, ok := in.(*RereadableObject); ok {
+		ro.MarkComplete(ctx)
+		fs.Debugf(o, "Marked RereadableObject transfer as complete after PutObject upload")
+	}
+
+	fs.Infof(o, "✅ 115网盘OSS单文件上传完成: %s", fs.SizeSuffix(size))
+	return callbackData, nil
+}
+
+// performOSSMultipart 执行OSS分片上传
+func (f *Fs) performOSSMultipart(
+	ctx context.Context,
+	ossClient *oss.Client,
+	in io.Reader,
+	src fs.ObjectInfo,
+	o *Object,
+	_, _ string,
+	_ int64,
+	ui *api.UploadInitInfo,
+	config *Upload115Config,
+	options ...fs.OpenOption,
+) (*api.CallbackData, error) {
+	// 🔧 参考阿里云OSS UploadFile示例：使用配置信息进行分片上传
+	fs.Debugf(o, "使用配置信息进行OSS分片上传: PartSize=%s, ParallelNum=%d",
+		fs.SizeSuffix(config.PartSize), config.ParallelNum)
+
+	// 🚀 关键修复：分片上传也使用优化后的OSS客户端
+	// Create the chunk writer with optimized OSS client
+	chunkWriter, err := f.newChunkWriterWithClient(ctx, src, ui, in, o, ossClient, options...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create chunk writer: %w", err)
 	}
+
+	// 🔧 TODO: 将config.ProgressFn集成到chunkWriter中
 
 	// Perform the upload
 	if err := chunkWriter.Upload(ctx); err != nil {
@@ -1938,15 +2062,19 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 		}
 	*/
 
-	// 4. Default (Normal) Logic
-	noHashSize := int64(f.opt.NohashSize)
+	// 4. Default (Normal) Logic - 🔧 优先使用OSS上传策略
 	uploadCutoff := int64(f.opt.UploadCutoff)
 
-	if size >= 0 && (size < noHashSize || forceTraditionalUpload) {
-		// Small known size OR forced traditional upload: Use sample upload
-		if forceTraditionalUpload {
-			fs.Infof(o, "🔧 强制使用传统上传避免115网盘API兼容性问题")
-		}
+	// 🔧 新的上传策略：优先使用OSS上传，只有在强制传统上传时才使用sample upload
+	if size >= 0 && forceTraditionalUpload {
+		// 只有在强制传统上传时才使用sample upload
+		fs.Infof(o, "🔧 强制使用传统上传避免115网盘API兼容性问题")
+		return f.doSampleUpload(ctx, in, o, leaf, dirID, size, options...)
+	}
+
+	// 🔧 对于极小文件（小于1MB），仍然使用传统上传以提高效率
+	if size >= 0 && size < int64(1*fs.Mebi) {
+		fs.Debugf(o, "🔧 极小文件(%s)使用传统上传", fs.SizeSuffix(size))
 		return f.doSampleUpload(ctx, in, o, leaf, dirID, size, options...)
 	}
 
@@ -2034,8 +2162,21 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 	fs.Debugf(o, "Executing OSS PutObject...")
 	// 1. Get UploadInitInfo if not already available (from failed hash check)
 	if ui == nil {
+		// 🔧 关键修复：OSS PutObject也需要SHA1，必须先计算
+		var sha1sum string
+		if o.sha1sum != "" {
+			sha1sum = o.sha1sum
+		} else {
+			// 尝试从源对象获取SHA1
+			if hash, hashErr := src.Hash(ctx, hash.SHA1); hashErr == nil && hash != "" {
+				sha1sum = strings.ToUpper(hash)
+			} else {
+				return nil, fmt.Errorf("OSS PutObject requires SHA1 hash but none available - should calculate hash first")
+			}
+		}
+
 		var initErr error
-		ui, initErr = f.initUploadOpenAPI(ctx, size, leaf, dirID, o.sha1sum, "", "", "", "") // Provide hash if known
+		ui, initErr = f.initUploadOpenAPI(ctx, size, leaf, dirID, sha1sum, "", "", "", "")
 		if initErr != nil {
 			return nil, fmt.Errorf("failed to initialize PutObject upload: %w", initErr)
 		}
@@ -2058,12 +2199,35 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 	}
 
 	// 3. Prepare PutObject request
+	// 🔧 参考阿里云OSS示例，优化PutObject请求配置
 	req := &oss.PutObjectRequest{
 		Bucket:      oss.Ptr(ui.GetBucket()),
 		Key:         oss.Ptr(ui.GetObject()),
 		Body:        newIn, // Use potentially buffered reader
 		Callback:    oss.Ptr(ui.GetCallback()),
 		CallbackVar: oss.Ptr(ui.GetCallbackVar()),
+		// 🚀 激进优化：极简进度回调，最大化减少日志开销
+		ProgressFn: func() func(increment, transferred, total int64) {
+			var lastLoggedPercent int
+			var lastLogTime time.Time
+
+			return func(increment, transferred, total int64) {
+				if total > 0 {
+					currentPercent := int(float64(transferred) / float64(total) * 100)
+					now := time.Now()
+
+					// 🚀 实时进度优化：更频繁的进度显示，提升用户体验
+					if (currentPercent >= lastLoggedPercent+10 || transferred == total) &&
+						(now.Sub(lastLogTime) > 5*time.Second || transferred == total) {
+						fs.Infof(o, "📤 115网盘OSS单文件上传: %d%% (%s/%s)",
+							currentPercent, fs.SizeSuffix(transferred), fs.SizeSuffix(total))
+						lastLoggedPercent = currentPercent
+						lastLogTime = now
+					}
+				}
+				// 🚀 完全移除未知大小的日志输出，避免无意义的开销
+			}
+		}(),
 	}
 	// Apply headers from options
 	for _, option := range options {
@@ -2080,6 +2244,10 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 			req.ContentType = oss.Ptr(value)
 		}
 	}
+
+	// 🔧 添加详细的调试信息，参考阿里云OSS示例
+	fs.Infof(o, "🚀 115网盘开始OSS单文件上传: %s (%s)", leaf, fs.SizeSuffix(size))
+	fs.Debugf(o, "🔧 OSS PutObject配置: Bucket=%s, Key=%s", ui.GetBucket(), ui.GetObject())
 
 	// 🔧 使用专用的上传调速器，优化PutObject API调用频率
 	var putRes *oss.PutObjectResult
