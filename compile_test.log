@@ -1,7 +1,0 @@
-go build -v --ldflags "-s -X github.com/rclone/rclone/fs.Version=v1.71.0-beta.9680.669667742.backup-before-optimization"  
-github.com/rclone/rclone
-mkdir -p `go env GOPATH`/bin/
-cp -av rclone`go env GOEXE` `go env GOPATH`/bin/rclone`go env GOEXE`.new
-rclone -> /Users/jonntd/go/bin/rclone.new
-mv -v `go env GOPATH`/bin/rclone`go env GOEXE`.new `go env GOPATH`/bin/rclone`go env GOEXE`
-/Users/jonntd/go/bin/rclone.new -> /Users/jonntd/go/bin/rclone
