@@ -1282,11 +1282,6 @@ Defaults to "%s". Only change this if you have a specific reason to use a differ
 			Help:     "Size of listing chunk.",
 			Advanced: true,
 		}, {
-			Name:     "censored_only",
-			Default:  false,
-			Help:     "Only show files that are censored (only applies to traditional API calls).",
-			Advanced: true,
-		}, {
 			Name:     "pacer_min_sleep",
 			Default:  unifiedMinSleep,
 			Help:     "Minimum time to sleep between API calls (controls unified QPS, default ~4 QPS).",
@@ -1409,7 +1404,6 @@ type Options struct {
 	UserAgent           string        `config:"user_agent"`
 	RootFolderID        string        `config:"root_folder_id"`
 	ListChunk           int           `config:"list_chunk"`
-	CensoredOnly        bool          `config:"censored_only"`
 	PacerMinSleep       fs.Duration   `config:"pacer_min_sleep"` // Global pacer setting
 	ConTimeout          fs.Duration   `config:"contimeout"`
 	Timeout             fs.Duration   `config:"timeout"`
@@ -3871,13 +3865,6 @@ The command returns the download URL for the specified file. Ensure the file pat
 func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (out any, err error) {
 	switch name {
 
-	case "getid":
-		path := ""
-		if len(arg) > 0 {
-			path = arg[0]
-		}
-		return f.getID(ctx, path) // Uses OpenAPI via listAll/FindDir/NewObject
-
 	case "getdownloadurlua":
 		path := ""
 		ua := ""
@@ -5761,8 +5748,6 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly, di
 			if dirsOnly && !isDir {
 				continue
 			}
-			// Censored check only applicable if using traditional API fallback
-			// if f.opt.CensoredOnly && item.Censored == 0 { continue }
 
 			// Decode name
 			item.FileName = f.opt.Enc.ToStandardName(item.FileNameBest()) // Use best name getter
@@ -9290,56 +9275,4 @@ func parseRootID(s string) (rootID, receiveCode string, err error) {
 
 	// If it doesn't match known patterns, return an error
 	return "", "", fmt.Errorf("invalid format in {}: %q", potentialID)
-}
-
-// getID finds the ID of a file or directory at the given path relative to the Fs root.
-func (f *Fs) getID(ctx context.Context, relativePath string) (id string, err error) {
-	// Handle the case where the Fs itself points to a single file
-	if f.fileObj != nil {
-		obj := *f.fileObj
-		if relativePath == "" || relativePath == obj.Remote() || relativePath == strings.TrimPrefix(obj.Remote(), "isFile:") {
-			if ider, ok := obj.(fs.IDer); ok {
-				return ider.ID(), nil
-			}
-			return "", fmt.Errorf("object does not implement IDer interface")
-		}
-		return "", fmt.Errorf("path %q does not match the single file remote %q", relativePath, obj.Remote())
-	}
-
-	// Trim leading/trailing slashes
-	cleanPath := strings.Trim(relativePath, "/")
-
-	// If path is empty, return the root ID of the Fs
-	if cleanPath == "" {
-		rootID, err := f.dirCache.RootID(ctx, false) // Don't create root if it doesn't exist
-		if err != nil {
-			return "", fmt.Errorf("failed to get root ID: %w", err)
-		}
-		return rootID, nil
-	}
-
-	// Try finding it as a directory first using the cache
-	id, err = f.dirCache.FindDir(ctx, cleanPath, false) // create = false
-	if err == nil {
-		return id, nil // Found as directory
-	}
-	if !errors.Is(err, fs.ErrorDirNotFound) {
-		return "", fmt.Errorf("error finding directory %q: %w", cleanPath, err) // Other error during dir search
-	}
-
-	// Directory not found, try finding it as a file object
-	fs.Debugf(f, "Path %q not found as directory, trying as file.", cleanPath)
-	o, err := f.NewObject(ctx, cleanPath)
-	if err == nil {
-		// Found as file, return its ID
-		objWithID, ok := o.(fs.IDer)
-		if !ok || objWithID.ID() == "" {
-			// This shouldn't happen if NewObject succeeds
-			return "", fmt.Errorf("found object %q but it has no ID", cleanPath)
-		}
-		return objWithID.ID(), nil
-	}
-
-	// If NewObject also fails (e.g., ErrorObjectNotFound), return that error
-	return "", fmt.Errorf("path %q not found as file or directory: %w", cleanPath, err)
 }

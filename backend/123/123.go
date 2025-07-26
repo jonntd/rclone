@@ -163,11 +163,6 @@ type Options struct {
 	DownloadPacerMinSleep fs.Duration `config:"download_pacer_min_sleep"`
 	StrictPacerMinSleep   fs.Duration `config:"strict_pacer_min_sleep"`
 
-	// 调试配置
-	DebugLevel             int         `config:"debug_level"`              // 调试级别：0=无，1=错误，2=信息，3=调试，4=详细
-	EnablePerformanceLog   bool        `config:"enable_performance_log"`   // 启用性能监控日志
-	PerformanceLogInterval fs.Duration `config:"performance_log_interval"` // 性能日志输出间隔
-
 	// 🔧 新增：编码配置
 	Enc encoder.MultiEncoder `config:"encoding"` // 文件名编码设置
 }
@@ -1069,96 +1064,6 @@ func (f *Fs) isRetryableError(code int) bool {
 	return false
 }
 
-// verifyServerChunkStatus 验证服务端分片状态
-// 🔧 增强：添加服务端状态查询，确保本地状态与服务端同步
-func (f *Fs) verifyServerChunkStatus(ctx context.Context, preuploadID string, partNumber int64) (bool, error) {
-	// 构造查询请求
-	reqBody := map[string]any{
-		"preuploadID": preuploadID,
-		"partNumber":  partNumber,
-	}
-
-	var response struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-		Data    struct {
-			Uploaded bool   `json:"uploaded"`
-			Etag     string `json:"etag"`
-		} `json:"data"`
-	}
-
-	// 调用服务端分片状态查询API
-	err := f.makeAPICallWithRest(ctx, "/upload/v2/file/part_status", "POST", reqBody, &response)
-	if err != nil {
-		fs.Debugf(f, "查询服务端分片状态失败: %v", err)
-		return false, err
-	}
-
-	if response.Code != 0 {
-		fs.Debugf(f, "服务端分片状态查询返回错误: %d - %s", response.Code, response.Message)
-		return false, fmt.Errorf("服务端状态查询失败: %d - %s", response.Code, response.Message)
-	}
-
-	fs.Debugf(f, "服务端分片 %d 状态: uploaded=%v", partNumber, response.Data.Uploaded)
-	return response.Data.Uploaded, nil
-}
-
-// syncLocalStateWithServer 同步本地状态与服务端状态
-// 🔧 增强：解决本地状态与服务端状态不一致的问题
-func (f *Fs) syncLocalStateWithServer(ctx context.Context, progress *UploadProgress) error {
-	if f.resumeManager == nil {
-		return fmt.Errorf("断点续传管理器未初始化")
-	}
-
-	// 🔧 简化：使用统一的TaskID获取和迁移函数
-	taskID := f.getTaskIDWithMigration(progress.PreuploadID, progress.FilePath, progress.FileSize)
-	uploadedParts := progress.GetUploadedParts()
-	syncErrors := 0
-	correctedCount := 0
-
-	fs.Debugf(f, "开始同步本地状态与服务端状态，本地已上传分片数: %d", len(uploadedParts))
-
-	for partNumber := range uploadedParts {
-		if uploadedParts[partNumber] {
-			// 验证服务端状态
-			serverUploaded, err := f.verifyServerChunkStatus(ctx, progress.PreuploadID, partNumber)
-			if err != nil {
-				syncErrors++
-				fs.Debugf(f, "验证分片 %d 服务端状态失败: %v", partNumber, err)
-
-				// 如果查询失败过多，停止同步避免过多API调用
-				if syncErrors > 5 {
-					fs.Logf(f, "⚠️ 服务端状态查询失败过多，停止同步")
-					break
-				}
-				continue
-			}
-
-			// 如果服务端显示未上传，但本地标记为已上传，修正本地状态
-			if !serverUploaded {
-				fs.Logf(f, "🔧 发现状态不一致：分片 %d 本地标记已上传，但服务端未确认，修正本地状态", partNumber)
-
-				// 修正本地状态
-				progress.RemoveUploaded(partNumber)
-				err := f.resumeManager.MarkChunkCompleted(taskID, partNumber-1) // 标记为未完成
-				if err != nil {
-					fs.Debugf(f, "修正本地状态失败: %v", err)
-				}
-				correctedCount++
-			}
-		}
-	}
-
-	if correctedCount > 0 {
-		fs.Infof(f, "✅ 状态同步完成，修正了 %d 个不一致的分片状态", correctedCount)
-		// 保存修正后的进度
-		return f.saveUploadProgress(progress)
-	}
-
-	fs.Debugf(f, "状态同步完成，本地状态与服务端一致")
-	return nil
-}
-
 // verifyChunkIntegrity 简化的分片完整性验证
 // 🔧 修复：使用统一TaskID生成机制，支持TaskID迁移
 func (f *Fs) verifyChunkIntegrity(_ context.Context, preuploadID string, partNumber int64, remotePath string, fileSize int64) (bool, error) {
@@ -1534,12 +1439,6 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 		path := arg[0]
 		ua := arg[1]
 		return f.getDownloadURLByUA(ctx, path, ua)
-
-	case "stats":
-		return "性能统计功能已简化，请使用rclone标准统计", nil
-
-	case "logstats":
-		return "性能统计功能已简化，请使用rclone标准统计", nil
 
 	case "cache-info":
 		// 使用统一缓存查看器
@@ -9256,6 +9155,8 @@ func (f *Fs) executeChunkedUpload(uploadCtx *UnifiedUploadContext) (*Object, err
 	// 🚀 智能秒传检测：无论本地还是跨云传输，都先尝试获取MD5进行秒传检测
 	var md5Hash string
 
+	var skipMD5Calculation bool // 标志是否跳过MD5计算以避免重复下载
+
 	if isRemoteSource {
 		fs.Infof(f, "🌐 检测到跨云传输，先尝试获取源文件MD5进行秒传检测")
 
@@ -9269,12 +9170,13 @@ func (f *Fs) executeChunkedUpload(uploadCtx *UnifiedUploadContext) (*Object, err
 			// 🔧 修复重复下载问题：跨云传输时不重新计算MD5
 			// 避免为了秒传而重复下载大文件，直接使用正常上传流程
 			fs.Infof(f, "🔧 115→123跨云传输：跳过MD5计算，避免重复下载，使用正常上传流程")
-			md5Hash = "" // 不使用秒传，直接上传
+			md5Hash = ""              // 不使用秒传，直接上传
+			skipMD5Calculation = true // 设置标志，避免后续重复计算MD5
 		}
 	}
 
-	// 本地文件或跨云传输无MD5时：获取或计算MD5
-	if !isRemoteSource || md5Hash == "" {
+	// 本地文件或跨云传输无MD5时：获取或计算MD5（但跳过已决定不计算的情况）
+	if (!isRemoteSource || md5Hash == "") && !skipMD5Calculation {
 		if hashValue, err := uploadCtx.src.Hash(uploadCtx.ctx, fshash.MD5); err == nil && hashValue != "" {
 			md5Hash = hashValue
 			fs.Debugf(f, "使用已知MD5: %s", md5Hash)
