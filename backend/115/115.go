@@ -4026,7 +4026,8 @@ func (f *Fs) getDownloadURLByUA(ctx context.Context, filePath string, UA string)
 
 	fs.Debugf(f, "处理文件路径: %s", filePath)
 
-	pickCode, err := f.GetPickCodeByPath(ctx, filePath)
+	// 🔧 性能优化：直接HTTP调用获取PickCode，避免rclone框架开销
+	pickCode, err := f.getPickCodeByPathDirect(ctx, filePath)
 	if err != nil {
 		return "", fmt.Errorf("failed to read metadata for file path %q: %w", filePath, err)
 	}
@@ -4086,6 +4087,63 @@ func (f *Fs) getDownloadURLByUA(ctx context.Context, filePath string, UA string)
 		}
 	}
 	return "", fmt.Errorf("未找到下载URL")
+}
+
+// getPickCodeByPathDirect 直接HTTP调用获取PickCode，避免rclone框架开销
+func (f *Fs) getPickCodeByPathDirect(ctx context.Context, path string) (string, error) {
+	fs.Debugf(f, "直接HTTP获取PickCode: %s", path)
+
+	// 创建HTTP客户端
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	// 构建请求URL
+	reqURL := openAPIRootURL + "/open/folder/get_info?path=" + url.QueryEscape(path)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("创建请求失败: %w", err)
+	}
+
+	// 准备认证信息
+	opts := rest.Opts{}
+	f.prepareTokenForRequest(ctx, &opts)
+
+	// 设置请求头
+	req.Header.Set("Authorization", opts.ExtraHeaders["Authorization"])
+	req.Header.Set("User-Agent", defaultUserAgent)
+
+	// 发送请求
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 解析响应
+	var response struct {
+		State   bool   `json:"state"`
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			PickCode     string `json:"pick_code"`
+			FileName     string `json:"file_name"`
+			FileID       string `json:"file_id"`
+			FileCategory string `json:"file_category"`
+		} `json:"data"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return "", fmt.Errorf("解析响应失败: %w", err)
+	}
+
+	if response.Code != 0 {
+		return "", fmt.Errorf("API返回错误: %s (Code: %d)", response.Message, response.Code)
+	}
+
+	fs.Debugf(f, "直接HTTP获取PickCode成功: %s -> %s", path, response.Data.PickCode)
+	return response.Data.PickCode, nil
 }
 
 // ------------------------------------------------------------
