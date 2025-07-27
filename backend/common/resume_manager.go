@@ -2,8 +2,6 @@
 package common
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -56,7 +54,7 @@ type UnifiedResumeManager interface {
 	CleanupExpiredInfo() error
 
 	// 🔧 监控和统计
-	GetResumeStats() ResumeStats
+	GetResumeStats() *ResumeStats
 	GetResumeHealthReport() map[string]interface{}
 }
 
@@ -553,31 +551,17 @@ func (r *ResumeInfo115) FromJSON(data []byte) error {
 // 工具函数
 
 // GenerateTaskID123 生成123网盘任务ID
-// 🔧 修复：使用稳定的哈希值，确保下载和上传使用一致的TaskID
+// 使用稳定的哈希值，确保下载和上传使用一致的TaskID
+// 已迁移到cache_utils.go中的GenerateTaskID函数，保留此函数用于向后兼容
 func GenerateTaskID123(filePath string, fileSize int64) string {
-	// 使用文件路径和大小生成稳定的哈希值
-	hasher := sha256.New()
-	hasher.Write([]byte(fmt.Sprintf("123_%s_%d", filePath, fileSize)))
-	hash := hex.EncodeToString(hasher.Sum(nil))[:16] // 取前16位作为短哈希
-
-	return fmt.Sprintf("123_%s_%d_%s",
-		filePath,
-		fileSize,
-		hash)
+	return GenerateTaskID("123", filePath, fileSize)
 }
 
 // GenerateTaskID115 生成115网盘任务ID
-// 🔧 修复：使用稳定的哈希值而不是时间戳，确保断点续传能正确工作
+// 使用稳定的哈希值而不是时间戳，确保断点续传能正确工作
+// 已迁移到cache_utils.go中的GenerateTaskID函数，保留此函数用于向后兼容
 func GenerateTaskID115(filePath string, fileSize int64) string {
-	// 使用文件路径和大小生成稳定的哈希值
-	hasher := sha256.New()
-	hasher.Write([]byte(fmt.Sprintf("115_%s_%d", filePath, fileSize)))
-	hash := hex.EncodeToString(hasher.Sum(nil))[:16] // 取前16位作为短哈希
-
-	return fmt.Sprintf("115_%s_%d_%s",
-		filePath,
-		fileSize,
-		hash)
+	return GenerateTaskID("115", filePath, fileSize)
 }
 
 // 🔧 缓存健康监控和恢复机制
@@ -718,13 +702,22 @@ func (rm *BadgerResumeManager) updateResumeStats(success bool, failureReason str
 }
 
 // GetResumeStats 获取断点续传统计信息
-func (rm *BadgerResumeManager) GetResumeStats() ResumeStats {
+func (rm *BadgerResumeManager) GetResumeStats() *ResumeStats {
 	rm.resumeStats.mu.RLock()
 	defer rm.resumeStats.mu.RUnlock()
 
-	// 创建副本避免并发问题
-	stats := rm.resumeStats
-	stats.FailureReasons = make(map[string]int64)
+	// 创建副本避免锁拷贝
+	stats := &ResumeStats{
+		TotalAttempts:      rm.resumeStats.TotalAttempts,
+		SuccessfulResumes:  rm.resumeStats.SuccessfulResumes,
+		FailedResumes:      rm.resumeStats.FailedResumes,
+		AverageResumeTime:  rm.resumeStats.AverageResumeTime,
+		LastSuccessTime:    rm.resumeStats.LastSuccessTime,
+		LastFailureTime:    rm.resumeStats.LastFailureTime,
+		FailureReasons:     make(map[string]int64),
+		PerformanceMetrics: rm.resumeStats.PerformanceMetrics,
+	}
+
 	for k, v := range rm.resumeStats.FailureReasons {
 		stats.FailureReasons[k] = v
 	}

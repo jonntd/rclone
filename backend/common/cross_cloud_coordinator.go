@@ -367,13 +367,22 @@ func (c *CrossCloudCoordinator) cleanupTempFile(fileID string) {
 }
 
 // GetStats 获取跨云传输统计信息
-func (c *CrossCloudCoordinator) GetStats() CrossCloudStats {
+func (c *CrossCloudCoordinator) GetStats() *CrossCloudStats {
 	c.transferStats.mu.RLock()
 	defer c.transferStats.mu.RUnlock()
 
-	// 创建副本
-	stats := *c.transferStats
-	stats.ErrorsByType = make(map[string]int64)
+	// 创建副本，避免锁拷贝
+	stats := &CrossCloudStats{
+		TotalTransfers:        c.transferStats.TotalTransfers,
+		CompletedTransfers:    c.transferStats.CompletedTransfers,
+		FailedTransfers:       c.transferStats.FailedTransfers,
+		TotalBytesTransferred: c.transferStats.TotalBytesTransferred,
+		AverageSpeed:          c.transferStats.AverageSpeed,
+		DuplicateDownloads:    c.transferStats.DuplicateDownloads,
+		ResumedTransfers:      c.transferStats.ResumedTransfers,
+		ErrorsByType:          make(map[string]int64),
+	}
+
 	for k, v := range c.transferStats.ErrorsByType {
 		stats.ErrorsByType[k] = v
 	}
