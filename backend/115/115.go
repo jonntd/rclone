@@ -4036,34 +4036,56 @@ func (f *Fs) getDownloadURLByUA(ctx context.Context, filePath string, UA string)
 		UA = defaultUserAgent
 	}
 
-	// 使用CallOpenAPI通过pacer进行调用
-	opts := rest.Opts{
-		Method:      "POST",
-		Path:        "/open/ufile/downurl",
-		ContentType: "application/x-www-form-urlencoded",
-		Body:        strings.NewReader("pick_code=" + pickCode),
-		ExtraHeaders: map[string]string{
-			"User-Agent": UA,
-		},
-	}
+	// 🔧 使用主人提供的原始HTTP代码实现
+	client := &http.Client{}
+	req, err := http.NewRequest("POST", openAPIRootURL+"/open/ufile/downurl", strings.NewReader("pick_code="+pickCode))
 
-	var response OpenAPIDownloadResp
-	err = f.CallOpenAPI(ctx, &opts, nil, &response, false)
 	if err != nil {
-		return "", fmt.Errorf("获取下载URL失败: %w", err)
+		fs.Errorf(nil, "创建请求失败: %v", err)
+		return "", err
 	}
 
-	// 🔧 实现：使用正确的响应处理方法
-	downInfo, err := response.GetDownloadInfo()
+	opts := rest.Opts{}
+	f.prepareTokenForRequest(ctx, &opts)
+
+	// 设置请求头
+	req.Header.Set("Authorization", opts.ExtraHeaders["Authorization"])
+	req.Header.Set("User-Agent", UA)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	fs.Infof(nil, "Authorization: %s, User-Agent: %s", opts.ExtraHeaders["Authorization"], UA)
+
+	// 发送请求并处理响应
+	res, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("解析下载信息失败: %w", err)
+		fs.Logf(nil, "请求失败: %v", err)
+		return "", err
+	}
+	defer res.Body.Close()
+
+	// 解析响应 - 使用你原始代码中的响应结构
+	var response struct {
+		State   bool   `json:"state"`
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    map[string]struct {
+			URL struct {
+				URL string `json:"url"`
+			} `json:"url"`
+		} `json:"data"`
 	}
 
-	if downInfo != nil && downInfo.URL.URL != "" {
-		fs.Infof(f, "成功获取下载URL: %s", downInfo.URL.URL)
-		return downInfo.URL.URL, nil
+	if decodeErr := json.NewDecoder(res.Body).Decode(&response); decodeErr != nil {
+		fs.Logf(nil, "解析响应失败: %v", decodeErr)
+		return "", decodeErr
 	}
-	return "", fmt.Errorf("未从API响应中获取到下载URL")
+
+	for _, downInfo := range response.Data {
+		if downInfo.URL.URL != "" {
+			fs.Infof(nil, "获取到下载URL: %s", downInfo.URL.URL)
+			return downInfo.URL.URL, nil
+		}
+	}
+	return "", fmt.Errorf("未找到下载URL")
 }
 
 // ------------------------------------------------------------
