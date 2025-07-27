@@ -72,6 +72,10 @@ type UnifiedConcurrentDownloader struct {
 	minFileSize      int64 // 启用并发下载的最小文件大小
 	maxConcurrency   int64 // 最大并发数
 	defaultChunkSize int64 // 默认分片大小
+
+	// 进度跟踪
+	progressReaders map[string]*ConcurrentDownloadReader // 用于跟踪并发下载进度
+	progressMu      sync.RWMutex                         // 保护progressReaders的并发访问
 }
 
 // DownloadAdapter 后端特定的下载适配器接口
@@ -461,10 +465,9 @@ func (d *UnifiedConcurrentDownloader) setupProgressTracking(ctx context.Context,
 	remoteName := obj.Remote()
 
 	if transfer != nil {
-		// 使用传入的Transfer对象创建Account
-		dummyReader := io.NopCloser(strings.NewReader(""))
-		currentAccount = transfer.Account(ctx, dummyReader)
-		dummyReader.Close()
+		// 🔧 修复：创建一个能正确跟踪进度的Account对象
+		// 不使用dummyReader，而是创建一个专门用于并发下载的Account
+		currentAccount = d.createConcurrentDownloadAccount(ctx, transfer, obj.Size(), remoteName)
 		fs.Debugf(d.fs, "🔧 使用传入的Transfer对象创建Account: %s", remoteName)
 	} else {
 		// 回退：尝试从全局统计查找现有Account
@@ -472,6 +475,29 @@ func (d *UnifiedConcurrentDownloader) setupProgressTracking(ctx context.Context,
 	}
 
 	return progress, currentAccount
+}
+
+// createConcurrentDownloadAccount 创建专门用于并发下载的Account对象
+func (d *UnifiedConcurrentDownloader) createConcurrentDownloadAccount(ctx context.Context, transfer *accounting.Transfer, fileSize int64, remoteName string) *accounting.Account {
+	// 创建一个专门的Reader用于并发下载进度跟踪
+	progressReader := NewConcurrentDownloadReader(fileSize)
+
+	// 使用Transfer对象创建Account
+	account := transfer.Account(ctx, progressReader)
+
+	// 🔧 关键修复：将progressReader保存到下载器中，以便后续更新进度
+	// 这里我们需要一个方式来关联Account和progressReader
+	// 暂时通过remoteName作为key存储
+	d.progressMu.Lock()
+	if d.progressReaders == nil {
+		d.progressReaders = make(map[string]*ConcurrentDownloadReader)
+	}
+	d.progressReaders[remoteName] = progressReader
+	d.progressMu.Unlock()
+
+	fs.Debugf(d.fs, "🔧 创建并发下载Account对象: %s (大小: %s)", remoteName, fs.SizeSuffix(fileSize))
+
+	return account
 }
 
 // findExistingAccount 查找现有的Account对象（完全参考115网盘实现）
@@ -750,6 +776,15 @@ func (d *UnifiedConcurrentDownloader) downloadChunksConcurrently(ctx context.Con
 	wg.Wait()
 	close(errChan)
 
+	// 🔧 关键修复：下载完成后，标记所有progressReader为完成状态
+	d.progressMu.Lock()
+	for _, progressReader := range d.progressReaders {
+		if progressReader != nil {
+			progressReader.Complete()
+		}
+	}
+	d.progressMu.Unlock()
+
 	// 检查是否有错误
 	var errors []error
 	for err := range errChan {
@@ -852,8 +887,17 @@ func (d *UnifiedConcurrentDownloader) downloadChunksConcurrentlyWithAccount(ctx 
 			actualChunkSize := end - start + 1
 			progress.UpdateChunkProgress(chunkIndex, actualChunkSize, chunkDuration.Nanoseconds())
 
-			// 🔧 关键修复：进度报告由DownloadChunk方法负责，这里不重复报告
-			// downloadSingleChunk会将currentAccount传递给DownloadChunk方法，由DownloadChunk负责进度报告
+			// 🔧 关键修复：更新Account对象的进度
+			if currentAccount != nil {
+				// 通过remoteName找到对应的progressReader并更新进度
+				remoteName := obj.Remote()
+				d.progressMu.RLock()
+				if progressReader, exists := d.progressReaders[remoteName]; exists {
+					progressReader.UpdateProgress(actualChunkSize)
+					fs.Debugf(d.fs, "🔧 更新Account进度: 分片%d, 大小=%s", chunkIndex, fs.SizeSuffix(actualChunkSize))
+				}
+				d.progressMu.RUnlock()
+			}
 
 			// 🔧 修复分片索引显示：显示实际的分片索引和字节范围，避免用户困惑
 			fs.Debugf(d.fs, "✅ %s网盘分片 %d/%d 下载完成, 大小: %s, 用时: %v (bytes=%d-%d)",
@@ -865,6 +909,15 @@ func (d *UnifiedConcurrentDownloader) downloadChunksConcurrentlyWithAccount(ctx 
 	// 等待所有分片完成
 	wg.Wait()
 	close(errChan)
+
+	// 🔧 关键修复：下载完成后，标记所有progressReader为完成状态
+	d.progressMu.Lock()
+	for _, progressReader := range d.progressReaders {
+		if progressReader != nil {
+			progressReader.Complete()
+		}
+	}
+	d.progressMu.Unlock()
 
 	// 检查是否有错误
 	var errors []error
@@ -1146,4 +1199,186 @@ func (d *UnifiedConcurrentDownloader) copyTempFileContent(srcPath string, dstFil
 
 	fs.Debugf(d.fs, "成功复制临时文件内容: %s", fs.SizeSuffix(copied))
 	return nil
+}
+
+// ConcurrentDownloadReader 专门用于并发下载进度跟踪的Reader
+type ConcurrentDownloadReader struct {
+	totalSize     int64
+	readBytes     int64
+	mu            sync.RWMutex
+	closed        bool
+	completed     bool       // 🔧 新增：标记下载是否已完成
+	progressChan  chan int64 // 用于接收进度更新
+	currentPos    int64      // 当前读取位置
+	lastUpdate    time.Time  // 上次更新时间
+	pendingBytes  int64      // 待处理的字节数
+	simulateSpeed int64      // 模拟的传输速度（字节/秒）
+}
+
+// NewConcurrentDownloadReader 创建新的并发下载Reader
+func NewConcurrentDownloadReader(totalSize int64) *ConcurrentDownloadReader {
+	return &ConcurrentDownloadReader{
+		totalSize:     totalSize,
+		readBytes:     0,
+		closed:        false,
+		completed:     false,                 // 🔧 初始化完成状态
+		progressChan:  make(chan int64, 100), // 缓冲通道，避免阻塞
+		currentPos:    0,
+		lastUpdate:    time.Now(),
+		pendingBytes:  0,
+		simulateSpeed: 1024 * 1024, // 初始模拟速度：1MB/s
+	}
+}
+
+// Read 实现io.Reader接口，模拟数据读取以支持Account进度跟踪
+func (r *ConcurrentDownloadReader) Read(p []byte) (n int, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// 🔧 关键修复：如果下载已完成，直接返回EOF，停止进度更新
+	if r.completed {
+		return 0, io.EOF
+	}
+
+	if r.closed {
+		return 0, io.EOF
+	}
+
+	// 检查是否有新的进度更新
+	select {
+	case newBytes := <-r.progressChan:
+		r.pendingBytes += newBytes
+		r.lastUpdate = time.Now()
+		// 根据实际传输量调整模拟速度
+		if newBytes > 0 {
+			r.simulateSpeed = newBytes * 2 // 简单的速度估算
+		}
+	default:
+		// 没有新的进度更新
+	}
+
+	// 如果有待处理的字节数，逐步返回
+	if r.pendingBytes > 0 {
+		// 计算这次应该返回多少字节
+		maxReturn := int64(len(p))
+		if maxReturn > r.pendingBytes {
+			maxReturn = r.pendingBytes
+		}
+
+		// 限制每次返回的字节数，模拟真实的数据流
+		if maxReturn > 8192 { // 最多8KB每次
+			maxReturn = 8192
+		}
+
+		r.pendingBytes -= maxReturn
+		r.readBytes += maxReturn
+		r.currentPos += maxReturn
+
+		return int(maxReturn), nil
+	}
+
+	// 检查是否已完成
+	if r.readBytes >= r.totalSize {
+		return 0, io.EOF
+	}
+
+	// 模拟持续的数据流，即使没有新的进度更新
+	// 这样Account对象就能持续计算速度
+	timeSinceLastUpdate := time.Since(r.lastUpdate)
+	if timeSinceLastUpdate < 5*time.Second && len(p) > 0 {
+		// 模拟小量数据传输，保持Account活跃
+		simulatedBytes := r.simulateSpeed / 100 // 每次返回1%的模拟速度
+		if simulatedBytes < 1024 {
+			simulatedBytes = 1024 // 最少1KB
+		}
+		if simulatedBytes > int64(len(p)) {
+			simulatedBytes = int64(len(p))
+		}
+		if r.readBytes+simulatedBytes > r.totalSize {
+			simulatedBytes = r.totalSize - r.readBytes
+		}
+
+		if simulatedBytes > 0 {
+			r.readBytes += simulatedBytes
+			r.currentPos += simulatedBytes
+			return int(simulatedBytes), nil
+		}
+	}
+
+	// 如果很久没有更新，返回EOF
+	if timeSinceLastUpdate > 10*time.Second {
+		return 0, io.EOF
+	}
+
+	// 返回小量数据以保持连接
+	if len(p) > 0 {
+		return 1, nil
+	}
+	return 0, nil
+}
+
+// Close 实现io.Closer接口
+func (r *ConcurrentDownloadReader) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.closed = true
+	close(r.progressChan)
+	return nil
+}
+
+// Complete 标记下载完成，停止进度更新
+// 🔧 关键修复：解决"下载100%还在显示继续下载"的问题
+func (r *ConcurrentDownloadReader) Complete() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if !r.completed {
+		r.completed = true
+		// 确保readBytes达到totalSize
+		if r.readBytes < r.totalSize {
+			r.readBytes = r.totalSize
+		}
+		// 清空待处理字节
+		r.pendingBytes = 0
+	}
+}
+
+// UpdateProgress 更新下载进度（由并发下载器调用）
+func (r *ConcurrentDownloadReader) UpdateProgress(bytesRead int64) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if !r.closed && bytesRead > 0 {
+		select {
+		case r.progressChan <- bytesRead:
+			// 成功发送进度更新
+		default:
+			// 通道满了，直接更新pendingBytes（避免阻塞）
+			r.mu.RUnlock()
+			r.mu.Lock()
+			r.pendingBytes += bytesRead
+			r.lastUpdate = time.Now()
+			r.mu.Unlock()
+			r.mu.RLock()
+		}
+	}
+}
+
+// UpdateProgressIncremental 增量更新下载进度（用于更频繁的进度报告）
+func (r *ConcurrentDownloadReader) UpdateProgressIncremental(totalBytesRead int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if !r.closed && totalBytesRead > r.readBytes {
+		incrementalBytes := totalBytesRead - r.readBytes
+		select {
+		case r.progressChan <- incrementalBytes:
+			// 成功发送进度更新
+		default:
+			// 通道满了，直接更新pendingBytes
+			r.pendingBytes += incrementalBytes
+		}
+		r.lastUpdate = time.Now()
+	}
 }

@@ -157,7 +157,7 @@ upload_test() {
     log_info "开始${description}上传测试: $filename"
     
     # 执行上传
-    ./rclone_test copy "$filename" "123:$test_dir/" \
+    ./rclone copy "$filename" "123:$test_dir/" \
         --transfers $CONCURRENT_TRANSFERS \
         --checkers 1 \
         -vv \
@@ -166,7 +166,7 @@ upload_test() {
     local upload_result=$?
     
     # 验证上传结果
-    if [ $upload_result -eq 0 ] && ./rclone_test ls "123:$test_dir/$filename" >/dev/null 2>&1; then
+    if [ $upload_result -eq 0 ] && ./rclone ls "123:$test_dir/$filename" >/dev/null 2>&1; then
         log_success "${description}上传成功"
         verify_file_size "$filename" "123:$test_dir/$filename"
         return 0
@@ -248,7 +248,7 @@ cleanup() {
         
         # 可选的远程目录清理
         if [ "$CLEAN_REMOTE" = true ]; then
-            ./rclone_test delete "123:$TEST_DIR/" 2>/dev/null || true
+            ./rclone delete "123:$TEST_DIR/" 2>/dev/null || true
             log_debug "已清理远程统一测试目录: 123:$TEST_DIR/"
         else
             log_debug "保留远程统一测试目录: 123:$TEST_DIR/ (设置CLEAN_REMOTE=true可清理)"
@@ -282,7 +282,7 @@ main() {
 
     # 确保统一测试目录存在
     log_info "确保统一测试目录存在: 123:$TEST_DIR/"
-    ./rclone_test mkdir "123:$TEST_DIR/" 2>/dev/null || true
+    ./rclone mkdir "123:$TEST_DIR/" 2>/dev/null || true
     
     # 设置错误处理
     set -e
@@ -290,7 +290,7 @@ main() {
     
     # 第一步：连接验证
     log_info "步骤1: 验证123网盘连接"
-    if ! ./rclone_test about 123: >/dev/null 2>&1; then
+    if ! ./rclone about 123: >/dev/null 2>&1; then
         log_error "123网盘连接失败"
         exit 1
     fi
@@ -412,7 +412,7 @@ quick_test() {
     log_info "使用统一测试目录: $TEST_DIR"
 
     # 确保统一测试目录存在
-    ./rclone_test mkdir "123:$TEST_DIR/" 2>/dev/null || true
+    ./rclone mkdir "123:$TEST_DIR/" 2>/dev/null || true
 
     # 只测试小文件，确保每次MD5不同
     local quick_size=10
@@ -440,7 +440,7 @@ performance_test() {
     log_info "使用统一测试目录: $TEST_DIR"
 
     # 确保统一测试目录存在
-    ./rclone_test mkdir "123:$TEST_DIR/" 2>/dev/null || true
+    ./rclone mkdir "123:$TEST_DIR/" 2>/dev/null || true
 
     # 创建多个文件进行并发测试，每个文件MD5都不同
     local perf_size=50

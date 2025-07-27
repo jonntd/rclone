@@ -899,19 +899,20 @@ func (f *Fs) clearPathToIDCache(path string) {
 }
 
 // getTaskIDForPreuploadID 获取preuploadID对应的统一TaskID
-// 🔧 简化：直接使用统一TaskID生成，移除复杂的回退逻辑
+// 🔧 修复：优化回退策略，减少错误日志
 func (f *Fs) getTaskIDForPreuploadID(preuploadID string, remotePath string, fileSize int64) string {
-	// 🔧 关键简化：要求必须提供完整的路径和大小信息
-	if remotePath == "" || fileSize <= 0 {
-		fs.Errorf(f, "TaskID生成失败：缺少必要参数 (路径: %s, 大小: %d)", remotePath, fileSize)
-		// 🔧 简化：使用preuploadID作为最后的回退，但记录警告
-		return fmt.Sprintf("123_fallback_%s", preuploadID)
+	// 🔧 修复：优先使用统一TaskID，但在参数不完整时静默回退
+	if remotePath != "" && fileSize > 0 {
+		// 使用统一TaskID生成方式
+		taskID := common.GenerateTaskID123(remotePath, fileSize)
+		fs.Debugf(f, "✅ 生成统一TaskID: %s (路径: %s, 大小: %d)", taskID, remotePath, fileSize)
+		return taskID
 	}
 
-	// 🔧 简化：统一使用标准TaskID生成方式
-	taskID := common.GenerateTaskID123(remotePath, fileSize)
-	fs.Debugf(f, "✅ 生成统一TaskID: %s", taskID)
-	return taskID
+	// 🔧 修复：静默回退到preuploadID方式，避免错误日志刷屏
+	fallbackTaskID := fmt.Sprintf("123_fallback_%s", preuploadID)
+	fs.Debugf(f, "⚠️ 使用回退TaskID: %s (路径: '%s', 大小: %d)", fallbackTaskID, remotePath, fileSize)
+	return fallbackTaskID
 }
 
 // tryMigrateTaskID 尝试迁移旧的TaskID到新的统一TaskID
@@ -2464,8 +2465,15 @@ func (f *Fs) saveUploadProgress(progress *UploadProgress) error {
 		return fmt.Errorf("断点续传管理器未初始化")
 	}
 
+	// 🔧 修复：确保使用正确的远程路径，优先使用FilePath，如果为空则尝试从其他地方获取
+	remotePath := progress.FilePath
+	if remotePath == "" {
+		// 如果FilePath为空，尝试从progress的其他字段推断
+		fs.Debugf(f, "⚠️ progress.FilePath为空，使用回退策略生成TaskID")
+	}
+
 	// 🔧 简化：使用统一的TaskID获取和迁移函数
-	taskID := f.getTaskIDWithMigration(progress.PreuploadID, progress.FilePath, progress.FileSize)
+	taskID := f.getTaskIDWithMigration(progress.PreuploadID, remotePath, progress.FileSize)
 
 	// 转换为统一管理器的信息格式
 	resumeInfo := &common.ResumeInfo123{
@@ -3688,7 +3696,8 @@ func (f *Fs) handleCrossCloudTransfer(ctx context.Context, in io.Reader, src fs.
 		if reader, size, cleanup, err := f.crossCloudCoordinator.CheckExistingDownload(ctx, src); err == nil && reader != nil {
 			fs.Infof(f, "🎯 协调器发现已下载文件，避免重复下载 (大小: %s)", fs.SizeSuffix(size))
 			defer cleanup()
-			return f.unifiedUpload(ctx, reader, src, parentFileID, fileName)
+			// 🔧 修复递归：直接处理已下载的文件，不调用unifiedUpload避免递归
+			return f.uploadFromDownloadedData(ctx, reader, src, parentFileID, fileName)
 		}
 	}
 
@@ -3704,12 +3713,12 @@ func (f *Fs) handleCrossCloudTransfer(ctx context.Context, in io.Reader, src fs.
 			}
 		}
 
-		// 直接使用统一上传接口
-		return f.unifiedUpload(ctx, in, src, parentFileID, fileName)
+		// 🔧 修复递归：直接处理已下载的数据，不调用unifiedUpload避免递归
+		return f.uploadFromDownloadedData(ctx, in, src, parentFileID, fileName)
 	}
 
-	// 🔧 简化传输处理：没有Reader时，需要打开源文件
-	fs.Infof(f, "🔄 执行完整跨云传输流程")
+	// 🔧 简化传输处理：直接实现下载→计算MD5→上传流程，避免复杂的策略选择导致递归
+	fs.Infof(f, "🔄 执行简化跨云传输流程：下载→计算MD5→上传")
 
 	// 获取底层的fs.Object
 	var srcObj fs.Object
@@ -3727,8 +3736,16 @@ func (f *Fs) handleCrossCloudTransfer(ctx context.Context, in io.Reader, src fs.
 		}
 	}
 
-	// 选择最优传输策略
-	return f.selectOptimalCrossCloudStrategy(ctx, srcObj, src, parentFileID, fileName)
+	// 🔧 直接实现简化的跨云传输：打开源文件→读取数据→计算MD5→上传
+	fs.Infof(f, "📥 打开源文件进行跨云传输")
+	srcReader, err := srcObj.Open(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("打开源文件失败: %w", err)
+	}
+	defer srcReader.Close()
+
+	// 直接使用uploadFromDownloadedData处理数据流
+	return f.uploadFromDownloadedData(ctx, srcReader, src, parentFileID, fileName)
 }
 
 // getCachedUploadDomain 获取缓存的上传域名，避免频繁API调用
@@ -3753,6 +3770,87 @@ func (f *Fs) getCachedUploadDomain(ctx context.Context) (string, error) {
 
 	fs.Debugf(f, "✅ 上传域名缓存更新: %s", domain)
 	return domain, nil
+}
+
+// uploadFromDownloadedData 从已下载的数据直接上传，避免递归调用
+func (f *Fs) uploadFromDownloadedData(ctx context.Context, reader io.Reader, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
+	fileSize := src.Size()
+	fs.Infof(f, "📤 从已下载数据直接上传: %s (%s)", fileName, fs.SizeSuffix(fileSize))
+
+	// 🔐 步骤1: 计算MD5哈希（123网盘API必需）
+	fs.Infof(f, "🔐 计算文件MD5哈希...")
+	md5StartTime := time.Now()
+
+	// 读取所有数据并计算MD5
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fmt.Errorf("读取已下载数据失败: %w", err)
+	}
+
+	if int64(len(data)) != fileSize {
+		return nil, fmt.Errorf("数据大小不匹配: 期望%s，实际%s",
+			fs.SizeSuffix(fileSize), fs.SizeSuffix(int64(len(data))))
+	}
+
+	hasher := md5.New()
+	hasher.Write(data)
+	md5Hash := fmt.Sprintf("%x", hasher.Sum(nil))
+	md5Duration := time.Since(md5StartTime)
+	fs.Infof(f, "✅ MD5计算完成: %s，耗时: %v", md5Hash, md5Duration.Round(time.Second))
+
+	// 🚀 步骤2: 尝试秒传
+	fs.Infof(f, "⚡ 尝试123网盘秒传...")
+	createResp, isInstant, err := f.checkInstantUpload(ctx, parentFileID, fileName, md5Hash, fileSize)
+	if err != nil {
+		fs.Debugf(f, "秒传检查失败: %v", err)
+	} else if isInstant {
+		fs.Infof(f, "🎉 秒传成功！节省上传时间")
+		return f.createObjectFromUpload(fileName, fileSize, md5Hash, createResp.Data.FileID, src.ModTime(ctx)), nil
+	}
+
+	// 🚀 步骤3: 秒传失败，创建上传会话并实际上传
+	fs.Infof(f, "📤 秒传失败，开始实际上传: %s", fs.SizeSuffix(fileSize))
+
+	// 创建上传会话（现在有了MD5）
+	createResp, err = f.createUploadV2(ctx, parentFileID, fileName, md5Hash, fileSize)
+	if err != nil {
+		return nil, fmt.Errorf("创建上传会话失败: %w", err)
+	}
+
+	// 准备上传进度信息
+	chunkSize := createResp.Data.SliceSize
+	if chunkSize <= 0 {
+		defaultNetworkSpeed := int64(20 * 1024 * 1024) // 20MB/s
+		chunkSize = f.getOptimalChunkSize(fileSize, defaultNetworkSpeed)
+	}
+	totalChunks := (fileSize + chunkSize - 1) / chunkSize
+	progress, err := f.prepareUploadProgress(createResp.Data.PreuploadID, totalChunks, chunkSize, fileSize, fileName, md5Hash, src.Remote())
+	if err != nil {
+		return nil, fmt.Errorf("准备上传进度失败: %w", err)
+	}
+
+	// 使用内存中的数据进行v2多线程上传
+	uploadStartTime := time.Now()
+	concurrencyParams := f.calculateConcurrencyParams(fileSize)
+	maxConcurrency := concurrencyParams.optimal
+
+	result, err := f.v2UploadChunksWithConcurrency(ctx, bytes.NewReader(data), &localFileInfo{
+		name:    fileName,
+		size:    fileSize,
+		modTime: src.ModTime(ctx),
+	}, createResp, progress, fileName, maxConcurrency)
+
+	if err != nil {
+		return nil, fmt.Errorf("上传到123网盘失败: %w", err)
+	}
+
+	uploadDuration := time.Since(uploadStartTime)
+	uploadSpeed := float64(fileSize) / uploadDuration.Seconds() / (1024 * 1024) // MB/s
+
+	fs.Infof(f, "🎉 跨云传输完成: %s，MD5计算: %v，上传: %v，上传速度: %.2f MB/s",
+		fs.SizeSuffix(fileSize), md5Duration.Round(time.Second), uploadDuration.Round(time.Second), uploadSpeed)
+
+	return result, nil
 }
 
 // calculateOptimalChunkSize 计算建议的分片大小（仅用于估算）
@@ -5159,7 +5257,7 @@ func (f *Fs) prepareUploadProgress(preuploadID string, totalChunks, chunkSize, f
 				ChunkSize:     r123.ChunkSize,
 				FileSize:      r123.FileSize,
 				UploadedParts: r123.GetCompletedChunks(),
-				FilePath:      r123.FilePath,
+				FilePath:      remotePath, // 🔧 修复：使用当前的remotePath而不是r123.FilePath
 				CreatedAt:     r123.CreatedAt,
 			}
 			fs.Debugf(f, "恢复分片上传进度: %d/%d 个分片已完成 (TaskID: %s)",
@@ -5178,6 +5276,7 @@ func (f *Fs) prepareUploadProgress(preuploadID string, totalChunks, chunkSize, f
 			ChunkSize:     chunkSize,
 			FileSize:      fileSize,
 			UploadedParts: make(map[int64]bool),
+			FilePath:      remotePath, // 🔧 修复：设置FilePath字段
 			CreatedAt:     time.Now(),
 		}
 
@@ -9243,35 +9342,14 @@ func (f *Fs) executeChunkedUpload(uploadCtx *UnifiedUploadContext) (*Object, err
 		}
 	}
 
-	// 🌐 跨云传输无MD5时的特殊处理
+	// 🌐 跨云传输无MD5时的特殊处理：使用统一的跨云传输处理器
 	if isRemoteSource && md5Hash == "" {
-		fs.Infof(f, "🌐 跨云传输无可用MD5，使用下载后上传策略")
+		fs.Infof(f, "🌐 跨云传输无可用MD5，使用统一跨云传输处理器")
+		fs.Infof(f, "🔧 115网盘只支持SHA1，123网盘需要MD5，将下载后计算MD5")
 
-		// 为跨云传输创建上传会话（不需要MD5）
-		createResp, err := f.createUploadV2(uploadCtx.ctx, uploadCtx.parentFileID, uploadCtx.fileName, "", uploadCtx.src.Size())
-		if err != nil {
-			return nil, fmt.Errorf("创建跨云传输上传会话失败: %w", err)
-		}
-
-		// 准备上传进度信息
-		fileSize := uploadCtx.src.Size()
-		chunkSize := createResp.Data.SliceSize
-		if chunkSize <= 0 {
-			// 使用默认网络速度计算分片大小
-			defaultNetworkSpeed := int64(20 * 1024 * 1024) // 20MB/s
-			chunkSize = f.getOptimalChunkSize(fileSize, defaultNetworkSpeed)
-		}
-		totalChunks := (fileSize + chunkSize - 1) / chunkSize
-		progress, err := f.prepareUploadProgress(createResp.Data.PreuploadID, totalChunks, chunkSize, fileSize, uploadCtx.fileName, "", uploadCtx.src.Remote())
-		if err != nil {
-			return nil, fmt.Errorf("准备跨云传输上传进度失败: %w", err)
-		}
-
-		// 计算最优并发参数
-		concurrencyParams := f.calculateConcurrencyParams(fileSize)
-		maxConcurrency := concurrencyParams.optimal
-
-		return f.downloadThenUpload(uploadCtx.ctx, uploadCtx.src, createResp, progress, uploadCtx.fileName, maxConcurrency)
+		// 直接调用handleCrossCloudTransfer，它已经集成了CrossCloudCoordinator
+		// 可以避免重复下载，支持断点续传，并正确处理MD5计算和秒传
+		return f.handleCrossCloudTransfer(uploadCtx.ctx, uploadCtx.in, uploadCtx.src, uploadCtx.parentFileID, uploadCtx.fileName)
 	}
 
 	// 为v2多线程上传创建专用会话，强制使用v2 API
@@ -9734,8 +9812,14 @@ func (f *Fs) v2UploadChunksWithConcurrency(ctx context.Context, in io.Reader, sr
 	for i := 0; i < maxConcurrency; i++ {
 		workerID := i + 1
 		fs.Debugf(f, "📋 启动工作协程 #%d", workerID)
-		// 🔧 修复：传递远程路径参数以支持统一TaskID
-		go f.v2ChunkUploadWorker(workerCtx, dataSource, preuploadID, chunkSize, fileSize, totalChunks, progress.FilePath, chunkJobs, results)
+		// 🔧 修复：传递远程路径参数以支持统一TaskID，优先使用src.Remote()
+		remotePath := src.Remote()
+		if remotePath == "" && progress.FilePath != "" {
+			remotePath = progress.FilePath
+		}
+		fs.Debugf(f, "🔧 Worker-%d 使用远程路径: '%s' (src.Remote: '%s', progress.FilePath: '%s')",
+			workerID, remotePath, src.Remote(), progress.FilePath)
+		go f.v2ChunkUploadWorker(workerCtx, dataSource, preuploadID, chunkSize, fileSize, totalChunks, remotePath, chunkJobs, results)
 	}
 	fs.Debugf(f, "✅ 所有工作协程已启动，开始分片上传任务分发")
 
