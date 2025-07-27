@@ -3,6 +3,8 @@ package common
 import (
 	"fmt"
 	"time"
+
+	"github.com/rclone/rclone/fs"
 )
 
 // UnifiedCacheConfig 统一的缓存配置结构
@@ -24,6 +26,13 @@ type UnifiedCacheConfig struct {
 	// 缓存清理配置
 	CleanupInterval time.Duration // 缓存清理间隔
 	CleanupTimeout  time.Duration // 缓存清理超时
+
+	// 内存优化和智能清理配置 - 新增
+	MaxCacheSize       fs.SizeSuffix // 最大缓存大小
+	TargetCleanSize    fs.SizeSuffix // 清理目标大小
+	MemTableSize       fs.SizeSuffix // BadgerDB内存表大小
+	EnableSmartCleanup bool          // 启用智能清理
+	CleanupStrategy    string        // 清理策略："lru", "size", "time", "priority_lru"
 
 	// 后端类型标识
 	BackendType string // "123" 或 "115"
@@ -51,6 +60,13 @@ func DefaultUnifiedCacheConfig(backendType string) UnifiedCacheConfig {
 		// 缓存清理配置
 		CleanupInterval: 5 * time.Minute,
 		CleanupTimeout:  2 * time.Minute,
+
+		// 内存优化和智能清理配置 - 新增默认值
+		MaxCacheSize:       fs.SizeSuffix(100 << 20), // 100MB (与第一阶段优化一致)
+		TargetCleanSize:    fs.SizeSuffix(64 << 20),  // 64MB (与第一阶段优化一致)
+		MemTableSize:       fs.SizeSuffix(32 << 20),  // 32MB (与第一阶段优化一致)
+		EnableSmartCleanup: false,                    // 默认关闭，支持渐进式部署
+		CleanupStrategy:    "size",                   // 默认使用大小策略
 
 		// 后端类型
 		BackendType: backendType,
@@ -173,6 +189,33 @@ func (c *UnifiedCacheConfig) Validate() error {
 		return fmt.Errorf("不支持的后端类型: %s", c.BackendType)
 	}
 
+	// 检查新增的内存优化配置
+	if c.MaxCacheSize <= 0 {
+		return fmt.Errorf("最大缓存大小必须为正值")
+	}
+	if c.TargetCleanSize <= 0 {
+		return fmt.Errorf("清理目标大小必须为正值")
+	}
+	if c.MemTableSize <= 0 {
+		return fmt.Errorf("内存表大小必须为正值")
+	}
+	if c.TargetCleanSize >= c.MaxCacheSize {
+		return fmt.Errorf("清理目标大小(%d)必须小于最大缓存大小(%d)", c.TargetCleanSize, c.MaxCacheSize)
+	}
+
+	// 检查清理策略
+	validStrategies := []string{"size", "lru", "time", "priority_lru"}
+	validStrategy := false
+	for _, strategy := range validStrategies {
+		if c.CleanupStrategy == strategy {
+			validStrategy = true
+			break
+		}
+	}
+	if !validStrategy {
+		return fmt.Errorf("不支持的清理策略: %s，支持的策略: %v", c.CleanupStrategy, validStrategies)
+	}
+
 	return nil
 }
 
@@ -190,6 +233,11 @@ func (c *UnifiedCacheConfig) Clone() UnifiedCacheConfig {
 		PickCodeCacheTTL:     c.PickCodeCacheTTL,
 		CleanupInterval:      c.CleanupInterval,
 		CleanupTimeout:       c.CleanupTimeout,
+		MaxCacheSize:         c.MaxCacheSize,
+		TargetCleanSize:      c.TargetCleanSize,
+		MemTableSize:         c.MemTableSize,
+		EnableSmartCleanup:   c.EnableSmartCleanup,
+		CleanupStrategy:      c.CleanupStrategy,
 		BackendType:          c.BackendType,
 	}
 }

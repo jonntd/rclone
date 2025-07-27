@@ -1364,6 +1364,26 @@ Rclone会自动增加大文件的分块大小以保持在10,000个分片限制�
 				encoder.EncodeRightSpace |
 				encoder.EncodeSlash | // 新增：默认编码斜杠
 				encoder.EncodeInvalidUtf8), // 保留：编码无效UTF-8字符
+		}, {
+			Name:     "cache_max_size",
+			Help:     "缓存清理触发前的最大缓存大小。设置为0禁用基于大小的清理。",
+			Default:  fs.SizeSuffix(100 << 20), // 100MB
+			Advanced: true,
+		}, {
+			Name:     "cache_target_size",
+			Help:     "清理后的目标缓存大小。应小于cache_max_size。",
+			Default:  fs.SizeSuffix(64 << 20), // 64MB
+			Advanced: true,
+		}, {
+			Name:     "enable_smart_cleanup",
+			Help:     "启用基于LRU策略的智能缓存清理，而不是简单的基于大小的清理。",
+			Default:  false,
+			Advanced: true,
+		}, {
+			Name:     "cleanup_strategy",
+			Help:     "缓存清理策略：'size'（基于大小）、'lru'（最近最少使用）、'priority_lru'（优先级+LRU）、'time'（基于时间）。",
+			Default:  "size",
+			Advanced: true,
 		}},
 	})
 }
@@ -1407,6 +1427,12 @@ type Options struct {
 	NoBuffer  bool                 `config:"no_buffer"` // Skip disk buffering for uploads
 	Enc       encoder.MultiEncoder `config:"encoding"`
 	AppID     string               `config:"app_id"` // Custom App ID for authentication
+
+	// 缓存优化配置 - 新增
+	CacheMaxSize       fs.SizeSuffix `config:"cache_max_size"`       // 最大缓存大小
+	CacheTargetSize    fs.SizeSuffix `config:"cache_target_size"`    // 清理目标大小
+	EnableSmartCleanup bool          `config:"enable_smart_cleanup"` // 启用智能清理
+	CleanupStrategy    string        `config:"cleanup_strategy"`     // 清理策略
 }
 
 // Fs represents a remote 115 drive
@@ -2719,8 +2745,14 @@ func initializeCaches115(f *Fs) error {
 	// 初始化缓存配置 - 使用统一配置
 	f.cacheConfig = common.DefaultUnifiedCacheConfig("115")
 
-	// 使用统一的缓存初始化器
-	return common.Initialize115Cache(f, &f.pathResolveCache, &f.dirListCache, &f.metadataCache, &f.fileIDCache)
+	// 应用用户配置到缓存配置
+	f.cacheConfig.MaxCacheSize = f.opt.CacheMaxSize
+	f.cacheConfig.TargetCleanSize = f.opt.CacheTargetSize
+	f.cacheConfig.EnableSmartCleanup = f.opt.EnableSmartCleanup
+	f.cacheConfig.CleanupStrategy = f.opt.CleanupStrategy
+
+	// 使用统一的缓存初始化器 - 传递配置参数
+	return common.Initialize115Cache(f, &f.pathResolveCache, &f.dirListCache, &f.metadataCache, &f.fileIDCache, &f.cacheConfig)
 }
 
 // initializeUnifiedComponents115 初始化115网盘统一组件
@@ -3747,67 +3779,43 @@ func (f *Fs) createObject(ctx context.Context, remote string, modTime time.Time,
 // ------------------------------------------------------------
 
 var commandHelp = []fs.CommandHelp{{
-	Name:  "addurls",
-	Short: "Add offline download task for urls (uses traditional API)",
-	Long: `This command adds offline download task for urls using the traditional API.
+	Name:  "getdownloadurlua",
+	Short: "通过文件路径获取下载URL",
+	Long: `此命令使用文件路径检索文件的下载URL。
 
-Usage:
+用法:
+rclone backend getdownloadurlua 115: "/path/to/file" "VidHub/1.7.24"
 
-    rclone backend addurls 115:dirpath url1 url2
-
-Downloads are saved to the folder "dirpath". If omitted or non-existent,
-it defaults to "云下载". Requires cookie authentication.
-This command always exits with code 0; check output for errors.`,
+该命令返回指定文件的下载URL。请确保文件路径正确。`,
 }, {
-	Name:  "getid",
-	Short: "Get the ID of a file or directory",
-	Long: `This command obtains the ID of a file or directory using the OpenAPI.
-
-Usage:
-
-    rclone backend getid 115:path/to/item
-
-Returns the internal ID used by the 115 API.`,
+	Name:  "cache-cleanup",
+	Short: "手动触发缓存清理",
+	Long: `手动触发115网盘缓存清理操作。
+用法:
+rclone backend cache-cleanup 115: --strategy=lru
+支持的清理策略: size, lru, priority_lru, time, clear
+该命令返回清理结果和统计信息。`,
 }, {
-	Name:  "addshare",
-	Short: "Add shared files/dirs from a share link (uses traditional API)",
-	Long: `This command adds shared files/dirs from a share link using the traditional API.
-
-Usage:
-
-    rclone backend addshare 115:dirpath share_link
-
-Content from the link is copied to "dirpath". Requires cookie authentication.`,
+	Name:  "cache-stats",
+	Short: "查看缓存统计信息",
+	Long: `获取115网盘缓存的详细统计信息。
+用法:
+rclone backend cache-stats 115:
+该命令返回所有缓存实例的统计数据，包括命中率、大小等。`,
 }, {
-	Name:  "stats",
-	Short: "Get folder statistics (uses OpenAPI)",
-	Long: `This command retrieves statistics for a folder using the OpenAPI.
-
-Usage:
-
-    rclone backend stats 115:path/to/folder
-
-Returns information like total size, file count, folder count, etc.`,
+	Name:  "cache-config",
+	Short: "查看当前缓存配置",
+	Long: `查看115网盘当前的缓存配置参数。
+用法:
+rclone backend cache-config 115:
+该命令返回当前的缓存配置和用户配置。`,
 }, {
-	Name:  "getdownloadurl",
-	Short: "Get the download URL of a file by its path",
-	Long: `This command retrieves the download URL of a file using its path.
-
-Usage:
-
-rclone backend getdownloadurl 115:path/to/file
-
-The command returns the download URL for the specified file. Ensure the file path is correct.`,
-}, {
-	Name:  "getdownloadurlau",
-	Short: "Get the download URL of a file by its path",
-	Long: `This command retrieves the download URL of a file using its path.
-
-Usage:
-
-rclone backend getdownloadurlau 115:path/to/file VidHub/1.7.24
-
-The command returns the download URL for the specified file. Ensure the file path is correct.`,
+	Name:  "cache-reset",
+	Short: "重置缓存配置为默认值",
+	Long: `将115网盘缓存配置重置为默认值。
+用法:
+rclone backend cache-reset 115:
+该命令会重置所有缓存配置参数。`,
 },
 }
 
@@ -3816,19 +3824,42 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 	switch name {
 
 	case "getdownloadurlua":
-		path := ""
-		ua := ""
-		if len(arg) > 0 {
+		// 🔧 修复：支持两种格式
+		// 格式1: rclone backend getdownloadurlua 115: "/path" "UA" (两个参数)
+		// 格式2: rclone backend getdownloadurlua "115:/path" "UA" (一个参数，路径在f.root中)
+
+		var path, ua string
+
+		if len(arg) >= 2 {
+			// 格式1：两个参数
+			path = arg[0]
+			ua = arg[1]
+		} else if len(arg) >= 1 {
+			// 格式2：一个参数，需要重构完整的文件路径
 			ua = arg[0]
+
+			// 检查是否是文件模式（当f.fileObj存在时）
+			if f.fileObj != nil {
+				// 文件模式：组合父目录路径和文件名
+				obj := *f.fileObj
+				fileName := obj.Remote()
+				if f.root == "" {
+					path = "/" + fileName
+				} else {
+					path = "/" + strings.Trim(f.root, "/") + "/" + fileName
+				}
+				fs.Debugf(f, "文件模式：组合完整路径: %s (父目录: %s, 文件名: %s)", path, f.root, fileName)
+			} else {
+				// 目录模式：使用f.root
+				path = f.root
+				fs.Debugf(f, "目录模式：使用root路径: %s", path)
+			}
+		} else {
+			return nil, fmt.Errorf("需要提供User-Agent参数")
 		}
 
 		return f.getDownloadURLByUA(ctx, path, ua)
-	case "clear-pickcode-cache":
-		// 新增：清理可能包含错误pickCode的缓存
-		return f.clearPickCodeCache(ctx)
-	case "fix-pickcode-cache":
-		// 新增：修复缓存中的pickCode错误
-		return f.fixPickCodeCache(ctx)
+
 	case "cache-info":
 		// 使用统一缓存查看器
 		caches := map[string]cache.PersistentCache{
@@ -3855,29 +3886,57 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 		default:
 			return viewer.GenerateDirectoryTreeText()
 		}
+
+	case "cache-cleanup":
+		// 🔧 新增：手动触发缓存清理
+		strategy := "size"
+		if strategyOpt, ok := opt["strategy"]; ok {
+			strategy = strategyOpt
+		}
+		return f.manualCacheCleanup115(ctx, strategy)
+
+	case "cache-stats":
+		// 🔧 新增：查看缓存统计信息
+		return f.getCacheStatistics115(ctx)
+
+	case "cache-config":
+		// 🔧 新增：查看当前缓存配置
+		return f.getCacheConfiguration115(ctx)
+
+	case "cache-reset":
+		// 🔧 新增：重置缓存配置为默认值
+		return f.resetCacheConfiguration115(ctx)
+
 	default:
 		return nil, fs.ErrorCommandNotFound
 	}
 }
 
 func (f *Fs) GetPickCodeByPath(ctx context.Context, path string) (string, error) {
-	// 使用CallOpenAPI通过pacer进行调用
-	formData := url.Values{}
-	formData.Add("path", path)
+	// 🔧 修复：根据官方API文档使用正确的参数类型和方法
+	fs.Debugf(f, "通过路径获取PickCode: %s", path)
 
+	// 根据API文档，可以使用GET方法，也可以使用POST方法
+	// 这里使用GET方法更简洁
 	opts := rest.Opts{
-		Method:      "POST",
-		Path:        "/open/folder/get_info",
-		ContentType: "application/x-www-form-urlencoded",
-		Body:        strings.NewReader(formData.Encode()),
+		Method: "GET",
+		Path:   "/open/folder/get_info",
+		Parameters: url.Values{
+			"path": {path},
+		},
 	}
 
 	var response struct {
-		State   int    `json:"state"`
+		State   bool   `json:"state"` // 🔧 修复：根据API文档，state是boolean类型
 		Code    int    `json:"code"`
 		Message string `json:"message"`
 		Data    struct {
-			PickCode string `json:"pick_code"`
+			PickCode     string `json:"pick_code"`
+			FileName     string `json:"file_name"`
+			FileID       string `json:"file_id"`
+			FileCategory string `json:"file_category"` // 1:文件, 0:文件夹
+			Size         string `json:"size"`
+			SizeByte     int64  `json:"size_byte"`
 		} `json:"data"`
 	}
 
@@ -3890,6 +3949,9 @@ func (f *Fs) GetPickCodeByPath(ctx context.Context, path string) (string, error)
 	if response.Code != 0 {
 		return "", fmt.Errorf("API返回错误: %s (Code: %d)", response.Message, response.Code)
 	}
+
+	fs.Debugf(f, "成功获取文件信息: %s -> PickCode: %s, 文件名: %s, 大小: %d字节",
+		path, response.Data.PickCode, response.Data.FileName, response.Data.SizeByte)
 
 	// 返回 PickCode
 	return response.Data.PickCode, nil
@@ -3949,6 +4011,21 @@ func (f *Fs) getPickCodeByFileID(ctx context.Context, fileID string) (string, er
 }
 
 func (f *Fs) getDownloadURLByUA(ctx context.Context, filePath string, UA string) (string, error) {
+	// 🔧 修复：添加与123后端一致的路径处理逻辑
+	if filePath == "" {
+		filePath = f.root
+	}
+
+	// 路径清理逻辑，参考123后端
+	if filePath == "/" {
+		return "", fmt.Errorf("根目录不是文件")
+	}
+	if len(filePath) > 1 && strings.HasSuffix(filePath, "/") {
+		filePath = filePath[:len(filePath)-1]
+	}
+
+	fs.Debugf(f, "处理文件路径: %s", filePath)
+
 	pickCode, err := f.GetPickCodeByPath(ctx, filePath)
 	if err != nil {
 		return "", fmt.Errorf("failed to read metadata for file path %q: %w", filePath, err)
@@ -3970,18 +4047,21 @@ func (f *Fs) getDownloadURLByUA(ctx context.Context, filePath string, UA string)
 		},
 	}
 
-	var response ApiResponse
+	var response OpenAPIDownloadResp
 	err = f.CallOpenAPI(ctx, &opts, nil, &response, false)
 	if err != nil {
 		return "", fmt.Errorf("获取下载URL失败: %w", err)
 	}
 
-	for fileID, fileInfo := range response.Data {
-		// 这里需要调用获取下载URL的API
-		// 暂时返回错误，因为这个逻辑需要重新实现
-		fs.Infof(nil, "找到文件ID: %s", fileID)
-		_ = fileInfo // 避免未使用变量错误
-		return "", fmt.Errorf("下载URL获取逻辑需要重新实现")
+	// 🔧 实现：使用正确的响应处理方法
+	downInfo, err := response.GetDownloadInfo()
+	if err != nil {
+		return "", fmt.Errorf("解析下载信息失败: %w", err)
+	}
+
+	if downInfo != nil && downInfo.URL.URL != "" {
+		fs.Infof(f, "成功获取下载URL: %s", downInfo.URL.URL)
+		return downInfo.URL.URL, nil
 	}
 	return "", fmt.Errorf("未从API响应中获取到下载URL")
 }
@@ -5238,8 +5318,9 @@ func (f *Fs) setupFileFromCache() (*Fs, error) {
 	var fsObj fs.Object = obj
 	f.fileObj = &fsObj
 
+	// 🔧 修复：对于backend命令，不返回ErrorIsFile，而是返回正常的Fs实例
 	fs.Debugf(f, " 缓存文件模式设置完成: %s", remote)
-	return f, fs.ErrorIsFile
+	return f, nil
 }
 
 // handleAsFile 将路径作为文件处理
@@ -5312,7 +5393,10 @@ func (f *Fs) handleAsFile(ctx context.Context) (*Fs, error) {
 		var fsObj fs.Object = obj
 		f.fileObj = &fsObj
 
-		return f, fs.ErrorIsFile
+		// 🔧 修复：对于backend命令，不返回ErrorIsFile，而是返回正常的Fs实例
+		// 这样可以让backend命令正常工作，同时保持文件对象的引用
+		fs.Debugf(f, "文件路径处理：创建文件模式Fs实例，文件: %s", obj.Remote())
+		return f, nil
 	} else {
 		fs.Debugf(f, " 文件验证失败，回退到目录模式: %v", err)
 		return f.handleAsDirectory(ctx)
@@ -9378,4 +9462,144 @@ func parseRootID(s string) (rootID, receiveCode string, err error) {
 
 	// If it doesn't match known patterns, return an error
 	return "", "", fmt.Errorf("invalid format in {}: %q", potentialID)
+}
+
+// manualCacheCleanup115 手动触发缓存清理
+// 🔧 新增：缓存管理命令接口
+func (f *Fs) manualCacheCleanup115(ctx context.Context, strategy string) (interface{}, error) {
+	fs.Infof(f, "开始手动缓存清理，策略: %s", strategy)
+
+	result := map[string]interface{}{
+		"backend":  "115",
+		"strategy": strategy,
+		"caches":   make(map[string]interface{}),
+	}
+
+	// 清理各个缓存实例
+	caches := map[string]cache.PersistentCache{
+		"path_resolve": f.pathResolveCache,
+		"dir_list":     f.dirListCache,
+		"metadata":     f.metadataCache,
+		"file_id":      f.fileIDCache,
+	}
+
+	for name, c := range caches {
+		if c != nil {
+			beforeStats := c.Stats()
+
+			// 根据策略执行清理
+			var err error
+			switch strategy {
+			case "size", "lru", "priority_lru", "time":
+				if badgerCache, ok := c.(*cache.BadgerCache); ok {
+					// 使用默认目标大小进行智能清理
+					targetSize := int64(f.cacheConfig.TargetCleanSize)
+					err = badgerCache.SmartCleanupWithStrategy(targetSize, strategy)
+				} else {
+					err = fmt.Errorf("缓存类型不支持智能清理")
+				}
+			case "clear":
+				err = c.Clear()
+			default:
+				err = fmt.Errorf("不支持的清理策略: %s", strategy)
+			}
+
+			afterStats := c.Stats()
+
+			result["caches"].(map[string]interface{})[name] = map[string]interface{}{
+				"success": err == nil,
+				"error": func() string {
+					if err != nil {
+						return err.Error()
+					}
+					return ""
+				}(),
+				"before_size": beforeStats["total_size"],
+				"after_size":  afterStats["total_size"],
+				"cleaned_mb":  float64(beforeStats["total_size"].(int64)-afterStats["total_size"].(int64)) / (1024 * 1024),
+			}
+
+			if err != nil {
+				fs.Errorf(f, "清理%s缓存失败: %v", name, err)
+			} else {
+				fs.Infof(f, "清理%s缓存成功", name)
+			}
+		}
+	}
+
+	fs.Infof(f, "手动缓存清理完成")
+	return result, nil
+}
+
+// getCacheStatistics115 获取缓存统计信息
+// 🔧 新增：缓存管理命令接口
+func (f *Fs) getCacheStatistics115(ctx context.Context) (interface{}, error) {
+	result := map[string]interface{}{
+		"backend": "115",
+		"caches":  make(map[string]interface{}),
+	}
+
+	// 获取各个缓存实例的统计
+	caches := map[string]cache.PersistentCache{
+		"path_resolve": f.pathResolveCache,
+		"dir_list":     f.dirListCache,
+		"metadata":     f.metadataCache,
+		"file_id":      f.fileIDCache,
+	}
+
+	for name, c := range caches {
+		if c != nil {
+			stats := c.Stats()
+			result["caches"].(map[string]interface{})[name] = stats
+		} else {
+			result["caches"].(map[string]interface{})[name] = map[string]interface{}{
+				"status": "not_initialized",
+			}
+		}
+	}
+
+	return result, nil
+}
+
+// getCacheConfiguration115 获取当前缓存配置
+// 🔧 新增：缓存管理命令接口
+func (f *Fs) getCacheConfiguration115(ctx context.Context) (interface{}, error) {
+	return map[string]interface{}{
+		"backend": "115",
+		"config": map[string]interface{}{
+			"max_cache_size":       f.cacheConfig.MaxCacheSize,
+			"target_clean_size":    f.cacheConfig.TargetCleanSize,
+			"mem_table_size":       f.cacheConfig.MemTableSize,
+			"enable_smart_cleanup": f.cacheConfig.EnableSmartCleanup,
+			"cleanup_strategy":     f.cacheConfig.CleanupStrategy,
+		},
+		"user_config": map[string]interface{}{
+			"cache_max_size":       f.opt.CacheMaxSize,
+			"cache_target_size":    f.opt.CacheTargetSize,
+			"enable_smart_cleanup": f.opt.EnableSmartCleanup,
+			"cleanup_strategy":     f.opt.CleanupStrategy,
+		},
+	}, nil
+}
+
+// resetCacheConfiguration115 重置缓存配置为默认值
+// 🔧 新增：缓存管理命令接口
+func (f *Fs) resetCacheConfiguration115(ctx context.Context) (interface{}, error) {
+	fs.Infof(f, "重置115缓存配置为默认值")
+
+	// 重置为默认配置
+	defaultConfig := common.DefaultUnifiedCacheConfig("115")
+	f.cacheConfig = defaultConfig
+
+	return map[string]interface{}{
+		"backend": "115",
+		"message": "缓存配置已重置为默认值",
+		"config": map[string]interface{}{
+			"max_cache_size":       f.cacheConfig.MaxCacheSize,
+			"target_clean_size":    f.cacheConfig.TargetCleanSize,
+			"mem_table_size":       f.cacheConfig.MemTableSize,
+			"enable_smart_cleanup": f.cacheConfig.EnableSmartCleanup,
+			"cleanup_strategy":     f.cacheConfig.CleanupStrategy,
+		},
+	}, nil
 }

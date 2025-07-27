@@ -21,6 +21,13 @@ type CloudDriveCacheConfig struct {
 
 	// 日志配置
 	LogContext fs.Fs // 日志上下文，用于输出日志
+
+	// 缓存优化配置 - 新增
+	MaxCacheSize       int64  // 最大缓存大小（字节）
+	TargetCleanSize    int64  // 清理目标大小（字节）
+	MemTableSize       int64  // BadgerDB内存表大小（字节）
+	EnableSmartCleanup bool   // 启用智能清理
+	CleanupStrategy    string // 清理策略
 }
 
 // InitCloudDriveCache 初始化云盘缓存系统
@@ -60,8 +67,26 @@ func InitCloudDriveCache(config *CloudDriveCacheConfig) error {
 			continue
 		}
 
-		// 创建BadgerCache实例
-		cache, err := NewBadgerCache(name, config.CacheDir)
+		// 创建BadgerCache实例 - 支持用户配置
+		var cache *BadgerCache
+		var err error
+
+		// 检查是否有缓存优化配置
+		if config.MaxCacheSize > 0 || config.EnableSmartCleanup || config.CleanupStrategy != "" {
+			// 使用配置创建缓存
+			cacheConfig := &BadgerCacheConfig{
+				MaxSize:            config.MaxCacheSize,
+				TargetSize:         config.TargetCleanSize,
+				MemTableSize:       config.MemTableSize,
+				EnableSmartCleanup: config.EnableSmartCleanup,
+				CleanupStrategy:    config.CleanupStrategy,
+			}
+			cache, err = NewBadgerCacheWithConfig(name, config.CacheDir, cacheConfig)
+		} else {
+			// 使用默认配置
+			cache, err = NewBadgerCache(name, config.CacheDir)
+		}
+
 		if err != nil {
 			if config.LogContext != nil {
 				fs.Errorf(config.LogContext, "初始化%s缓存失败: %v", name, err)

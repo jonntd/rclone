@@ -26,7 +26,8 @@ type UnifiedCacheInitializer struct {
 
 // InitializeCloudDriveCache 统一的云盘缓存初始化函数
 // 替代原来的重复初始化逻辑，支持123网盘和115网盘
-func InitializeCloudDriveCache(backendType string, logContext fs.Fs, instances map[string]**cache.BadgerCache) error {
+// 🔧 新增：支持缓存优化配置参数
+func InitializeCloudDriveCache(backendType string, logContext fs.Fs, instances map[string]**cache.BadgerCache, config *UnifiedCacheConfig) error {
 	if backendType == "" {
 		return fmt.Errorf("后端类型不能为空")
 	}
@@ -43,13 +44,19 @@ func InitializeCloudDriveCache(backendType string, logContext fs.Fs, instances m
 		fs.Debugf(logContext, "开始初始化%s缓存系统: %s", backendType, cacheDir)
 	}
 
-	// 使用现有的公共缓存初始化函数
+	// 使用现有的公共缓存初始化函数 - 支持用户配置
 	cacheConfig := &cache.CloudDriveCacheConfig{
 		CacheType:       backendType + "drive",
 		CacheDir:        cacheDir,
 		CacheInstances:  instances,
 		ContinueOnError: true, // 缓存失败不阻止文件系统工作
 		LogContext:      logContext,
+		// 应用用户配置参数
+		MaxCacheSize:       int64(config.MaxCacheSize),
+		TargetCleanSize:    int64(config.TargetCleanSize),
+		MemTableSize:       int64(config.MemTableSize),
+		EnableSmartCleanup: config.EnableSmartCleanup,
+		CleanupStrategy:    config.CleanupStrategy,
 	}
 
 	err := cache.InitCloudDriveCache(cacheConfig)
@@ -69,19 +76,21 @@ func InitializeCloudDriveCache(backendType string, logContext fs.Fs, instances m
 
 // Initialize123Cache 初始化123网盘缓存
 // 专门为123网盘设计的缓存初始化函数
-func Initialize123Cache(logContext fs.Fs, parentIDCache, dirListCache, pathToIDCache **cache.BadgerCache) error {
+// 🔧 新增：支持缓存优化配置参数
+func Initialize123Cache(logContext fs.Fs, parentIDCache, dirListCache, pathToIDCache **cache.BadgerCache, config *UnifiedCacheConfig) error {
 	instances := map[string]**cache.BadgerCache{
 		"parent_ids": parentIDCache,
 		"dir_list":   dirListCache,
 		"path_to_id": pathToIDCache,
 	}
 
-	return InitializeCloudDriveCache("123", logContext, instances)
+	return InitializeCloudDriveCache("123", logContext, instances, config)
 }
 
 // Initialize115Cache 初始化115网盘缓存
 // 专门为115网盘设计的缓存初始化函数
-func Initialize115Cache(logContext fs.Fs, pathResolveCache, dirListCache, metadataCache, fileIDCache **cache.BadgerCache) error {
+// 🔧 新增：支持缓存优化配置参数
+func Initialize115Cache(logContext fs.Fs, pathResolveCache, dirListCache, metadataCache, fileIDCache **cache.BadgerCache, config *UnifiedCacheConfig) error {
 	instances := map[string]**cache.BadgerCache{
 		"path_resolve": pathResolveCache,
 		"dir_list":     dirListCache,
@@ -89,7 +98,7 @@ func Initialize115Cache(logContext fs.Fs, pathResolveCache, dirListCache, metada
 		"file_id":      fileIDCache,
 	}
 
-	return InitializeCloudDriveCache("115", logContext, instances)
+	return InitializeCloudDriveCache("115", logContext, instances, config)
 }
 
 // ValidateCacheInstances 验证缓存实例配置的有效性

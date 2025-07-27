@@ -164,6 +164,12 @@ type Options struct {
 
 	// 编码配置
 	Enc encoder.MultiEncoder `config:"encoding"` // 文件名编码设置
+
+	// 缓存优化配置 - 新增
+	CacheMaxSize       fs.SizeSuffix `config:"cache_max_size"`       // 最大缓存大小
+	CacheTargetSize    fs.SizeSuffix `config:"cache_target_size"`    // 清理目标大小
+	EnableSmartCleanup bool          `config:"enable_smart_cleanup"` // 启用智能清理
+	CleanupStrategy    string        `config:"cleanup_strategy"`     // 清理策略
 }
 
 // Fs 表示远程123网盘驱动器实例
@@ -1414,6 +1420,26 @@ func init() {
 				encoder.EncodeRightSpace |
 				encoder.EncodeSlash | // 新增：默认编码斜杠
 				encoder.EncodeInvalidUtf8), // 新增：编码无效UTF-8字符
+		}, {
+			Name:     "cache_max_size",
+			Help:     "缓存清理触发前的最大缓存大小。设置为0禁用基于大小的清理。",
+			Default:  fs.SizeSuffix(100 << 20), // 100MB
+			Advanced: true,
+		}, {
+			Name:     "cache_target_size",
+			Help:     "清理后的目标缓存大小。应小于cache_max_size。",
+			Default:  fs.SizeSuffix(64 << 20), // 64MB
+			Advanced: true,
+		}, {
+			Name:     "enable_smart_cleanup",
+			Help:     "启用基于LRU策略的智能缓存清理，而不是简单的基于大小的清理。",
+			Default:  false,
+			Advanced: true,
+		}, {
+			Name:     "cleanup_strategy",
+			Help:     "缓存清理策略：'size'（基于大小）、'lru'（最近最少使用）、'priority_lru'（优先级+LRU）、'time'（基于时间）。",
+			Default:  "size",
+			Advanced: true,
 		}},
 	})
 }
@@ -1425,6 +1451,35 @@ var commandHelp = []fs.CommandHelp{{
 用法:
 rclone backend getdownloadurlau 123:path/to/file VidHub/1.7.24
 该命令返回指定文件的下载URL。请确保文件路径正确。`,
+}, {
+	Name:  "cache-cleanup",
+	Short: "手动触发缓存清理",
+	Long: `手动触发123网盘缓存清理操作。
+用法:
+rclone backend cache-cleanup 123: --strategy=lru
+支持的清理策略: size, lru, priority_lru, time, clear
+该命令返回清理结果和统计信息。`,
+}, {
+	Name:  "cache-stats",
+	Short: "查看缓存统计信息",
+	Long: `获取123网盘缓存的详细统计信息。
+用法:
+rclone backend cache-stats 123:
+该命令返回所有缓存实例的统计数据，包括命中率、大小等。`,
+}, {
+	Name:  "cache-config",
+	Short: "查看当前缓存配置",
+	Long: `查看123网盘当前的缓存配置参数。
+用法:
+rclone backend cache-config 123:
+该命令返回当前的缓存配置和用户配置。`,
+}, {
+	Name:  "cache-reset",
+	Short: "重置缓存配置为默认值",
+	Long: `将123网盘缓存配置重置为默认值。
+用法:
+rclone backend cache-reset 123:
+该命令会重置所有缓存配置参数。`,
 },
 }
 
@@ -1433,11 +1488,33 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 	switch name {
 
 	case "getdownloadurlua":
-		if len(arg) < 2 {
-			return nil, fmt.Errorf("需要提供文件路径和User-Agent参数")
+		// 🔧 修复：支持两种格式
+		// 格式1: rclone backend getdownloadurlua 123: "/path" "UA" (两个参数)
+		// 格式2: rclone backend getdownloadurlua "123:/path" "UA" (一个参数，路径在f.root中)
+
+		var path, ua string
+
+		if len(arg) >= 2 {
+			// 格式1：两个参数
+			path = arg[0]
+			ua = arg[1]
+		} else if len(arg) >= 1 {
+			// 格式2：一个参数，需要重构完整的文件路径
+			ua = arg[0]
+
+			// 在文件模式下，需要组合父目录路径和文件名
+			// 123后端在handleRootDirectory中会分割路径，f.root是父目录
+			// 需要从原始路径重构完整路径
+			if f.root == "" {
+				path = "/"
+			} else {
+				path = "/" + strings.Trim(f.root, "/")
+			}
+			fs.Debugf(f, "123后端文件模式：使用路径: %s", path)
+		} else {
+			return nil, fmt.Errorf("需要提供User-Agent参数")
 		}
-		path := arg[0]
-		ua := arg[1]
+
 		return f.getDownloadURLByUA(ctx, path, ua)
 
 	case "cache-info":
@@ -1465,6 +1542,26 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 		default:
 			return viewer.GenerateDirectoryTreeText()
 		}
+
+	case "cache-cleanup":
+		// 🔧 新增：手动触发缓存清理
+		strategy := "size"
+		if strategyOpt, ok := opt["strategy"]; ok {
+			strategy = strategyOpt
+		}
+		return f.manualCacheCleanup(ctx, strategy)
+
+	case "cache-stats":
+		// 🔧 新增：查看缓存统计信息
+		return f.getCacheStatistics(ctx)
+
+	case "cache-config":
+		// 🔧 新增：查看当前缓存配置
+		return f.getCacheConfiguration(ctx)
+
+	case "cache-reset":
+		// 🔧 新增：重置缓存配置为默认值
+		return f.resetCacheConfiguration(ctx)
 
 	default:
 		return nil, fs.ErrorCommandNotFound
@@ -6270,8 +6367,14 @@ func initializeCaches(f *Fs) error {
 	// 初始化缓存配置 - 使用统一配置
 	f.cacheConfig = common.DefaultUnifiedCacheConfig("123")
 
-	// 使用统一的缓存初始化器
-	return common.Initialize123Cache(f, &f.parentIDCache, &f.dirListCache, &f.pathToIDCache)
+	// 应用用户配置到缓存配置
+	f.cacheConfig.MaxCacheSize = f.opt.CacheMaxSize
+	f.cacheConfig.TargetCleanSize = f.opt.CacheTargetSize
+	f.cacheConfig.EnableSmartCleanup = f.opt.EnableSmartCleanup
+	f.cacheConfig.CleanupStrategy = f.opt.CleanupStrategy
+
+	// 使用统一的缓存初始化器 - 传递配置参数
+	return common.Initialize123Cache(f, &f.parentIDCache, &f.dirListCache, &f.pathToIDCache, &f.cacheConfig)
 }
 
 // initializeUnifiedComponents 初始化统一组件
@@ -6440,8 +6543,10 @@ func handleRootDirectory(ctx context.Context, f *Fs, root string) (fs.Fs, error)
 			// unable to list folder so return old f
 			return f, nil
 		}
-		// return an error with an fs which points to the parent
-		return tempF, fs.ErrorIsFile
+		// 🔧 修复：对于backend命令，不返回ErrorIsFile，而是返回正常的Fs实例
+		// 这样可以让backend命令正常工作，同时保持文件对象的引用
+		fs.Debugf(tempF, "文件路径处理：创建文件模式Fs实例，文件: %s", remote)
+		return tempF, nil
 	}
 
 	return f, nil
@@ -12005,4 +12110,142 @@ func (a *Pan123DownloadAdapter) GetConfig() common.DownloadConfig {
 		DefaultChunkSize: 50 * 1024 * 1024, // 优化：提升到50MB分片，减少API调用次数
 		TimeoutPerChunk:  60 * time.Second, // 优化：延长到60秒，适应大分片下载
 	}
+}
+
+// manualCacheCleanup 手动触发缓存清理
+// 🔧 新增：缓存管理命令接口
+func (f *Fs) manualCacheCleanup(ctx context.Context, strategy string) (interface{}, error) {
+	fs.Infof(f, "开始手动缓存清理，策略: %s", strategy)
+
+	result := map[string]interface{}{
+		"backend":  "123",
+		"strategy": strategy,
+		"caches":   make(map[string]interface{}),
+	}
+
+	// 清理各个缓存实例
+	caches := map[string]cache.PersistentCache{
+		"parent_ids": f.parentIDCache,
+		"dir_list":   f.dirListCache,
+		"path_to_id": f.pathToIDCache,
+	}
+
+	for name, c := range caches {
+		if c != nil {
+			beforeStats := c.Stats()
+
+			// 根据策略执行清理
+			var err error
+			switch strategy {
+			case "size", "lru", "priority_lru", "time":
+				if badgerCache, ok := c.(*cache.BadgerCache); ok {
+					// 使用默认目标大小进行智能清理
+					targetSize := int64(f.cacheConfig.TargetCleanSize)
+					err = badgerCache.SmartCleanupWithStrategy(targetSize, strategy)
+				} else {
+					err = fmt.Errorf("缓存类型不支持智能清理")
+				}
+			case "clear":
+				err = c.Clear()
+			default:
+				err = fmt.Errorf("不支持的清理策略: %s", strategy)
+			}
+
+			afterStats := c.Stats()
+
+			result["caches"].(map[string]interface{})[name] = map[string]interface{}{
+				"success": err == nil,
+				"error": func() string {
+					if err != nil {
+						return err.Error()
+					}
+					return ""
+				}(),
+				"before_size": beforeStats["total_size"],
+				"after_size":  afterStats["total_size"],
+				"cleaned_mb":  float64(beforeStats["total_size"].(int64)-afterStats["total_size"].(int64)) / (1024 * 1024),
+			}
+
+			if err != nil {
+				fs.Errorf(f, "清理%s缓存失败: %v", name, err)
+			} else {
+				fs.Infof(f, "清理%s缓存成功", name)
+			}
+		}
+	}
+
+	fs.Infof(f, "手动缓存清理完成")
+	return result, nil
+}
+
+// getCacheStatistics 获取缓存统计信息
+// 🔧 新增：缓存管理命令接口
+func (f *Fs) getCacheStatistics(ctx context.Context) (interface{}, error) {
+	result := map[string]interface{}{
+		"backend": "123",
+		"caches":  make(map[string]interface{}),
+	}
+
+	// 获取各个缓存实例的统计
+	caches := map[string]cache.PersistentCache{
+		"parent_ids": f.parentIDCache,
+		"dir_list":   f.dirListCache,
+		"path_to_id": f.pathToIDCache,
+	}
+
+	for name, c := range caches {
+		if c != nil {
+			stats := c.Stats()
+			result["caches"].(map[string]interface{})[name] = stats
+		} else {
+			result["caches"].(map[string]interface{})[name] = map[string]interface{}{
+				"status": "not_initialized",
+			}
+		}
+	}
+
+	return result, nil
+}
+
+// getCacheConfiguration 获取当前缓存配置
+// 🔧 新增：缓存管理命令接口
+func (f *Fs) getCacheConfiguration(ctx context.Context) (interface{}, error) {
+	return map[string]interface{}{
+		"backend": "123",
+		"config": map[string]interface{}{
+			"max_cache_size":       f.cacheConfig.MaxCacheSize,
+			"target_clean_size":    f.cacheConfig.TargetCleanSize,
+			"mem_table_size":       f.cacheConfig.MemTableSize,
+			"enable_smart_cleanup": f.cacheConfig.EnableSmartCleanup,
+			"cleanup_strategy":     f.cacheConfig.CleanupStrategy,
+		},
+		"user_config": map[string]interface{}{
+			"cache_max_size":       f.opt.CacheMaxSize,
+			"cache_target_size":    f.opt.CacheTargetSize,
+			"enable_smart_cleanup": f.opt.EnableSmartCleanup,
+			"cleanup_strategy":     f.opt.CleanupStrategy,
+		},
+	}, nil
+}
+
+// resetCacheConfiguration 重置缓存配置为默认值
+// 🔧 新增：缓存管理命令接口
+func (f *Fs) resetCacheConfiguration(ctx context.Context) (interface{}, error) {
+	fs.Infof(f, "重置123缓存配置为默认值")
+
+	// 重置为默认配置
+	defaultConfig := common.DefaultUnifiedCacheConfig("123")
+	f.cacheConfig = defaultConfig
+
+	return map[string]interface{}{
+		"backend": "123",
+		"message": "缓存配置已重置为默认值",
+		"config": map[string]interface{}{
+			"max_cache_size":       f.cacheConfig.MaxCacheSize,
+			"target_clean_size":    f.cacheConfig.TargetCleanSize,
+			"mem_table_size":       f.cacheConfig.MemTableSize,
+			"enable_smart_cleanup": f.cacheConfig.EnableSmartCleanup,
+			"cleanup_strategy":     f.cacheConfig.CleanupStrategy,
+		},
+	}, nil
 }
