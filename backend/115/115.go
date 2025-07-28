@@ -9580,6 +9580,26 @@ func (f *Fs) manualCacheCleanup115(ctx context.Context, strategy string) (interf
 				}
 			case "clear":
 				err = c.Clear()
+				// 添加额外的验证步骤，确保缓存确实被清除了
+				if err == nil {
+					// 验证清理是否成功
+					keys, listErr := c.ListAllKeys()
+					if listErr != nil {
+						fs.Debugf(f, "无法验证清理操作: %v", listErr)
+					} else if len(keys) > 0 {
+						// 如果还有键存在，记录前几个键用于调试
+						fs.Debugf(f, "清除后缓存中仍有%d个键", len(keys))
+						maxKeys := len(keys)
+						if maxKeys > 5 {
+							maxKeys = 5
+						}
+						fs.Debugf(f, "前%d个键: %v", maxKeys, keys[:maxKeys])
+						// 认为清理不完全，返回错误
+						err = fmt.Errorf("清理后仍有%d个键未被清除", len(keys))
+					} else {
+						fs.Debugf(f, "验证成功：缓存已完全清除")
+					}
+				}
 			default:
 				err = fmt.Errorf("不支持的清理策略: %s", strategy)
 			}

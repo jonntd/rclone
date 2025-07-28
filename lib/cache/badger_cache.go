@@ -455,9 +455,64 @@ func (c *BadgerCache) DeletePrefix(prefix string) error {
 func (c *BadgerCache) Clear() error {
 	// 如果数据库被禁用，静默忽略
 	if c.db == nil {
+		fs.Debugf(nil, "数据库被禁用，跳过清除操作")
 		return nil
 	}
-	return c.db.DropAll()
+
+	// 记录清除前的状态
+	lsm, vlog := c.db.Size()
+	fs.Debugf(nil, "清除前数据库大小: LSM=%d, VLog=%d, Total=%d", lsm, vlog, lsm+vlog)
+
+	// 执行清除操作
+	if err := c.db.DropAll(); err != nil {
+		fs.Errorf(nil, "清除数据库失败: %v", err)
+		return err
+	}
+
+	// 记录清除后的状态
+	lsm, vlog = c.db.Size()
+	fs.Debugf(nil, "清除后数据库大小: LSM=%d, VLog=%d, Total=%d", lsm, vlog, lsm+vlog)
+
+	// 验证清除操作是否成功
+	if lsm+vlog > 0 {
+		// 尝试列出所有键以进一步验证
+		keys, err := c.ListAllKeys()
+		if err != nil {
+			fs.Debugf(nil, "无法验证清除操作: %v", err)
+		} else {
+			fs.Debugf(nil, "清除后缓存中仍有%d个键", len(keys))
+			// 如果还有键存在，记录前几个键用于调试
+			if len(keys) > 0 {
+				maxKeys := len(keys)
+				if maxKeys > 5 {
+					maxKeys = 5
+				}
+				fs.Debugf(nil, "前%d个键: %v", maxKeys, keys[:maxKeys])
+				// 返回错误，表示清除不完全
+				return fmt.Errorf("清除后仍有%d个键未被删除", len(keys))
+			}
+		}
+	} else {
+		// 进一步验证：尝试列出所有键确认数据库为空
+		keys, err := c.ListAllKeys()
+		if err != nil {
+			fs.Debugf(nil, "无法验证清除操作: %v", err)
+		} else if len(keys) > 0 {
+			// 即使大小显示为0，但仍有一些键存在
+			fs.Debugf(nil, "警告：数据库大小显示为0，但仍检测到%d个键", len(keys))
+			maxKeys := len(keys)
+			if maxKeys > 5 {
+				maxKeys = 5
+			}
+			fs.Debugf(nil, "前%d个键: %v", maxKeys, keys[:maxKeys])
+			// 返回错误，表示清除不完全
+			return fmt.Errorf("清除后仍有%d个键未被删除（数据库大小显示为0）", len(keys))
+		} else {
+			fs.Debugf(nil, "验证成功：数据库已完全清除")
+		}
+	}
+
+	return nil
 }
 
 // Stats 获取缓存统计信息
