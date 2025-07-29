@@ -3816,6 +3816,64 @@ rclone backend cache-config 115:
 用法:
 rclone backend cache-reset 115:
 该命令会重置所有缓存配置参数。`,
+}, {
+	Name:  "media-sync",
+	Short: "同步媒体库并创建优化的.strm文件",
+	Long: `将115网盘中的视频文件同步到本地目录，创建对应的.strm文件。
+.strm文件将包含优化的pick_code格式，支持直接播放和媒体库管理。
+
+用法示例:
+rclone backend media-sync 115:Movies /local/media/movies
+rclone backend media-sync 115:Videos /local/media/videos -o min-size=200M -o strm-format=true
+
+支持的视频格式: mp4, mkv, avi, mov, wmv, flv, webm, m4v, 3gp, ts, m2ts
+.strm文件内容格式: 115://pick_code (可通过strm-format选项调整)`,
+	Opts: map[string]string{
+		"min-size":    "最小文件大小过滤，小于此大小的文件将被忽略 (默认: 100M)",
+		"strm-format": ".strm文件内容格式: true(优化格式)/false(路径格式) (默认: true，兼容: fileid/pickcode/path)",
+		"include":     "包含的文件扩展名，逗号分隔 (默认: mp4,mkv,avi,mov,wmv,flv,webm,m4v,3gp,ts,m2ts)",
+		"exclude":     "排除的文件扩展名，逗号分隔",
+		"update-mode": "更新模式: full/incremental (默认: full)",
+		"dry-run":     "预览模式，显示将要创建的文件但不实际创建 (true/false)",
+		"target-path": "目标路径，如果不在参数中指定则必须通过此选项提供",
+	},
+}, {
+	Name:  "get-download-url",
+	Short: "通过pick_code或.strm内容获取下载URL",
+	Long: `通过115网盘的pick_code或.strm文件内容获取实际的下载URL。
+支持多种输入格式，特别适用于媒体服务器和.strm文件处理。
+返回格式与getdownloadurlua保持一致。
+
+用法示例:
+rclone backend get-download-url 115: "115://eybr9y4jowdenzff0"
+rclone backend get-download-url 115: "eybr9y4jowdenzff0"
+rclone backend get-download-url 115: "/path/to/file.mp4"
+
+输入格式支持:
+- 115://pick_code 格式 (来自.strm文件)
+- 纯pick_code
+- 文件路径 (自动解析为pick_code)`,
+}, {
+	Name:  "media-sync",
+	Short: "同步媒体库并创建优化的.strm文件",
+	Long: `将115网盘中的视频文件同步到本地目录，创建对应的.strm文件。
+.strm文件将包含优化的pick_code格式，支持直接播放和媒体库管理。
+
+用法示例:
+rclone backend media-sync 115:Movies /local/media/movies
+rclone backend media-sync 115:Videos /local/media/videos -o min-size=200M -o strm-format=pickcode
+
+支持的视频格式: mp4, mkv, avi, mov, wmv, flv, webm, m4v, 3gp, ts, m2ts
+.strm文件内容格式: 115://pick_code (可通过strm-format选项调整)`,
+	Opts: map[string]string{
+		"min-size":    "最小文件大小过滤，小于此大小的文件将被忽略 (默认: 100M)",
+		"strm-format": ".strm文件内容格式: pickcode/path (默认: pickcode)",
+		"include":     "包含的文件扩展名，逗号分隔 (默认: mp4,mkv,avi,mov,wmv,flv,webm,m4v,3gp,ts,m2ts)",
+		"exclude":     "排除的文件扩展名，逗号分隔",
+		"update-mode": "更新模式: full/incremental (默认: full)",
+		"dry-run":     "预览模式，显示将要创建的文件但不实际创建 (true/false)",
+		"target-path": "目标路径，如果不在参数中指定则必须通过此选项提供",
+	},
 },
 }
 
@@ -3906,6 +3964,14 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 	case "cache-reset":
 		// 🔧 新增：重置缓存配置为默认值
 		return f.resetCacheConfiguration115(ctx)
+
+	case "media-sync":
+		// 🎬 新增：媒体库同步功能
+		return f.mediaSyncCommand(ctx, arg, opt)
+
+	case "get-download-url":
+		// 🔗 新增：通过pick_code获取下载URL
+		return f.getDownloadURLCommand(ctx, arg, opt)
 
 	default:
 		return nil, fs.ErrorCommandNotFound
@@ -4032,61 +4098,10 @@ func (f *Fs) getDownloadURLByUA(ctx context.Context, filePath string, UA string)
 		return "", fmt.Errorf("failed to read metadata for file path %q: %w", filePath, err)
 	}
 
-	// 如果没有提供 UA，使用默认值
-	if UA == "" {
-		UA = defaultUserAgent
-	}
+	fs.Debugf(f, "🔄 通过路径获取pick_code成功: %s -> %s", filePath, pickCode)
 
-	// 🔧 使用主人提供的原始HTTP代码实现
-	client := &http.Client{}
-	req, err := http.NewRequest("POST", openAPIRootURL+"/open/ufile/downurl", strings.NewReader("pick_code="+pickCode))
-
-	if err != nil {
-		fs.Errorf(nil, "创建请求失败: %v", err)
-		return "", err
-	}
-
-	opts := rest.Opts{}
-	f.prepareTokenForRequest(ctx, &opts)
-
-	// 设置请求头
-	req.Header.Set("Authorization", opts.ExtraHeaders["Authorization"])
-	req.Header.Set("User-Agent", UA)
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	fs.Infof(nil, "Authorization: %s, User-Agent: %s", opts.ExtraHeaders["Authorization"], UA)
-
-	// 发送请求并处理响应
-	res, err := client.Do(req)
-	if err != nil {
-		fs.Logf(nil, "请求失败: %v", err)
-		return "", err
-	}
-	defer res.Body.Close()
-
-	// 解析响应 - 使用你原始代码中的响应结构
-	var response struct {
-		State   bool   `json:"state"`
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-		Data    map[string]struct {
-			URL struct {
-				URL string `json:"url"`
-			} `json:"url"`
-		} `json:"data"`
-	}
-
-	if decodeErr := json.NewDecoder(res.Body).Decode(&response); decodeErr != nil {
-		fs.Logf(nil, "解析响应失败: %v", decodeErr)
-		return "", decodeErr
-	}
-
-	for _, downInfo := range response.Data {
-		if downInfo.URL.URL != "" {
-			fs.Infof(nil, "获取到下载URL: %s", downInfo.URL.URL)
-			return downInfo.URL.URL, nil
-		}
-	}
-	return "", fmt.Errorf("未找到下载URL")
+	// 使用通用的原始HTTP实现
+	return f.getDownloadURLByPickCodeHTTP(ctx, pickCode, UA)
 }
 
 // getPickCodeByPathDirect 直接HTTP调用获取PickCode，避免rclone框架开销
@@ -6084,10 +6099,6 @@ func (f *Fs) getDownloadURL(ctx context.Context, pickCode string) (durl *Downloa
 
 // getDownloadURLWithForce gets a download URL using OpenAPI with optional cache bypass.
 func (f *Fs) getDownloadURLWithForce(ctx context.Context, pickCode string, forceRefresh bool) (durl *DownloadURL, err error) {
-	if f.isShare {
-		// Should call getDownloadURLFromShare for shared links
-		return nil, errors.New("use getDownloadURLFromShare for shared filesystems")
-	}
 
 	// 根本性修复：在函数入口就验证和修正pickCode
 	originalPickCode := pickCode
@@ -9702,4 +9713,129 @@ func (f *Fs) resetCacheConfiguration115(ctx context.Context) (interface{}, error
 			"cleanup_strategy":     f.cacheConfig.CleanupStrategy,
 		},
 	}, nil
+}
+
+// getDownloadURLCommand 通过pick_code或.strm内容获取下载URL
+func (f *Fs) getDownloadURLCommand(ctx context.Context, args []string, opt map[string]string) (interface{}, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("需要提供pick_code、115://pick_code格式或文件路径")
+	}
+
+	input := args[0]
+	fs.Debugf(f, "🔗 处理下载URL请求: %s", input)
+
+	// 解析输入格式
+	if strings.HasPrefix(input, "/") {
+		// 文件路径格式，使用 getDownloadURLByUA 方法（支持302重定向）
+		fs.Debugf(f, "✅ 使用文件路径，采用UA方式: %s", input)
+
+		userAgent := opt["user-agent"]
+		if userAgent == "" {
+			userAgent = defaultUserAgent
+		}
+
+		fs.Debugf(f, "🌐 使用UA方式获取下载URL: 路径=%s, UA=%s", input, userAgent)
+		downloadURL, err := f.getDownloadURLByUA(ctx, input, userAgent)
+		if err != nil {
+			return nil, fmt.Errorf("UA方式获取下载URL失败: %w", err)
+		}
+
+		fs.Infof(f, "✅ 成功获取115网盘可播放URL: 路径=%s", input)
+		return downloadURL, nil
+	}
+
+	// pick_code 格式，使用原始HTTP实现
+	var pickCode string
+	if strings.HasPrefix(input, "115://") {
+		// 115://pick_code 格式 (来自.strm文件)
+		pickCode = strings.TrimPrefix(input, "115://")
+		fs.Debugf(f, "✅ 解析.strm格式: pick_code=%s", pickCode)
+	} else {
+		// 假设是纯pick_code
+		pickCode = input
+		fs.Debugf(f, "✅ 使用纯pick_code: %s", pickCode)
+	}
+
+	// 验证pick_code格式
+	if pickCode == "" {
+		return nil, fmt.Errorf("无效的pick_code: %s", input)
+	}
+
+	// 使用原始HTTP实现获取下载URL
+	fs.Debugf(f, "🌐 使用原始HTTP方式获取下载URL: pick_code=%s", pickCode)
+	downloadURL, err := f.getDownloadURLByHTTP(ctx, pickCode, opt["user-agent"])
+	if err != nil {
+		return nil, fmt.Errorf("获取下载URL失败: %w", err)
+	}
+
+	fs.Infof(f, "✅ 成功获取115网盘下载URL: pick_code=%s", pickCode)
+
+	// 返回下载URL字符串（与getdownloadurlua保持一致）
+	return downloadURL, nil
+}
+
+// getDownloadURLByPickCodeHTTP 使用原始HTTP实现通过pick_code获取下载URL
+func (f *Fs) getDownloadURLByPickCodeHTTP(ctx context.Context, pickCode string, userAgent string) (string, error) {
+	// 如果没有提供 UA，使用默认值
+	if userAgent == "" {
+		userAgent = defaultUserAgent
+	}
+
+	fs.Debugf(f, "🌐 使用原始HTTP方式获取下载URL: pick_code=%s, UA=%s", pickCode, userAgent)
+
+	// 🔧 使用原始HTTP代码实现
+	client := &http.Client{}
+	req, err := http.NewRequest("POST", openAPIRootURL+"/open/ufile/downurl", strings.NewReader("pick_code="+pickCode))
+
+	if err != nil {
+		fs.Errorf(f, "创建请求失败: %v", err)
+		return "", err
+	}
+
+	opts := rest.Opts{}
+	f.prepareTokenForRequest(ctx, &opts)
+
+	// 设置请求头
+	req.Header.Set("Authorization", opts.ExtraHeaders["Authorization"])
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	fs.Debugf(f, "🔧 HTTP请求头: Authorization=%s, User-Agent=%s", opts.ExtraHeaders["Authorization"], userAgent)
+
+	// 发送请求并处理响应
+	res, err := client.Do(req)
+	if err != nil {
+		fs.Errorf(f, "请求失败: %v", err)
+		return "", err
+	}
+	defer res.Body.Close()
+
+	// 解析响应 - 使用原始代码中的响应结构
+	var response struct {
+		State   bool   `json:"state"`
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    map[string]struct {
+			URL struct {
+				URL string `json:"url"`
+			} `json:"url"`
+		} `json:"data"`
+	}
+
+	if decodeErr := json.NewDecoder(res.Body).Decode(&response); decodeErr != nil {
+		fs.Errorf(f, "解析响应失败: %v", decodeErr)
+		return "", decodeErr
+	}
+
+	for _, downInfo := range response.Data {
+		if downInfo.URL.URL != "" {
+			fs.Debugf(f, "✅ 获取到下载URL: %s", downInfo.URL.URL)
+			return downInfo.URL.URL, nil
+		}
+	}
+	return "", fmt.Errorf("未找到下载URL")
+}
+
+// getDownloadURLByHTTP 使用原始HTTP实现获取下载URL（兼容性函数）
+func (f *Fs) getDownloadURLByHTTP(ctx context.Context, pickCode string, userAgent string) (string, error) {
+	return f.getDownloadURLByPickCodeHTTP(ctx, pickCode, userAgent)
 }
