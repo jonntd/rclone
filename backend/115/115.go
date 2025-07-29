@@ -3834,6 +3834,7 @@ rclone backend media-sync 115:Videos /local/media/videos -o min-size=200M -o str
 		"include":     "包含的文件扩展名，逗号分隔 (默认: mp4,mkv,avi,mov,wmv,flv,webm,m4v,3gp,ts,m2ts)",
 		"exclude":     "排除的文件扩展名，逗号分隔",
 		"update-mode": "更新模式: full/incremental (默认: full)",
+		"sync-delete": "同步删除: false(仅创建.strm文件)/true(删除孤立文件和空目录) (默认: true，类似rclone sync)",
 		"dry-run":     "预览模式，显示将要创建的文件但不实际创建 (true/false)",
 		"target-path": "目标路径，如果不在参数中指定则必须通过此选项提供",
 	},
@@ -5223,82 +5224,6 @@ func (f *Fs) getDirListFromCache(parentID, lastID string) (*DirListCacheEntry115
 
 	fs.Debugf(f, "从缓存获取目录列表成功: parentID=%s, 文件数=%d", parentID, len(entry.FileList))
 	return &entry, true
-}
-
-// clearPickCodeCache 清理可能包含错误pickCode的缓存
-func (f *Fs) clearPickCodeCache(_ context.Context) (any, error) {
-	fs.Infof(f, "🔧 开始清理可能包含错误pickCode的缓存...")
-
-	cleared := 0
-
-	// 清理目录列表缓存（可能包含错误的pickCode）
-	if f.dirListCache != nil {
-		err := f.dirListCache.Clear()
-		if err != nil {
-			fs.Debugf(f, "清理目录列表缓存失败: %v", err)
-		} else {
-			cleared++
-			fs.Debugf(f, " 已清理目录列表缓存")
-		}
-	}
-
-	// 清理元数据缓存（可能包含错误的pickCode）
-	if f.metadataCache != nil {
-		err := f.metadataCache.Clear()
-		if err != nil {
-			fs.Debugf(f, "清理元数据缓存失败: %v", err)
-		} else {
-			cleared++
-			fs.Debugf(f, " 已清理元数据缓存")
-		}
-	}
-
-	// 重置目录缓存
-	if f.dirCache != nil {
-		f.dirCache.ResetRoot()
-		cleared++
-		fs.Debugf(f, " 已重置目录缓存")
-	}
-
-	result := map[string]any{
-		"message":        "pickCode缓存清理完成",
-		"cleared_caches": cleared,
-		"timestamp":      time.Now().Format(time.RFC3339),
-	}
-
-	fs.Infof(f, "🎉 pickCode缓存清理完成，清理了 %d 个缓存", cleared)
-	return result, nil
-}
-
-// fixPickCodeCache 修复缓存中的pickCode错误
-func (f *Fs) fixPickCodeCache(ctx context.Context) (any, error) {
-	fs.Infof(f, "🔧 开始修复缓存中的pickCode错误...")
-
-	// 先清理错误的缓存
-	_, err := f.clearPickCodeCache(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("清理缓存失败: %w", err)
-	}
-
-	// 强制重新加载根目录，这会触发重新获取正确的pickCode
-	if f.dirCache != nil {
-		err := f.dirCache.FindRoot(ctx, false)
-		if err != nil {
-			fs.Debugf(f, "重新加载根目录失败: %v", err)
-		} else {
-			fs.Debugf(f, " 已重新加载根目录")
-		}
-	}
-
-	result := map[string]any{
-		"message":   "pickCode缓存修复完成",
-		"action":    "cleared_cache_and_reloaded_root",
-		"timestamp": time.Now().Format(time.RFC3339),
-		"note":      "下次访问文件时将自动获取正确的pickCode",
-	}
-
-	fs.Infof(f, "🎉 pickCode缓存修复完成")
-	return result, nil
 }
 
 // saveDirListToCache 保存目录列表到缓存

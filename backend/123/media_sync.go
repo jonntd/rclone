@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/rclone/rclone/fs"
@@ -16,9 +17,12 @@ type MediaSyncStats struct {
 	ProcessedFiles int      `json:"processed_files"`
 	CreatedStrm    int      `json:"created_strm"`
 	SkippedFiles   int      `json:"skipped_files"`
+	DeletedStrm    int      `json:"deleted_strm"`
+	DeletedDirs    int      `json:"deleted_dirs"`
 	Errors         int      `json:"errors"`
 	ErrorMessages  []string `json:"error_messages,omitempty"`
 	DryRun         bool     `json:"dry_run"`
+	SyncDelete     bool     `json:"sync_delete"`
 }
 
 // mediaSyncCommand 实现媒体库同步功能
@@ -60,14 +64,21 @@ func (f *Fs) mediaSyncCommand(ctx context.Context, args []string, opt map[string
 	excludeExts := f.parseExtensions(opt["exclude"], "")
 
 	dryRun := opt["dry-run"] == "true"
+	// media-sync 默认启用同步删除，类似 rclone sync
+	syncDelete := true
+	// 如果用户明确设置为 false，则禁用同步删除
+	if opt["sync-delete"] == "false" {
+		syncDelete = false
+	}
 
 	// 3. 初始化统计信息
 	stats := &MediaSyncStats{
-		DryRun: dryRun,
+		DryRun:     dryRun,
+		SyncDelete: syncDelete,
 	}
 
-	fs.Infof(f, "📋 同步参数: 源=%s, 目标=%s, 最小大小=%s, 格式=%s, 预览=%v",
-		sourcePath, targetPath, fs.SizeSuffix(minSize), strmFormat, dryRun)
+	fs.Infof(f, "📋 同步参数: 源=%s, 目标=%s, 最小大小=%s, 格式=%s, 预览=%v, 同步删除=%v",
+		sourcePath, targetPath, fs.SizeSuffix(minSize), strmFormat, dryRun, syncDelete)
 
 	// 4. 开始递归处理
 	// 获取源路径的根目录名称，并添加到目标路径中
@@ -87,8 +98,28 @@ func (f *Fs) mediaSyncCommand(ctx context.Context, args []string, opt map[string
 		return stats, fmt.Errorf("媒体同步失败: %w", err)
 	}
 
-	fs.Infof(f, "🎉 媒体同步完成! 处理目录:%d, 处理文件:%d, 创建.strm:%d, 跳过:%d, 错误:%d",
-		stats.ProcessedDirs, stats.ProcessedFiles, stats.CreatedStrm, stats.SkippedFiles, stats.Errors)
+	// 5. 如果启用了同步删除，进行全局清理
+	if stats.SyncDelete {
+		fs.Infof(f, "🧹 开始全局同步删除...")
+		err := f.globalSyncDelete(ctx, sourcePath, targetPath, includeExts, excludeExts, stats)
+		if err != nil {
+			fs.Logf(f, "⚠️ 全局同步删除失败: %v", err)
+			// 不中断整个过程，继续执行
+		}
+	}
+
+	if stats.SyncDelete {
+		if stats.DeletedDirs > 0 {
+			fs.Infof(f, "🎉 媒体同步完成! 处理目录:%d, 处理文件:%d, 创建.strm:%d, 删除.strm:%d, 删除目录:%d, 跳过:%d, 错误:%d",
+				stats.ProcessedDirs, stats.ProcessedFiles, stats.CreatedStrm, stats.DeletedStrm, stats.DeletedDirs, stats.SkippedFiles, stats.Errors)
+		} else {
+			fs.Infof(f, "🎉 媒体同步完成! 处理目录:%d, 处理文件:%d, 创建.strm:%d, 删除.strm:%d, 跳过:%d, 错误:%d",
+				stats.ProcessedDirs, stats.ProcessedFiles, stats.CreatedStrm, stats.DeletedStrm, stats.SkippedFiles, stats.Errors)
+		}
+	} else {
+		fs.Infof(f, "🎉 媒体同步完成! 处理目录:%d, 处理文件:%d, 创建.strm:%d, 跳过:%d, 错误:%d",
+			stats.ProcessedDirs, stats.ProcessedFiles, stats.CreatedStrm, stats.SkippedFiles, stats.Errors)
+	}
 
 	return stats, nil
 }
@@ -245,6 +276,8 @@ func (f *Fs) processDirectoryForMediaSync(ctx context.Context, sourcePath, targe
 		}
 	}
 
+	// 注意：同步删除将在所有目录处理完成后统一进行
+
 	return nil
 }
 
@@ -315,6 +348,312 @@ func (f *Fs) createStrmFileFor123(ctx context.Context, obj fs.Object, targetDir,
 
 	fs.Infof(f, "✅ 创建.strm文件: %s (大小: %s, 内容: %s)",
 		strmPath, fs.SizeSuffix(obj.Size()), strings.TrimSpace(content))
+
+	return nil
+}
+
+// globalSyncDelete 全局同步删除功能，类似 rclone sync
+func (f *Fs) globalSyncDelete(ctx context.Context, sourcePath, targetPath string,
+	includeExts, excludeExts map[string]bool, stats *MediaSyncStats) error {
+
+	fs.Debugf(f, "🧹 开始全局同步删除: %s", targetPath)
+
+	// 1. 递归收集所有本地.strm文件
+	localStrmFiles := make(map[string]string) // 相对路径 -> 绝对路径
+	err := f.collectLocalStrmFiles(targetPath, "", localStrmFiles)
+	if err != nil {
+		return fmt.Errorf("收集本地.strm文件失败: %w", err)
+	}
+
+	if len(localStrmFiles) == 0 {
+		fs.Debugf(f, "📂 没有找到.strm文件: %s", targetPath)
+		return nil
+	}
+
+	fs.Debugf(f, "📂 找到 %d 个本地.strm文件", len(localStrmFiles))
+
+	// 2. 递归收集网盘中的所有视频文件
+	cloudVideoFiles := make(map[string]bool) // .strm文件名 -> 是否存在
+	err = f.collectCloudVideoFiles(ctx, sourcePath, "", includeExts, excludeExts, cloudVideoFiles)
+	if err != nil {
+		return fmt.Errorf("收集网盘视频文件失败: %w", err)
+	}
+
+	fs.Debugf(f, "📂 找到 %d 个网盘视频文件", len(cloudVideoFiles))
+
+	// 3. 找出孤立的.strm文件
+	orphanedFiles := make([]string, 0)
+	for relativePath, absolutePath := range localStrmFiles {
+		strmName := filepath.Base(relativePath)
+		if !cloudVideoFiles[strmName] {
+			orphanedFiles = append(orphanedFiles, absolutePath)
+		}
+	}
+
+	// 4. 删除孤立的.strm文件
+	for _, strmFile := range orphanedFiles {
+		if stats.DryRun {
+			fs.Infof(f, "🔍 [预览] 将删除孤立的.strm文件: %s", strmFile)
+		} else {
+			fs.Infof(f, "🗑️ 删除孤立的.strm文件: %s", strmFile)
+			if err := os.Remove(strmFile); err != nil {
+				errMsg := fmt.Sprintf("删除.strm文件失败 %s: %v", strmFile, err)
+				stats.ErrorMessages = append(stats.ErrorMessages, errMsg)
+				stats.Errors++
+				fs.Logf(f, "❌ %s", errMsg)
+				continue
+			}
+		}
+		stats.DeletedStrm++
+	}
+
+	// 5. 清理空目录
+	if stats.DeletedStrm > 0 {
+		fs.Debugf(f, "✅ 删除了 %d 个孤立的.strm文件，开始清理空目录", stats.DeletedStrm)
+		err := f.cleanupEmptyDirectoriesGlobal(ctx, targetPath, stats)
+		if err != nil {
+			fs.Logf(f, "⚠️ 清理空目录失败: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// cleanupEmptyDirectories 清理空目录
+func (f *Fs) cleanupEmptyDirectories(ctx context.Context, startPath string, stats *MediaSyncStats) error {
+	fs.Debugf(f, "🗂️ 开始清理空目录: %s", startPath)
+
+	// 递归清理空目录，从最深层开始
+	return f.cleanupEmptyDirectoriesRecursive(ctx, startPath, stats, 0)
+}
+
+// cleanupEmptyDirectoriesRecursive 递归清理空目录
+func (f *Fs) cleanupEmptyDirectoriesRecursive(ctx context.Context, dirPath string, stats *MediaSyncStats, depth int) error {
+	// 防止无限递归，最多向上清理5层
+	if depth > 5 {
+		return nil
+	}
+
+	// 检查目录是否存在
+	if _, err := os.Stat(dirPath); os.IsNotExist(err) {
+		return nil
+	}
+
+	// 读取目录内容
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		return fmt.Errorf("读取目录失败 %s: %w", dirPath, err)
+	}
+
+	// 如果目录不为空，不删除
+	if len(entries) > 0 {
+		fs.Debugf(f, "📁 目录不为空，保留: %s (%d个项目)", dirPath, len(entries))
+		return nil
+	}
+
+	// 目录为空，检查是否应该删除
+	// 不删除根目录和用户指定的主要目录
+	if f.shouldPreserveDirectory(dirPath) {
+		fs.Debugf(f, "🔒 保护目录，不删除: %s", dirPath)
+		return nil
+	}
+
+	// 删除空目录
+	if stats.DryRun {
+		fs.Infof(f, "🔍 [预览] 将删除空目录: %s", dirPath)
+	} else {
+		fs.Infof(f, "🗑️ 删除空目录: %s", dirPath)
+		if err := os.Remove(dirPath); err != nil {
+			errMsg := fmt.Sprintf("删除空目录失败 %s: %v", dirPath, err)
+			stats.ErrorMessages = append(stats.ErrorMessages, errMsg)
+			stats.Errors++
+			fs.Logf(f, "❌ %s", errMsg)
+			return nil // 不中断整个过程
+		}
+	}
+	stats.DeletedDirs++
+
+	// 递归检查父目录
+	parentDir := filepath.Dir(dirPath)
+	if parentDir != dirPath && parentDir != "." && parentDir != "/" {
+		return f.cleanupEmptyDirectoriesRecursive(ctx, parentDir, stats, depth+1)
+	}
+
+	return nil
+}
+
+// shouldPreserveDirectory 检查是否应该保护目录不被删除
+func (f *Fs) shouldPreserveDirectory(dirPath string) bool {
+	// 不删除根目录
+	if dirPath == "/" || dirPath == "." {
+		return true
+	}
+
+	// 不删除用户主目录相关路径
+	if strings.Contains(dirPath, "/home/") || strings.Contains(dirPath, "/Users/") {
+		// 只有在路径很深的情况下才允许删除
+		parts := strings.Split(dirPath, "/")
+		if len(parts) < 5 { // 至少要有 /Users/username/some/deep/path
+			return true
+		}
+	}
+
+	// 不删除系统重要目录
+	systemDirs := []string{"/bin", "/usr", "/etc", "/var", "/opt", "/tmp"}
+	for _, sysDir := range systemDirs {
+		if strings.HasPrefix(dirPath, sysDir) && len(strings.Split(dirPath, "/")) < 4 {
+			return true
+		}
+	}
+
+	return false
+}
+
+// collectLocalStrmFiles 递归收集本地目录中的所有.strm文件
+func (f *Fs) collectLocalStrmFiles(basePath, relativePath string, strmFiles map[string]string) error {
+	currentPath := filepath.Join(basePath, relativePath)
+
+	entries, err := os.ReadDir(currentPath)
+	if err != nil {
+		return fmt.Errorf("读取目录失败 %s: %w", currentPath, err)
+	}
+
+	for _, entry := range entries {
+		entryPath := filepath.Join(relativePath, entry.Name())
+		fullPath := filepath.Join(basePath, entryPath)
+
+		if entry.IsDir() {
+			// 递归处理子目录
+			err := f.collectLocalStrmFiles(basePath, entryPath, strmFiles)
+			if err != nil {
+				fs.Debugf(f, "⚠️ 处理子目录失败: %v", err)
+				// 继续处理其他目录
+			}
+		} else if strings.HasSuffix(entry.Name(), ".strm") {
+			// 收集.strm文件
+			strmFiles[entryPath] = fullPath
+		}
+	}
+
+	return nil
+}
+
+// collectCloudVideoFiles 递归收集网盘中的所有视频文件
+func (f *Fs) collectCloudVideoFiles(ctx context.Context, basePath, relativePath string,
+	includeExts, excludeExts map[string]bool, videoFiles map[string]bool) error {
+
+	currentPath := filepath.Join(basePath, relativePath)
+	if currentPath == "." {
+		currentPath = ""
+	}
+
+	entries, err := f.List(ctx, currentPath)
+	if err != nil {
+		return fmt.Errorf("列出目录失败 %s: %w", currentPath, err)
+	}
+
+	for _, entry := range entries {
+		switch e := entry.(type) {
+		case fs.Directory:
+			// 递归处理子目录
+			dirName := filepath.Base(e.Remote())
+			subRelativePath := filepath.Join(relativePath, dirName)
+			err := f.collectCloudVideoFiles(ctx, basePath, subRelativePath, includeExts, excludeExts, videoFiles)
+			if err != nil {
+				fs.Debugf(f, "⚠️ 处理子目录失败: %v", err)
+				// 继续处理其他目录
+			}
+		case fs.Object:
+			// 检查是否为视频文件
+			fileName := filepath.Base(e.Remote())
+			if f.isVideoFile(fileName, includeExts, excludeExts) {
+				// 生成对应的.strm文件名
+				baseName := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+				strmName := baseName + ".strm"
+				videoFiles[strmName] = true
+			}
+		}
+	}
+
+	return nil
+}
+
+// cleanupEmptyDirectoriesGlobal 全局清理空目录，类似 rclone sync
+func (f *Fs) cleanupEmptyDirectoriesGlobal(ctx context.Context, targetPath string, stats *MediaSyncStats) error {
+	fs.Debugf(f, "🗂️ 开始全局清理空目录: %s", targetPath)
+
+	// 收集所有目录
+	allDirs := make([]string, 0)
+	err := f.collectAllDirectories(targetPath, &allDirs)
+	if err != nil {
+		return fmt.Errorf("收集目录失败: %w", err)
+	}
+
+	// 按路径长度排序，从最深的开始删除（类似 rclone sync）
+	sort.Slice(allDirs, func(i, j int) bool {
+		return len(allDirs[i]) > len(allDirs[j])
+	})
+
+	// 删除空目录
+	for _, dirPath := range allDirs {
+		// 检查目录是否为空
+		entries, err := os.ReadDir(dirPath)
+		if err != nil {
+			fs.Debugf(f, "⚠️ 读取目录失败: %s: %v", dirPath, err)
+			continue
+		}
+
+		if len(entries) == 0 {
+			// 目录为空，检查是否应该删除
+			if f.shouldPreserveDirectory(dirPath) {
+				fs.Debugf(f, "🔒 保护目录，不删除: %s", dirPath)
+				continue
+			}
+
+			// 删除空目录
+			if stats.DryRun {
+				fs.Infof(f, "🔍 [预览] 将删除空目录: %s", dirPath)
+			} else {
+				fs.Infof(f, "🗑️ 删除空目录: %s", dirPath)
+				if err := os.Remove(dirPath); err != nil {
+					errMsg := fmt.Sprintf("删除空目录失败 %s: %v", dirPath, err)
+					stats.ErrorMessages = append(stats.ErrorMessages, errMsg)
+					stats.Errors++
+					fs.Logf(f, "❌ %s", errMsg)
+					continue
+				}
+			}
+			stats.DeletedDirs++
+		}
+	}
+
+	if stats.DeletedDirs > 0 {
+		fs.Debugf(f, "✅ 全局清理完成，删除了 %d 个空目录", stats.DeletedDirs)
+	}
+
+	return nil
+}
+
+// collectAllDirectories 递归收集所有目录
+func (f *Fs) collectAllDirectories(basePath string, dirs *[]string) error {
+	entries, err := os.ReadDir(basePath)
+	if err != nil {
+		return fmt.Errorf("读取目录失败 %s: %w", basePath, err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			dirPath := filepath.Join(basePath, entry.Name())
+			*dirs = append(*dirs, dirPath)
+
+			// 递归收集子目录
+			err := f.collectAllDirectories(dirPath, dirs)
+			if err != nil {
+				fs.Debugf(f, "⚠️ 收集子目录失败: %v", err)
+				// 继续处理其他目录
+			}
+		}
+	}
 
 	return nil
 }
