@@ -1449,7 +1449,7 @@ var commandHelp = []fs.CommandHelp{{
 	Short: "通过文件路径获取下载URL",
 	Long: `此命令使用文件路径检索文件的下载URL。
 用法:
-rclone backend getdownloadurlau 123:path/to/file VidHub/1.7.24
+rclone backend getdownloadurlua 123:path/to/file VidHub/1.7.24
 该命令返回指定文件的下载URL。请确保文件路径正确。`,
 }, {
 	Name:  "cache-cleanup",
