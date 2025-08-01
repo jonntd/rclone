@@ -21,5 +21,6 @@ __pycache__
 resource_windows_*.syso
 .devcontainer
 /OpenList-main/
-*.sh
 rclone_test
+*.log
+*.bin
