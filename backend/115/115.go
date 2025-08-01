@@ -2862,17 +2862,10 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 
 // Put uploads the object.
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	// Check if destination exists. If not, use PutUnchecked. If yes, use Update.
-	existingObj, err := f.NewObject(ctx, src.Remote())
-	if err == fs.ErrorObjectNotFound {
-		// Not found, so create it using PutUnchecked
-		return f.PutUnchecked(ctx, in, src, options...)
-	} else if err != nil {
-		// An error other than not found
-		return nil, err
-	}
-	// Object exists, so update it
-	return existingObj, existingObj.Update(ctx, in, src, options...)
+	// 优化：对于新文件上传，直接使用PutUnchecked避免不必要的文件检查
+	// 这可以减少API调用次数，提高上传性能
+	fs.Debugf(f, "Put: 直接使用PutUnchecked进行上传，避免预检查: %s", src.Remote())
+	return f.PutUnchecked(ctx, in, src, options...)
 }
 
 // PutUnchecked uploads the object without checking for existence first.

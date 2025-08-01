@@ -178,8 +178,8 @@ upload_test() {
     if [ $upload_result -eq 0 ] && ./rclone_test ls "115:$test_dir/$filename" >/dev/null 2>&1; then
         log_success "${log_suffix}文件(${size_mb}MB)上传成功"
         
-        # 文件大小验证
-        local remote_size=$(./rclone_test size "115:$test_dir/$filename" --json 2>/dev/null | jq -r '.bytes' 2>/dev/null || echo "unknown")
+        # 文件大小验证 - 使用lsjson获取准确的文件大小
+        local remote_size=$(./rclone_test lsjson "115:$test_dir/" 2>/dev/null | jq -r ".[] | select(.Name == \"$filename\") | .Size" 2>/dev/null || echo "unknown")
         if [ "$remote_size" != "unknown" ] && [ "$remote_size" -gt 0 ]; then
             local expected_size=$((size_mb * 1024 * 1024))
             if [ "$remote_size" -eq "$expected_size" ]; then
@@ -187,6 +187,8 @@ upload_test() {
             else
                 log_warning "文件大小不匹配: 期望 $expected_size, 实际 $remote_size"
             fi
+        else
+            log_warning "无法获取远程文件大小信息"
         fi
         
         echo "$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] ${log_suffix}文件(${size_mb}MB)上传成功，耗时: ${duration}秒" >> "$SUMMARY_LOG"
@@ -227,9 +229,19 @@ analyze_log() {
     fi
     
     # 性能分析
-    if grep -q "speed\|MB/s" "$log_file" 2>/dev/null; then
+    if grep -q "speed\|MB/s\|Upload stats" "$log_file" 2>/dev/null; then
         echo "性能信息:" >> "$SUMMARY_LOG"
-        grep "speed\|MB/s" "$log_file" | tail -3 >> "$SUMMARY_LOG" 2>/dev/null || true
+        grep "speed\|MB/s\|Upload stats\|duration" "$log_file" | tail -5 >> "$SUMMARY_LOG" 2>/dev/null || true
+    fi
+
+    # API调用分析
+    local api_calls=$(grep -c "pacer: OpenAPI call successful\|Making API call" "$log_file" 2>/dev/null || echo "0")
+    echo "API调用次数: $api_calls" >> "$SUMMARY_LOG"
+
+    # 错误类型分析
+    if grep -q "object not found" "$log_file" 2>/dev/null; then
+        local not_found_count=$(grep -c "object not found" "$log_file" 2>/dev/null || echo "0")
+        echo "文件不存在检查次数: $not_found_count (正常，用于检查文件是否已存在)" >> "$SUMMARY_LOG"
     fi
     
     echo "日志统计: 总行数=$total_lines, 错误=$error_lines, 警告=$warning_lines" >> "$SUMMARY_LOG"

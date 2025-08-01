@@ -71,14 +71,20 @@ show_progress() {
     fi
 }
 
-# 文件大小验证函数
+# 文件大小验证函数 - 使用lsjson获取准确的文件大小
 verify_file_size() {
     local local_file=$1
     local remote_path=$2
-    
+
     local local_size=$(stat -f%z "$local_file" 2>/dev/null || stat -c%s "$local_file" 2>/dev/null)
-    local remote_size=$(./rclone_test size "$remote_path" --json 2>/dev/null | jq -r '.bytes' 2>/dev/null || echo "unknown")
-    
+
+    # 从remote_path中提取目录和文件名
+    local remote_dir=$(dirname "$remote_path")
+    local filename=$(basename "$remote_path")
+
+    # 使用lsjson获取准确的文件大小
+    local remote_size=$(./rclone_test lsjson "$remote_dir/" 2>/dev/null | jq -r ".[] | select(.Name == \"$filename\") | .Size" 2>/dev/null || echo "unknown")
+
     if [ "$remote_size" = "$local_size" ]; then
         log_success "文件大小验证通过: $local_size 字节"
         return 0
