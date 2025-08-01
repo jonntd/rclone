@@ -157,7 +157,7 @@ upload_test() {
     log_info "开始${description}上传测试: $filename"
     
     # 执行上传
-    ./rclone copy "$filename" "123:$test_dir/" \
+    ./rclone_test copy "$filename" "123:$test_dir/" \
         --transfers $CONCURRENT_TRANSFERS \
         --checkers 1 \
         -vv \
@@ -166,7 +166,7 @@ upload_test() {
     local upload_result=$?
     
     # 验证上传结果
-    if [ $upload_result -eq 0 ] && ./rclone ls "123:$test_dir/$filename" >/dev/null 2>&1; then
+    if [ $upload_result -eq 0 ] && ./rclone_test ls "123:$test_dir/$filename" >/dev/null 2>&1; then
         log_success "${description}上传成功"
         verify_file_size "$filename" "123:$test_dir/$filename"
         return 0
@@ -227,9 +227,11 @@ analyze_upload_log() {
     
     # 错误统计
     local error_count=$(grep -c "ERROR\|Failed\|失败" "$log_file" 2>/dev/null || echo "0")
+    # 确保error_count是一个数字
+    error_count=$(echo "$error_count" | tr -d ' ' | head -1)
     echo "错误数量: $error_count" >> "$SUMMARY_LOG"
-    
-    if [ $error_count -gt 0 ]; then
+
+    if [ "$error_count" -gt 0 ] 2>/dev/null; then
         echo "主要错误:" >> "$SUMMARY_LOG"
         grep "ERROR\|Failed\|失败" "$log_file" | head -3 >> "$SUMMARY_LOG"
     fi
@@ -248,7 +250,7 @@ cleanup() {
         
         # 可选的远程目录清理
         if [ "$CLEAN_REMOTE" = true ]; then
-            ./rclone delete "123:$TEST_DIR/" 2>/dev/null || true
+            ./rclone_test delete "123:$TEST_DIR/" 2>/dev/null || true
             log_debug "已清理远程统一测试目录: 123:$TEST_DIR/"
         else
             log_debug "保留远程统一测试目录: 123:$TEST_DIR/ (设置CLEAN_REMOTE=true可清理)"
@@ -280,9 +282,19 @@ main() {
     log_info "日志目录: $LOG_DIR"
     log_info "配置: 小文件=${SMALL_FILE_SIZE}MB, 中等=${MEDIUM_FILE_SIZE}MB, 大文件=${LARGE_FILE_SIZE}MB, 超大=${HUGE_FILE_SIZE}MB"
 
+    # 步骤0: 编译最新代码
+    log_info "步骤0: 编译最新的rclone代码"
+    if go build -o rclone_test . 2>&1 | tee "$LOG_DIR/build.log"; then
+        log_success "代码编译成功"
+    else
+        log_error "代码编译失败，请检查编译错误"
+        cat "$LOG_DIR/build.log"
+        exit 1
+    fi
+
     # 确保统一测试目录存在
     log_info "确保统一测试目录存在: 123:$TEST_DIR/"
-    ./rclone mkdir "123:$TEST_DIR/" 2>/dev/null || true
+    ./rclone_test mkdir "123:$TEST_DIR/" 2>/dev/null || true
     
     # 设置错误处理
     set -e
@@ -290,7 +302,7 @@ main() {
     
     # 第一步：连接验证
     log_info "步骤1: 验证123网盘连接"
-    if ! ./rclone about 123: >/dev/null 2>&1; then
+    if ! ./rclone_test about 123: >/dev/null 2>&1; then
         log_error "123网盘连接失败"
         exit 1
     fi
@@ -412,7 +424,7 @@ quick_test() {
     log_info "使用统一测试目录: $TEST_DIR"
 
     # 确保统一测试目录存在
-    ./rclone mkdir "123:$TEST_DIR/" 2>/dev/null || true
+    ./rclone_test mkdir "123:$TEST_DIR/" 2>/dev/null || true
 
     # 只测试小文件，确保每次MD5不同
     local quick_size=10
@@ -440,7 +452,7 @@ performance_test() {
     log_info "使用统一测试目录: $TEST_DIR"
 
     # 确保统一测试目录存在
-    ./rclone mkdir "123:$TEST_DIR/" 2>/dev/null || true
+    ./rclone_test mkdir "123:$TEST_DIR/" 2>/dev/null || true
 
     # 创建多个文件进行并发测试，每个文件MD5都不同
     local perf_size=50
@@ -504,7 +516,7 @@ case "$1" in
   $0 --quick                           # 快速测试
   $0 --performance                     # 性能测试
   VERBOSE_LEVEL=verbose $0              # 详细模式
-  SMALL_FILE_SIZE=50 LARGE_FILE_SIZE=1000 $0  # 自定义文件大小
+  SMALL_FILE_SIZE=50 LARGE_FILE_SIZE=1050 $0  # 自定义文件大小
   KEEP_FILES=true $0                    # 保留测试文件
   UNIFIED_TEST_DIR=my_test_dir $0       # 自定义统一目录
   CLEAN_REMOTE=true $0                  # 测试后清理远程目录
