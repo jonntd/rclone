@@ -6,7 +6,6 @@ import (
 	_ "github.com/rclone/rclone/backend/115"
 	_ "github.com/rclone/rclone/backend/123"
 	_ "github.com/rclone/rclone/backend/alias"
-	_ "github.com/rclone/rclone/backend/alist"
 	_ "github.com/rclone/rclone/backend/azureblob"
 	_ "github.com/rclone/rclone/backend/azurefiles"
 	_ "github.com/rclone/rclone/backend/b2"

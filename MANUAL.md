@@ -1,6 +1,6 @@
 % rclone(1) User Manual
 % Nick Craig-Wood
-% Jun 17, 2025
+% Jul 09, 2025
 
 # NAME
 
@@ -192,8 +192,8 @@ WebDAV or S3, that work out of the box.)
 - Dropbox
 - Enterprise File Fabric
 - Fastmail Files
-- Files.com
 - FileLu Cloud Storage
+- Files.com
 - FlashBlade
 - FTP
 - Gofile
@@ -511,6 +511,12 @@ package is here.
 ## Docker installation {#docker}
 
 The rclone developers maintain a [docker image for rclone](https://hub.docker.com/r/rclone/rclone).
+
+**Note:** We also now offer a paid version of rclone with
+enterprise-grade security and zero CVEs through our partner
+[SecureBuild](https://securebuild.com/blog/introducing-securebuild).
+If you are interested, check out their website and the [Rclone
+SecureBuild Image](https://securebuild.com/images/rclone).
 
 These images are built as part of the release process based on a
 minimal Alpine Linux.
@@ -4036,6 +4042,40 @@ See the [global flags page](https://rclone.org/flags/) for global options not li
 
 * [rclone config](https://rclone.org/commands/rclone_config/)	 - Enter an interactive configuration session.
 
+# rclone config redacted
+
+Print redacted (decrypted) config file, or the redacted config for a single remote.
+
+# Synopsis
+
+This prints a redacted copy of the config file, either the
+whole config file or for a given remote.
+
+The config file will be redacted by replacing all passwords and other
+sensitive info with XXX.
+
+This makes the config file suitable for posting online for support.
+
+It should be double checked before posting as the redaction may not be perfect.
+
+
+
+```
+rclone config redacted [<remote>] [flags]
+```
+
+# Options
+
+```
+  -h, --help   help for redacted
+```
+
+See the [global flags page](https://rclone.org/flags/) for global options not listed here.
+
+# SEE ALSO
+
+* [rclone config](https://rclone.org/commands/rclone_config/)	 - Enter an interactive configuration session.
+
 # rclone config show
 
 Print (decrypted) config file, or the config for a single remote.
@@ -4452,12 +4492,12 @@ rclone convmv "stories/The Quick Brown Fox!.txt" --name-transform "all,command=e
 
 ```
 rclone convmv "stories/The Quick Brown Fox!" --name-transform "date=-{YYYYMMDD}"
-// Output: stories/The Quick Brown Fox!-20250617
+// Output: stories/The Quick Brown Fox!-20250618
 ```
 
 ```
 rclone convmv "stories/The Quick Brown Fox!" --name-transform "date=-{macfriendlytime}"
-// Output: stories/The Quick Brown Fox!-2025-06-17 0551PM
+// Output: stories/The Quick Brown Fox!-2025-06-18 0148PM
 ```
 
 ```
@@ -4465,17 +4505,15 @@ rclone convmv "stories/The Quick Brown Fox!.txt" --name-transform "all,regex=[\\
 // Output: ababababababab/ababab ababababab ababababab ababab!abababab
 ```
 
-
-
 Multiple transformations can be used in sequence, applied in the order they are specified on the command line.
 
 The `--name-transform` flag is also available in `sync`, `copy`, and `move`.
 
-# Files vs Directories ##
+# Files vs Directories
 
 By default `--name-transform` will only apply to file names. The means only the leaf file name will be transformed.
 However some of the transforms would be better applied to the whole path or just directories.
-To choose which which part of the file path is affected some tags can be added to the `--name-transform`
+To choose which which part of the file path is affected some tags can be added to the `--name-transform`.
 
 | Tag | Effect |
 |------|------|
@@ -4485,11 +4523,11 @@ To choose which which part of the file path is affected some tags can be added t
 
 This is used by adding the tag into the transform name like this: `--name-transform file,prefix=ABC` or `--name-transform dir,prefix=DEF`.
 
-For some conversions using all is more likely to be useful, for example `--name-transform all,nfc`
+For some conversions using all is more likely to be useful, for example `--name-transform all,nfc`.
 
 Note that `--name-transform` may not add path separators `/` to the name. This will cause an error.
 
-# Ordering and Conflicts ##
+# Ordering and Conflicts
 
 * Transformations will be applied in the order specified by the user.
     * If the `file` tag is in use (the default) then only the leaf name of files will be transformed.
@@ -4504,19 +4542,19 @@ user, allowing for intentional use cases (e.g., trimming one prefix before addin
     * Users should be aware that certain combinations may lead to unexpected results and should verify
 transformations using `--dry-run` before execution.
 
-# Race Conditions and Non-Deterministic Behavior ##
+# Race Conditions and Non-Deterministic Behavior
 
 Some transformations, such as `replace=old:new`, may introduce conflicts where multiple source files map to the same destination name.
 This can lead to race conditions when performing concurrent transfers. It is up to the user to anticipate these.
 * If two files from the source are transformed into the same name at the destination, the final state may be non-deterministic.
 * Running rclone check after a sync using such transformations may erroneously report missing or differing files due to overwritten results.
 
-* To minimize risks, users should:
-    * Carefully review transformations that may introduce conflicts.
-    * Use `--dry-run` to inspect changes before executing a sync (but keep in mind that it won't show the effect of non-deterministic transformations).
-    * Avoid transformations that cause multiple distinct source files to map to the same destination name.
-    * Consider disabling concurrency with `--transfers=1` if necessary.
-    * Certain transformations (e.g. `prefix`) will have a multiplying effect every time they are used. Avoid these when using `bisync`.
+To minimize risks, users should:
+* Carefully review transformations that may introduce conflicts.
+* Use `--dry-run` to inspect changes before executing a sync (but keep in mind that it won't show the effect of non-deterministic transformations).
+* Avoid transformations that cause multiple distinct source files to map to the same destination name.
+* Consider disabling concurrency with `--transfers=1` if necessary.
+* Certain transformations (e.g. `prefix`) will have a multiplying effect every time they are used. Avoid these when using `bisync`.
 
 	
 
@@ -16328,9 +16366,16 @@ This option is only supported Windows platforms.
 
 ### --use-json-log ###
 
-This switches the log format to JSON for rclone. The fields of JSON
-log are `level`, `msg`, `source`, `time`. The JSON logs will be
-printed on a single line, but are shown expanded here for clarity.
+This switches the log format to JSON. The log messages are then
+streamed as individual JSON objects, with fields: `level`, `msg`, `source`,
+and `time`. The resulting format is what is sometimes referred to as
+[newline-delimited JSON](https://en.wikipedia.org/wiki/JSON_streaming#Newline-delimited_JSON)
+(NDJSON), or JSON Lines (JSONL). This is well suited for processing by
+traditional line-oriented tools and shell pipelines, but a complete log
+file is not strictly valid JSON and needs a parser that can handle it.
+
+The JSON logs will be printed on a single line, but are shown expanded
+here for clarity.
 
 ```json
 {
@@ -22400,7 +22445,7 @@ Flags for general networking and HTTP stuff.
       --tpslimit float                     Limit HTTP transactions per second to this
       --tpslimit-burst int                 Max burst of transactions for --tpslimit (default 1)
       --use-cookies                        Enable session cookiejar
-      --user-agent string                  Set the user-agent to a specified string (default "rclone/v1.70.0")
+      --user-agent string                  Set the user-agent to a specified string (default "rclone/v1.70.3")
 ```
 
 
@@ -22882,6 +22927,7 @@ Backend-only flags (these can be set in the config file also).
       --ftp-explicit-tls                                    Use Explicit FTPS (FTP over TLS)
       --ftp-force-list-hidden                               Use LIST -a to force listing of hidden files and folders. This will disable the use of MLSD
       --ftp-host string                                     FTP host to connect to
+      --ftp-http-proxy string                               URL for HTTP CONNECT proxy
       --ftp-idle-timeout Duration                           Max time before closing idle connections (default 1m0s)
       --ftp-no-check-certificate                            Do not verify the TLS certificate of the server
       --ftp-no-check-upload                                 Don't check the upload is OK
@@ -33549,6 +33595,8 @@ Use client credentials OAuth flow.
 
 This will use the OAUTH2 client Credentials Flow as described in RFC 6749.
 
+Note that this option is NOT supported by all backends.
+
 Properties:
 
 - Config:      client_credentials
@@ -35368,6 +35416,8 @@ Use client credentials OAuth flow.
 
 This will use the OAUTH2 client Credentials Flow as described in RFC 6749.
 
+Note that this option is NOT supported by all backends.
+
 Properties:
 
 - Config:      client_credentials
@@ -36631,7 +36681,7 @@ See the [metadata](https://rclone.org/docs/#metadata) docs for more info.
 
 The DOI remote is a read only remote for reading files from digital object identifiers (DOI).
 
-Currently, the DOI backend supports supports DOIs hosted with:
+Currently, the DOI backend supports DOIs hosted with:
 - [InvenioRDM](https://inveniosoftware.org/products/rdm/)
   - [Zenodo](https://zenodo.org)
   - [CaltechDATA](https://data.caltech.edu)
@@ -37109,6 +37159,8 @@ Properties:
 Use client credentials OAuth flow.
 
 This will use the OAUTH2 client Credentials Flow as described in RFC 6749.
+
+Note that this option is NOT supported by all backends.
 
 Properties:
 
@@ -38548,6 +38600,20 @@ Properties:
 - Type:        string
 - Required:    false
 
+#### --ftp-http-proxy
+
+URL for HTTP CONNECT proxy
+
+Set this to a URL for an HTTP proxy which supports the HTTP CONNECT verb.
+
+
+Properties:
+
+- Config:      http_proxy
+- Env Var:     RCLONE_FTP_HTTP_PROXY
+- Type:        string
+- Required:    false
+
 #### --ftp-no-check-upload
 
 Don't check the upload is OK
@@ -39591,6 +39657,8 @@ Use client credentials OAuth flow.
 
 This will use the OAUTH2 client Credentials Flow as described in RFC 6749.
 
+Note that this option is NOT supported by all backends.
+
 Properties:
 
 - Config:      client_credentials
@@ -40403,6 +40471,8 @@ Properties:
 Use client credentials OAuth flow.
 
 This will use the OAUTH2 client Credentials Flow as described in RFC 6749.
+
+Note that this option is NOT supported by all backends.
 
 Properties:
 
@@ -41939,6 +42009,8 @@ Use client credentials OAuth flow.
 
 This will use the OAUTH2 client Credentials Flow as described in RFC 6749.
 
+Note that this option is NOT supported by all backends.
+
 Properties:
 
 - Config:      client_credentials
@@ -42245,6 +42317,25 @@ Rclone cannot delete files anywhere except under `album`.
 ### Deleting albums
 
 The Google Photos API does not support deleting albums - see [bug #135714733](https://issuetracker.google.com/issues/135714733).
+
+## Making your own client_id
+
+When you use rclone with Google photos in its default configuration you
+are using rclone's client_id.  This is shared between all the rclone
+users.  There is a global rate limit on the number of queries per
+second that each client_id can do set by Google.
+
+If there is a problem with this client_id (eg quota too low or the
+client_id stops working) then you can make your own.
+
+Please follow the steps in [the google drive docs](https://rclone.org/drive/#making-your-own-client-id).
+You will need these scopes instead of the drive ones detailed:
+
+```
+https://www.googleapis.com/auth/photoslibrary.appendonly
+https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata
+https://www.googleapis.com/auth/photoslibrary.edit.appcreateddata
+```
 
 #  Hasher
 
@@ -43127,6 +43218,8 @@ Properties:
 Use client credentials OAuth flow.
 
 This will use the OAUTH2 client Credentials Flow as described in RFC 6749.
+
+Note that this option is NOT supported by all backends.
 
 Properties:
 
@@ -44697,6 +44790,8 @@ Use client credentials OAuth flow.
 
 This will use the OAUTH2 client Credentials Flow as described in RFC 6749.
 
+Note that this option is NOT supported by all backends.
+
 Properties:
 
 - Config:      client_credentials
@@ -45572,6 +45667,8 @@ Properties:
 Use client credentials OAuth flow.
 
 This will use the OAUTH2 client Credentials Flow as described in RFC 6749.
+
+Note that this option is NOT supported by all backends.
 
 Properties:
 
@@ -48306,7 +48403,8 @@ For example, you might see throttling.
 
 To create your own Client ID, please follow these steps:
 
-1. Open https://portal.azure.com/#blade/Microsoft_AAD_RegisteredApps/ApplicationsListBlade and then click `New registration`.
+1. Open https://portal.azure.com/?quickstart=true#view/Microsoft_AAD_IAM/ActiveDirectoryMenuBlade/~/Overview and then under the `Add` menu click `App registration`.
+    * If you have not created an Azure account, you will be prompted to. This is free, but you need to provide a phone number, address, and credit card for identity verification.
 2. Enter a name for your app, choose account type `Accounts in any organizational directory (Any Azure AD directory - Multitenant) and personal Microsoft accounts (e.g. Skype, Xbox)`, select `Web` in `Redirect URI`, then type (do not copy and paste) `http://localhost:53682/` and click Register. Copy and keep the `Application (client) ID` under the app name for later use.
 3. Under `manage` select `Certificates & secrets`, click `New client secret`. Enter a description (can be anything) and set `Expires` to 24 months. Copy and keep that secret _Value_ for later use (you _won't_ be able to see this value afterwards).
 4. Under `manage` select `API permissions`, click `Add a permission` and select `Microsoft Graph` then select `delegated permissions`.
@@ -48558,6 +48656,8 @@ Properties:
 Use client credentials OAuth flow.
 
 This will use the OAUTH2 client Credentials Flow as described in RFC 6749.
+
+Note that this option is NOT supported by all backends.
 
 Properties:
 
@@ -52187,6 +52287,8 @@ Use client credentials OAuth flow.
 
 This will use the OAUTH2 client Credentials Flow as described in RFC 6749.
 
+Note that this option is NOT supported by all backends.
+
 Properties:
 
 - Config:      client_credentials
@@ -52988,6 +53090,8 @@ Use client credentials OAuth flow.
 
 This will use the OAUTH2 client Credentials Flow as described in RFC 6749.
 
+Note that this option is NOT supported by all backends.
+
 Properties:
 
 - Config:      client_credentials
@@ -53583,6 +53687,8 @@ Properties:
 Use client credentials OAuth flow.
 
 This will use the OAUTH2 client Credentials Flow as described in RFC 6749.
+
+Note that this option is NOT supported by all backends.
 
 Properties:
 
@@ -58004,6 +58110,8 @@ Use client credentials OAuth flow.
 
 This will use the OAUTH2 client Credentials Flow as described in RFC 6749.
 
+Note that this option is NOT supported by all backends.
+
 Properties:
 
 - Config:      client_credentials
@@ -58303,6 +58411,8 @@ Properties:
 Use client credentials OAuth flow.
 
 This will use the OAUTH2 client Credentials Flow as described in RFC 6749.
+
+Note that this option is NOT supported by all backends.
 
 Properties:
 
@@ -59070,6 +59180,54 @@ Options:
 
 
 # Changelog
+
+## v1.70.3 - 2025-07-09
+
+[See commits](https://github.com/rclone/rclone/compare/v1.70.2...v1.70.3)
+
+* Bug Fixes
+    * check: Fix difference report (was reporting error counts) (albertony)
+    * march: Fix deadlock when using `--no-traverse` (Nick Craig-Wood)
+    * doc fixes (albertony, Nick Craig-Wood)
+* Azure Blob
+    * Fix server side copy error "requires exactly one scope" (Nick Craig-Wood)
+* B2
+    * Fix finding objects when using `--b2-version-at` (Davide Bizzarri)
+* Linkbox
+    * Fix upload error "user upload file not exist" (Nick Craig-Wood)
+* Pikpak
+    * Improve error handling for missing links and unrecoverable 500s (wiserain)
+* WebDAV
+    * Fix setting modtime to that of local object instead of remote (WeidiDeng)
+
+## v1.70.2 - 2025-06-27
+
+[See commits](https://github.com/rclone/rclone/compare/v1.70.1...v1.70.2)
+
+* Bug Fixes
+    * convmv: Make --dry-run logs less noisy (nielash)
+    * sync: Avoid copying dir metadata to itself (nielash)
+    * build: Bump github.com/go-chi/chi/v5 from 5.2.1 to 5.2.2 to fix GHSA-vrw8-fxc6-2r93 (dependabot[bot])
+    * convmv: Fix moving to unicode-equivalent name (nielash)
+    * log: Fix deadlock when using systemd logging (Nick Craig-Wood)
+    * pacer: Fix nil pointer deref in RetryError (Nick Craig-Wood)
+    * doc fixes (Ali Zein Yousuf, Nick Craig-Wood)
+* Local
+    * Fix --skip-links on Windows when skipping Junction points (Nick Craig-Wood)
+* Combine
+    * Fix directory not found errors with ListP interface (Nick Craig-Wood)
+* Mega
+    * Fix tls handshake failure (necaran)
+* Pikpak
+    * Fix uploads fail with "aws-chunked encoding is not supported" error (Nick Craig-Wood)
+
+## v1.70.1 - 2025-06-19
+
+[See commits](https://github.com/rclone/rclone/compare/v1.70.0...v1.70.1)
+
+* Bug Fixes
+    * convmv: Fix spurious "error running command echo" on Windows (Nick Craig-Wood)
+    * doc fixes (albertony, Ed Craig-Wood, jinjingroad)
 
 ## v1.70.0 - 2025-06-17
 

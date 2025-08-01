@@ -5,6 +5,7 @@
   <meta name="generator" content="pandoc" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
   <meta name="author" content="Nick Craig-Wood" />
+  <meta name="dcterms.date" content="2025-05-21" />
   <title>rclone(1) User Manual</title>
   <style>
     code{white-space: pre-wrap;}
@@ -81,7 +82,7 @@
 <header id="title-block-header">
 <h1 class="title">rclone(1) User Manual</h1>
 <p class="author">Nick Craig-Wood</p>
-<p class="date">Jun 17, 2025</p>
+<p class="date">Jul 09, 2025</p>
 </header>
 <h1 id="name">NAME</h1>
 <p>rclone - manage files on cloud storage</p>
@@ -222,8 +223,8 @@ Use &quot;rclone help backends&quot; for a list of supported services.
 <li>Dropbox</li>
 <li>Enterprise File Fabric</li>
 <li>Fastmail Files</li>
-<li>Files.com</li>
 <li>FileLu Cloud Storage</li>
+<li>Files.com</li>
 <li>FlashBlade</li>
 <li>FTP</li>
 <li>Gofile</li>
@@ -426,6 +427,7 @@ choco install rclone</code></pre>
 <p><a href="https://repology.org/project/rclone/versions"><img src="https://repology.org/badge/vertical-allrepos/rclone.svg?columns=3" alt="Packaging status" /></a></p>
 <h2 id="docker">Docker installation</h2>
 <p>The rclone developers maintain a <a href="https://hub.docker.com/r/rclone/rclone">docker image for rclone</a>.</p>
+<p><strong>Note:</strong> We also now offer a paid version of rclone with enterprise-grade security and zero CVEs through our partner <a href="https://securebuild.com/blog/introducing-securebuild">SecureBuild</a>. If you are interested, check out their website and the <a href="https://securebuild.com/images/rclone">Rclone SecureBuild Image</a>.</p>
 <p>These images are built as part of the release process based on a minimal Alpine Linux.</p>
 <p>The <code>:latest</code> tag will always point to the latest stable release. You can use the <code>:beta</code> tag to get the latest build from master. You can also use version tags, e.g. <code>:1.49.1</code>, <code>:1.49</code> or <code>:1</code>.</p>
 <pre><code>$ docker pull rclone/rclone:latest
@@ -2330,6 +2332,21 @@ rclone config password myremote fieldname=mypassword</code></pre>
 <ul>
 <li><a href="https://rclone.org/commands/rclone_config/">rclone config</a> - Enter an interactive configuration session.</li>
 </ul>
+<h1 id="rclone-config-redacted">rclone config redacted</h1>
+<p>Print redacted (decrypted) config file, or the redacted config for a single remote.</p>
+<h1 id="synopsis-33">Synopsis</h1>
+<p>This prints a redacted copy of the config file, either the whole config file or for a given remote.</p>
+<p>The config file will be redacted by replacing all passwords and other sensitive info with XXX.</p>
+<p>This makes the config file suitable for posting online for support.</p>
+<p>It should be double checked before posting as the redaction may not be perfect.</p>
+<pre><code>rclone config redacted [&lt;remote&gt;] [flags]</code></pre>
+<h1 id="options-39">Options</h1>
+<pre><code>  -h, --help   help for redacted</code></pre>
+<p>See the <a href="https://rclone.org/flags/">global flags page</a> for global options not listed here.</p>
+<h1 id="see-also-39">SEE ALSO</h1>
+<ul>
+<li><a href="https://rclone.org/commands/rclone_config/">rclone config</a> - Enter an interactive configuration session.</li>
+</ul>
 <h1 id="rclone-config-show">rclone config show</h1>
 <p>Print (decrypted) config file, or the config for a single remote.</p>
 <pre><code>rclone config show [&lt;remote&gt;] [flags]</code></pre>
@@ -2682,15 +2699,15 @@ X-User-Defined  </code></pre>
 <pre><code>rclone convmv &quot;stories/The Quick Brown Fox!.txt&quot; --name-transform &quot;all,command=echo&quot;
 // Output: stories/The Quick Brown Fox!.txt</code></pre>
 <pre><code>rclone convmv &quot;stories/The Quick Brown Fox!&quot; --name-transform &quot;date=-{YYYYMMDD}&quot;
-// Output: stories/The Quick Brown Fox!-20250617</code></pre>
+// Output: stories/The Quick Brown Fox!-20250618</code></pre>
 <pre><code>rclone convmv &quot;stories/The Quick Brown Fox!&quot; --name-transform &quot;date=-{macfriendlytime}&quot;
-// Output: stories/The Quick Brown Fox!-2025-06-17 0551PM</code></pre>
+// Output: stories/The Quick Brown Fox!-2025-06-18 0148PM</code></pre>
 <pre><code>rclone convmv &quot;stories/The Quick Brown Fox!.txt&quot; --name-transform &quot;all,regex=[\\.\\w]/ab&quot;
 // Output: ababababababab/ababab ababababab ababababab ababab!abababab</code></pre>
 <p>Multiple transformations can be used in sequence, applied in the order they are specified on the command line.</p>
 <p>The <code>--name-transform</code> flag is also available in <code>sync</code>, <code>copy</code>, and <code>move</code>.</p>
 <h1 id="files-vs-directories">Files vs Directories</h1>
-<p>By default <code>--name-transform</code> will only apply to file names. The means only the leaf file name will be transformed. However some of the transforms would be better applied to the whole path or just directories. To choose which which part of the file path is affected some tags can be added to the <code>--name-transform</code></p>
+<p>By default <code>--name-transform</code> will only apply to file names. The means only the leaf file name will be transformed. However some of the transforms would be better applied to the whole path or just directories. To choose which which part of the file path is affected some tags can be added to the <code>--name-transform</code>.</p>
 <table>
 <colgroup>
 <col style="width: 50%" />
@@ -2718,7 +2735,7 @@ X-User-Defined  </code></pre>
 </tbody>
 </table>
 <p>This is used by adding the tag into the transform name like this: <code>--name-transform file,prefix=ABC</code> or <code>--name-transform dir,prefix=DEF</code>.</p>
-<p>For some conversions using all is more likely to be useful, for example <code>--name-transform all,nfc</code></p>
+<p>For some conversions using all is more likely to be useful, for example <code>--name-transform all,nfc</code>.</p>
 <p>Note that <code>--name-transform</code> may not add path separators <code>/</code> to the name. This will cause an error.</p>
 <h1 id="ordering-and-conflicts">Ordering and Conflicts</h1>
 <ul>
@@ -2739,16 +2756,7 @@ X-User-Defined  </code></pre>
 </ul>
 <h1 id="race-conditions-and-non-deterministic-behavior">Race Conditions and Non-Deterministic Behavior</h1>
 <p>Some transformations, such as <code>replace=old:new</code>, may introduce conflicts where multiple source files map to the same destination name. This can lead to race conditions when performing concurrent transfers. It is up to the user to anticipate these. * If two files from the source are transformed into the same name at the destination, the final state may be non-deterministic. * Running rclone check after a sync using such transformations may erroneously report missing or differing files due to overwritten results.</p>
-<ul>
-<li>To minimize risks, users should:
-<ul>
-<li>Carefully review transformations that may introduce conflicts.</li>
-<li>Use <code>--dry-run</code> to inspect changes before executing a sync (but keep in mind that it won't show the effect of non-deterministic transformations).</li>
-<li>Avoid transformations that cause multiple distinct source files to map to the same destination name.</li>
-<li>Consider disabling concurrency with <code>--transfers=1</code> if necessary.</li>
-<li>Certain transformations (e.g. <code>prefix</code>) will have a multiplying effect every time they are used. Avoid these when using <code>bisync</code>.</li>
-</ul></li>
-</ul>
+<p>To minimize risks, users should: * Carefully review transformations that may introduce conflicts. * Use <code>--dry-run</code> to inspect changes before executing a sync (but keep in mind that it won't show the effect of non-deterministic transformations). * Avoid transformations that cause multiple distinct source files to map to the same destination name. * Consider disabling concurrency with <code>--transfers=1</code> if necessary. * Certain transformations (e.g. <code>prefix</code>) will have a multiplying effect every time they are used. Avoid these when using <code>bisync</code>.</p>
 <pre><code>rclone convmv dest:path --name-transform XXX [flags]</code></pre>
 <h2 id="options-48">Options</h2>
 <pre><code>      --create-empty-src-dirs   Create empty source dirs on destination after move
@@ -4699,8 +4707,7 @@ htpasswd -B htpasswd anotherUser</code></pre>
 <p>This recursively removes any empty directories (including directories that only contain empty directories), that it finds under the path. The root path itself will also be removed if it is empty, unless you supply the <code>--leave-root</code> flag.</p>
 <p>Use command <a href="https://rclone.org/commands/rclone_rmdir/">rmdir</a> to delete just the empty directory given by path, not recurse.</p>
 <p>This is useful for tidying up remotes that rclone has left a lot of empty directories in. For example the <a href="https://rclone.org/commands/rclone_delete/">delete</a> command will delete files but leave the directory structure (unless used with option <code>--rmdirs</code>).</p>
-<p>This will delete <code>--checkers</code> directories concurrently so if you have thousands of empty directories consider increasing this number.</p>
-<p>To delete a path and any objects in it, use the <a href="https://rclone.org/commands/rclone_purge/">purge</a> command.</p>
+<p>To delete a path and any objects in it, use <a href="https://rclone.org/commands/rclone_purge/">purge</a> command.</p>
 <pre><code>rclone rmdirs remote:path [flags]</code></pre>
 <h2 id="options-69">Options</h2>
 <pre><code>  -h, --help         help for rmdirs
@@ -8266,7 +8273,8 @@ y/n/s/!/q&gt; n</code></pre>
 <pre><code>--log-file rclone.log --log-level DEBUG --windows-event-log ERROR</code></pre>
 <p>This option is only supported Windows platforms.</p>
 <h3 id="use-json-log">--use-json-log</h3>
-<p>This switches the log format to JSON for rclone. The fields of JSON log are <code>level</code>, <code>msg</code>, <code>source</code>, <code>time</code>. The JSON logs will be printed on a single line, but are shown expanded here for clarity.</p>
+<p>This switches the log format to JSON. The log messages are then streamed as individual JSON objects, with fields: <code>level</code>, <code>msg</code>, <code>source</code>, and <code>time</code>. The resulting format is what is sometimes referred to as <a href="https://en.wikipedia.org/wiki/JSON_streaming#Newline-delimited_JSON">newline-delimited JSON</a> (NDJSON), or JSON Lines (JSONL). This is well suited for processing by traditional line-oriented tools and shell pipelines, but a complete log file is not strictly valid JSON and needs a parser that can handle it.</p>
+<p>The JSON logs will be printed on a single line, but are shown expanded here for clarity.</p>
 <div class="sourceCode" id="cb654"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb654-1"><a href="#cb654-1" aria-hidden="true"></a><span class="fu">{</span></span>
 <span id="cb654-2"><a href="#cb654-2" aria-hidden="true"></a>  <span class="dt">&quot;time&quot;</span><span class="fu">:</span> <span class="st">&quot;2025-05-13T17:30:51.036237518+01:00&quot;</span><span class="fu">,</span></span>
 <span id="cb654-3"><a href="#cb654-3" aria-hidden="true"></a>  <span class="dt">&quot;level&quot;</span><span class="fu">:</span> <span class="st">&quot;debug&quot;</span><span class="fu">,</span></span>
@@ -12672,6 +12680,20 @@ Showing nodes accounting for 1537.03kB, 100% of 1537.03kB total
 <td style="text-align: center;">Yes</td>
 </tr>
 <tr class="odd">
+<td>ImageKit</td>
+<td style="text-align: center;">Yes</td>
+<td style="text-align: center;">Yes</td>
+<td style="text-align: center;">Yes</td>
+<td style="text-align: center;">No</td>
+<td style="text-align: center;">No</td>
+<td style="text-align: center;">No</td>
+<td style="text-align: center;">No</td>
+<td style="text-align: left;">No</td>
+<td style="text-align: center;">No</td>
+<td style="text-align: center;">No</td>
+<td style="text-align: center;">Yes</td>
+</tr>
+<tr class="even">
 <td>Internet Archive</td>
 <td style="text-align: center;">No</td>
 <td style="text-align: center;">Yes</td>
@@ -12685,7 +12707,7 @@ Showing nodes accounting for 1537.03kB, 100% of 1537.03kB total
 <td style="text-align: center;">Yes</td>
 <td style="text-align: center;">No</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td>Jottacloud</td>
 <td style="text-align: center;">Yes</td>
 <td style="text-align: center;">Yes</td>
@@ -12699,7 +12721,7 @@ Showing nodes accounting for 1537.03kB, 100% of 1537.03kB total
 <td style="text-align: center;">Yes</td>
 <td style="text-align: center;">Yes</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td>Koofr</td>
 <td style="text-align: center;">Yes</td>
 <td style="text-align: center;">Yes</td>
@@ -12713,7 +12735,7 @@ Showing nodes accounting for 1537.03kB, 100% of 1537.03kB total
 <td style="text-align: center;">Yes</td>
 <td style="text-align: center;">Yes</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td>Mail.ru Cloud</td>
 <td style="text-align: center;">Yes</td>
 <td style="text-align: center;">Yes</td>
@@ -12727,7 +12749,7 @@ Showing nodes accounting for 1537.03kB, 100% of 1537.03kB total
 <td style="text-align: center;">Yes</td>
 <td style="text-align: center;">Yes</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td>Mega</td>
 <td style="text-align: center;">Yes</td>
 <td style="text-align: center;">No</td>
@@ -12741,7 +12763,7 @@ Showing nodes accounting for 1537.03kB, 100% of 1537.03kB total
 <td style="text-align: center;">Yes</td>
 <td style="text-align: center;">Yes</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td>Memory</td>
 <td style="text-align: center;">No</td>
 <td style="text-align: center;">Yes</td>
@@ -12755,7 +12777,7 @@ Showing nodes accounting for 1537.03kB, 100% of 1537.03kB total
 <td style="text-align: center;">No</td>
 <td style="text-align: center;">No</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td>Microsoft Azure Blob Storage</td>
 <td style="text-align: center;">Yes</td>
 <td style="text-align: center;">Yes</td>
@@ -12769,7 +12791,7 @@ Showing nodes accounting for 1537.03kB, 100% of 1537.03kB total
 <td style="text-align: center;">No</td>
 <td style="text-align: center;">No</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td>Microsoft Azure Files Storage</td>
 <td style="text-align: center;">No</td>
 <td style="text-align: center;">Yes</td>
@@ -12783,7 +12805,7 @@ Showing nodes accounting for 1537.03kB, 100% of 1537.03kB total
 <td style="text-align: center;">Yes</td>
 <td style="text-align: center;">Yes</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td>Microsoft OneDrive</td>
 <td style="text-align: center;">Yes</td>
 <td style="text-align: center;">Yes</td>
@@ -12797,7 +12819,7 @@ Showing nodes accounting for 1537.03kB, 100% of 1537.03kB total
 <td style="text-align: center;">Yes</td>
 <td style="text-align: center;">Yes</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td>OpenDrive</td>
 <td style="text-align: center;">Yes</td>
 <td style="text-align: center;">Yes</td>
@@ -12811,7 +12833,7 @@ Showing nodes accounting for 1537.03kB, 100% of 1537.03kB total
 <td style="text-align: center;">Yes</td>
 <td style="text-align: center;">Yes</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td>OpenStack Swift</td>
 <td style="text-align: center;">Yes ¹</td>
 <td style="text-align: center;">Yes</td>
@@ -12825,7 +12847,7 @@ Showing nodes accounting for 1537.03kB, 100% of 1537.03kB total
 <td style="text-align: center;">Yes</td>
 <td style="text-align: center;">No</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td>Oracle Object Storage</td>
 <td style="text-align: center;">No</td>
 <td style="text-align: center;">Yes</td>
@@ -12839,7 +12861,7 @@ Showing nodes accounting for 1537.03kB, 100% of 1537.03kB total
 <td style="text-align: center;">No</td>
 <td style="text-align: center;">No</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td>pCloud</td>
 <td style="text-align: center;">Yes</td>
 <td style="text-align: center;">Yes</td>
@@ -12853,7 +12875,7 @@ Showing nodes accounting for 1537.03kB, 100% of 1537.03kB total
 <td style="text-align: center;">Yes</td>
 <td style="text-align: center;">Yes</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td>PikPak</td>
 <td style="text-align: center;">Yes</td>
 <td style="text-align: center;">Yes</td>
@@ -13239,7 +13261,7 @@ Showing nodes accounting for 1537.03kB, 100% of 1537.03kB total
       --tpslimit float                     Limit HTTP transactions per second to this
       --tpslimit-burst int                 Max burst of transactions for --tpslimit (default 1)
       --use-cookies                        Enable session cookiejar
-      --user-agent string                  Set the user-agent to a specified string (default &quot;rclone/v1.70.0&quot;)</code></pre>
+      --user-agent string                  Set the user-agent to a specified string (default &quot;rclone/v1.70.3&quot;)</code></pre>
 <h2 id="performance">Performance</h2>
 <p>Flags helpful for increasing performance.</p>
 <pre><code>      --buffer-size SizeSuffix   In memory buffer size when reading files for each --transfer (default 16Mi)
@@ -13661,6 +13683,7 @@ Showing nodes accounting for 1537.03kB, 100% of 1537.03kB total
       --ftp-explicit-tls                                    Use Explicit FTPS (FTP over TLS)
       --ftp-force-list-hidden                               Use LIST -a to force listing of hidden files and folders. This will disable the use of MLSD
       --ftp-host string                                     FTP host to connect to
+      --ftp-http-proxy string                               URL for HTTP CONNECT proxy
       --ftp-idle-timeout Duration                           Max time before closing idle connections (default 1m0s)
       --ftp-no-check-certificate                            Do not verify the TLS certificate of the server
       --ftp-no-check-upload                                 Don&#39;t check the upload is OK
@@ -21368,6 +21391,7 @@ y/e/d&gt; y</code></pre>
 <h4 id="box-client-credentials">--box-client-credentials</h4>
 <p>Use client credentials OAuth flow.</p>
 <p>This will use the OAUTH2 client Credentials Flow as described in RFC 6749.</p>
+<p>Note that this option is NOT supported by all backends.</p>
 <p>Properties:</p>
 <ul>
 <li>Config: client_credentials</li>
@@ -22622,6 +22646,7 @@ y/e/d&gt; y</code></pre>
 <h4 id="sharefile-client-credentials">--sharefile-client-credentials</h4>
 <p>Use client credentials OAuth flow.</p>
 <p>This will use the OAUTH2 client Credentials Flow as described in RFC 6749.</p>
+<p>Note that this option is NOT supported by all backends.</p>
 <p>Properties:</p>
 <ul>
 <li>Config: client_credentials</li>
@@ -23395,7 +23420,7 @@ upstreams = &quot;My Drive=My Drive:&quot; &quot;Test Drive=Test Drive:&quot;</c
 <p>See the <a href="https://rclone.org/docs/#metadata">metadata</a> docs for more info.</p>
 <h1 id="doi">DOI</h1>
 <p>The DOI remote is a read only remote for reading files from digital object identifiers (DOI).</p>
-<p>Currently, the DOI backend supports supports DOIs hosted with: - <a href="https://inveniosoftware.org/products/rdm/">InvenioRDM</a> - <a href="https://zenodo.org">Zenodo</a> - <a href="https://data.caltech.edu">CaltechDATA</a> - <a href="https://inveniosoftware.org/showcase/">Other InvenioRDM repositories</a> - <a href="https://dataverse.org">Dataverse</a> - <a href="https://dataverse.harvard.edu">Harvard Dataverse</a> - <a href="https://dataverse.org/installations">Other Dataverse repositories</a></p>
+<p>Currently, the DOI backend supports DOIs hosted with: - <a href="https://inveniosoftware.org/products/rdm/">InvenioRDM</a> - <a href="https://zenodo.org">Zenodo</a> - <a href="https://data.caltech.edu">CaltechDATA</a> - <a href="https://inveniosoftware.org/showcase/">Other InvenioRDM repositories</a> - <a href="https://dataverse.org">Dataverse</a> - <a href="https://dataverse.harvard.edu">Harvard Dataverse</a> - <a href="https://dataverse.org/installations">Other Dataverse repositories</a></p>
 <p>Paths are specified as <code>remote:path</code></p>
 <p>Paths may be as deep as required, e.g. <code>remote:directory/subdirectory</code>.</p>
 <h2 id="configuration-12">Configuration</h2>
@@ -23756,6 +23781,7 @@ y/e/d&gt; y</code></pre>
 <h4 id="dropbox-client-credentials">--dropbox-client-credentials</h4>
 <p>Use client credentials OAuth flow.</p>
 <p>This will use the OAUTH2 client Credentials Flow as described in RFC 6749.</p>
+<p>Note that this option is NOT supported by all backends.</p>
 <p>Properties:</p>
 <ul>
 <li>Config: client_credentials</li>
@@ -24724,6 +24750,16 @@ rclone lsf :ftp,host=speedtest.tele2.net,user=anonymous,pass=IXs2wc8OJOz7SYLBk47
 <li>Type: string</li>
 <li>Required: false</li>
 </ul>
+<h4 id="ftp-http-proxy">--ftp-http-proxy</h4>
+<p>URL for HTTP CONNECT proxy</p>
+<p>Set this to a URL for an HTTP proxy which supports the HTTP CONNECT verb.</p>
+<p>Properties:</p>
+<ul>
+<li>Config: http_proxy</li>
+<li>Env Var: RCLONE_FTP_HTTP_PROXY</li>
+<li>Type: string</li>
+<li>Required: false</li>
+</ul>
 <h4 id="ftp-no-check-upload">--ftp-no-check-upload</h4>
 <p>Don't check the upload is OK</p>
 <p>Normally rclone will try to check the upload exists after it has uploaded a file to make sure the size and modification time are as expected.</p>
@@ -25651,6 +25687,7 @@ ya29.c.c0ASRK0GbAFEewXD [truncated]</code></pre>
 <h4 id="gcs-client-credentials">--gcs-client-credentials</h4>
 <p>Use client credentials OAuth flow.</p>
 <p>This will use the OAUTH2 client Credentials Flow as described in RFC 6749.</p>
+<p>Note that this option is NOT supported by all backends.</p>
 <p>Properties:</p>
 <ul>
 <li>Config: client_credentials</li>
@@ -26354,6 +26391,7 @@ trashed=false and &#39;c&#39; in parents</code></pre>
 <h4 id="drive-client-credentials">--drive-client-credentials</h4>
 <p>Use client credentials OAuth flow.</p>
 <p>This will use the OAUTH2 client Credentials Flow as described in RFC 6749.</p>
+<p>Note that this option is NOT supported by all backends.</p>
 <p>Properties:</p>
 <ul>
 <li>Config: client_credentials</li>
@@ -27429,6 +27467,7 @@ y/e/d&gt; y</code></pre>
 <h4 id="gphotos-client-credentials">--gphotos-client-credentials</h4>
 <p>Use client credentials OAuth flow.</p>
 <p>This will use the OAUTH2 client Credentials Flow as described in RFC 6749.</p>
+<p>Note that this option is NOT supported by all backends.</p>
 <p>Properties:</p>
 <ul>
 <li>Config: client_credentials</li>
@@ -27596,6 +27635,13 @@ y/e/d&gt; y</code></pre>
 <p>Rclone cannot delete files anywhere except under <code>album</code>.</p>
 <h3 id="deleting-albums">Deleting albums</h3>
 <p>The Google Photos API does not support deleting albums - see <a href="https://issuetracker.google.com/issues/135714733">bug #135714733</a>.</p>
+<h2 id="making-your-own-client_id-1">Making your own client_id</h2>
+<p>When you use rclone with Google photos in its default configuration you are using rclone's client_id. This is shared between all the rclone users. There is a global rate limit on the number of queries per second that each client_id can do set by Google.</p>
+<p>If there is a problem with this client_id (eg quota too low or the client_id stops working) then you can make your own.</p>
+<p>Please follow the steps in <a href="https://rclone.org/drive/#making-your-own-client-id">the google drive docs</a>. You will need these scopes instead of the drive ones detailed:</p>
+<pre><code>https://www.googleapis.com/auth/photoslibrary.appendonly
+https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata
+https://www.googleapis.com/auth/photoslibrary.edit.appcreateddata</code></pre>
 <h1 id="hasher">Hasher</h1>
 <p>Hasher is a special overlay backend to create remotes which handle checksums for other remotes. It's main functions include: - Emulate hash types unimplemented by backends - Cache checksums to help with slow hashing of large local or (S)FTP files - Warm up checksum cache from external SUM files</p>
 <h2 id="getting-started-1">Getting started</h2>
@@ -28151,6 +28197,7 @@ rclone lsd remote:/users/test/path</code></pre>
 <h4 id="hidrive-client-credentials">--hidrive-client-credentials</h4>
 <p>Use client credentials OAuth flow.</p>
 <p>This will use the OAUTH2 client Credentials Flow as described in RFC 6749.</p>
+<p>Note that this option is NOT supported by all backends.</p>
 <p>Properties:</p>
 <ul>
 <li>Config: client_credentials</li>
@@ -29403,6 +29450,7 @@ y/e/d&gt; y</code></pre>
 <h4 id="jottacloud-client-credentials">--jottacloud-client-credentials</h4>
 <p>Use client credentials OAuth flow.</p>
 <p>This will use the OAUTH2 client Credentials Flow as described in RFC 6749.</p>
+<p>Note that this option is NOT supported by all backends.</p>
 <p>Properties:</p>
 <ul>
 <li>Config: client_credentials</li>
@@ -30162,6 +30210,7 @@ y/e/d&gt; y</code></pre>
 <h4 id="mailru-client-credentials">--mailru-client-credentials</h4>
 <p>Use client credentials OAuth flow.</p>
 <p>This will use the OAUTH2 client Credentials Flow as described in RFC 6749.</p>
+<p>Note that this option is NOT supported by all backends.</p>
 <p>Properties:</p>
 <ul>
 <li>Config: client_credentials</li>
@@ -32064,7 +32113,10 @@ y/e/d&gt; y</code></pre>
 <h4 id="creating-client-id-for-onedrive-personal">Creating Client ID for OneDrive Personal</h4>
 <p>To create your own Client ID, please follow these steps:</p>
 <ol type="1">
-<li>Open https://portal.azure.com/#blade/Microsoft_AAD_RegisteredApps/ApplicationsListBlade and then click <code>New registration</code>.</li>
+<li>Open https://portal.azure.com/?quickstart=true#view/Microsoft_AAD_IAM/ActiveDirectoryMenuBlade/~/Overview and then under the <code>Add</code> menu click <code>App registration</code>.
+<ul>
+<li>If you have not created an Azure account, you will be prompted to. This is free, but you need to provide a phone number, address, and credit card for identity verification.</li>
+</ul></li>
 <li>Enter a name for your app, choose account type <code>Accounts in any organizational directory (Any Azure AD directory - Multitenant) and personal Microsoft accounts (e.g. Skype, Xbox)</code>, select <code>Web</code> in <code>Redirect URI</code>, then type (do not copy and paste) <code>http://localhost:53682/</code> and click Register. Copy and keep the <code>Application (client) ID</code> under the app name for later use.</li>
 <li>Under <code>manage</code> select <code>Certificates &amp; secrets</code>, click <code>New client secret</code>. Enter a description (can be anything) and set <code>Expires</code> to 24 months. Copy and keep that secret <em>Value</em> for later use (you <em>won't</em> be able to see this value afterwards).</li>
 <li>Under <code>manage</code> select <code>API permissions</code>, click <code>Add a permission</code> and select <code>Microsoft Graph</code> then select <code>delegated permissions</code>.</li>
@@ -32302,6 +32354,7 @@ y/e/d&gt; y</code></pre>
 <h4 id="onedrive-client-credentials">--onedrive-client-credentials</h4>
 <p>Use client credentials OAuth flow.</p>
 <p>This will use the OAUTH2 client Credentials Flow as described in RFC 6749.</p>
+<p>Note that this option is NOT supported by all backends.</p>
 <p>Properties:</p>
 <ul>
 <li>Config: client_credentials</li>
@@ -32635,75 +32688,75 @@ rclone rc vfs/refresh recursive=true</code></pre>
 <p>Permissions are also supported, if <code>--onedrive-metadata-permissions</code> is set. The accepted values for <code>--onedrive-metadata-permissions</code> are "<code>read</code>", "<code>write</code>", "<code>read,write</code>", and "<code>off</code>" (the default). "<code>write</code>" supports adding new permissions, updating the "role" of existing permissions, and removing permissions. Updating and removing require the Permission ID to be known, so it is recommended to use "<code>read,write</code>" instead of "<code>write</code>" if you wish to update/remove permissions.</p>
 <p>Permissions are read/written in JSON format using the same schema as the <a href="https://learn.microsoft.com/en-us/onedrive/developer/rest-api/resources/permission?view=odsp-graph-online">OneDrive API</a>, which differs slightly between OneDrive Personal and Business.</p>
 <p>Example for OneDrive Personal:</p>
-<div class="sourceCode" id="cb1405"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb1405-1"><a href="#cb1405-1" aria-hidden="true"></a><span class="ot">[</span></span>
-<span id="cb1405-2"><a href="#cb1405-2" aria-hidden="true"></a>    <span class="fu">{</span></span>
-<span id="cb1405-3"><a href="#cb1405-3" aria-hidden="true"></a>        <span class="dt">&quot;id&quot;</span><span class="fu">:</span> <span class="st">&quot;1234567890ABC!123&quot;</span><span class="fu">,</span></span>
-<span id="cb1405-4"><a href="#cb1405-4" aria-hidden="true"></a>        <span class="dt">&quot;grantedTo&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
-<span id="cb1405-5"><a href="#cb1405-5" aria-hidden="true"></a>            <span class="dt">&quot;user&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
-<span id="cb1405-6"><a href="#cb1405-6" aria-hidden="true"></a>                <span class="dt">&quot;id&quot;</span><span class="fu">:</span> <span class="st">&quot;ryan@contoso.com&quot;</span></span>
-<span id="cb1405-7"><a href="#cb1405-7" aria-hidden="true"></a>            <span class="fu">},</span></span>
-<span id="cb1405-8"><a href="#cb1405-8" aria-hidden="true"></a>            <span class="dt">&quot;application&quot;</span><span class="fu">:</span> <span class="fu">{},</span></span>
-<span id="cb1405-9"><a href="#cb1405-9" aria-hidden="true"></a>            <span class="dt">&quot;device&quot;</span><span class="fu">:</span> <span class="fu">{}</span></span>
-<span id="cb1405-10"><a href="#cb1405-10" aria-hidden="true"></a>        <span class="fu">},</span></span>
-<span id="cb1405-11"><a href="#cb1405-11" aria-hidden="true"></a>        <span class="dt">&quot;invitation&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
-<span id="cb1405-12"><a href="#cb1405-12" aria-hidden="true"></a>            <span class="dt">&quot;email&quot;</span><span class="fu">:</span> <span class="st">&quot;ryan@contoso.com&quot;</span></span>
-<span id="cb1405-13"><a href="#cb1405-13" aria-hidden="true"></a>        <span class="fu">},</span></span>
-<span id="cb1405-14"><a href="#cb1405-14" aria-hidden="true"></a>        <span class="dt">&quot;link&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
-<span id="cb1405-15"><a href="#cb1405-15" aria-hidden="true"></a>            <span class="dt">&quot;webUrl&quot;</span><span class="fu">:</span> <span class="st">&quot;https://1drv.ms/t/s!1234567890ABC&quot;</span></span>
-<span id="cb1405-16"><a href="#cb1405-16" aria-hidden="true"></a>        <span class="fu">},</span></span>
-<span id="cb1405-17"><a href="#cb1405-17" aria-hidden="true"></a>        <span class="dt">&quot;roles&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
-<span id="cb1405-18"><a href="#cb1405-18" aria-hidden="true"></a>            <span class="st">&quot;read&quot;</span></span>
-<span id="cb1405-19"><a href="#cb1405-19" aria-hidden="true"></a>        <span class="ot">]</span><span class="fu">,</span></span>
-<span id="cb1405-20"><a href="#cb1405-20" aria-hidden="true"></a>        <span class="dt">&quot;shareId&quot;</span><span class="fu">:</span> <span class="st">&quot;s!1234567890ABC&quot;</span></span>
-<span id="cb1405-21"><a href="#cb1405-21" aria-hidden="true"></a>    <span class="fu">}</span></span>
-<span id="cb1405-22"><a href="#cb1405-22" aria-hidden="true"></a><span class="ot">]</span></span></code></pre></div>
-<p>Example for OneDrive Business:</p>
 <div class="sourceCode" id="cb1406"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb1406-1"><a href="#cb1406-1" aria-hidden="true"></a><span class="ot">[</span></span>
 <span id="cb1406-2"><a href="#cb1406-2" aria-hidden="true"></a>    <span class="fu">{</span></span>
-<span id="cb1406-3"><a href="#cb1406-3" aria-hidden="true"></a>        <span class="dt">&quot;id&quot;</span><span class="fu">:</span> <span class="st">&quot;48d31887-5fad-4d73-a9f5-3c356e68a038&quot;</span><span class="fu">,</span></span>
-<span id="cb1406-4"><a href="#cb1406-4" aria-hidden="true"></a>        <span class="dt">&quot;grantedToIdentities&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
-<span id="cb1406-5"><a href="#cb1406-5" aria-hidden="true"></a>            <span class="fu">{</span></span>
-<span id="cb1406-6"><a href="#cb1406-6" aria-hidden="true"></a>                <span class="dt">&quot;user&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
-<span id="cb1406-7"><a href="#cb1406-7" aria-hidden="true"></a>                    <span class="dt">&quot;displayName&quot;</span><span class="fu">:</span> <span class="st">&quot;ryan@contoso.com&quot;</span></span>
-<span id="cb1406-8"><a href="#cb1406-8" aria-hidden="true"></a>                <span class="fu">},</span></span>
-<span id="cb1406-9"><a href="#cb1406-9" aria-hidden="true"></a>                <span class="dt">&quot;application&quot;</span><span class="fu">:</span> <span class="fu">{},</span></span>
-<span id="cb1406-10"><a href="#cb1406-10" aria-hidden="true"></a>                <span class="dt">&quot;device&quot;</span><span class="fu">:</span> <span class="fu">{}</span></span>
-<span id="cb1406-11"><a href="#cb1406-11" aria-hidden="true"></a>            <span class="fu">}</span></span>
-<span id="cb1406-12"><a href="#cb1406-12" aria-hidden="true"></a>        <span class="ot">]</span><span class="fu">,</span></span>
-<span id="cb1406-13"><a href="#cb1406-13" aria-hidden="true"></a>        <span class="dt">&quot;link&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
-<span id="cb1406-14"><a href="#cb1406-14" aria-hidden="true"></a>            <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;view&quot;</span><span class="fu">,</span></span>
-<span id="cb1406-15"><a href="#cb1406-15" aria-hidden="true"></a>            <span class="dt">&quot;scope&quot;</span><span class="fu">:</span> <span class="st">&quot;users&quot;</span><span class="fu">,</span></span>
-<span id="cb1406-16"><a href="#cb1406-16" aria-hidden="true"></a>            <span class="dt">&quot;webUrl&quot;</span><span class="fu">:</span> <span class="st">&quot;https://contoso.sharepoint.com/:w:/t/design/a577ghg9hgh737613bmbjf839026561fmzhsr85ng9f3hjck2t5s&quot;</span></span>
-<span id="cb1406-17"><a href="#cb1406-17" aria-hidden="true"></a>        <span class="fu">},</span></span>
-<span id="cb1406-18"><a href="#cb1406-18" aria-hidden="true"></a>        <span class="dt">&quot;roles&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
-<span id="cb1406-19"><a href="#cb1406-19" aria-hidden="true"></a>            <span class="st">&quot;read&quot;</span></span>
-<span id="cb1406-20"><a href="#cb1406-20" aria-hidden="true"></a>        <span class="ot">]</span><span class="fu">,</span></span>
-<span id="cb1406-21"><a href="#cb1406-21" aria-hidden="true"></a>        <span class="dt">&quot;shareId&quot;</span><span class="fu">:</span> <span class="st">&quot;u!LKj1lkdlals90j1nlkascl&quot;</span></span>
-<span id="cb1406-22"><a href="#cb1406-22" aria-hidden="true"></a>    <span class="fu">}</span><span class="ot">,</span></span>
-<span id="cb1406-23"><a href="#cb1406-23" aria-hidden="true"></a>    <span class="fu">{</span></span>
-<span id="cb1406-24"><a href="#cb1406-24" aria-hidden="true"></a>        <span class="dt">&quot;id&quot;</span><span class="fu">:</span> <span class="st">&quot;5D33DD65C6932946&quot;</span><span class="fu">,</span></span>
-<span id="cb1406-25"><a href="#cb1406-25" aria-hidden="true"></a>        <span class="dt">&quot;grantedTo&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
-<span id="cb1406-26"><a href="#cb1406-26" aria-hidden="true"></a>            <span class="dt">&quot;user&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
-<span id="cb1406-27"><a href="#cb1406-27" aria-hidden="true"></a>                <span class="dt">&quot;displayName&quot;</span><span class="fu">:</span> <span class="st">&quot;John Doe&quot;</span><span class="fu">,</span></span>
-<span id="cb1406-28"><a href="#cb1406-28" aria-hidden="true"></a>                <span class="dt">&quot;id&quot;</span><span class="fu">:</span> <span class="st">&quot;efee1b77-fb3b-4f65-99d6-274c11914d12&quot;</span></span>
-<span id="cb1406-29"><a href="#cb1406-29" aria-hidden="true"></a>            <span class="fu">},</span></span>
-<span id="cb1406-30"><a href="#cb1406-30" aria-hidden="true"></a>            <span class="dt">&quot;application&quot;</span><span class="fu">:</span> <span class="fu">{},</span></span>
-<span id="cb1406-31"><a href="#cb1406-31" aria-hidden="true"></a>            <span class="dt">&quot;device&quot;</span><span class="fu">:</span> <span class="fu">{}</span></span>
-<span id="cb1406-32"><a href="#cb1406-32" aria-hidden="true"></a>        <span class="fu">},</span></span>
-<span id="cb1406-33"><a href="#cb1406-33" aria-hidden="true"></a>        <span class="dt">&quot;roles&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
-<span id="cb1406-34"><a href="#cb1406-34" aria-hidden="true"></a>            <span class="st">&quot;owner&quot;</span></span>
-<span id="cb1406-35"><a href="#cb1406-35" aria-hidden="true"></a>        <span class="ot">]</span><span class="fu">,</span></span>
-<span id="cb1406-36"><a href="#cb1406-36" aria-hidden="true"></a>        <span class="dt">&quot;shareId&quot;</span><span class="fu">:</span> <span class="st">&quot;FWxc1lasfdbEAGM5fI7B67aB5ZMPDMmQ11U&quot;</span></span>
-<span id="cb1406-37"><a href="#cb1406-37" aria-hidden="true"></a>    <span class="fu">}</span></span>
-<span id="cb1406-38"><a href="#cb1406-38" aria-hidden="true"></a><span class="ot">]</span></span></code></pre></div>
+<span id="cb1406-3"><a href="#cb1406-3" aria-hidden="true"></a>        <span class="dt">&quot;id&quot;</span><span class="fu">:</span> <span class="st">&quot;1234567890ABC!123&quot;</span><span class="fu">,</span></span>
+<span id="cb1406-4"><a href="#cb1406-4" aria-hidden="true"></a>        <span class="dt">&quot;grantedTo&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb1406-5"><a href="#cb1406-5" aria-hidden="true"></a>            <span class="dt">&quot;user&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb1406-6"><a href="#cb1406-6" aria-hidden="true"></a>                <span class="dt">&quot;id&quot;</span><span class="fu">:</span> <span class="st">&quot;ryan@contoso.com&quot;</span></span>
+<span id="cb1406-7"><a href="#cb1406-7" aria-hidden="true"></a>            <span class="fu">},</span></span>
+<span id="cb1406-8"><a href="#cb1406-8" aria-hidden="true"></a>            <span class="dt">&quot;application&quot;</span><span class="fu">:</span> <span class="fu">{},</span></span>
+<span id="cb1406-9"><a href="#cb1406-9" aria-hidden="true"></a>            <span class="dt">&quot;device&quot;</span><span class="fu">:</span> <span class="fu">{}</span></span>
+<span id="cb1406-10"><a href="#cb1406-10" aria-hidden="true"></a>        <span class="fu">},</span></span>
+<span id="cb1406-11"><a href="#cb1406-11" aria-hidden="true"></a>        <span class="dt">&quot;invitation&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb1406-12"><a href="#cb1406-12" aria-hidden="true"></a>            <span class="dt">&quot;email&quot;</span><span class="fu">:</span> <span class="st">&quot;ryan@contoso.com&quot;</span></span>
+<span id="cb1406-13"><a href="#cb1406-13" aria-hidden="true"></a>        <span class="fu">},</span></span>
+<span id="cb1406-14"><a href="#cb1406-14" aria-hidden="true"></a>        <span class="dt">&quot;link&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb1406-15"><a href="#cb1406-15" aria-hidden="true"></a>            <span class="dt">&quot;webUrl&quot;</span><span class="fu">:</span> <span class="st">&quot;https://1drv.ms/t/s!1234567890ABC&quot;</span></span>
+<span id="cb1406-16"><a href="#cb1406-16" aria-hidden="true"></a>        <span class="fu">},</span></span>
+<span id="cb1406-17"><a href="#cb1406-17" aria-hidden="true"></a>        <span class="dt">&quot;roles&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb1406-18"><a href="#cb1406-18" aria-hidden="true"></a>            <span class="st">&quot;read&quot;</span></span>
+<span id="cb1406-19"><a href="#cb1406-19" aria-hidden="true"></a>        <span class="ot">]</span><span class="fu">,</span></span>
+<span id="cb1406-20"><a href="#cb1406-20" aria-hidden="true"></a>        <span class="dt">&quot;shareId&quot;</span><span class="fu">:</span> <span class="st">&quot;s!1234567890ABC&quot;</span></span>
+<span id="cb1406-21"><a href="#cb1406-21" aria-hidden="true"></a>    <span class="fu">}</span></span>
+<span id="cb1406-22"><a href="#cb1406-22" aria-hidden="true"></a><span class="ot">]</span></span></code></pre></div>
+<p>Example for OneDrive Business:</p>
+<div class="sourceCode" id="cb1407"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb1407-1"><a href="#cb1407-1" aria-hidden="true"></a><span class="ot">[</span></span>
+<span id="cb1407-2"><a href="#cb1407-2" aria-hidden="true"></a>    <span class="fu">{</span></span>
+<span id="cb1407-3"><a href="#cb1407-3" aria-hidden="true"></a>        <span class="dt">&quot;id&quot;</span><span class="fu">:</span> <span class="st">&quot;48d31887-5fad-4d73-a9f5-3c356e68a038&quot;</span><span class="fu">,</span></span>
+<span id="cb1407-4"><a href="#cb1407-4" aria-hidden="true"></a>        <span class="dt">&quot;grantedToIdentities&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb1407-5"><a href="#cb1407-5" aria-hidden="true"></a>            <span class="fu">{</span></span>
+<span id="cb1407-6"><a href="#cb1407-6" aria-hidden="true"></a>                <span class="dt">&quot;user&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb1407-7"><a href="#cb1407-7" aria-hidden="true"></a>                    <span class="dt">&quot;displayName&quot;</span><span class="fu">:</span> <span class="st">&quot;ryan@contoso.com&quot;</span></span>
+<span id="cb1407-8"><a href="#cb1407-8" aria-hidden="true"></a>                <span class="fu">},</span></span>
+<span id="cb1407-9"><a href="#cb1407-9" aria-hidden="true"></a>                <span class="dt">&quot;application&quot;</span><span class="fu">:</span> <span class="fu">{},</span></span>
+<span id="cb1407-10"><a href="#cb1407-10" aria-hidden="true"></a>                <span class="dt">&quot;device&quot;</span><span class="fu">:</span> <span class="fu">{}</span></span>
+<span id="cb1407-11"><a href="#cb1407-11" aria-hidden="true"></a>            <span class="fu">}</span></span>
+<span id="cb1407-12"><a href="#cb1407-12" aria-hidden="true"></a>        <span class="ot">]</span><span class="fu">,</span></span>
+<span id="cb1407-13"><a href="#cb1407-13" aria-hidden="true"></a>        <span class="dt">&quot;link&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb1407-14"><a href="#cb1407-14" aria-hidden="true"></a>            <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;view&quot;</span><span class="fu">,</span></span>
+<span id="cb1407-15"><a href="#cb1407-15" aria-hidden="true"></a>            <span class="dt">&quot;scope&quot;</span><span class="fu">:</span> <span class="st">&quot;users&quot;</span><span class="fu">,</span></span>
+<span id="cb1407-16"><a href="#cb1407-16" aria-hidden="true"></a>            <span class="dt">&quot;webUrl&quot;</span><span class="fu">:</span> <span class="st">&quot;https://contoso.sharepoint.com/:w:/t/design/a577ghg9hgh737613bmbjf839026561fmzhsr85ng9f3hjck2t5s&quot;</span></span>
+<span id="cb1407-17"><a href="#cb1407-17" aria-hidden="true"></a>        <span class="fu">},</span></span>
+<span id="cb1407-18"><a href="#cb1407-18" aria-hidden="true"></a>        <span class="dt">&quot;roles&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb1407-19"><a href="#cb1407-19" aria-hidden="true"></a>            <span class="st">&quot;read&quot;</span></span>
+<span id="cb1407-20"><a href="#cb1407-20" aria-hidden="true"></a>        <span class="ot">]</span><span class="fu">,</span></span>
+<span id="cb1407-21"><a href="#cb1407-21" aria-hidden="true"></a>        <span class="dt">&quot;shareId&quot;</span><span class="fu">:</span> <span class="st">&quot;u!LKj1lkdlals90j1nlkascl&quot;</span></span>
+<span id="cb1407-22"><a href="#cb1407-22" aria-hidden="true"></a>    <span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb1407-23"><a href="#cb1407-23" aria-hidden="true"></a>    <span class="fu">{</span></span>
+<span id="cb1407-24"><a href="#cb1407-24" aria-hidden="true"></a>        <span class="dt">&quot;id&quot;</span><span class="fu">:</span> <span class="st">&quot;5D33DD65C6932946&quot;</span><span class="fu">,</span></span>
+<span id="cb1407-25"><a href="#cb1407-25" aria-hidden="true"></a>        <span class="dt">&quot;grantedTo&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb1407-26"><a href="#cb1407-26" aria-hidden="true"></a>            <span class="dt">&quot;user&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb1407-27"><a href="#cb1407-27" aria-hidden="true"></a>                <span class="dt">&quot;displayName&quot;</span><span class="fu">:</span> <span class="st">&quot;John Doe&quot;</span><span class="fu">,</span></span>
+<span id="cb1407-28"><a href="#cb1407-28" aria-hidden="true"></a>                <span class="dt">&quot;id&quot;</span><span class="fu">:</span> <span class="st">&quot;efee1b77-fb3b-4f65-99d6-274c11914d12&quot;</span></span>
+<span id="cb1407-29"><a href="#cb1407-29" aria-hidden="true"></a>            <span class="fu">},</span></span>
+<span id="cb1407-30"><a href="#cb1407-30" aria-hidden="true"></a>            <span class="dt">&quot;application&quot;</span><span class="fu">:</span> <span class="fu">{},</span></span>
+<span id="cb1407-31"><a href="#cb1407-31" aria-hidden="true"></a>            <span class="dt">&quot;device&quot;</span><span class="fu">:</span> <span class="fu">{}</span></span>
+<span id="cb1407-32"><a href="#cb1407-32" aria-hidden="true"></a>        <span class="fu">},</span></span>
+<span id="cb1407-33"><a href="#cb1407-33" aria-hidden="true"></a>        <span class="dt">&quot;roles&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb1407-34"><a href="#cb1407-34" aria-hidden="true"></a>            <span class="st">&quot;owner&quot;</span></span>
+<span id="cb1407-35"><a href="#cb1407-35" aria-hidden="true"></a>        <span class="ot">]</span><span class="fu">,</span></span>
+<span id="cb1407-36"><a href="#cb1407-36" aria-hidden="true"></a>        <span class="dt">&quot;shareId&quot;</span><span class="fu">:</span> <span class="st">&quot;FWxc1lasfdbEAGM5fI7B67aB5ZMPDMmQ11U&quot;</span></span>
+<span id="cb1407-37"><a href="#cb1407-37" aria-hidden="true"></a>    <span class="fu">}</span></span>
+<span id="cb1407-38"><a href="#cb1407-38" aria-hidden="true"></a><span class="ot">]</span></span></code></pre></div>
 <p>To write permissions, pass in a "permissions" metadata key using this same format. The <a href="https://rclone.org/docs/#metadata-mapper"><code>--metadata-mapper</code></a> tool can be very helpful for this.</p>
 <p>When adding permissions, an email address can be provided in the <code>User.ID</code> or <code>DisplayName</code> properties of <code>grantedTo</code> or <code>grantedToIdentities</code>. Alternatively, an ObjectID can be provided in <code>User.ID</code>. At least one valid recipient must be provided in order to add a permission for a user. Creating a Public Link is also supported, if <code>Link.Scope</code> is set to <code>"anonymous"</code>.</p>
 <p>Example request to add a "read" permission with <code>--metadata-mapper</code>:</p>
-<div class="sourceCode" id="cb1407"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb1407-1"><a href="#cb1407-1" aria-hidden="true"></a><span class="fu">{</span></span>
-<span id="cb1407-2"><a href="#cb1407-2" aria-hidden="true"></a>    <span class="dt">&quot;Metadata&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
-<span id="cb1407-3"><a href="#cb1407-3" aria-hidden="true"></a>        <span class="dt">&quot;permissions&quot;</span><span class="fu">:</span> <span class="st">&quot;[{</span><span class="ch">\&quot;</span><span class="st">grantedToIdentities</span><span class="ch">\&quot;</span><span class="st">:[{</span><span class="ch">\&quot;</span><span class="st">user</span><span class="ch">\&quot;</span><span class="st">:{</span><span class="ch">\&quot;</span><span class="st">id</span><span class="ch">\&quot;</span><span class="st">:</span><span class="ch">\&quot;</span><span class="st">ryan@contoso.com</span><span class="ch">\&quot;</span><span class="st">}}],</span><span class="ch">\&quot;</span><span class="st">roles</span><span class="ch">\&quot;</span><span class="st">:[</span><span class="ch">\&quot;</span><span class="st">read</span><span class="ch">\&quot;</span><span class="st">]}]&quot;</span></span>
-<span id="cb1407-4"><a href="#cb1407-4" aria-hidden="true"></a>    <span class="fu">}</span></span>
-<span id="cb1407-5"><a href="#cb1407-5" aria-hidden="true"></a><span class="fu">}</span></span></code></pre></div>
+<div class="sourceCode" id="cb1408"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb1408-1"><a href="#cb1408-1" aria-hidden="true"></a><span class="fu">{</span></span>
+<span id="cb1408-2"><a href="#cb1408-2" aria-hidden="true"></a>    <span class="dt">&quot;Metadata&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb1408-3"><a href="#cb1408-3" aria-hidden="true"></a>        <span class="dt">&quot;permissions&quot;</span><span class="fu">:</span> <span class="st">&quot;[{</span><span class="ch">\&quot;</span><span class="st">grantedToIdentities</span><span class="ch">\&quot;</span><span class="st">:[{</span><span class="ch">\&quot;</span><span class="st">user</span><span class="ch">\&quot;</span><span class="st">:{</span><span class="ch">\&quot;</span><span class="st">id</span><span class="ch">\&quot;</span><span class="st">:</span><span class="ch">\&quot;</span><span class="st">ryan@contoso.com</span><span class="ch">\&quot;</span><span class="st">}}],</span><span class="ch">\&quot;</span><span class="st">roles</span><span class="ch">\&quot;</span><span class="st">:[</span><span class="ch">\&quot;</span><span class="st">read</span><span class="ch">\&quot;</span><span class="st">]}]&quot;</span></span>
+<span id="cb1408-4"><a href="#cb1408-4" aria-hidden="true"></a>    <span class="fu">}</span></span>
+<span id="cb1408-5"><a href="#cb1408-5" aria-hidden="true"></a><span class="fu">}</span></span></code></pre></div>
 <p>Note that adding a permission can fail if a conflicting permission already exists for the file/folder.</p>
 <p>To update an existing permission, include both the Permission ID and the new <code>roles</code> to be assigned. <code>roles</code> is the only property that can be changed.</p>
 <p>To remove permissions, pass in a blob containing only the permissions you wish to keep (which can be empty, to remove all.) Note that the <code>owner</code> role will be ignored, as it cannot be removed.</p>
@@ -35077,6 +35130,7 @@ y/e/d&gt; y</code></pre>
 <h4 id="pcloud-client-credentials">--pcloud-client-credentials</h4>
 <p>Use client credentials OAuth flow.</p>
 <p>This will use the OAUTH2 client Credentials Flow as described in RFC 6749.</p>
+<p>Note that this option is NOT supported by all backends.</p>
 <p>Properties:</p>
 <ul>
 <li>Config: client_credentials</li>
@@ -35686,6 +35740,7 @@ y/e/d&gt; </code></pre>
 <h4 id="premiumizeme-client-credentials">--premiumizeme-client-credentials</h4>
 <p>Use client credentials OAuth flow.</p>
 <p>This will use the OAUTH2 client Credentials Flow as described in RFC 6749.</p>
+<p>Note that this option is NOT supported by all backends.</p>
 <p>Properties:</p>
 <ul>
 <li>Config: client_credentials</li>
@@ -36077,6 +36132,7 @@ e/n/d/r/c/s/q&gt; q</code></pre>
 <h4 id="putio-client-credentials">--putio-client-credentials</h4>
 <p>Use client credentials OAuth flow.</p>
 <p>This will use the OAUTH2 client Credentials Flow as described in RFC 6749.</p>
+<p>Note that this option is NOT supported by all backends.</p>
 <p>Properties:</p>
 <ul>
 <li>Config: client_credentials</li>
@@ -39099,6 +39155,7 @@ y/e/d&gt; y</code></pre>
 <h4 id="yandex-client-credentials">--yandex-client-credentials</h4>
 <p>Use client credentials OAuth flow.</p>
 <p>This will use the OAUTH2 client Credentials Flow as described in RFC 6749.</p>
+<p>Note that this option is NOT supported by all backends.</p>
 <p>Properties:</p>
 <ul>
 <li>Config: client_credentials</li>
@@ -39322,6 +39379,7 @@ y/e/d&gt; </code></pre>
 <h4 id="zoho-client-credentials">--zoho-client-credentials</h4>
 <p>Use client credentials OAuth flow.</p>
 <p>This will use the OAUTH2 client Credentials Flow as described in RFC 6749.</p>
+<p>Note that this option is NOT supported by all backends.</p>
 <p>Properties:</p>
 <ul>
 <li>Config: client_credentials</li>
@@ -40062,6 +40120,75 @@ $ tree /tmp/c
 <li>"error": return an error based on option value</li>
 </ul>
 <h1 id="changelog-1">Changelog</h1>
+<h2 id="v1.70.3---2025-07-09">v1.70.3 - 2025-07-09</h2>
+<p><a href="https://github.com/rclone/rclone/compare/v1.70.2...v1.70.3">See commits</a></p>
+<ul>
+<li>Bug Fixes
+<ul>
+<li>check: Fix difference report (was reporting error counts) (albertony)</li>
+<li>march: Fix deadlock when using <code>--no-traverse</code> (Nick Craig-Wood)</li>
+<li>doc fixes (albertony, Nick Craig-Wood)</li>
+</ul></li>
+<li>Azure Blob
+<ul>
+<li>Fix server side copy error "requires exactly one scope" (Nick Craig-Wood)</li>
+</ul></li>
+<li>B2
+<ul>
+<li>Fix finding objects when using <code>--b2-version-at</code> (Davide Bizzarri)</li>
+</ul></li>
+<li>Linkbox
+<ul>
+<li>Fix upload error "user upload file not exist" (Nick Craig-Wood)</li>
+</ul></li>
+<li>Pikpak
+<ul>
+<li>Improve error handling for missing links and unrecoverable 500s (wiserain)</li>
+</ul></li>
+<li>WebDAV
+<ul>
+<li>Fix setting modtime to that of local object instead of remote (WeidiDeng)</li>
+</ul></li>
+</ul>
+<h2 id="v1.70.2---2025-06-27">v1.70.2 - 2025-06-27</h2>
+<p><a href="https://github.com/rclone/rclone/compare/v1.70.1...v1.70.2">See commits</a></p>
+<ul>
+<li>Bug Fixes
+<ul>
+<li>convmv: Make --dry-run logs less noisy (nielash)</li>
+<li>sync: Avoid copying dir metadata to itself (nielash)</li>
+<li>build: Bump github.com/go-chi/chi/v5 from 5.2.1 to 5.2.2 to fix GHSA-vrw8-fxc6-2r93 (dependabot[bot])</li>
+<li>convmv: Fix moving to unicode-equivalent name (nielash)</li>
+<li>log: Fix deadlock when using systemd logging (Nick Craig-Wood)</li>
+<li>pacer: Fix nil pointer deref in RetryError (Nick Craig-Wood)</li>
+<li>doc fixes (Ali Zein Yousuf, Nick Craig-Wood)</li>
+</ul></li>
+<li>Local
+<ul>
+<li>Fix --skip-links on Windows when skipping Junction points (Nick Craig-Wood)</li>
+</ul></li>
+<li>Combine
+<ul>
+<li>Fix directory not found errors with ListP interface (Nick Craig-Wood)</li>
+</ul></li>
+<li>Mega
+<ul>
+<li>Fix tls handshake failure (necaran)</li>
+</ul></li>
+<li>Pikpak
+<ul>
+<li>Fix uploads fail with "aws-chunked encoding is not supported" error (Nick Craig-Wood)</li>
+</ul></li>
+</ul>
+<h2 id="v1.70.1---2025-06-19">v1.70.1 - 2025-06-19</h2>
+<p><a href="https://github.com/rclone/rclone/compare/v1.70.0...v1.70.1">See commits</a></p>
+<ul>
+<li>Bug Fixes
+<ul>
+<li>convmv: Fix spurious "error running command echo" on Windows (Nick Craig-Wood)</li>
+<li>doc fixes (albertony, Ed Craig-Wood, jinjingroad)</li>
+</ul></li>
+</ul>
 <h2 id="v1.70.0---2025-06-17">v1.70.0 - 2025-06-17</h2>
 <p><a href="https://github.com/rclone/rclone/compare/v1.69.0...v1.70.0">See commits</a></p>
 <ul>

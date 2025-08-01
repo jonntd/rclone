@@ -2,6 +2,7 @@ package _115
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,7 +27,7 @@ type MediaSyncStats struct {
 }
 
 // mediaSyncCommand 实现媒体库同步功能
-func (f *Fs) mediaSyncCommand(ctx context.Context, args []string, opt map[string]string) (interface{}, error) {
+func (f *Fs) mediaSyncCommand(ctx context.Context, args []string, opt map[string]string) (any, error) {
 	fs.Infof(f, "🎬 开始115网盘媒体库同步...")
 
 	// 1. 参数解析和验证
@@ -196,7 +197,7 @@ func (f *Fs) processDirectoryForMediaSync(ctx context.Context, sourcePath, targe
 			errMsg := fmt.Sprintf("创建目录失败 %s: %v", targetPath, err)
 			stats.ErrorMessages = append(stats.ErrorMessages, errMsg)
 			stats.Errors++
-			return fmt.Errorf(errMsg)
+			return errors.New(errMsg)
 		}
 	} else {
 		fs.Infof(f, "🔍 [预览] 将创建目录: %s", targetPath)
@@ -208,7 +209,7 @@ func (f *Fs) processDirectoryForMediaSync(ctx context.Context, sourcePath, targe
 		errMsg := fmt.Sprintf("列出目录失败 %s: %v", sourcePath, err)
 		stats.ErrorMessages = append(stats.ErrorMessages, errMsg)
 		stats.Errors++
-		return fmt.Errorf(errMsg)
+		return errors.New(errMsg)
 	}
 
 	// 3. 处理每个条目
@@ -227,8 +228,8 @@ func (f *Fs) processDirectoryForMediaSync(ctx context.Context, sourcePath, targe
 			relativePath := e.Remote()
 			if sourcePath != "" {
 				// 如果有源路径前缀，去掉它来获取相对路径
-				if strings.HasPrefix(relativePath, sourcePath+"/") {
-					relativePath = strings.TrimPrefix(relativePath, sourcePath+"/")
+				if path, found := strings.CutPrefix(relativePath, sourcePath+"/"); found {
+					relativePath = path
 				} else if relativePath == sourcePath {
 					// 如果完全匹配，说明这是当前目录本身，跳过
 					continue
@@ -699,7 +700,7 @@ func (f *Fs) collectCloudVideoFiles115(ctx context.Context, basePath, relativePa
 }
 
 // cleanupEmptyDirectoriesGlobal115 全局清理空目录，类似 rclone sync
-func (f *Fs) cleanupEmptyDirectoriesGlobal115(ctx context.Context, targetPath string, stats *MediaSyncStats) error {
+func (f *Fs) cleanupEmptyDirectoriesGlobal115(_ context.Context, targetPath string, stats *MediaSyncStats) error {
 	fs.Debugf(f, "🗂️ 开始全局清理空目录: %s", targetPath)
 
 	// 收集所有目录

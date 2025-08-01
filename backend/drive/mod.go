@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
-	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -28,10 +27,15 @@ import (
 
 // ------------------------------------------------------------
 
+var (
+	reRootID         = regexp.MustCompile(`^\{([^}]{5,})\}`)
+	reRootIDURLPath  = regexp.MustCompile(`\/(folders|files|file\/d)(\/([A-Za-z0-9_-]{6,}))+\/?`)
+	reRootIDURLParam = regexp.MustCompile(`.+id=([A-Za-z0-9_-]{6,}).?`)
+)
+
 // parse object id from path remote:{ID}
 func parseRootID(s string) (rootID string, err error) {
-	re := regexp.MustCompile(`\{([^}]{5,})\}`)
-	m := re.FindStringSubmatch(s)
+	m := reRootID.FindStringSubmatch(s)
 	if m == nil {
 		return "", fmt.Errorf("%s does not contain any valid id", s)
 	}
@@ -40,14 +44,12 @@ func parseRootID(s string) (rootID string, err error) {
 	if strings.HasPrefix(rootID, "http") {
 		// folders - https://drive.google.com/drive/u/0/folders/
 		// file - https://drive.google.com/file/d/
-		re := regexp.MustCompile(`\/(folders|files|file\/d)(\/([A-Za-z0-9_-]{6,}))+\/?`)
-		if m := re.FindStringSubmatch(rootID); m != nil {
+		if m := reRootIDURLPath.FindStringSubmatch(rootID); m != nil {
 			rootID = m[len(m)-1]
 			return
 		}
 		// id - https://drive.google.com/open?id=
-		re = regexp.MustCompile(`.+id=([A-Za-z0-9_-]{6,}).?`)
-		if m := re.FindStringSubmatch(rootID); m != nil {
+		if m := reRootIDURLParam.FindStringSubmatch(rootID); m != nil {
 			rootID = m[1]
 			return
 		}
@@ -116,7 +118,7 @@ func newServiceAccountPool(opt *Options) (*ServiceAccountPool, error) {
 	}
 	// initial load
 	if err := p.LoadSA(); err != nil {
-		return nil, fmt.Errorf("service accout pool: initial load failed: %w", err)
+		return nil, fmt.Errorf("service account pool: initial load failed: %w", err)
 	}
 	return p, nil
 }
@@ -156,12 +158,12 @@ func (p *ServiceAccountPool) LoadSA() error {
 }
 
 func (p *ServiceAccountPool) _getSA() (newSA []*baseSAobject, err error) {
-	SAs := p.SAs
-	if len(SAs) == 0 {
-		err = fmt.Errorf("no available service account")
-		return
+	if len(p.SAs) == 0 {
+		return nil, fmt.Errorf("no available service account")
 	}
-	p.SAs, newSA = SAs[:len(SAs)-1], SAs[len(SAs)-1:]
+	last := len(p.SAs) - 1
+	newSA = []*baseSAobject{p.SAs[last]}
+	p.SAs = p.SAs[:last]
 	return newSA, nil
 }
 
@@ -212,30 +214,32 @@ func (f *Fs) changeServiceAccount(ctx context.Context) (err error) {
 			return fmt.Errorf("couldn't create Drive v2 client: %w", err)
 		}
 	}
-	if err == nil {
-		f.changeSAtime = time.Now()
-		f.pacer = fs.NewPacer(ctx, pacer.NewGoogleDrive(pacer.MinSleep(f.opt.PacerMinSleep), pacer.Burst(f.opt.PacerBurst)))
-		svcAcc := "service account credential"
-		if sa[0].ServiceAccountFile != "" {
-			svcAcc = fmt.Sprintf("service account file \"%s\"", filepath.Base(sa[0].ServiceAccountFile))
-		}
-		if sa[0].Impersonate != "" {
-			fs.Debugf(nil, "Now working with %s as %q", svcAcc, sa[0].Impersonate)
-		} else {
-			fs.Debugf(nil, "Now working with %s", svcAcc)
-		}
-		fs.Debugf(nil, "%d service account remaining", len(f.changeSApool.SAs))
+	f.changeSAtime = time.Now()
+	f.pacer = fs.NewPacer(ctx, pacer.NewGoogleDrive(pacer.MinSleep(f.opt.PacerMinSleep), pacer.Burst(f.opt.PacerBurst)))
+	svcAcc := "service account credential"
+	if sa[0].ServiceAccountFile != "" {
+		svcAcc = fmt.Sprintf("service account file \"%s\"", filepath.Base(sa[0].ServiceAccountFile))
 	}
-	return err
+	if sa[0].Impersonate != "" {
+		fs.Debugf(nil, "Now working with %s as %q", svcAcc, sa[0].Impersonate)
+	} else {
+		fs.Debugf(nil, "Now working with %s", svcAcc)
+	}
+	fs.Debugf(nil, "%d service account remaining", len(f.changeSApool.SAs))
+	return
 }
 
 // ------------------------------------------------------------
 
+type GdsRequest struct {
+	UserID string `json:"userid"`
+	ApiKey string `json:"apikey"`
+	Mode   string `json:"mode"`
+}
+
 type GdsClient struct {
 	client *rest.Client
-	userid string
-	apikey string
-	mode   string
+	req    *GdsRequest
 }
 
 func newGdsClient(ctx context.Context, opt *Options) (*GdsClient, bool, error) {
@@ -247,9 +251,11 @@ func newGdsClient(ctx context.Context, opt *Options) (*GdsClient, bool, error) {
 	}
 	gds := &GdsClient{
 		client: rest.NewClient(fshttp.NewClient(ctx)).SetRoot(opt.GdsEndpoint),
-		userid: opt.GdsUserid,
-		apikey: opt.GdsApikey,
-		mode:   opt.GdsMode,
+		req: &GdsRequest{
+			UserID: opt.GdsUserid,
+			ApiKey: opt.GdsApikey,
+			Mode:   opt.GdsMode,
+		},
 	}
 	return gds, ok, nil
 }
@@ -270,22 +276,14 @@ type GdsRemote struct {
 }
 
 func (gds *GdsClient) getGdsRemote(ctx context.Context) (remote *GdsRemote, err error) {
-	form := url.Values{}
-	form.Set("userid", gds.userid)
-	form.Set("apikey", gds.apikey)
-	form.Set("mode", gds.mode)
-	opts := rest.Opts{
-		Method:          "POST",
-		MultipartParams: form,
-	}
+	opts := rest.Opts{Method: "POST"}
 	var info *GdsResponse
-	_, err = gds.client.CallJSON(ctx, &opts, nil, &info)
+	_, err = gds.client.CallJSON(ctx, &opts, gds.req, &info)
 	if err != nil {
-		return
+		return nil, err
 	}
 	if info.Result != "success" {
-		err = fmt.Errorf("%v", info.Result)
-		return
+		return nil, fmt.Errorf("%s", info.Result)
 	}
 	fs.Debugf(nil, "member: %+v\n", string(info.Data.Member))
 	return info.Data.Remote, nil
@@ -336,13 +334,14 @@ func (f *Fs) changeParents(ctx context.Context, dstFs *Fs, dstCreate bool, srcDe
 
 	// list the objects
 	infos := []*drive.File{}
-	if srcDepth == "0" {
+	switch srcDepth {
+	case "0":
 		info, err := f.getFile(ctx, srcID, "id,name,parents")
 		if err != nil {
 			return nil, fmt.Errorf("couldn't get source info: %w", err)
 		}
 		infos = append(infos, info)
-	} else if srcDepth == "1" {
+	case "1":
 		_, err = f.list(ctx, []string{srcID}, "", false, false, f.opt.TrashedOnly, true, func(info *drive.File) bool {
 			infos = append(infos, info)
 			return false
@@ -397,6 +396,11 @@ func (f *Fs) activityNotify(ctx context.Context, notifyFunc func(string, fs.Entr
 		var tickerC <-chan time.Time
 		for {
 			select {
+			case <-ctx.Done():
+				if ticker != nil {
+					ticker.Stop()
+				}
+				return
 			case pollInterval, ok := <-pollIntervalChan:
 				if !ok {
 					if ticker != nil {
@@ -603,33 +607,31 @@ func (f *Fs) _activityNotifyRunner(ctx context.Context, notifyFunc func(string, 
 			return err
 		}
 
-		type entryToClear struct {
-			path      string
-			entryType fs.EntryType
-		}
-		var pathsToClear []entryToClear
+		visitedPaths := make(map[string]struct{})
 		for _, activity := range info.Activities {
 			actType, oldPath, newPath, isDir := f.parseActivity(ctx, activity)
-			fs.Infof(nil, "driveactivity %s: %q -> %q", actType, oldPath, newPath)
+			if oldPath == "" && newPath == "" {
+				continue
+			}
+			fs.Infof(nil, "driveactivity: %s: %q -> %q", actType, oldPath, newPath)
 			entryType := fs.EntryDirectory
 			if !isDir {
 				entryType = fs.EntryObject
 			}
-			pathsToClear = append(pathsToClear, entryToClear{path: oldPath, entryType: entryType})
-			pathsToClear = append(pathsToClear, entryToClear{path: newPath, entryType: entryType})
-		}
-
-		visitedPaths := make(map[string]bool)
-		for _, entry := range pathsToClear {
-			if entry.path == "" {
-				continue
+			if oldPath != "" {
+				parentPath, _ := dircache.SplitPath(oldPath)
+				if _, seen := visitedPaths[parentPath]; !seen {
+					visitedPaths[parentPath] = struct{}{}
+					notifyFunc(oldPath, entryType)
+				}
 			}
-			parentPath, _ := dircache.SplitPath(entry.path)
-			if visitedPaths[parentPath] {
-				continue
+			if newPath != "" && newPath != oldPath {
+				parentPath, _ := dircache.SplitPath(newPath)
+				if _, seen := visitedPaths[parentPath]; !seen {
+					visitedPaths[parentPath] = struct{}{}
+					notifyFunc(newPath, entryType)
+				}
 			}
-			visitedPaths[parentPath] = true
-			notifyFunc(entry.path, entry.entryType)
 		}
 
 		if info.NextPageToken == "" {

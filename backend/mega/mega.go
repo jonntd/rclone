@@ -17,16 +17,17 @@ Improvements:
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"path"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
-	mega "github.com/Sakura-Byte/go-mega"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
@@ -38,6 +39,7 @@ import (
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/readers"
+	mega "github.com/t3rm1n4l/go-mega"
 )
 
 const (
@@ -103,11 +105,6 @@ Enabling it will increase CPU usage and add network overhead.`,
 			// Encode invalid UTF-8 bytes as json doesn't handle them properly.
 			Default: (encoder.Base |
 				encoder.EncodeInvalidUtf8),
-		}, {
-			Name:     "use_ipv6",
-			Help:     `Use multiple IPv6 addresses to bypass bandwidth limits`,
-			Default:  false,
-			Advanced: true,
 		}},
 	})
 }
@@ -120,7 +117,6 @@ type Options struct {
 	HardDelete bool                 `config:"hard_delete"`
 	UseHTTPS   bool                 `config:"use_https"`
 	Enc        encoder.MultiEncoder `config:"encoding"`
-	UseIPv6    bool                 `config:"use_ipv6"`
 }
 
 // Fs represents a remote mega
@@ -222,13 +218,25 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	defer megaCacheMu.Unlock()
 	srv := megaCache[opt.User]
 	if srv == nil {
-		srv = mega.New().SetClient(fshttp.NewClient(ctx))
-		// Configure IPv6 if enabled
-		if opt.UseIPv6 {
-			if err := srv.AutoConfigureIPv6CIDR(); err != nil {
-				fs.Logf("mega", "IPv6 bypass unavailable: %v", err)
+		// srv = mega.New().SetClient(fshttp.NewClient(ctx))
+
+		// Workaround for Mega's use of insecure cipher suites which are no longer supported by default since Go 1.22.
+		// Relevant issues:
+		// https://github.com/rclone/rclone/issues/8565
+		// https://github.com/meganz/webclient/issues/103
+		clt := fshttp.NewClient(ctx)
+		clt.Transport = fshttp.NewTransportCustom(ctx, func(t *http.Transport) {
+			var ids []uint16
+			// Read default ciphers
+			for _, cs := range tls.CipherSuites() {
+				ids = append(ids, cs.ID)
 			}
-		}
+			// Insecure but Mega uses TLS_RSA_WITH_AES_128_GCM_SHA256 for storage endpoints
+			// (e.g. https://gfs302n114.userstorage.mega.co.nz) as of June 18, 2025.
+			t.TLSClientConfig.CipherSuites = append(ids, tls.TLS_RSA_WITH_AES_128_GCM_SHA256)
+		})
+		srv = mega.New().SetClient(clt)
+
 		srv.SetRetries(ci.LowLevelRetries) // let mega do the low level retries
 		srv.SetHTTPS(opt.UseHTTPS)
 		srv.SetLogger(func(format string, v ...any) {

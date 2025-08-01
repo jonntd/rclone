@@ -36,10 +36,7 @@ Run without a hash to see the list of all supported hashes, e.g.
       * whirlpool
       * crc32
       * sha256
-      * dropbox
-      * hidrive
-      * mailru
-      * quickxor
+      * sha512
 
 Then
 

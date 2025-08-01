@@ -6,21 +6,12 @@ import (
 
 	"github.com/rclone/rclone/cmd"
 	"github.com/rclone/rclone/fs/operations"
-	"github.com/rclone/rclone/fs/operations/operationsflags"
 	"github.com/rclone/rclone/fs/sync"
 	"github.com/spf13/cobra"
 )
 
-var (
-	loggerOpt      = operations.LoggerOpt{}
-	loggerFlagsOpt = operationsflags.AddLoggerFlagsOptions{}
-)
-
 func init() {
 	cmd.Root.AddCommand(commandDefinition)
-	cmdFlags := commandDefinition.Flags()
-	operationsflags.AddLoggerFlags(cmdFlags, &loggerOpt, &loggerFlagsOpt)
-	loggerOpt.LoggerFn = operations.NewDefaultLoggerFn(&loggerOpt)
 }
 
 var commandDefinition = &cobra.Command{
@@ -56,8 +47,7 @@ successful transfer.
 ` + "`--dry-run` or the `--interactive`/`-i`" + ` flag.
 
 **Note**: Use the ` + "`-P`" + `/` + "`--progress`" + ` flag to view real-time transfer statistics.
-
-` + operationsflags.Help(),
+`,
 	Annotations: map[string]string{
 		"versionIntroduced": "v1.35",
 		"groups":            "Filter,Listing,Important,Copy",
@@ -67,21 +57,10 @@ successful transfer.
 		fsrc, srcFileName, fdst, dstFileName := cmd.NewFsSrcDstFiles(args)
 
 		cmd.Run(true, true, command, func() error {
-			ctx := context.Background()
-			close, err := operationsflags.ConfigureLoggers(ctx, fdst, command, &loggerOpt, loggerFlagsOpt)
-			if err != nil {
-				return err
-			}
-			defer close()
-
-			if loggerFlagsOpt.AnySet() {
-				ctx = operations.WithSyncLogger(ctx, loggerOpt)
-			}
-
 			if srcFileName == "" {
-				return sync.MoveDir(ctx, fdst, fsrc, false, false)
+				return sync.MoveDir(context.Background(), fdst, fsrc, false, false)
 			}
-			return operations.MoveFile(ctx, fdst, fsrc, dstFileName, srcFileName)
+			return operations.MoveFile(context.Background(), fdst, fsrc, dstFileName, srcFileName)
 		})
 	},
 }

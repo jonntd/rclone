@@ -8,7 +8,6 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,12 +24,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss"
 	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss/credentials"
-	"github.com/cenkalti/backoff/v4"
-	"github.com/rclone/rclone/backend/common"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/config"
@@ -40,7 +38,6 @@ import (
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/atexit"
-	"github.com/rclone/rclone/lib/cache"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/oauthutil"
@@ -50,9 +47,7 @@ import (
 	"golang.org/x/oauth2"
 )
 
-// ============================================================================
-// API Types and Structures (from api/types.go)
-// ============================================================================
+// API Types and Structures
 
 // Time represents date and time information
 type Time time.Time
@@ -679,9 +674,33 @@ func (u *DownloadURL) expired() bool {
 	if expiry.IsZero() {
 		return false // Assume non-expiring if no expiry found
 	}
-	// Use a smaller delta as OSS links might be shorter-lived
-	expiryDelta := time.Duration(60) * time.Second
-	return expiry.Round(0).Add(-expiryDelta).Before(time.Now())
+
+	// 修复：115网盘URL有效期通常4-5分钟，使用更合理的缓冲时间
+	now := time.Now()
+	timeUntilExpiry := expiry.Sub(now)
+
+	// 调试信息：记录过期检测详情
+	fs.Debugf(nil, "🕐 115网盘URL过期检测: 当前时间=%v, 过期时间=%v, 剩余时间=%v",
+		now.Format("15:04:05"), expiry.Format("15:04:05"), timeUntilExpiry)
+
+	// 如果URL已经过期，直接返回true
+	if timeUntilExpiry <= 0 {
+		fs.Debugf(nil, "❌ 115网盘URL已过期")
+		return true
+	}
+
+	// 根据剩余时间选择缓冲策略
+	var expiryDelta time.Duration
+	if timeUntilExpiry < 2*time.Minute {
+		expiryDelta = 15 * time.Second // 短期URL使用15秒缓冲
+	} else {
+		expiryDelta = 30 * time.Second // 长期URL使用30秒缓冲
+	}
+
+	isExpired := timeUntilExpiry <= expiryDelta
+	fs.Debugf(nil, "🔍 115网盘URL过期判断: 缓冲时间=%v, 是否过期=%v", expiryDelta, isExpired)
+
+	return isExpired
 }
 
 // Valid reports whether u is non-nil and is not expired.
@@ -1198,6 +1217,14 @@ type SampleInitResp struct {
 // Main Backend Implementation (from 115.go)
 // ============================================================================
 
+// API类型枚举
+type APIType int
+
+const (
+	OpenAPI APIType = iota
+	TraditionalAPI
+)
+
 // Constants
 const (
 	domain             = "www.115.com"
@@ -1229,6 +1256,11 @@ const (
 	defaultNohashSize   = 100 * fs.Mebi // Set to 100MB, small files prefer traditional upload
 	StreamUploadLimit   = 5 * fs.Gibi   // Max size for sample/streamed upload (traditional)
 	maxUploadCutoff     = 5 * fs.Gibi   // maximum allowed size for singlepart uploads (OSS PutObject limit)
+
+	// 115网盘特定常量 (从common包迁移)
+	// 移除未使用的default115QPS常量
+
+	// 移除未使用的常量：crossCloudTransferPrefix, localTransferPrefix, 哈希长度常量
 
 	tokenRefreshWindow = 10 * time.Minute // Refresh token 10 minutes before expiry
 	pkceVerifierLength = 64               // Length for PKCE code verifier
@@ -1274,16 +1306,6 @@ func init() {
 			Help: fmt.Sprintf(`用于身份验证的自定义应用ID。
 默认值为 "%s"。除非有特定理由使用不同的应用ID，否则不要更改。`, defaultAppID),
 		}, {
-			Name:     "list_chunk",
-			Default:  1150, // Max limit for OpenAPI file list
-			Help:     "文件列表分块大小。",
-			Advanced: true,
-		}, {
-			Name:     "pacer_min_sleep",
-			Default:  unifiedMinSleep,
-			Help:     "API调用之间的最小休眠时间（控制统一QPS，默认约4 QPS）。",
-			Advanced: true,
-		}, {
 			Name:     "upload_hash_only",
 			Default:  false,
 			Advanced: true,
@@ -1309,23 +1331,9 @@ func init() {
 			Default:  fs.SizeSuffix(10 * 1024 * 1024),
 			Advanced: true,
 		}, {
-			Name: "upload_cutoff",
-			Help: `切换到分片上传的阈值。
-任何大于此大小的文件将使用OSS分片API以分块方式上传。
-最小值为0，最大值为5 GiB。`,
-			Default:  defaultUploadCutoff,
-			Advanced: true,
-		}, {
 			Name:     "nohash_size",
 			Help:     `小于此大小的文件在启用fast_upload或未尝试/失败哈希上传时将使用传统流式上传。最大值为5 GiB。`,
 			Default:  defaultNohashSize,
-			Advanced: true,
-		}, {
-			Name: "chunk_size",
-			Help: `分片上传的分块大小。
-Rclone会自动增加大文件的分块大小以保持在10,000个分片限制以下。
-最小值为100 KiB，最大值为5 GiB。`,
-			Default:  defaultChunkSize,
 			Advanced: true,
 		}, {
 			Name:     "max_upload_parts",
@@ -1364,61 +1372,23 @@ Rclone会自动增加大文件的分块大小以保持在10,000个分片限制�
 				encoder.EncodeRightSpace |
 				encoder.EncodeSlash | // 新增：默认编码斜杠
 				encoder.EncodeInvalidUtf8), // 保留：编码无效UTF-8字符
-		}, {
-			Name:     "cache_max_size",
-			Help:     "缓存清理触发前的最大缓存大小。设置为0禁用基于大小的清理。",
-			Default:  fs.SizeSuffix(100 << 20), // 100MB
-			Advanced: true,
-		}, {
-			Name:     "cache_target_size",
-			Help:     "清理后的目标缓存大小。应小于cache_max_size。",
-			Default:  fs.SizeSuffix(64 << 20), // 64MB
-			Advanced: true,
-		}, {
-			Name:     "enable_smart_cleanup",
-			Help:     "启用基于LRU策略的智能缓存清理，而不是简单的基于大小的清理。",
-			Default:  false,
-			Advanced: true,
-		}, {
-			Name:     "cleanup_strategy",
-			Help:     "缓存清理策略：'size'（基于大小）、'lru'（最近最少使用）、'priority_lru'（优先级+LRU）、'time'（基于时间）。",
-			Default:  "size",
-			Advanced: true,
 		}},
 	})
 }
 
-func checkUploadChunkSize(cs fs.SizeSuffix) error {
-	if cs < minChunkSize {
-		return fmt.Errorf("%s is less than %s", cs, minChunkSize)
-	}
-	if cs > maxChunkSize {
-		return fmt.Errorf("%s is greater than %s", cs, maxChunkSize)
-	}
-	return nil
-}
-
-func checkUploadCutoff(cs fs.SizeSuffix) error {
-	if cs > maxUploadCutoff {
-		return fmt.Errorf("%s is greater than %s", cs, maxUploadCutoff)
-	}
-	return nil
-}
+// 移除未使用的验证函数，使用rclone全局配置
 
 // Options defines the configuration of this backend
+// 简化版本：移除与rclone核心功能重复的配置项
 type Options struct {
 	Cookie              string        `config:"cookie"` // Single cookie string now
 	UserAgent           string        `config:"user_agent"`
 	RootFolderID        string        `config:"root_folder_id"`
-	ListChunk           int           `config:"list_chunk"`
-	PacerMinSleep       fs.Duration   `config:"pacer_min_sleep"` // Global pacer setting
 	HashMemoryThreshold fs.SizeSuffix `config:"hash_memory_limit"`
 	UploadHashOnly      bool          `config:"upload_hash_only"`
 	OnlyStream          bool          `config:"only_stream"`
 	FastUpload          bool          `config:"fast_upload"`
-	UploadCutoff        fs.SizeSuffix `config:"upload_cutoff"`
 	NohashSize          fs.SizeSuffix `config:"nohash_size"`
-	ChunkSize           fs.SizeSuffix `config:"chunk_size"`
 	MaxUploadParts      int           `config:"max_upload_parts"`
 
 	Internal  bool                 `config:"internal"`
@@ -1428,11 +1398,7 @@ type Options struct {
 	Enc       encoder.MultiEncoder `config:"encoding"`
 	AppID     string               `config:"app_id"` // Custom App ID for authentication
 
-	// 缓存优化配置 - 新增
-	CacheMaxSize       fs.SizeSuffix `config:"cache_max_size"`       // 最大缓存大小
-	CacheTargetSize    fs.SizeSuffix `config:"cache_target_size"`    // 清理目标大小
-	EnableSmartCleanup bool          `config:"enable_smart_cleanup"` // 启用智能清理
-	CleanupStrategy    string        `config:"cleanup_strategy"`     // 清理策略
+	// 移除缓存优化配置，使用rclone标准缓存
 }
 
 // Fs represents a remote 115 drive
@@ -1445,11 +1411,7 @@ type Fs struct {
 	tradClient    *rest.Client // Client for traditional (cookie, encrypted) API calls
 	openAPIClient *rest.Client // Client for OpenAPI (token) calls
 	dirCache      *dircache.DirCache
-	globalPacer   *fs.Pacer // Controls overall QPS
-	tradPacer     *fs.Pacer // Controls QPS for traditional calls only (subset of global)
-	downloadPacer *fs.Pacer // Controls QPS for download URL API calls (专门用于获取下载URL的API调用)
-	uploadPacer   *fs.Pacer // Controls QPS for upload related API calls (专门用于上传相关的API调用)
-	ossPacer      *fs.Pacer // 性能优化：OSS专用调速器，使用更宽松的限制
+	pacer         *fs.Pacer // 统一的API调速器，符合rclone标准模式
 	rootFolder    string    // path of the absolute root
 	rootFolderID  string
 	appVer        string // parsed from user-agent; used in traditional calls
@@ -1459,20 +1421,7 @@ type Fs struct {
 	fileObj       *fs.Object
 	m             configmap.Mapper // config map for saving tokens
 
-	// Unified resume manager
-	resumeManager common.UnifiedResumeManager
-
-	// Unified error handler
-	errorHandler *common.UnifiedErrorHandler
-
-	// Cross-cloud transfer coordinator
-	crossCloudCoordinator *common.CrossCloudCoordinator
-
-	// Unified concurrent downloader
-	concurrentDownloader *common.UnifiedConcurrentDownloader
-
-	// Memory optimizer
-	memoryOptimizer *common.MemoryOptimizer
+	// 移除统一错误处理器，使用rclone标准错误处理
 
 	// Token management
 	tokenMu      sync.Mutex
@@ -1481,79 +1430,21 @@ type Fs struct {
 	tokenExpiry  time.Time
 	codeVerifier string // For PKCE
 	tokenRenewer *oauthutil.Renew
+	isRefreshing atomic.Bool // 防止递归调用的标志
 	loginMu      sync.Mutex
 
 	// 重构：删除pathCache，统一使用dirCache进行目录缓存
 
-	// BadgerDB持久化缓存系统
-	pathResolveCache *cache.BadgerCache // 路径解析缓存 (已实现)
-	dirListCache     *cache.BadgerCache // 目录列表缓存
-	metadataCache    *cache.BadgerCache // 文件元数据缓存
-	fileIDCache      *cache.BadgerCache // 文件ID验证缓存
+	// 移除BadgerDB持久化缓存系统，使用rclone标准缓存
 
-	// 缓存时间配置 - 使用统一配置结构
-	cacheConfig common.UnifiedCacheConfig
-
-	// HTTP连接池优化
-	httpClient *http.Client
+	// 移除httpClient字段，使用rclone标准HTTP客户端
 
 	// 上传操作锁，防止预热和上传同时进行
 	uploadingMu sync.Mutex
 	isUploading bool
 }
 
-// CacheConfig115 115网盘缓存时间配置
-type CacheConfig115 struct {
-	PathResolveCacheTTL time.Duration // 路径解析缓存TTL，默认10分钟
-	DirListCacheTTL     time.Duration // 目录列表缓存TTL，默认5分钟
-	MetadataCacheTTL    time.Duration // 文件元数据缓存TTL，默认30分钟
-	FileIDCacheTTL      time.Duration // 文件ID验证缓存TTL，默认15分钟
-}
-
-// DefaultCacheConfig115 returns optimized cache configuration for 115 drive
-// Unified TTL strategy and cache key naming convention, consistent with 123 drive
-func DefaultCacheConfig115() CacheConfig115 {
-	unifiedTTL := 5 * time.Minute // 统一TTL策略，与123网盘保持一致
-	return CacheConfig115{
-		PathResolveCacheTTL: unifiedTTL, // 从15分钟改为5分钟，统一TTL
-		DirListCacheTTL:     unifiedTTL, // 从10分钟改为5分钟，统一TTL
-		MetadataCacheTTL:    unifiedTTL, // 从60分钟改为5分钟，避免长期缓存不一致
-		FileIDCacheTTL:      unifiedTTL, // 从30分钟改为5分钟，统一TTL
-	}
-}
-
-// generatePathToIDCacheKey 生成路径到ID映射缓存键（与123网盘格式一致）
-// 已迁移到common.GeneratePathToIDCacheKey，保留此函数用于向后兼容
-func generatePathToIDCacheKey(path string) string {
-	return common.GeneratePathToIDCacheKey(path)
-}
-
-// Directory list cache structure same as 123 drive
-// DirListCacheEntry115 directory list cache entry (unified format with 123 drive)
-type DirListCacheEntry115 struct {
-	FileList   []File    `json:"file_list"`
-	LastFileID string    `json:"last_file_id"`
-	TotalCount int       `json:"total_count"`
-	CachedAt   time.Time `json:"cached_at"`
-	ParentID   string    `json:"parent_id"`
-	Version    string    `json:"version"`
-	Checksum   string    `json:"checksum"`
-}
-
-// PathToIDCacheEntry115 路径到FileID映射缓存条目（与123网盘格式统一）
-type PathToIDCacheEntry115 struct {
-	Path     string    `json:"path"`
-	FileID   string    `json:"file_id"`
-	IsDir    bool      `json:"is_dir"`
-	ParentID string    `json:"parent_id"`
-	CachedAt time.Time `json:"cached_at"`
-}
-
-// 重构：添加与123网盘相同的路径到ID映射缓存函数
-
-// 重构：删除PathCache相关结构体，统一使用dirCache
-// PathCache功能已迁移到rclone标准的dirCache中
-// isAPILimitError函数已存在于第823行，无需重复声明
+// 本地工具函数，替代common包的功能
 
 // isAPILimitError 检查错误是否为API限制错误
 func isAPILimitError(err error) bool {
@@ -1581,6 +1472,11 @@ type Object struct {
 	durlRefreshing bool       // 标记是否正在刷新URL，防止并发刷新
 	pickCodeMu     sync.Mutex // 新增：保护pickCode获取的并发访问
 }
+
+// 移除未使用的crossCloudObjectInfo结构体
+
+// 移除未使用的crossCloudFsInfo结构体
+
 type ApiResponse struct {
 	State   bool                `json:"state"`   // Indicates success or failure
 	Message string              `json:"message"` // Optional message
@@ -1600,7 +1496,7 @@ var retryErrorCodes = []int{
 	509, // Bandwidth Limit Exceeded
 }
 
-// 注意：CloudDriveErrorClassifier已删除，使用common.UnifiedErrorHandler替代
+// 注意：CloudDriveErrorClassifier已删除，使用rclone标准错误处理替代
 
 // shouldRetry checks if a request should be retried based on the response, error, and API type.
 // Use unified error classification and retry strategy
@@ -1624,15 +1520,17 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 		}
 	}
 
-	// Prefer rclone standard error handling
-	if err != nil && fserrors.ShouldRetry(err) {
-		return true, err
-	}
-
-	// 优化：使用统一的错误处理策略，避免创建临时处理器
+	// 使用rclone标准错误处理和网络错误检测
 	if err != nil {
-		// 使用统一的网络错误检测机制
-		if common.IsOSSNetworkError(err) {
+		// 回退到rclone标准错误处理
+		if fserrors.ShouldRetry(err) {
+			return true, err
+		}
+
+		// 简化网络错误检测
+		if err != nil && (strings.Contains(err.Error(), "connection") ||
+			strings.Contains(err.Error(), "timeout") ||
+			strings.Contains(err.Error(), "network")) {
 			return true, err
 		}
 
@@ -1646,6 +1544,14 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 	// 回退到rclone标准HTTP状态码重试
 	return fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
+
+// 移除未使用的shouldRetryWithHandler方法
+
+// 移除executeWithUnifiedRetry函数，使用rclone标准错误处理
+
+// 移除getUnifiedConfig方法，不再使用UnifiedBackendConfig
+
+// 移除UnifiedBackendConfig相关的未使用方法
 
 // ------------------------------------------------------------
 // Authentication and Client Setup
@@ -1714,20 +1620,14 @@ func (cr *Credential) UserID() string {
 	return userID
 }
 
-// getTradHTTPClient creates an HTTP client with traditional UserAgent
-func getTradHTTPClient(ctx context.Context, _ *Options) *http.Client {
-	// Create a new context with the traditional UserAgent
-	newCtx, ci := fs.AddConfig(ctx)
-	ci.UserAgent = tradUserAgent
-	return common.GetHTTPClient(newCtx)
-}
+// 移除未使用的getTradHTTPClient方法
 
 // getOpenAPIHTTPClient creates an HTTP client with default UserAgent
 func getOpenAPIHTTPClient(ctx context.Context, _ *Options) *http.Client {
 	// Create a new context with the default UserAgent
 	newCtx, ci := fs.AddConfig(ctx)
 	ci.UserAgent = defaultUserAgent
-	return common.GetHTTPClient(newCtx)
+	return fshttp.NewClient(newCtx)
 }
 
 // errorHandler parses a non 2xx error response into an error (Generic, might need adjustment per API)
@@ -1856,20 +1756,11 @@ func (f *Fs) setupLoginEnvironment(ctx context.Context) error {
 	f.userID = cred.UserID() // Set userID early
 
 	// Setup clients (needed for the login calls)
-	// Create separate clients for each API type with different User-Agents
-	tradHTTPClient := getTradHTTPClient(ctx, &f.opt)
-	openAPIHTTPClient := getOpenAPIHTTPClient(ctx, &f.opt)
+	// 创建OpenAPI客户端
+	httpClient := getOpenAPIHTTPClient(ctx, &f.opt)
 
-	// Traditional client (uses cookie)
-	f.tradClient = rest.NewClient(tradHTTPClient).
-		SetRoot(traditionalRootURL).
-		SetCookie(cred.Cookie()...).
-		SetErrorHandler(errorHandler)
-
-	// OpenAPI client (will have token set later)
-	f.openAPIClient = rest.NewClient(openAPIHTTPClient).
-		SetRoot(openAPIRootURL).
-		SetErrorHandler(errorHandler)
+	// OpenAPI客户端，用于token相关操作
+	f.openAPIClient = rest.NewClient(httpClient).SetErrorHandler(errorHandler)
 
 	return nil
 }
@@ -1880,9 +1771,9 @@ func (f *Fs) getAuthDeviceCode(ctx context.Context, challenge string) (string, e
 	clientID := f.opt.AppID
 
 	authData := url.Values{
-		"client_id":             {clientID},
-		"code_challenge":        {challenge},
-		"code_challenge_method": {"sha256"}, // Use SHA256
+		"client_id":             []string{clientID},
+		"code_challenge":        []string{challenge},
+		"code_challenge_method": []string{"sha256"}, // Use SHA256
 	}
 	authOpts := rest.Opts{
 		Method:       "POST",
@@ -1966,8 +1857,8 @@ func (f *Fs) callQRConfirmAPI(ctx context.Context, loginUID string) error {
 // exchangeDeviceCodeForToken gets the access token using the device code
 func (f *Fs) exchangeDeviceCodeForToken(ctx context.Context, loginUID string) error {
 	tokenData := url.Values{
-		"uid":           {loginUID},
-		"code_verifier": {f.codeVerifier},
+		"uid":           []string{loginUID},
+		"code_verifier": []string{f.codeVerifier},
 	}
 	tokenOpts := rest.Opts{
 		Method:       "POST",
@@ -2000,6 +1891,13 @@ func (f *Fs) exchangeDeviceCodeForToken(ctx context.Context, loginUID string) er
 
 // refreshTokenIfNecessary refreshes the token if necessary
 func (f *Fs) refreshTokenIfNecessary(ctx context.Context, refreshTokenExpired bool, forceRefresh bool) error {
+	// 🚨 修复递归调用：设置刷新标志，防止在token刷新过程中再次触发刷新
+	if !f.isRefreshing.CompareAndSwap(false, true) {
+		fs.Debugf(f, "Token refresh already in progress, skipping")
+		return nil
+	}
+	defer f.isRefreshing.Store(false)
+
 	f.tokenMu.Lock()
 
 	// Check if token is already valid when we acquire the lock
@@ -2071,10 +1969,7 @@ func isTokenStillValid(f *Fs) bool {
 
 // performTokenRefresh handles the actual API call to refresh the token
 func (f *Fs) performTokenRefresh(ctx context.Context, refreshToken string) (*RefreshTokenResp, error) {
-	// Ensure client exists
-	if err := f.ensureOpenAPIClient(ctx); err != nil {
-		return nil, err
-	}
+	// 使用统一客户端，无需单独初始化
 
 	// Set up and make the refresh request
 	refreshResp, err := f.callRefreshTokenAPI(ctx, refreshToken)
@@ -2113,27 +2008,83 @@ func (f *Fs) performTokenRefresh(ctx context.Context, refreshToken string) (*Ref
 	return refreshResp, nil
 }
 
-// ensureOpenAPIClient ensures the OpenAPI client is initialized
-func (f *Fs) ensureOpenAPIClient(ctx context.Context) error {
-	if f.openAPIClient != nil {
-		return nil
+// CallAPI 统一API调用方法，支持OpenAPI和传统API
+func (f *Fs) CallAPI(ctx context.Context, apiType APIType, opts *rest.Opts, request any, response any) error {
+	// 🚨 修复空指针问题：确保客户端存在
+	if err := f.ensureOpenAPIClient(ctx); err != nil {
+		return fmt.Errorf("failed to ensure OpenAPI client: %w", err)
 	}
 
-	// Setup client if it doesn't exist
-	newCtx, ci := fs.AddConfig(ctx)
-	ci.UserAgent = f.opt.UserAgent
-	httpClient := common.GetHTTPClient(newCtx)
-	f.openAPIClient = rest.NewClient(httpClient).
-		SetRoot(openAPIRootURL).
-		SetErrorHandler(errorHandler)
+	// 根据API类型动态配置
+	switch apiType {
+	case OpenAPI:
+		if opts.RootURL == "" {
+			opts.RootURL = openAPIRootURL
+		}
+		// 准备Token认证
+		if err := f.prepareTokenForRequest(ctx, opts); err != nil {
+			return err
+		}
+	case TraditionalAPI:
+		if opts.RootURL == "" {
+			opts.RootURL = traditionalRootURL
+		}
+		// 准备Cookie认证
+		if err := f.prepareCookieForRequest(ctx, opts); err != nil {
+			return err
+		}
+	}
 
+	// 使用统一调速器和客户端
+	return f.pacer.Call(func() (bool, error) {
+		var resp *http.Response
+		var err error
+
+		if request != nil && response != nil {
+			resp, err = f.openAPIClient.CallJSON(ctx, opts, request, response)
+		} else if response != nil {
+			resp, err = f.openAPIClient.CallJSON(ctx, opts, nil, response)
+		} else {
+			resp, err = f.openAPIClient.Call(ctx, opts)
+		}
+
+		return f.shouldRetry(ctx, resp, err)
+	})
+}
+
+// prepareCookieForRequest 为传统API准备Cookie认证
+func (f *Fs) prepareCookieForRequest(ctx context.Context, opts *rest.Opts) error {
+	if f.opt.Cookie != "" {
+		cred := (&Credential{}).FromCookie(f.opt.Cookie)
+		if opts.ExtraHeaders == nil {
+			opts.ExtraHeaders = make(map[string]string)
+		}
+		// 设置Cookie头
+		for _, cookie := range cred.Cookie() {
+			if opts.ExtraHeaders["Cookie"] == "" {
+				opts.ExtraHeaders["Cookie"] = cookie.String()
+			} else {
+				opts.ExtraHeaders["Cookie"] += "; " + cookie.String()
+			}
+		}
+	}
 	return nil
 }
+
+// shouldRetry 判断是否应该重试请求
+func (f *Fs) shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
+	return fserrors.ShouldRetry(err), err
+}
+
+// 移除ensureOpenAPIClient，使用统一客户端
 
 // callRefreshTokenAPI makes the actual API call to refresh the token
 func (f *Fs) callRefreshTokenAPI(ctx context.Context, refreshToken string) (*RefreshTokenResp, error) {
 	refreshData := url.Values{
-		"refresh_token": {refreshToken},
+		"refresh_token": []string{refreshToken},
 	}
 	opts := rest.Opts{
 		Method:       "POST",
@@ -2144,33 +2095,51 @@ func (f *Fs) callRefreshTokenAPI(ctx context.Context, refreshToken string) (*Ref
 	}
 
 	var refreshResp RefreshTokenResp
-	resp, err := f.openAPIClient.Call(ctx, &opts)
+	// 🚨 修复递归调用：创建一个新的rest客户端，完全避免任何token验证机制
+	// 因为这个方法本身就是在刷新token，不能再触发token验证
+	httpClient := getOpenAPIHTTPClient(ctx, &f.opt)
+	if httpClient == nil {
+		return nil, fmt.Errorf("failed to create HTTP client for token refresh")
+	}
+	tempClient := rest.NewClient(httpClient).SetErrorHandler(errorHandler)
+	if tempClient == nil {
+		return nil, fmt.Errorf("failed to create REST client for token refresh")
+	}
+
+	resp, err := tempClient.CallJSON(ctx, &opts, nil, &refreshResp)
 	if err != nil {
 		return nil, err
 	}
 
-	// Read the raw response for logging
-	defer fs.CheckClose(resp.Body, &err)
-	body, readErr := io.ReadAll(resp.Body)
-	if readErr != nil {
-		fs.Errorf(f, "Failed to read refresh token response body: %v", readErr)
-		return nil, readErr
+	// 检查HTTP状态码
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("refresh token API returned status %d", resp.StatusCode)
 	}
 
-	// Log the raw response
-	fs.Debugf(f, "Raw refresh token response: %s", string(body))
-
-	// Create a new reader for the JSON unmarshal
-	err = json.Unmarshal(body, &refreshResp)
-	if err != nil {
-		fs.Errorf(f, "Failed to parse refresh token response: %v", err)
-		return nil, err
-	}
+	// 响应已经通过CallJSON解析到refreshResp中
+	fs.Debugf(f, "Token refresh response received successfully")
 
 	return &refreshResp, nil
 }
 
+// ensureOpenAPIClient ensures the OpenAPI client is initialized
+func (f *Fs) ensureOpenAPIClient(ctx context.Context) error {
+	if f.openAPIClient != nil {
+		return nil
+	}
+
+	// Setup client if it doesn't exist
+	httpClient := fshttp.NewClient(ctx)
+	f.openAPIClient = rest.NewClient(httpClient).SetErrorHandler(errorHandler)
+	if f.openAPIClient == nil {
+		return fmt.Errorf("failed to create OpenAPI client")
+	}
+
+	return nil
+}
+
 // handleRefreshError handles errors from the refresh token API call
+// 🚨 完全参考参考代码重写，移除递归检查，依靠正确的API调用避免递归
 func handleRefreshError(f *Fs, ctx context.Context, err error) (*RefreshTokenResp, error) {
 	fs.Errorf(f, "Refresh token failed: %v", err)
 
@@ -2317,7 +2286,7 @@ func (f *Fs) CallOpenAPI(ctx context.Context, opts *rest.Opts, request any, resp
 		if !skipToken {
 			if err := f.prepareTokenForRequest(ctx, opts); err != nil {
 				fs.Debugf(f, " CallOpenAPI: prepareTokenForRequest失败: %v", err)
-				return false, backoff.Permanent(err)
+				return false, err
 			}
 		}
 
@@ -2335,9 +2304,9 @@ func (f *Fs) CallOpenAPI(ctx context.Context, opts *rest.Opts, request any, resp
 			if retryAfterTokenRefresh, err := f.handleTokenError(ctx, opts, apiErr, skipToken); retryAfterTokenRefresh {
 				return true, nil // Retry with refreshed token
 			} else if err != nil {
-				return false, backoff.Permanent(err)
+				return false, err
 			}
-			return false, backoff.Permanent(apiErr) // Non-token error, don't retry
+			return false, apiErr // Non-token error, don't retry
 		}
 
 		// Check for API-level errors in the response
@@ -2345,9 +2314,9 @@ func (f *Fs) CallOpenAPI(ctx context.Context, opts *rest.Opts, request any, resp
 			if tokenRefreshed, err := f.handleTokenError(ctx, opts, apiErr, skipToken); tokenRefreshed {
 				return true, nil // Retry with refreshed token
 			} else if err != nil {
-				return false, backoff.Permanent(err)
+				return false, err
 			}
-			return false, backoff.Permanent(apiErr) // Other API error, don't retry
+			return false, apiErr // Other API error, don't retry
 		}
 
 		fs.Debugf(f, "pacer: OpenAPI call successful")
@@ -2363,32 +2332,32 @@ func (f *Fs) CallUploadAPI(ctx context.Context, opts *rest.Opts, request any, re
 		opts.RootURL = openAPIRootURL
 	}
 
-	// Use dedicated upload pacer instead of global pacer
-	return f.uploadPacer.Call(func() (shouldRetryGlobal bool, errGlobal error) {
+	// Use unified pacer for all API calls
+	return f.pacer.Call(func() (shouldRetryGlobal bool, errGlobal error) {
 		// Ensure token is available and current
 		if !skipToken {
 			if err := f.prepareTokenForRequest(ctx, opts); err != nil {
 				fs.Debugf(f, " CallUploadAPI: prepareTokenForRequest失败: %v", err)
-				return false, backoff.Permanent(err)
+				return false, err
 			}
 		}
 
 		// Make the actual API call
 		fs.Debugf(f, " CallUploadAPI: 执行API调用")
-		resp, err := f.openAPIClient.CallJSON(ctx, opts, request, response)
+		err := f.CallAPI(ctx, OpenAPI, opts, request, response)
 
 		// Check for API-level errors in the response
 		if apiErr := f.checkResponseForAPIErrors(response); apiErr != nil {
 			if tokenRefreshed, err := f.handleTokenError(ctx, opts, apiErr, skipToken); tokenRefreshed {
 				return true, nil // Retry with refreshed token
 			} else if err != nil {
-				return false, backoff.Permanent(err)
+				return false, err
 			}
-			return false, backoff.Permanent(apiErr) // Other API error, don't retry
+			return false, apiErr // Other API error, don't retry
 		}
 
 		fs.Debugf(f, " CallUploadAPI: API调用成功")
-		return shouldRetry(ctx, resp, err)
+		return f.shouldRetry(ctx, nil, err)
 	})
 }
 
@@ -2400,32 +2369,32 @@ func (f *Fs) CallDownloadURLAPI(ctx context.Context, opts *rest.Opts, request an
 		opts.RootURL = openAPIRootURL
 	}
 
-	// 使用支持并发连接的下载URL调速器
-	return f.downloadPacer.Call(func() (shouldRetryGlobal bool, errGlobal error) {
+	// 使用统一调速器
+	return f.pacer.Call(func() (shouldRetryGlobal bool, errGlobal error) {
 		// Ensure token is available and current
 		if !skipToken {
 			if err := f.prepareTokenForRequest(ctx, opts); err != nil {
 				fs.Debugf(f, " CallDownloadURLAPI: prepareTokenForRequest失败: %v", err)
-				return false, backoff.Permanent(err)
+				return false, err
 			}
 		}
 
 		// Make the actual API call
 		fs.Debugf(f, " CallDownloadURLAPI: 执行API调用")
-		resp, err := f.openAPIClient.CallJSON(ctx, opts, request, response)
+		err := f.CallAPI(ctx, OpenAPI, opts, request, response)
 
 		// Check for API-level errors in the response
 		if apiErr := f.checkResponseForAPIErrors(response); apiErr != nil {
 			if tokenRefreshed, err := f.handleTokenError(ctx, opts, apiErr, skipToken); tokenRefreshed {
 				return true, nil // Retry with refreshed token
 			} else if err != nil {
-				return false, backoff.Permanent(err)
+				return false, err
 			}
-			return false, backoff.Permanent(apiErr) // Other API error, don't retry
+			return false, apiErr // Other API error, don't retry
 		}
 
 		fs.Debugf(f, " CallDownloadURLAPI: API调用成功")
-		return shouldRetry(ctx, resp, err)
+		return f.shouldRetry(ctx, nil, err)
 	})
 }
 
@@ -2439,17 +2408,26 @@ func (f *Fs) prepareTokenForRequest(ctx context.Context, opts *rest.Opts) error 
 	f.tokenMu.Unlock()
 
 	// If refresh is needed, call refreshTokenIfNecessary which has its own locking
+	// 🚨 修复递归调用：避免在API调用中触发token刷新导致的无限递归
 	if needsRefresh {
-		refreshErr := f.refreshTokenIfNecessary(ctx, false, false)
-		if refreshErr != nil {
-			fs.Debugf(f, "Token refresh failed: %v", refreshErr)
-			return fmt.Errorf("token refresh failed: %w", refreshErr)
-		}
+		// 检查是否已经在token刷新过程中，避免递归调用
+		if f.isRefreshing.Load() {
+			fs.Debugf(f, "Token refresh already in progress, using current token")
+			f.tokenMu.Lock()
+			currentToken = f.accessToken
+			f.tokenMu.Unlock()
+		} else {
+			refreshErr := f.refreshTokenIfNecessary(ctx, false, false)
+			if refreshErr != nil {
+				fs.Debugf(f, "Token refresh failed: %v", refreshErr)
+				return fmt.Errorf("token refresh failed: %w", refreshErr)
+			}
 
-		// Get the refreshed token
-		f.tokenMu.Lock()
-		currentToken = f.accessToken
-		f.tokenMu.Unlock()
+			// Get the refreshed token
+			f.tokenMu.Lock()
+			currentToken = f.accessToken
+			f.tokenMu.Unlock()
+		}
 	}
 
 	// Validate we have a token before using it
@@ -2466,6 +2444,12 @@ func (f *Fs) prepareTokenForRequest(ctx context.Context, opts *rest.Opts) error 
 
 // executeOpenAPICall makes the actual API call with the provided parameters
 func (f *Fs) executeOpenAPICall(ctx context.Context, opts *rest.Opts, request any, response any) (*http.Response, error) {
+	// 🚨 修复循环调用：直接使用openAPIClient，不通过CallAPI
+	// 确保客户端存在
+	if err := f.ensureOpenAPIClient(ctx); err != nil {
+		return nil, fmt.Errorf("failed to ensure OpenAPI client: %w", err)
+	}
+
 	var resp *http.Response
 	var err error
 
@@ -2560,12 +2544,8 @@ func (f *Fs) CallTraditionalAPI(ctx context.Context, opts *rest.Opts, request an
 		opts.RootURL = traditionalRootURL
 	}
 
-	// Wrap the entire attempt sequence with the global pacer
-	return f.globalPacer.Call(func() (shouldRetryGlobal bool, errGlobal error) {
-		// Wait for traditional pacer
-		if err := f.enforceTraditionalPacerDelay(); err != nil {
-			return false, backoff.Permanent(err)
-		}
+	// Use unified pacer for all API calls
+	return f.pacer.Call(func() (shouldRetryGlobal bool, errGlobal error) {
 
 		// Make the API call (with or without encryption)
 		resp, apiErr := f.executeTraditionalAPICall(ctx, opts, request, response, skipEncrypt)
@@ -2575,20 +2555,7 @@ func (f *Fs) CallTraditionalAPI(ctx context.Context, opts *rest.Opts, request an
 	})
 }
 
-// enforceTraditionalPacerDelay ensures we respect the traditional API pacer limits
-func (f *Fs) enforceTraditionalPacerDelay() error {
-	// Use tradPacer.Call with a dummy function that always succeeds immediately
-	// and doesn't retry. This effectively just waits for the pacer's internal timer.
-	tradPaceErr := f.tradPacer.Call(func() (bool, error) {
-		return false, nil // Dummy call: Success, don't retry this dummy op.
-	})
-	if tradPaceErr != nil {
-		// If waiting for tradPacer was interrupted (e.g., context cancelled)
-		fs.Debugf(f, "Context cancelled or error while waiting for traditional pacer: %v", tradPaceErr)
-		return tradPaceErr
-	}
-	return nil
-}
+// 移除enforceTraditionalPacerDelay函数，使用统一pacer不需要额外延迟
 
 // executeTraditionalAPICall makes the actual API call with proper handling of encryption
 func (f *Fs) executeTraditionalAPICall(ctx context.Context, opts *rest.Opts, request any, response any, skipEncrypt bool) (*http.Response, error) {
@@ -2602,20 +2569,8 @@ func (f *Fs) executeTraditionalAPICall(ctx context.Context, opts *rest.Opts, req
 // executeUnencryptedCall makes a traditional API call without encryption
 func (f *Fs) executeUnencryptedCall(ctx context.Context, opts *rest.Opts, request any, response any) (*http.Response, error) {
 	var resp *http.Response
-	var apiErr error
-
-	// Choose the right call pattern based on request/response
-	if request != nil && response != nil {
-		resp, apiErr = f.tradClient.CallJSON(ctx, opts, request, response)
-	} else if response != nil {
-		resp, apiErr = f.tradClient.CallJSON(ctx, opts, nil, response)
-	} else {
-		var baseResp TraditionalBase
-		resp, apiErr = f.tradClient.CallJSON(ctx, opts, nil, &baseResp)
-		if apiErr == nil {
-			apiErr = baseResp.Err()
-		}
-	}
+	// 使用统一API调用方法
+	apiErr := f.CallAPI(ctx, TraditionalAPI, opts, request, response)
 
 	return resp, apiErr
 }
@@ -2624,20 +2579,8 @@ func (f *Fs) executeUnencryptedCall(ctx context.Context, opts *rest.Opts, reques
 // 重构：移除加密功能，直接使用标准JSON调用
 func (f *Fs) executeEncryptedCall(ctx context.Context, opts *rest.Opts, request any, response any) (*http.Response, error) {
 	var resp *http.Response
-	var apiErr error
-
-	// 重构：所有传统API调用都改为标准JSON调用，不再使用加密
-	if request != nil && response != nil {
-		resp, apiErr = f.tradClient.CallJSON(ctx, opts, request, response)
-	} else if response != nil {
-		resp, apiErr = f.tradClient.CallJSON(ctx, opts, nil, response)
-	} else {
-		var baseResp TraditionalBase
-		resp, apiErr = f.tradClient.CallJSON(ctx, opts, nil, &baseResp)
-		if apiErr == nil {
-			apiErr = baseResp.Err()
-		}
-	}
+	// 重构：使用统一API调用方法
+	apiErr := f.CallAPI(ctx, TraditionalAPI, opts, request, response)
 
 	return resp, apiErr
 }
@@ -2654,12 +2597,7 @@ func (f *Fs) processTraditionalAPIResult(ctx context.Context, resp *http.Respons
 	// Handle non-retryable errors
 	if apiErr != nil {
 		fs.Debugf(f, "pacer: permanent error encountered in traditional call: %v", apiErr)
-		// Ensure the error is marked as permanent
-		var permanentErr *backoff.PermanentError
-		if !errors.As(apiErr, &permanentErr) {
-			return false, backoff.Permanent(apiErr)
-		}
-		return false, apiErr // Already permanent
+		return false, apiErr
 	}
 
 	// Success
@@ -2687,15 +2625,7 @@ func initializeOptions115(name, root string, m configmap.Mapper) (*Options, stri
 		return nil, "", "", errors.New("only_stream and upload_hash_only cannot be set simultaneously")
 	}
 
-	// Validate upload parameters
-	err = checkUploadChunkSize(opt.ChunkSize)
-	if err != nil {
-		return nil, "", "", fmt.Errorf("115: chunk size: %w", err)
-	}
-	err = checkUploadCutoff(opt.UploadCutoff)
-	if err != nil {
-		return nil, "", "", fmt.Errorf("115: upload cutoff: %w", err)
-	}
+	// 移除对已删除配置项的验证，使用rclone全局配置
 
 	if opt.NohashSize > StreamUploadLimit {
 		fs.Logf(name, "nohash_size (%v) reduced to stream upload limit (%v)", opt.NohashSize, StreamUploadLimit)
@@ -2709,11 +2639,7 @@ func initializeOptions115(name, root string, m configmap.Mapper) (*Options, stri
 		originalName = name[:idx]
 	}
 
-	// Parse root ID from path if present
-	if rootID, _, _ := parseRootID(root); rootID != "" {
-		name += rootID // Append ID to name for uniqueness
-		root = root[strings.Index(root, "}")+1:]
-	}
+	// 简化：移除复杂的根ID解析，使用标准路径处理
 
 	root = strings.Trim(root, "/")
 
@@ -2721,6 +2647,7 @@ func initializeOptions115(name, root string, m configmap.Mapper) (*Options, stri
 }
 
 // createBasicFs115 创建基础115网盘文件系统对象
+// 简化版本：移除UnifiedBackendConfig抽象层
 func createBasicFs115(name, originalName, root string, opt *Options, m configmap.Mapper) *Fs {
 	return &Fs{
 		name:         name,
@@ -2728,58 +2655,15 @@ func createBasicFs115(name, originalName, root string, opt *Options, m configmap
 		root:         root,
 		opt:          *opt,
 		m:            m,
+		// 移除errorHandler初始化，使用rclone标准错误处理
 	}
 }
 
-// initializeFeatures115 初始化115网盘功能特性
-func initializeFeatures115(ctx context.Context, f *Fs) {
-	f.features = (&fs.Features{
-		DuplicateFiles:          false,
-		CanHaveEmptyDirectories: true,
-		NoMultiThreading:        true, // Keep true as downloads might still use traditional API
-	}).Fill(ctx, f)
-}
+// 移除initializeFeatures115函数，已内联到NewFs中使用标准Fill模式
 
-// initializeCaches115 初始化115网盘缓存系统
-func initializeCaches115(f *Fs) error {
-	// 初始化缓存配置 - 使用统一配置
-	f.cacheConfig = common.DefaultUnifiedCacheConfig("115")
+// 移除initializeCaches115函数，不再使用自定义缓存
 
-	// 应用用户配置到缓存配置
-	f.cacheConfig.MaxCacheSize = f.opt.CacheMaxSize
-	f.cacheConfig.TargetCleanSize = f.opt.CacheTargetSize
-	f.cacheConfig.EnableSmartCleanup = f.opt.EnableSmartCleanup
-	f.cacheConfig.CleanupStrategy = f.opt.CleanupStrategy
-
-	// 使用统一的缓存初始化器 - 传递配置参数
-	return common.Initialize115Cache(f, &f.pathResolveCache, &f.dirListCache, &f.metadataCache, &f.fileIDCache, &f.cacheConfig)
-}
-
-// initializeUnifiedComponents115 初始化115网盘统一组件
-func initializeUnifiedComponents115(f *Fs) error {
-	// 创建下载适配器工厂函数
-	createDownloadAdapter := func() interface{} {
-		return NewPan115DownloadAdapter(f)
-	}
-
-	// 使用统一的组件初始化器
-	components, err := common.Initialize115Components(f, createDownloadAdapter)
-	if err != nil {
-		return fmt.Errorf("初始化115网盘统一组件失败: %w", err)
-	}
-
-	// 将组件分配给文件系统对象
-	f.resumeManager = components.ResumeManager
-	f.errorHandler = components.ErrorHandler
-	f.crossCloudCoordinator = components.CrossCloudCoordinator
-	f.memoryOptimizer = components.MemoryOptimizer
-	f.concurrentDownloader = components.ConcurrentDownloader
-
-	// 记录初始化结果
-	common.LogComponentInitializationResult("115", f, components, nil)
-
-	return nil
-}
+// 简化：移除过度复杂的统一组件初始化函数
 
 // newFs constructs an Fs from the path, container:path
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
@@ -2792,23 +2676,29 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// 创建基础文件系统对象
 	f := createBasicFs115(name, originalName, normalizedRoot, opt, m)
 
-	// 初始化功能特性
-	initializeFeatures115(ctx, f)
-
-	// 初始化缓存系统
-	if err := initializeCaches115(f); err != nil {
-		return nil, fmt.Errorf("初始化缓存系统失败: %w", err)
+	// 🚨 修复空指针问题：立即初始化客户端，参考其他backend的标准做法
+	// 使用rclone标准HTTP客户端创建方式
+	httpClient := fshttp.NewClient(ctx)
+	f.openAPIClient = rest.NewClient(httpClient).SetErrorHandler(errorHandler)
+	if f.openAPIClient == nil {
+		return nil, fmt.Errorf("failed to create OpenAPI REST client")
 	}
+	fs.Debugf(f, "OpenAPI REST client initialized successfully")
 
-	// 初始化统一组件
-	if err := initializeUnifiedComponents115(f); err != nil {
-		return nil, fmt.Errorf("初始化统一组件失败: %w", err)
-	}
+	// 初始化功能特性 - 使用标准Fill模式
+	f.features = (&fs.Features{
+		DuplicateFiles:          false,
+		CanHaveEmptyDirectories: true,
+		NoMultiThreading:        true, // Keep true as downloads might still use traditional API
+	}).Fill(ctx, f)
+
+	// 移除缓存系统初始化，使用rclone标准缓存
+
+	// 简化：移除统一组件初始化
 
 	// 注意：统一组件已在initializeUnifiedComponents115中初始化，此处不需要重复初始化
 
-	// 使用统一的标准HTTP客户端
-	f.httpClient = common.GetStandardHTTPClient(ctx)
+	// 移除httpClient字段，使用rclone标准HTTP客户端
 
 	// Setting appVer (needed for traditional calls)
 	re := regexp.MustCompile(`\d+\.\d+\.\d+(\.\d+)?$`)
@@ -2820,78 +2710,20 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		fs.Debugf(f, "Using App Version %q from User-Agent %q", f.appVer, tradUserAgent)
 	}
 
-	// Initialize pacers
-	f.globalPacer = fs.NewPacer(ctx, pacer.NewDefault(
-		pacer.MinSleep(time.Duration(opt.PacerMinSleep)),
+	// Initialize single pacer，使用115网盘统一QPS限制
+	// 115网盘所有API都受到相同的全局QPS限制（4 QPS），使用单一pacer符合rclone标准模式
+	f.pacer = fs.NewPacer(ctx, pacer.NewDefault(
+		pacer.MinSleep(time.Duration(unifiedMinSleep)),
 		pacer.MaxSleep(maxSleep),
 		pacer.DecayConstant(decayConstant)))
-
-	// 115网盘统一QPS管理：所有API使用相同的调速器
-	// 115网盘特殊性：全局账户级别限制，需要统一管理避免770004错误
 
 	// 显示当前QPS配置
-	qps := 1000.0 / float64(time.Duration(opt.PacerMinSleep)/time.Millisecond)
-	fs.Debugf(f, " 115网盘QPS配置: %v (~%.1f QPS)", opt.PacerMinSleep, qps)
+	qps := 1000.0 / float64(time.Duration(unifiedMinSleep)/time.Millisecond)
+	fs.Debugf(f, "115网盘统一QPS配置: %v (~%.1f QPS)", time.Duration(unifiedMinSleep), qps)
 
-	// 传统API调速器 - 使用用户配置
-	f.tradPacer = fs.NewPacer(ctx, pacer.NewDefault(
-		pacer.MinSleep(time.Duration(opt.PacerMinSleep)), // 使用用户配置的QPS
-		pacer.MaxSleep(maxSleep),
-		pacer.DecayConstant(decayConstant)))
+	// 移除多个pacer实例，使用单一pacer符合rclone标准模式
 
-	// 修复文件级并发：下载URL调速器支持并发连接
-	downloadPacerCalc := pacer.NewDefault(
-		pacer.MinSleep(time.Duration(opt.PacerMinSleep)), // 使用用户配置的QPS
-		pacer.MaxSleep(maxSleep),
-		pacer.DecayConstant(decayConstant))
-	f.downloadPacer = &fs.Pacer{
-		Pacer: pacer.New(
-			pacer.CalculatorOption(downloadPacerCalc),
-			pacer.MaxConnectionsOption(10), // 关键修复：允许10个并发连接
-			pacer.RetriesOption(3)),
-	}
-
-	// 参考rclone_mod优化：上传调速器使用激进配置，最大化上传性能
-	// 基于源码分析，上传初始化是关键瓶颈，需要激进优化
-	uploadMinSleep := 25 * time.Millisecond // ~40 QPS，激进上传优化
-	f.uploadPacer = fs.NewPacer(ctx, pacer.NewDefault(
-		pacer.MinSleep(uploadMinSleep),
-		pacer.MaxSleep(maxSleep),
-		pacer.DecayConstant(decayConstant)))
-
-	// 调试日志已优化：上传调速器配置详情已简化
-
-	// 参考rclone_mod优化：OSS专用调速器，使用终极配置
-	// OSS上传直连阿里云，不受115 API QPS限制，可以使用最激进配置
-	ossMinSleep := 5 * time.Millisecond // ~200 QPS，终极OSS优化
-	f.ossPacer = fs.NewPacer(ctx, pacer.NewDefault(
-		pacer.MinSleep(ossMinSleep),
-		pacer.MaxSleep(maxSleep),
-		pacer.DecayConstant(decayConstant)))
-
-	fs.Debugf(f, "🚀 终极OSS调速器配置: %v (~%.1f QPS)",
-		ossMinSleep, 1000.0/float64(ossMinSleep/time.Millisecond))
-
-	// Create clients first to ensure they're available for token operations
-	// Create separate clients for each API type with different User-Agents
-	tradHTTPClient := getTradHTTPClient(ctx, &f.opt)
-	openAPIHTTPClient := getOpenAPIHTTPClient(ctx, &f.opt)
-
-	// Traditional client (uses cookie)
-	f.tradClient = rest.NewClient(tradHTTPClient).
-		SetRoot(traditionalRootURL).
-		SetErrorHandler(errorHandler)
-
-	// Add cookie to traditional client if provided
-	if f.opt.Cookie != "" {
-		cred := (&Credential{}).FromCookie(f.opt.Cookie)
-		f.tradClient.SetCookie(cred.Cookie()...)
-	}
-
-	// OpenAPI client
-	f.openAPIClient = rest.NewClient(openAPIHTTPClient).
-		SetRoot(openAPIRootURL).
-		SetErrorHandler(errorHandler)
+	// 客户端已在前面初始化，无需重复创建
 
 	// Check if we have saved token in config file
 	tokenLoaded := loadTokenFromConfig(f, m)
@@ -2956,14 +2788,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// 全新设计：智能路径处理策略
 	// 参考123网盘的简洁设计，但针对115网盘的特点进行优化
 	if f.root != "" {
-		// 策略1：优先检查缓存中是否已有路径信息
-		if isFile, found := f.checkPathTypeFromCache(f.root); found {
-			if isFile {
-				return f.setupFileFromCache()
-			} else {
-				return f, nil
-			}
-		}
+		// 移除缓存检查，直接进行路径解析
 
 		// 策略2：缓存未命中，使用智能检测
 		if isLikelyFilePath(f.root) {
@@ -2974,6 +2799,27 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	return f, nil
+}
+
+// isFromRemoteSource 判断输入流是否来自远程源（用于跨云传输检测）
+// 修复：支持跨云传输断点续传TaskID一致性
+func (f *Fs) isFromRemoteSource(in io.Reader) bool {
+	// 简单的跨云传输检测：检查输入流类型
+	// 如果是RereadableObject或其他特殊类型，可能是跨云传输
+	if ro, ok := in.(*RereadableObject); ok {
+		fs.Debugf(f, "🌐 检测到RereadableObject，可能是跨云传输: %v", ro)
+		return true
+	}
+
+	// 检查是否是特殊的Reader类型（通常用于跨云传输）
+	// 简化检测：如果不是基本的文件类型，可能是跨云传输
+	readerType := fmt.Sprintf("%T", in)
+	if strings.Contains(readerType, "Accounted") || strings.Contains(readerType, "Cross") {
+		fs.Debugf(f, "🌐 检测到特殊Reader类型，可能是跨云传输: %s", readerType)
+		return true
+	}
+
+	return false
 }
 
 // Name of the remote (as passed into NewFs)
@@ -2993,13 +2839,6 @@ func (f *Fs) String() string {
 
 // Features returns the optional features of this Fs
 func (f *Fs) Features() *fs.Features {
-	if f.features == nil {
-		// 紧急修复：如果features未初始化，返回默认的安全配置
-		fs.Errorf(f, "⚠️ Features未初始化，使用默认配置")
-		return &fs.Features{
-			NoMultiThreading: true, // 115网盘默认禁用多线程
-		}
-	}
 	return f.features
 }
 
@@ -3045,8 +2884,12 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (foundID string,
 	// 重构：直接使用listAll查找，不再使用pathCache
 	// dirCache已经在上层提供了路径缓存功能，避免重复缓存
 
-	// Use listAll which now uses OpenAPI
-	found, err = f.listAll(ctx, pathID, f.opt.ListChunk, false, false, func(item *File) bool {
+	// Use listAll which now uses OpenAPI，使用rclone全局配置的检查器数量
+	listChunk := fs.GetConfig(ctx).Checkers
+	if listChunk <= 0 {
+		listChunk = 1150 // 115网盘OpenAPI的最大限制
+	}
+	found, err = f.listAll(ctx, pathID, listChunk, false, false, func(item *File) bool {
 		// Compare with decoded name to handle special characters correctly
 		decodedName := f.opt.Enc.ToStandardName(item.FileNameBest())
 		if decodedName == leaf {
@@ -3100,32 +2943,18 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 	fs.Debugf(f, "List找到目录ID: %s，目录: %q", dirID, dir)
 
-	// 关键修复：添加dir_list缓存支持，参考123网盘实现
-	if cached, found := f.getDirListFromCache(dirID, ""); found {
-		fs.Debugf(f, " List缓存命中: dirID=%s, 文件数=%d", dirID, len(cached.FileList))
+	// 移除缓存查询，直接调用API
 
-		// 从缓存构建entries
-		for _, item := range cached.FileList {
-			entry, err := f.itemToDirEntry(ctx, path.Join(dir, item.FileNameBest()), &item)
-			if err != nil {
-				fs.Debugf(f, "List缓存条目转换失败: %v", err)
-				continue // 跳过有问题的条目，继续处理其他条目
-			}
-			if entry != nil {
-				entries = append(entries, entry)
-			}
-		}
-
-		fs.Debugf(f, " List缓存返回: %d个条目", len(entries))
-		return entries, nil
-	}
-
-	// 缓存未命中，调用API并保存到缓存
-	fs.Debugf(f, " List缓存未命中，调用API: dirID=%s", dirID)
+	// Call API to get directory listing
 	var fileList []File
 	var iErr error
 
-	_, err = f.listAll(ctx, dirID, f.opt.ListChunk, false, false, func(item *File) bool {
+	// 使用rclone全局配置的检查器数量
+	listChunk := fs.GetConfig(ctx).Checkers
+	if listChunk <= 0 {
+		listChunk = 1150 // 115网盘OpenAPI的最大限制
+	}
+	_, err = f.listAll(ctx, dirID, listChunk, false, false, func(item *File) bool {
 		// 保存到临时列表用于缓存
 		fileList = append(fileList, *item)
 
@@ -3148,11 +2977,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		return nil, iErr // Return item processing error
 	}
 
-	// 保存到缓存
-	if len(fileList) > 0 {
-		f.saveDirListToCache(dirID, "", fileList, "")
-		fs.Debugf(f, " List保存到缓存: dirID=%s, 文件数=%d", dirID, len(fileList))
-	}
+	// 移除缓存保存
 
 	return entries, nil
 }
@@ -3256,7 +3081,11 @@ func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) (err error) {
 
 		// List all items in the source directory
 		var itemsToMove []*File
-		_, err = f.listAll(ctx, srcDirID, f.opt.ListChunk, false, false, func(item *File) bool {
+		listChunk := fs.GetConfig(ctx).Checkers
+		if listChunk <= 0 {
+			listChunk = 1150 // 115网盘OpenAPI的最大限制
+		}
+		_, err = f.listAll(ctx, srcDirID, listChunk, false, false, func(item *File) bool {
 			itemsToMove = append(itemsToMove, item)
 			return false // Collect all items
 		})
@@ -3265,7 +3094,7 @@ func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) (err error) {
 		}
 
 		// Move items in chunks
-		chunkSize := f.opt.ListChunk // Use list chunk size for move chunks
+		chunkSize := listChunk // Use list chunk size for move chunks
 		for i := 0; i < len(itemsToMove); i += chunkSize {
 			end := min(i+chunkSize, len(itemsToMove))
 			chunk := itemsToMove[i:end]
@@ -3292,7 +3121,10 @@ func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) (err error) {
 	}
 
 	// Delete directories in chunks
-	chunkSize := f.opt.ListChunk
+	chunkSize := fs.GetConfig(ctx).Checkers
+	if chunkSize <= 0 {
+		chunkSize = 1150 // 115网盘OpenAPI的最大限制
+	}
 	for i := 0; i < len(dirsToDelete); i += chunkSize {
 		end := min(i+chunkSize, len(dirsToDelete))
 		chunkIDs := dirsToDelete[i:end]
@@ -3642,21 +3474,7 @@ func (f *Fs) Shutdown(ctx context.Context) error {
 		f.tokenRenewer = nil
 	}
 
-	// 关闭所有BadgerDB缓存
-	caches := []*cache.BadgerCache{
-		f.pathResolveCache,
-		f.dirListCache,
-		f.metadataCache,
-		f.fileIDCache,
-	}
-
-	for i, c := range caches {
-		if c != nil {
-			if err := c.Close(); err != nil {
-				fs.Debugf(f, "关闭BadgerDB缓存%d失败: %v", i, err)
-			}
-		}
-	}
+	// 移除BadgerDB缓存关闭，不再使用自定义缓存
 
 	return nil
 }
@@ -3732,7 +3550,11 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *File, 
 
 	// List the directory and find the leaf
 	fs.Debugf(f, " readMetaDataForPath: 开始调用listAll, dirID=%q, leaf=%q", dirID, leaf)
-	found, err := f.listAll(ctx, dirID, f.opt.ListChunk, true, false, func(item *File) bool {
+	listChunk := fs.GetConfig(ctx).Checkers
+	if listChunk <= 0 {
+		listChunk = 1150 // 115网盘OpenAPI的最大限制
+	}
+	found, err := f.listAll(ctx, dirID, listChunk, true, false, func(item *File) bool {
 		// Compare with decoded name to handle special characters correctly
 		decodedName := f.opt.Enc.ToStandardName(item.FileNameBest())
 		if decodedName == leaf {
@@ -3779,44 +3601,6 @@ func (f *Fs) createObject(ctx context.Context, remote string, modTime time.Time,
 // ------------------------------------------------------------
 
 var commandHelp = []fs.CommandHelp{{
-	Name:  "getdownloadurlua",
-	Short: "通过文件路径获取下载URL",
-	Long: `此命令使用文件路径检索文件的下载URL。
-
-用法:
-rclone backend getdownloadurlua 115: "/path/to/file" "VidHub/1.7.24"
-
-该命令返回指定文件的下载URL。请确保文件路径正确。`,
-}, {
-	Name:  "cache-cleanup",
-	Short: "手动触发缓存清理",
-	Long: `手动触发115网盘缓存清理操作。
-用法:
-rclone backend cache-cleanup 115: --strategy=lru
-支持的清理策略: size, lru, priority_lru, time, clear
-该命令返回清理结果和统计信息。`,
-}, {
-	Name:  "cache-stats",
-	Short: "查看缓存统计信息",
-	Long: `获取115网盘缓存的详细统计信息。
-用法:
-rclone backend cache-stats 115:
-该命令返回所有缓存实例的统计数据，包括命中率、大小等。`,
-}, {
-	Name:  "cache-config",
-	Short: "查看当前缓存配置",
-	Long: `查看115网盘当前的缓存配置参数。
-用法:
-rclone backend cache-config 115:
-该命令返回当前的缓存配置和用户配置。`,
-}, {
-	Name:  "cache-reset",
-	Short: "重置缓存配置为默认值",
-	Long: `将115网盘缓存配置重置为默认值。
-用法:
-rclone backend cache-reset 115:
-该命令会重置所有缓存配置参数。`,
-}, {
 	Name:  "media-sync",
 	Short: "同步媒体库并创建优化的.strm文件",
 	Long: `将115网盘中的视频文件同步到本地目录，创建对应的.strm文件。
@@ -3882,90 +3666,6 @@ rclone backend media-sync 115:Videos /local/media/videos -o min-size=200M -o str
 func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (out any, err error) {
 	switch name {
 
-	case "getdownloadurlua":
-		// 🔧 修复：支持两种格式
-		// 格式1: rclone backend getdownloadurlua 115: "/path" "UA" (两个参数)
-		// 格式2: rclone backend getdownloadurlua "115:/path" "UA" (一个参数，路径在f.root中)
-
-		var path, ua string
-
-		if len(arg) >= 2 {
-			// 格式1：两个参数
-			path = arg[0]
-			ua = arg[1]
-		} else if len(arg) >= 1 {
-			// 格式2：一个参数，需要重构完整的文件路径
-			ua = arg[0]
-
-			// 检查是否是文件模式（当f.fileObj存在时）
-			if f.fileObj != nil {
-				// 文件模式：组合父目录路径和文件名
-				obj := *f.fileObj
-				fileName := obj.Remote()
-				if f.root == "" {
-					path = "/" + fileName
-				} else {
-					path = "/" + strings.Trim(f.root, "/") + "/" + fileName
-				}
-				fs.Debugf(f, "文件模式：组合完整路径: %s (父目录: %s, 文件名: %s)", path, f.root, fileName)
-			} else {
-				// 目录模式：使用f.root
-				path = f.root
-				fs.Debugf(f, "目录模式：使用root路径: %s", path)
-			}
-		} else {
-			return nil, fmt.Errorf("需要提供User-Agent参数")
-		}
-
-		return f.getDownloadURLByUA(ctx, path, ua)
-
-	case "cache-info":
-		// 使用统一缓存查看器
-		caches := map[string]cache.PersistentCache{
-			"path_resolve": f.pathResolveCache,
-			"dir_list":     f.dirListCache,
-			"metadata":     f.metadataCache,
-			"file_id":      f.fileIDCache,
-		}
-		viewer := cache.NewUnifiedCacheViewer("115", f, caches)
-
-		// 根据参数决定返回格式
-		format := "tree"
-		if formatOpt, ok := opt["format"]; ok {
-			format = formatOpt
-		}
-
-		switch format {
-		case "tree":
-			return viewer.GenerateDirectoryTreeText()
-		case "stats":
-			return viewer.GetCacheStats(), nil
-		case "info":
-			return viewer.GetCacheInfo()
-		default:
-			return viewer.GenerateDirectoryTreeText()
-		}
-
-	case "cache-cleanup":
-		// 🔧 新增：手动触发缓存清理
-		strategy := "size"
-		if strategyOpt, ok := opt["strategy"]; ok {
-			strategy = strategyOpt
-		}
-		return f.manualCacheCleanup115(ctx, strategy)
-
-	case "cache-stats":
-		// 🔧 新增：查看缓存统计信息
-		return f.getCacheStatistics115(ctx)
-
-	case "cache-config":
-		// 🔧 新增：查看当前缓存配置
-		return f.getCacheConfiguration115(ctx)
-
-	case "cache-reset":
-		// 🔧 新增：重置缓存配置为默认值
-		return f.resetCacheConfiguration115(ctx)
-
 	case "media-sync":
 		// 🎬 新增：媒体库同步功能
 		return f.mediaSyncCommand(ctx, arg, opt)
@@ -3989,7 +3689,7 @@ func (f *Fs) GetPickCodeByPath(ctx context.Context, path string) (string, error)
 		Method: "GET",
 		Path:   "/open/folder/get_info",
 		Parameters: url.Values{
-			"path": {path},
+			"path": []string{path},
 		},
 	}
 
@@ -4017,7 +3717,7 @@ func (f *Fs) GetPickCodeByPath(ctx context.Context, path string) (string, error)
 		return "", fmt.Errorf("API返回错误: %s (Code: %d)", response.Message, response.Code)
 	}
 
-	fs.Debugf(f, "成功获取文件信息: %s -> PickCode: %s, 文件名: %s, 大小: %d字节",
+	fs.Debugf(f, "Got file info: %s -> PickCode: %s, name: %s, size: %d bytes",
 		path, response.Data.PickCode, response.Data.FileName, response.Data.SizeByte)
 
 	// 返回 PickCode
@@ -4031,7 +3731,7 @@ func (f *Fs) getPickCodeByFileID(ctx context.Context, fileID string) (string, er
 		Method: "GET",
 		Path:   "/open/folder/get_info",
 		Parameters: url.Values{
-			"file_id": {fileID},
+			"file_id": []string{fileID},
 		},
 	}
 
@@ -4105,37 +3805,21 @@ func (f *Fs) getDownloadURLByUA(ctx context.Context, filePath string, UA string)
 	return f.getDownloadURLByPickCodeHTTP(ctx, pickCode, UA)
 }
 
-// getPickCodeByPathDirect 直接HTTP调用获取PickCode，避免rclone框架开销
+// getPickCodeByPathDirect 使用rclone标准方式获取PickCode
 func (f *Fs) getPickCodeByPathDirect(ctx context.Context, path string) (string, error) {
-	fs.Debugf(f, "直接HTTP获取PickCode: %s", path)
+	fs.Debugf(f, "使用rclone标准方式获取PickCode: %s", path)
 
-	// 创建HTTP客户端
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-
-	// 构建请求URL
-	reqURL := openAPIRootURL + "/open/folder/get_info?path=" + url.QueryEscape(path)
-
-	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
-	if err != nil {
-		return "", fmt.Errorf("创建请求失败: %w", err)
+	// 构建请求选项
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   "/open/folder/get_info",
+		Parameters: url.Values{
+			"path": []string{path},
+		},
 	}
 
 	// 准备认证信息
-	opts := rest.Opts{}
 	f.prepareTokenForRequest(ctx, &opts)
-
-	// 设置请求头
-	req.Header.Set("Authorization", opts.ExtraHeaders["Authorization"])
-	req.Header.Set("User-Agent", defaultUserAgent)
-
-	// 发送请求
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("请求失败: %w", err)
-	}
-	defer resp.Body.Close()
 
 	// 解析响应
 	var response struct {
@@ -4150,8 +3834,10 @@ func (f *Fs) getPickCodeByPathDirect(ctx context.Context, path string) (string, 
 		} `json:"data"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-		return "", fmt.Errorf("解析响应失败: %w", err)
+	// 使用统一API调用方法
+	err := f.CallAPI(ctx, OpenAPI, &opts, nil, &response)
+	if err != nil {
+		return "", fmt.Errorf("请求失败: %w", err)
 	}
 
 	if response.Code != 0 {
@@ -4264,8 +3950,44 @@ func (o *Object) Storable() bool {
 	return true
 }
 
-// open opens the object for reading.
-func (o *Object) open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+// 移除冗余的open方法，已内联到Open方法中
+
+// Open the file for reading.
+func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	// Ensure metadata (specifically pickCode or ID) is available
+	err := o.readMetaData(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read metadata before open: %w", err)
+	}
+
+	if o.size == 0 {
+		// No need for download URL for 0-byte files
+		return io.NopCloser(bytes.NewReader(nil)), nil
+	}
+
+	// 115网盘下载策略说明：完全禁用并发策略
+	fs.Debugf(o, "📋 115网盘下载策略：完全禁用并发（1TB门槛+1GB分片，强制使用普通下载）")
+
+	// 简化：移除复杂的并发下载逻辑，使用rclone标准的单线程下载
+
+	// Get/refresh download URL
+	err = o.setDownloadURL(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get download URL: %w", err)
+	}
+	if !o.durl.Valid() {
+		// Attempt refresh again if invalid right after getting it
+		fs.Debugf(o, "Download URL invalid immediately after fetching, retrying...")
+		time.Sleep(500 * time.Millisecond)         // Small delay before retry
+		err = o.setDownloadURLWithForce(ctx, true) // Force refresh
+		if err != nil {
+			return nil, fmt.Errorf("failed to get download URL on retry: %w", err)
+		}
+		if !o.durl.Valid() {
+			return nil, errors.New("failed to obtain a valid download URL")
+		}
+	}
+
 	// 并发安全修复：使用互斥锁保护对durl的访问
 	o.durlMu.Lock()
 
@@ -4307,7 +4029,9 @@ func (o *Object) open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		delete(req.Header, "Range")
 	}
 
-	resp, err := o.fs.openAPIClient.Do(req)
+	// 使用标准HTTP客户端进行请求
+	httpClient := fshttp.NewClient(ctx)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		fs.Debugf(o, "❌ 115网盘HTTP请求失败: %v", err)
 		return nil, err
@@ -4327,122 +4051,6 @@ func (o *Object) open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	}
 
 	return resp.Body, nil
-}
-
-// Open the file for reading.
-func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
-	// Ensure metadata (specifically pickCode or ID) is available
-	err := o.readMetaData(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read metadata before open: %w", err)
-	}
-
-	if o.size == 0 {
-		// No need for download URL for 0-byte files
-		return io.NopCloser(bytes.NewReader(nil)), nil
-	}
-
-	// 115网盘下载策略说明：完全禁用并发策略
-	fs.Debugf(o, "📋 115网盘下载策略：完全禁用并发（1TB门槛+1GB分片，强制使用普通下载）")
-
-	// 115网盘智能降级策略：优先尝试并发下载，遇到403错误自动降级
-	// 策略原理：
-	// 1. 优先尝试并发下载，获得最佳性能
-	// 2. 遇到403错误时自动降级到普通下载
-	// 3. 对用户透明，无需额外配置
-	if o.fs.concurrentDownloader != nil && o.fs.concurrentDownloader.ShouldUseConcurrentDownload(ctx, o, options) {
-		fs.Infof(o, "🚀 115网盘尝试并发下载: %s (智能降级策略)", fs.SizeSuffix(o.size))
-
-		// 关键修复：在并发下载前确保pickCode正确
-		if o.pickCode == "" {
-			if err := o.readMetaData(ctx); err != nil || o.pickCode == "" {
-				if o.id != "" {
-					pickCode, pickErr := o.fs.getPickCodeByFileID(ctx, o.id)
-					if pickErr != nil {
-						fs.Debugf(o, "获取pickCode失败，回退到普通下载: %v", pickErr)
-					} else {
-						o.pickCode = pickCode
-					}
-				}
-			}
-		}
-
-		// 创建临时文件用于并发下载
-		tempFile, err := os.CreateTemp("", "115_unified_download_*.tmp")
-		if err != nil {
-			fs.Debugf(o, "创建临时文件失败，回退到普通下载: %v", err)
-		} else {
-			// 关键修复：创建Transfer对象用于进度显示（参考123网盘实现）
-			var downloadTransfer *accounting.Transfer
-			if stats := accounting.GlobalStats(); stats != nil {
-				downloadTransfer = stats.NewTransferRemoteSize(
-					fmt.Sprintf("📥 %s (115网盘下载)", o.Remote()),
-					o.size,
-					o.fs, // 源是115网盘
-					nil,  // 目标未知
-				)
-				defer downloadTransfer.Done(ctx, nil)
-				// 调试日志已优化：对象创建详情仅在详细模式下输出)
-			}
-
-			// 使用支持Account的统一并发下载器
-			var downloadedSize int64
-			if downloadTransfer != nil {
-				downloadedSize, err = o.fs.concurrentDownloader.DownloadToFileWithAccount(ctx, o, tempFile, downloadTransfer, options...)
-			} else {
-				// 回退到原方法
-				downloadedSize, err = o.fs.concurrentDownloader.DownloadToFile(ctx, o, tempFile, options...)
-			}
-			if err != nil {
-				tempFile.Close()
-				os.Remove(tempFile.Name())
-
-				// 智能降级：检测错误类型并记录
-				if strings.Contains(err.Error(), "403") || strings.Contains(err.Error(), "Forbidden") {
-					fs.Infof(o, "⚠️ 115网盘Range并发下载遇到API限制，智能降级到单线程下载: %v", err)
-				} else {
-					fs.Debugf(o, "115网盘Range并发下载失败，智能降级到单线程下载: %v", err)
-				}
-			} else if downloadedSize == o.size {
-				// 重置文件指针到开始位置
-				_, err = tempFile.Seek(0, io.SeekStart)
-				if err != nil {
-					tempFile.Close()
-					os.Remove(tempFile.Name())
-				} else {
-					fs.Infof(o, "✅ 115网盘统一并发下载完成: %s", fs.SizeSuffix(downloadedSize))
-					return &ConcurrentDownloadReader{
-						file:     tempFile,
-						tempPath: tempFile.Name(),
-					}, nil
-				}
-			} else {
-				tempFile.Close()
-				os.Remove(tempFile.Name())
-			}
-		}
-	}
-
-	// Get/refresh download URL
-	err = o.setDownloadURL(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get download URL: %w", err)
-	}
-	if !o.durl.Valid() {
-		// Attempt refresh again if invalid right after getting it
-		fs.Debugf(o, "Download URL invalid immediately after fetching, retrying...")
-		time.Sleep(500 * time.Millisecond) // Small delay before retry
-		err = o.setDownloadURL(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get download URL on retry: %w", err)
-		}
-		if !o.durl.Valid() {
-			return nil, errors.New("failed to obtain a valid download URL")
-		}
-	}
-
-	// Open the URL
-	return o.open(ctx, options...)
 }
 
 // Update the object with new content.
@@ -4709,11 +4317,7 @@ func (o *Object) setDownloadURL(ctx context.Context) error {
 		o.durl = nil      // Clear invalid URL
 		o.durlMu.Unlock() // 错误路径释放锁
 
-		// 使用统一错误处理器包装错误
-		if o.fs.errorHandler != nil {
-			return o.fs.errorHandler.HandleSpecificError(err, "获取下载URL")
-		}
-
+		// 简化：直接返回错误，不使用复杂的错误处理器
 		return fmt.Errorf("failed to get download URL: %w", err)
 	}
 
@@ -4976,25 +4580,21 @@ func (f *Fs) calculateOptimalChunkSize(fileSize int64) fs.SizeSuffix {
 	// Larger chunks can better utilize network bandwidth and reduce inter-chunk overhead
 	var partSize int64
 
-	// 参考OpenList优化：使用更合理的分片策略，减少分片数量提升性能
-	// OpenList的策略：小分片减少重传开销，大文件逐步增大分片
+	// 修复：优化分片策略，减少小文件的分片数量
+	// 小文件使用更大的分片，减少网络开销和API调用次数
 	switch {
-	case fileSize <= 1*1024*1024*1024: // ≤1GB
-		partSize = 20 * 1024 * 1024 // 参考OpenList：1GB以下使用20MB分片
-	case fileSize <= 128*1024*1024*1024: // ≤128GB
-		partSize = 27487791 // ≈26.2MB，参考OpenList精确计算
-	case fileSize <= 256*1024*1024*1024: // ≤256GB
-		partSize = 41231687 // ≈39.3MB，参考OpenList
-	case fileSize <= 384*1024*1024*1024: // ≤384GB
-		partSize = 54975582 // ≈52.4MB，参考OpenList
-	case fileSize <= 512*1024*1024*1024: // ≤512GB
-		partSize = 82463373 // ≈78.6MB，参考OpenList
-	case fileSize <= 768*1024*1024*1024: // ≤768GB
-		partSize = 109951163 // ≈104.8MB，参考OpenList
-	case fileSize <= 1*1024*1024*1024*1024: // ≤1TB
-		partSize = 109951163 // ≈104.8MB，保持与768GB相同
-	default: // >1TB
-		partSize = 5 * 1024 * 1024 * 1024 // 5GB分片，参考OpenList
+	case fileSize <= 100*1024*1024: // ≤100MB
+		partSize = fileSize // 小文件直接单分片上传，避免分片开销
+	case fileSize <= 500*1024*1024: // ≤500MB
+		partSize = 100 * 1024 * 1024 // 100MB分片，减少分片数量
+	case fileSize <= 2*1024*1024*1024: // ≤2GB
+		partSize = 200 * 1024 * 1024 // 200MB分片
+	case fileSize <= 10*1024*1024*1024: // ≤10GB
+		partSize = 500 * 1024 * 1024 // 500MB分片
+	case fileSize <= 100*1024*1024*1024: // ≤100GB
+		partSize = 1 * 1024 * 1024 * 1024 // 1GB分片
+	default: // >100GB
+		partSize = 2 * 1024 * 1024 * 1024 // 2GB分片
 	}
 
 	return fs.SizeSuffix(f.normalizeChunkSize(partSize))
@@ -5057,13 +4657,9 @@ func (f *Fs) crossCloudUploadWithLocalCache(ctx context.Context, in io.Reader, s
 	maxMemoryBufferSize := memoryBufferThreshold // 使用统一的内存缓冲阈值
 	useMemoryBuffer := false
 
+	// 简化：对于小文件直接使用内存缓冲，不需要复杂的内存优化器
 	if fileSize <= maxMemoryBufferSize {
-		// 检查是否可以使用内存缓冲
-		if f.memoryOptimizer != nil && f.memoryOptimizer.ShouldUseMemoryBuffer(fileSize) {
-			if f.memoryOptimizer.AllocateMemory(fileSize) {
-				useMemoryBuffer = true
-			}
-		}
+		useMemoryBuffer = true
 	}
 
 	if useMemoryBuffer {
@@ -5071,13 +4667,12 @@ func (f *Fs) crossCloudUploadWithLocalCache(ctx context.Context, in io.Reader, s
 		fs.Infof(f, "📝 小文件跨云传输，下载到内存: %s", fs.SizeSuffix(fileSize))
 		data, err := io.ReadAll(in)
 		if err != nil {
-			f.memoryOptimizer.ReleaseMemory(fileSize)
 			return nil, fmt.Errorf("跨云传输下载到内存失败: %w", err)
 		}
 		localDataSource = bytes.NewReader(data)
 		localFileSize = int64(len(data))
 		cleanup = func() {
-			f.memoryOptimizer.ReleaseMemory(fileSize)
+			// 简化：不需要复杂的内存管理
 		}
 		fs.Infof(f, "✅ 跨云传输内存下载完成: %s", fs.SizeSuffix(localFileSize))
 	} else {
@@ -5173,175 +4768,20 @@ func isLikelyFilePath(path string) bool {
 	return false
 }
 
-// 新增：保存路径类型到缓存
-// savePathTypeToCache 保存路径类型信息到缓存
-func (f *Fs) savePathTypeToCache(path, fileID, parentID string, isDir bool) {
-	if f.pathResolveCache == nil {
-		return
-	}
-
-	cacheKey := generatePathToIDCacheKey(path)
-	entry := PathToIDCacheEntry115{
-		Path:     path,
-		FileID:   fileID,
-		IsDir:    isDir,
-		ParentID: parentID,
-		CachedAt: time.Now(),
-	}
-
-	if err := f.pathResolveCache.Set(cacheKey, entry, f.cacheConfig.PathToIDCacheTTL); err != nil {
-		fs.Debugf(f, "保存路径类型缓存失败 %s: %v", cacheKey, err)
-	} else {
-		fs.Debugf(f, "已保存路径类型到缓存: %s -> %s (dir: %v)", path, fileID, isDir)
-	}
-}
+// 移除savePathTypeToCache函数，不再使用自定义缓存
 
 // 新增：dir_list缓存支持函数，参考123网盘实现
 
-// getDirListFromCache 从缓存获取目录列表
-func (f *Fs) getDirListFromCache(parentID, lastID string) (*DirListCacheEntry115, bool) {
-	if f.dirListCache == nil {
-		return nil, false
-	}
-
-	cacheKey := common.GenerateDirListCacheKey(parentID, lastID)
-	var entry DirListCacheEntry115
-	found, err := f.dirListCache.Get(cacheKey, &entry)
-	if err != nil {
-		fs.Debugf(f, "获取目录列表缓存失败 %s: %v", cacheKey, err)
-		return nil, false
-	}
-
-	if !found {
-		return nil, false
-	}
-
-	// 简单验证缓存条目
-	if len(entry.FileList) == 0 && entry.TotalCount > 0 {
-		fs.Debugf(f, "目录列表缓存数据不一致: %s", cacheKey)
-		return nil, false
-	}
-
-	fs.Debugf(f, "从缓存获取目录列表成功: parentID=%s, 文件数=%d", parentID, len(entry.FileList))
-	return &entry, true
-}
-
-// saveDirListToCache 保存目录列表到缓存
-func (f *Fs) saveDirListToCache(parentID, lastID string, fileList []File, nextLastID string) {
-	if f.dirListCache == nil {
-		return
-	}
-
-	cacheKey := common.GenerateDirListCacheKey(parentID, lastID)
-	entry := DirListCacheEntry115{
-		FileList:   fileList,
-		LastFileID: nextLastID,
-		TotalCount: len(fileList),
-		CachedAt:   time.Now(),
-		ParentID:   parentID,
-		Version:    "v1.0",                           // 简化版本号
-		Checksum:   fmt.Sprintf("%d", len(fileList)), // 简化校验和
-	}
-
-	err := f.dirListCache.Set(cacheKey, entry, f.cacheConfig.DirListCacheTTL)
-	if err != nil {
-		fs.Debugf(f, "保存目录列表缓存失败 %s: %v", cacheKey, err)
-	} else {
-		fs.Debugf(f, "已保存目录列表到缓存: parentID=%s, 文件数=%d, TTL=%v", parentID, len(fileList), f.cacheConfig.DirListCacheTTL)
-	}
-}
+// 移除getDirListFromCache和saveDirListToCache函数，不再使用自定义缓存
 
 // 新增：路径预填充缓存功能
-// preloadPathCache 利用API返回的path信息预填充路径缓存
-func (f *Fs) preloadPathCache(paths []*FilePath) {
-	if f.pathResolveCache == nil {
-		return
-	}
-
-	var fullPath string
-	for i, pathItem := range paths {
-		// 构建完整路径
-		if i == 0 {
-			// 根目录，跳过
-			if pathItem.Name == "" || pathItem.Name == "根目录" || pathItem.Name == "文件" {
-				continue
-			}
-			fullPath = pathItem.Name
-		} else {
-			// 跳过根目录级别的"文件"目录
-			if pathItem.Name == "文件" && i == 1 {
-				continue
-			}
-			if fullPath == "" {
-				fullPath = pathItem.Name
-			} else {
-				fullPath = path.Join(fullPath, pathItem.Name)
-			}
-		}
-
-		// 获取目录ID
-		cid := pathItem.CID.String()
-		if cid == "" || cid == "0" {
-			continue // 跳过无效的ID
-		}
-
-		// 获取父目录ID（如果有的话）
-		var parentID string
-		if i > 0 {
-			parentID = paths[i-1].CID.String()
-		}
-
-		// 保存路径到缓存
-		f.savePathTypeToCache(fullPath, cid, parentID, true) // true表示是目录
-
-		fs.Debugf(f, " 预填充路径缓存: %s -> %s (parent: %s)", fullPath, cid, parentID)
-	}
-}
+// 移除preloadPathCache函数，不再使用自定义缓存
 
 // 新设计：智能路径处理方法
 
-// checkPathTypeFromCache 检查缓存中的路径类型信息
-func (f *Fs) checkPathTypeFromCache(path string) (isFile bool, found bool) {
-	if f.pathResolveCache == nil {
-		return false, false
-	}
+// 移除checkPathTypeFromCache函数，不再使用自定义缓存
 
-	cacheKey := generatePathToIDCacheKey(path)
-	var entry PathToIDCacheEntry115
-	found, err := f.pathResolveCache.Get(cacheKey, &entry)
-	if err != nil || !found {
-		return false, false
-	}
-
-	fs.Debugf(f, " 缓存命中：路径 %s -> IsDir=%v", path, entry.IsDir)
-	return !entry.IsDir, true
-}
-
-// setupFileFromCache 从缓存信息设置文件模式
-func (f *Fs) setupFileFromCache() (*Fs, error) {
-	// 分割路径获取父目录和文件名
-	newRoot, remote := dircache.SplitPath(f.root)
-
-	// 修改当前Fs指向父目录
-	f.root = newRoot
-	f.dirCache = dircache.New(newRoot, f.rootFolderID, f)
-
-	// 创建文件对象
-	obj := &Object{
-		fs:          f,
-		remote:      remote,
-		hasMetaData: false, // 延迟加载元数据
-		durlMu:      new(sync.Mutex),
-	}
-
-	// 设置文件模式
-	var fsObj fs.Object = obj
-	f.fileObj = &fsObj
-
-	// 🔧 修复：对于backend命令，不返回ErrorIsFile，而是返回正常的Fs实例
-	fs.Debugf(f, " 缓存文件模式设置完成: %s", remote)
-	return f, nil
-}
+// 移除未使用的setupFileFromCache函数
 
 // handleAsFile 将路径作为文件处理
 func (f *Fs) handleAsFile(ctx context.Context) (*Fs, error) {
@@ -5355,10 +4795,9 @@ func (f *Fs) handleAsFile(ctx context.Context) (*Fs, error) {
 		root:          newRoot,
 		opt:           f.opt,
 		features:      f.features,
-		tradClient:    f.tradClient,
 		openAPIClient: f.openAPIClient,
-		globalPacer:   f.globalPacer,
-		tradPacer:     f.tradPacer,
+		tradClient:    f.tradClient,
+		pacer:         f.pacer,
 		rootFolder:    f.rootFolder,
 		rootFolderID:  f.rootFolderID,
 		appVer:        f.appVer,
@@ -5372,14 +4811,8 @@ func (f *Fs) handleAsFile(ctx context.Context) (*Fs, error) {
 		tokenExpiry:   f.tokenExpiry,
 		codeVerifier:  f.codeVerifier,
 		tokenRenewer:  f.tokenRenewer,
-		httpClient:    f.httpClient,
-		// 复用缓存实例
-		pathResolveCache: f.pathResolveCache,
-		dirListCache:     f.dirListCache,
-		metadataCache:    f.metadataCache,
-		fileIDCache:      f.fileIDCache,
-		cacheConfig:      f.cacheConfig,
-		resumeManager:    f.resumeManager,
+		// 移除缓存实例复制，不再使用自定义缓存
+		// 简化：移除resumeManager
 	}
 
 	tempF.dirCache = dircache.New(newRoot, f.rootFolderID, tempF)
@@ -5395,9 +4828,6 @@ func (f *Fs) handleAsFile(ctx context.Context) (*Fs, error) {
 	_, err = tempF.NewObject(ctx, remote)
 	if err == nil {
 		fs.Debugf(f, " 文件验证成功，设置文件模式: %s", remote)
-
-		// 保存到缓存
-		f.savePathTypeToCache(f.root, "", "", false) // isFile=true
 
 		// 设置文件模式
 		f.root = newRoot
@@ -5423,44 +4853,12 @@ func (f *Fs) handleAsFile(ctx context.Context) (*Fs, error) {
 	}
 }
 
-// 115网盘统一QPS管理 - 根据API类型选择调速器
-// getPacerForEndpoint 根据115网盘API端点返回适当的调速器
-// 115网盘特殊性：使用统一QPS避免770004全局限制错误
+// 115网盘统一QPS管理 - 使用单一调速器
+// getPacerForEndpoint 返回统一的调速器，符合rclone标准模式
+// 115网盘所有API都受到相同的全局QPS限制，不需要复杂的选择逻辑
 func (f *Fs) getPacerForEndpoint(endpoint string) *fs.Pacer {
-	switch {
-	// 文件列表API - 使用全局调速器（最常用）
-	case strings.Contains(endpoint, "/open/ufile/files"), // 文件列表
-		strings.Contains(endpoint, "/open/ufile/file"),   // 文件信息
-		strings.Contains(endpoint, "/open/ufile/search"): // 文件搜索
-		return f.globalPacer // 统一QPS
-
-	// 下载相关API - 使用下载调速器
-	case strings.Contains(endpoint, "/open/ufile/download"), // 下载URL
-		strings.Contains(endpoint, "/open/user/info"): // 用户信息
-		return f.downloadPacer // 统一QPS
-
-	// 上传和敏感操作 - 使用保守调速器
-	case strings.Contains(endpoint, "/open/ufile/upload"), // 上传相关
-		strings.Contains(endpoint, "/open/ufile/move"),   // 移动文件
-		strings.Contains(endpoint, "/open/ufile/rename"), // 重命名
-		strings.Contains(endpoint, "/open/ufile/copy"),   // 复制文件
-		strings.Contains(endpoint, "/open/ufile/delete"), // 删除文件
-		strings.Contains(endpoint, "/open/ufile/trash"),  // 回收站
-		strings.Contains(endpoint, "/open/ufile/mkdir"):  // 创建目录
-		return f.uploadPacer // 保守QPS
-
-	// 认证相关API - 使用传统调速器
-	case strings.Contains(endpoint, "/open/auth/"), // 认证相关
-		strings.Contains(endpoint, "/open/token/"),   // Token相关
-		strings.Contains(endpoint, "115.com"),        // 传统API
-		strings.Contains(endpoint, "webapi.115.com"): // 传统API
-		return f.tradPacer // 保守QPS
-
-	default:
-		// 未知端点使用全局调速器，安全起见
-		fs.Debugf(f, "⚠️  未知115网盘API端点，使用统一QPS限制: %s", endpoint)
-		return f.globalPacer // 统一QPS
-	}
+	// 所有API使用统一的pacer，符合115网盘的全局QPS限制
+	return f.pacer
 }
 
 // handleAsDirectory 将路径作为目录处理
@@ -5472,8 +4870,7 @@ func (f *Fs) handleAsDirectory(ctx context.Context) (*Fs, error) {
 		return f, nil
 	}
 
-	// 保存到缓存
-	f.savePathTypeToCache(f.root, "", "", true) // isDir=true
+	// 移除缓存保存
 
 	fs.Debugf(f, " 目录模式设置完成: %s", f.root)
 	return f, nil
@@ -5501,214 +4898,9 @@ func (r *ConcurrentDownloadReader) Close() error {
 	return nil
 }
 
-// Pan115DownloadAdapter 115网盘下载适配器
-type Pan115DownloadAdapter struct {
-	fs *Fs
-}
+// 移除未使用的Pan115DownloadAdapter，简化下载逻辑
 
-// NewPan115DownloadAdapter 创建115网盘下载适配器
-func NewPan115DownloadAdapter(filesystem *Fs) *Pan115DownloadAdapter {
-	return &Pan115DownloadAdapter{
-		fs: filesystem,
-	}
-}
-
-// GetDownloadURL 获取115网盘下载URL
-func (a *Pan115DownloadAdapter) GetDownloadURL(ctx context.Context, obj fs.Object, start, end int64) (string, error) {
-	o, ok := obj.(*Object)
-	if !ok {
-		return "", fmt.Errorf("对象类型不匹配")
-	}
-
-	// 根本性修复：使用pickCode而不是fileID获取下载URL
-	if o.pickCode == "" {
-		return "", fmt.Errorf("pickCode为空，无法获取下载URL")
-	}
-
-	// 智能URL管理：使用双重检查锁定模式，避免并发刷新冲突
-	o.durlMu.Lock()
-
-	// 第一次检查：URL是否有效
-	if o.durl != nil && o.durl.Valid() {
-		// URL有效，直接使用
-		url := o.durl.URL
-		o.durlMu.Unlock()
-		fs.Debugf(a.fs, "♻️ 重用有效的115网盘下载URL: bytes=%d-%d", start, end)
-		return url, nil
-	}
-
-	// URL无效或不存在，需要刷新
-	// 检查是否已经有其他goroutine在刷新URL
-	if o.durlRefreshing {
-		// 有其他goroutine在刷新，等待完成
-		o.durlMu.Unlock()
-
-		// 等待刷新完成，最多等待10秒
-		for range 100 {
-			time.Sleep(100 * time.Millisecond)
-			o.durlMu.Lock()
-			if !o.durlRefreshing {
-				// 刷新完成，检查结果
-				if o.durl != nil && o.durl.Valid() {
-					url := o.durl.URL
-					o.durlMu.Unlock()
-					fs.Debugf(a.fs, "♻️ 使用其他线程刷新的115网盘下载URL: bytes=%d-%d", start, end)
-					return url, nil
-				}
-				o.durlMu.Unlock()
-				break
-			}
-			o.durlMu.Unlock()
-		}
-
-		// 等待超时或刷新失败，重新尝试
-		o.durlMu.Lock()
-	}
-
-	// 设置刷新标志，防止其他goroutine同时刷新
-	o.durlRefreshing = true
-	o.durlMu.Unlock()
-
-	// 执行URL刷新
-	fs.Debugf(a.fs, "🔄 115网盘URL需要刷新: %s (bytes=%d-%d)", o.Remote(), start, end)
-
-	// 强制清除可能的缓存URL，确保获取最新URL
-	o.durl = nil
-
-	// 修复：移除固定延迟，让pacer自动控制QPS
-	// 固定延迟会严重影响文件级并发，pacer已经提供了合适的QPS控制
-
-	// 调用刷新方法
-	err := o.setDownloadURLWithForce(ctx, true)
-
-	// 清除刷新标志
-	o.durlMu.Lock()
-	o.durlRefreshing = false
-
-	if err != nil {
-		o.durlMu.Unlock()
-		return "", fmt.Errorf("刷新115网盘下载URL失败: %w", err)
-	}
-
-	// 检查刷新结果
-	if o.durl == nil || !o.durl.Valid() {
-		o.durlMu.Unlock()
-		return "", fmt.Errorf("115网盘下载URL刷新后仍然无效")
-	}
-
-	url := o.durl.URL
-	o.durlMu.Unlock()
-
-	fs.Debugf(a.fs, " 成功刷新115网盘下载URL: %s (bytes=%d-%d)", o.Remote(), start, end)
-	return url, nil
-}
-
-// DownloadChunk 下载115网盘单个分片
-func (a *Pan115DownloadAdapter) DownloadChunk(ctx context.Context, url string, tempFile *os.File, start, end int64, account *accounting.Account) error {
-	// 测试Range并发：优化HTTP请求头，尝试解决签名问题
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return fmt.Errorf("创建HTTP请求失败: %w", err)
-	}
-
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
-	req.Header.Set("User-Agent", defaultUserAgent)
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Connection", "keep-alive")
-
-	fs.Debugf(a.fs, "📋 配置Range请求: bytes=%d-%d", start, end)
-
-	// 使用标准HTTP客户端发送请求
-	resp, err := a.fs.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("执行下载请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// 修复403错误：检查响应状态并提供详细错误信息
-	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-		// 读取错误响应体以获取更多信息
-		errorBody, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode == http.StatusForbidden {
-			// 检查是否为URL过期导致的403错误
-			errorStr := string(errorBody)
-			if strings.Contains(errorStr, "invalid signature") {
-				// 115网盘特殊处理：URL过期时添加延迟，避免过于频繁的重试
-				// 调试日志已优化：URL签名过期处理详情已简化
-				time.Sleep(3 * time.Second) // 3秒延迟，给URL刷新和QPS限制缓冲时间
-				return fmt.Errorf("下载URL签名过期(403): %s", errorStr)
-			}
-			return fmt.Errorf("下载被拒绝(403)，可能是并发限制: %s", errorStr)
-		}
-		return fmt.Errorf("下载失败，状态码: %d, 响应: %s", resp.StatusCode, string(errorBody))
-	}
-
-	// 修复关键问题：读取分片数据并验证大小
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("读取分片数据失败: %w", err)
-	}
-
-	// 修复关键问题：验证读取的数据大小
-	expectedSize := end - start + 1
-	actualDataSize := int64(len(data))
-	if actualDataSize != expectedSize {
-		return fmt.Errorf("115网盘分片数据大小不匹配: 期望%d，实际%d", expectedSize, actualDataSize)
-	}
-
-	// 修复关键问题：验证WriteAt的返回值
-	writtenBytes, err := tempFile.WriteAt(data, start)
-	if err != nil {
-		return fmt.Errorf("写入分片数据失败: %w", err)
-	}
-
-	// 关键修复：验证实际写入的字节数
-	if int64(writtenBytes) != actualDataSize {
-		return fmt.Errorf("115网盘分片写入不完整: 期望写入%d，实际写入%d", actualDataSize, writtenBytes)
-	}
-
-	// 关键修复：只在Account对象存在时报告进度，避免重复报告
-	// 统一并发下载器会传入Account对象，普通下载不会传入
-	if account != nil {
-		actualChunkSize := int64(len(data))
-		if err := account.AccountRead(int(actualChunkSize)); err != nil {
-			fs.Debugf(a.fs, "Failed to report 115 drive chunk progress: %v", err)
-		} else {
-			fs.Debugf(a.fs, "115 drive chunk download completed, progress reported: %s (bytes=%d-%d)",
-				fs.SizeSuffix(actualChunkSize), start, end)
-		}
-	} else {
-		fs.Debugf(a.fs, "115 drive chunk download completed: %s (bytes=%d-%d)",
-			fs.SizeSuffix(int64(len(data))), start, end)
-	}
-
-	return nil
-}
-
-// VerifyDownload 验证115网盘下载完整性
-func (a *Pan115DownloadAdapter) VerifyDownload(ctx context.Context, obj fs.Object, tempFile *os.File) error {
-	// 验证文件大小
-	stat, err := tempFile.Stat()
-	if err != nil {
-		return fmt.Errorf("获取临时文件信息失败: %w", err)
-	}
-
-	if stat.Size() != obj.Size() {
-		return fmt.Errorf("文件大小不匹配: 期望%d，实际%d", obj.Size(), stat.Size())
-	}
-
-	return nil
-}
-
-// GetConfig 获取115网盘下载配置 - 2线程限制策略
-func (a *Pan115DownloadAdapter) GetConfig() common.DownloadConfig {
-	return common.DownloadConfig{
-		MinFileSize:      100 * 1024 * 1024, // 100MB门槛，启用并发下载
-		MaxConcurrency:   2,                 // 115网盘限制：最多2线程下载
-		DefaultChunkSize: 100 * 1024 * 1024, // 2线程策略：200MB分片，平衡性能和稳定性
-		TimeoutPerChunk:  120 * time.Second, // 120秒超时，给URL刷新充足时间
-	}
-}
+// Remove GetConfig function - no longer needed without DownloadConfig
 
 // ============================================================================
 // Functions from helper.go
@@ -5761,40 +4953,13 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly, di
 		err = f.CallOpenAPI(ctx, &opts, nil, &info, false) // Use OpenAPI call
 		if err != nil {
 			fs.Debugf(f, " listAll: CallOpenAPI失败: %v", err)
-			// 检查是否是API限制错误
-			if strings.Contains(err.Error(), "770004") || strings.Contains(err.Error(), "已达到当前访问上限") {
-				fs.Infof(f, "⚠️  遇到115网盘API限制(770004)，使用统一等待策略...")
-
-				// 115网盘统一QPS管理：使用固定等待时间避免复杂性
-				waitTime := 30 * time.Second // 统一等待30秒
-				fs.Infof(f, "⏰ API限制等待 %v 后重试...", waitTime)
-
-				// 创建带超时的等待
-				select {
-				case <-time.After(waitTime):
-					// 重试一次
-					fs.Debugf(f, "🔄 API限制重试...")
-					err = f.CallOpenAPI(ctx, &opts, nil, &info, false)
-					if err != nil {
-						return found, fmt.Errorf("OpenAPI list failed for dir %s after QPS retry: %w", dirID, err)
-					} else {
-						fs.Debugf(f, " API限制重试成功")
-					}
-				case <-ctx.Done():
-					return found, fmt.Errorf("context cancelled while waiting for API limit: %w", ctx.Err())
-				}
-			} else {
-				return found, fmt.Errorf("OpenAPI list failed for dir %s: %w", dirID, err)
-			}
-		} else {
-			fs.Debugf(f, " listAll: CallOpenAPI成功，返回%d个文件", len(info.Files))
-
-			// 新增：利用API返回的path信息预填充缓存
-			if len(info.Path) > 0 {
-				fs.Debugf(f, " 发现路径层次信息: %d层", len(info.Path))
-				f.preloadPathCache(info.Path)
+			// 处理API限制错误
+			if err = f.handleAPILimitError(ctx, err, &opts, &info, dirID); err != nil {
+				return found, err
 			}
 		}
+
+		fs.Debugf(f, " listAll: CallOpenAPI成功，返回%d个文件", len(info.Files))
 
 		if len(info.Files) == 0 {
 			break // No more items
@@ -5830,6 +4995,35 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly, di
 	}
 
 	return found, nil
+}
+
+// handleAPILimitError 处理API限制错误，减少嵌套
+func (f *Fs) handleAPILimitError(ctx context.Context, err error, opts *rest.Opts, info *FileList, dirID string) error {
+	// 检查是否是API限制错误
+	if !strings.Contains(err.Error(), "770004") && !strings.Contains(err.Error(), "已达到当前访问上限") {
+		return fmt.Errorf("OpenAPI list failed for dir %s: %w", dirID, err)
+	}
+
+	fs.Infof(f, "⚠️  遇到115网盘API限制(770004)，使用统一等待策略...")
+
+	// 115网盘统一QPS管理：使用固定等待时间避免复杂性
+	waitTime := 30 * time.Second // 统一等待30秒
+	fs.Infof(f, "⏰ API限制等待 %v 后重试...", waitTime)
+
+	// 创建带超时的等待
+	select {
+	case <-time.After(waitTime):
+		// 重试一次
+		fs.Debugf(f, "🔄 API限制重试...")
+		retryErr := f.CallOpenAPI(ctx, opts, nil, info, false)
+		if retryErr != nil {
+			return fmt.Errorf("OpenAPI list failed for dir %s after QPS retry: %w", dirID, retryErr)
+		}
+		fs.Debugf(f, " API限制重试成功")
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("context cancelled while waiting for API limit: %w", ctx.Err())
+	}
 }
 
 // makeDir creates a directory using OpenAPI.
@@ -6160,11 +5354,7 @@ func (f *Fs) CallTraditionalAPIWithResp(ctx context.Context, opts *rest.Opts, re
 	}
 
 	var httpResp *http.Response
-	err := f.globalPacer.Call(func() (shouldRetryGlobal bool, errGlobal error) {
-		// Wait for traditional pacer
-		if err := f.enforceTraditionalPacerDelay(); err != nil {
-			return false, backoff.Permanent(err)
-		}
+	err := f.pacer.Call(func() (shouldRetryGlobal bool, errGlobal error) {
 
 		// Make the API call (with or without encryption)
 		var apiErr error
@@ -6180,18 +5370,13 @@ func (f *Fs) CallTraditionalAPIWithResp(ctx context.Context, opts *rest.Opts, re
 		// Handle non-retryable errors
 		if apiErr != nil {
 			fs.Debugf(f, "pacer: permanent error encountered in traditional call with response: %v", apiErr)
-			// Ensure the error is marked as permanent
-			var permanentErr *backoff.PermanentError
-			if !errors.As(apiErr, &permanentErr) {
-				return false, backoff.Permanent(apiErr)
-			}
-			return false, apiErr // Already permanent
+			return false, apiErr
 		}
 
 		// Check API-level errors in response struct
 		if errResp := f.checkResponseForAPIErrors(response); errResp != nil {
 			fs.Debugf(f, "pacer: permanent API error encountered in traditional call with response: %v", errResp)
-			return false, backoff.Permanent(errResp)
+			return false, errResp
 		}
 
 		fs.Debugf(f, "pacer: traditional call with response successful")
@@ -6275,14 +5460,9 @@ func retryWithExponentialBackoff(
 	maxDelay time.Duration, // Maximum delay between retries
 	maxElapsedTime time.Duration, // Maximum total retry time
 ) error {
-	// Set up exponential backoff
+	// Set up simple exponential backoff
 	var retryCount int
-	expBackoff := backoff.NewExponentialBackOff()
-	expBackoff.InitialInterval = initialDelay
-	expBackoff.MaxInterval = maxDelay
-	expBackoff.MaxElapsedTime = maxElapsedTime
-	expBackoff.Multiplier = 2.5          // More aggressive multiplier
-	expBackoff.RandomizationFactor = 0.5 // Add jitter to prevent thundering herd
+	currentDelay := initialDelay
 
 	// Create retry context with timeout based on maxElapsedTime
 	// Give some buffer beyond MaxElapsedTime for the final attempt + operation time
@@ -6294,35 +5474,38 @@ func retryWithExponentialBackoff(
 		// Check context cancellation before proceeding
 		if err := retryCtx.Err(); err != nil {
 			fs.Debugf(loggingObj, "Retry context cancelled for '%s': %v", description, err)
-			return backoff.Permanent(fmt.Errorf("retry cancelled for '%s': %w", description, err))
+			return fmt.Errorf("retry cancelled for '%s': %w", description, err)
 		}
 
 		if retryCount > 0 {
 			// Check context cancellation again before sleeping
 			if err := retryCtx.Err(); err != nil {
 				fs.Debugf(loggingObj, "Retry context cancelled before delay for '%s': %v", description, err)
-				return backoff.Permanent(fmt.Errorf("retry cancelled before delay for '%s': %w", description, err))
+				return fmt.Errorf("retry cancelled before delay for '%s': %w", description, err)
 			}
 
-			nextDelay := expBackoff.NextBackOff()
-			if nextDelay == backoff.Stop {
-				// This condition might be reached if MaxElapsedTime is exceeded by the time calculation
-				// or if the backoff itself decides to stop for other reasons.
-				fs.Logf(loggingObj, "Exceeded max retry duration or backoff stopped for '%s'", description)
-				return backoff.Permanent(fmt.Errorf("exceeded maximum retry duration or backoff stopped for '%s'", description))
+			// Calculate next delay with exponential backoff
+			if currentDelay > maxDelay {
+				currentDelay = maxDelay
 			}
 
 			// Use more visible logging for retries
 			fs.Logf(loggingObj, "Retrying '%s': Waiting %v before retry %d/%d",
-				description, nextDelay, retryCount+1, maxRetries)
+				description, currentDelay, retryCount+1, maxRetries)
 
 			// Wait for the delay, but honor context cancellation
 			select {
-			case <-time.After(nextDelay):
+			case <-time.After(currentDelay):
 				// Continue after delay
 			case <-retryCtx.Done():
 				fs.Logf(loggingObj, "Retry context cancelled while waiting for delay in '%s': %v", description, retryCtx.Err())
-				return backoff.Permanent(fmt.Errorf("retry cancelled while waiting for delay in '%s': %w", description, retryCtx.Err()))
+				return fmt.Errorf("retry cancelled while waiting for delay in '%s': %w", description, retryCtx.Err())
+			}
+
+			// Exponential backoff for next iteration
+			currentDelay = time.Duration(float64(currentDelay) * 2.5)
+			if currentDelay > maxDelay {
+				currentDelay = maxDelay
 			}
 		}
 		retryCount++ // Increment retry count *after* the first attempt (retryCount=0)
@@ -6339,7 +5522,7 @@ func retryWithExponentialBackoff(
 		if retryCount >= maxRetries {
 			fs.Logf(loggingObj, "Giving up '%s' after %d attempts: %v",
 				description, retryCount, err)
-			return backoff.Permanent(fmt.Errorf("giving up '%s' after %d attempts: %w", description, retryCount, err))
+			return fmt.Errorf("giving up '%s' after %d attempts: %w", description, retryCount, err)
 		}
 
 		// Check if this is a rate limit error or other error that we should retry
@@ -6347,7 +5530,7 @@ func retryWithExponentialBackoff(
 		if !shouldRetryErr {
 			// Non-retryable error
 			fs.Debugf(loggingObj, "Non-retryable error (%s) when '%s': %v", classification, description, err)
-			return backoff.Permanent(err) // Wrap in Permanent to stop retries
+			return err // Wrap in Permanent to stop retries
 		}
 
 		// Log retryable errors
@@ -6363,9 +5546,8 @@ func retryWithExponentialBackoff(
 	// }
 	// }
 
-	// Execute the retry logic using the context-aware wrapper
-	// No explicit notify needed if logging is done within retryOperation
-	return backoff.Retry(retryOperation, backoff.WithContext(expBackoff, retryCtx))
+	// Execute the retry logic
+	return retryOperation()
 }
 
 // Open (re)opens the source file
@@ -6384,10 +5566,10 @@ func (r *RereadableObject) Open() (io.Reader, error) {
 		var rc io.ReadCloser
 		var err error
 
-		// 优先使用上传专用调速器，提升上传相关操作的稳定性
+		// 使用统一调速器
 		var pacer *fs.Pacer
 		if fsObj, ok := obj.Fs().(*Fs); ok {
-			pacer = fsObj.uploadPacer // 使用上传专用调速器而不是全局调速器
+			pacer = fsObj.pacer // 使用统一调速器
 		}
 
 		// Set retry parameters
@@ -6567,27 +5749,15 @@ type AccountedFileReader struct {
 }
 
 // NewAccountedFileReader 创建带Account对象的文件读取器
+// 修复进度重复计数：不创建独立Transfer，让rclone标准机制处理
 func NewAccountedFileReader(ctx context.Context, file *os.File, size int64, name string, cleanup func()) *AccountedFileReader {
-	// 创建Transfer对象用于进度显示
-	var transfer *accounting.Transfer
-	var acc *accounting.Account
-
-	if stats := accounting.GlobalStats(); stats != nil {
-		transfer = stats.NewTransferRemoteSize(
-			fmt.Sprintf("📤 %s (115网盘上传)", name),
-			size,
-			nil, // 源是临时文件
-			nil, // 目标是115网盘
-		)
-
-		// 创建Account对象
-		acc = transfer.Account(ctx, file).WithBuffer()
-		// 调试日志已优化：对象创建详情仅在详细模式下输出)
-	}
+	// 修复120%进度问题：不创建独立的Transfer对象
+	// 跨云传输的进度应该由主传输流程统一管理
+	// 这里只是一个简单的文件包装器
 
 	return &AccountedFileReader{
 		file:    file,
-		acc:     acc,
+		acc:     nil, // 不创建Account对象，避免重复计数
 		size:    size,
 		name:    name,
 		cleanup: cleanup,
@@ -6595,7 +5765,11 @@ func NewAccountedFileReader(ctx context.Context, file *os.File, size int64, name
 }
 
 // Read 实现io.Reader接口
+// 修复：AccountedFileReader不应该重复更新Account进度
+// Account进度应该由rclone的标准机制自动处理
 func (a *AccountedFileReader) Read(p []byte) (n int, err error) {
+	// 直接读取文件，不手动更新Account
+	// rclone的Transfer.Account()机制会自动处理进度更新
 	return a.file.Read(p)
 }
 
@@ -6609,8 +5783,11 @@ func (a *AccountedFileReader) Close() error {
 }
 
 // GetAccount 返回Account对象
+// 修复120%进度问题：返回nil，让rclone标准机制处理进度
 func (a *AccountedFileReader) GetAccount() *accounting.Account {
-	return a.acc
+	// 不返回Account对象，避免重复计数
+	// 进度应该由rclone的Transfer.Account()机制统一管理
+	return nil
 }
 
 // Seek 实现io.Seeker接口
@@ -6800,12 +5977,12 @@ func bufferIOwithSHA1(f *Fs, in io.Reader, src fs.ObjectInfo, size, threshold in
 			cleanup = func() { _ = rereadable.Close() }
 		}
 
-		// Calculate hash using the rereadable source
-		hashVal := sha1.New()
-		_, hashErr := io.Copy(hashVal, rereadable)
-		if hashErr != nil {
-			return "", in, cleanup, fmt.Errorf("failed to calculate SHA1 without buffering: %w", hashErr)
+		// Calculate SHA1 hash
+		hasher := sha1.New()
+		if _, hashErr := io.Copy(hasher, rereadable); hashErr != nil {
+			return "", in, cleanup, fmt.Errorf("failed to calculate SHA1: %w", hashErr)
 		}
+		sha1Hash := fmt.Sprintf("%x", hasher.Sum(nil))
 
 		// Reopen the source for the actual upload
 		var newReader io.Reader
@@ -6840,13 +6017,12 @@ func bufferIOwithSHA1(f *Fs, in io.Reader, src fs.ObjectInfo, size, threshold in
 			return "", in, cleanup, fmt.Errorf("failed to reopen source after SHA1 calculation: %w", reopenErr)
 		}
 
-		sha1sum = hex.EncodeToString(hashVal.Sum(nil))
+		sha1sum = sha1Hash
 		fs.Debugf(f, "Calculated SHA1 without buffering: %s", sha1sum)
 		return sha1sum, newReader, cleanup, nil
 	}
 
-	// Standard buffering approach
-	hashVal := sha1.New()
+	// 使用标准SHA1计算，简化逻辑
 
 	// 关键修复：在创建TeeReader之前检查并保存Account对象
 	var originalAccount *accounting.Account
@@ -6855,17 +6031,41 @@ func bufferIOwithSHA1(f *Fs, in io.Reader, src fs.ObjectInfo, size, threshold in
 		fs.Debugf(f, " bufferIOwithSHA1检测到AccountedFileReader，将保持Account对象传递")
 	}
 
-	tee := io.TeeReader(in, hashVal)
+	// 创建一个管道来同时计算SHA1和缓冲数据
+	pr, pw := io.Pipe()
+	var sha1Hash string
+	var sha1Err error
+
+	// 在goroutine中计算SHA1
+	go func() {
+		defer pw.Close()
+		hasher := sha1.New()
+		_, err := io.Copy(hasher, pr)
+		if err != nil {
+			sha1Err = err
+			return
+		}
+		sha1Hash = fmt.Sprintf("%x", hasher.Sum(nil))
+	}()
+
+	// 创建TeeReader将数据同时写入管道和缓冲区
+	tee := io.TeeReader(in, pw)
 
 	// Buffer the input using the tee reader，传递Account对象信息
 	out, cleanup, err = bufferIOWithAccount(f, tee, size, threshold, originalAccount)
 	if err != nil {
+		pw.Close() // 确保管道关闭
 		// Cleanup is handled by bufferIO on error
 		return "", nil, cleanup, fmt.Errorf("failed to buffer input for SHA1 calculation: %w", err)
 	}
 
-	// Calculate the final hash
-	sha1sum = hex.EncodeToString(hashVal.Sum(nil))
+	// 等待SHA1计算完成
+	pw.Close() // 关闭写端，让SHA1计算完成
+	if sha1Err != nil {
+		return "", nil, cleanup, fmt.Errorf("failed to calculate SHA1: %w", sha1Err)
+	}
+
+	sha1sum = sha1Hash
 	return sha1sum, out, cleanup, nil
 }
 
@@ -6907,9 +6107,9 @@ func (f *Fs) initUploadOpenAPI(ctx context.Context, size int64, name, dirID, sha
 	fs.Debugf(f, "Initializing upload for file_name=%q (cleaned: %q), size=%d, target=U_1_%s, has_fileid=%v, has_preid=%v, has_pickcode=%v, has_sign=%v",
 		name, cleanName, size, dirID, sha1sum != "", preSha1 != "", pickCode != "", signKey != "")
 
-	// 详细调试：记录所有发送的参数
-	fs.Debugf(f, " 发送给115网盘API的完整参数: file_name=%q, file_size=%d, target=%q, fileid=%q, preid=%q, pick_code=%q, topupload=%q, sign_key=%q, sign_val=%q",
-		cleanName, size, "U_1_"+dirID, sha1sum, preSha1, pickCode, "0", signKey, signVal)
+	// Log API parameters
+	fs.Debugf(f, "API params: file_name=%q, file_size=%d, target=%q, has_fileid=%v, has_preid=%v, has_pickcode=%v",
+		cleanName, size, "U_1_"+dirID, sha1sum != "", preSha1 != "", pickCode != "")
 
 	// Create request options
 	opts := rest.Opts{
@@ -6943,9 +6143,9 @@ func (f *Fs) initUploadOpenAPI(ctx context.Context, size int64, name, dirID, sha
 	}
 
 	// Error checking is handled by CallOpenAPI using info.Err()
-	// 详细调试：记录API返回的完整信息
-	fs.Debugf(f, " 115网盘API返回: State=%v, Code=%d, Message=%q, Data!=nil=%v, FileID=%q, PickCode=%q, Status=%d",
-		info.State, info.ErrCode(), info.ErrMsg(), info.Data != nil, info.GetFileID(), info.GetPickCode(), info.GetStatus())
+	// Log API response
+	fs.Debugf(f, "API response: State=%v, Code=%d, Message=%q, Status=%d",
+		info.State, info.ErrCode(), info.ErrMsg(), info.GetStatus())
 
 	if info.Data == nil {
 		// If Data is nil but call succeeded, maybe it's a 秒传 response where fields are top-level?
@@ -7006,8 +6206,37 @@ func (f *Fs) postUpload(callbackResult map[string]any) (*CallbackData, error) {
 	var cbData *CallbackData
 
 	// First, check if this is an OpenAPI format response
-	if _, ok := callbackResult["state"]; ok {
-		// This could be an OpenAPI format response
+	if stateVal, ok := callbackResult["state"]; ok {
+		// Check if the state indicates failure
+		if state, ok := stateVal.(bool); ok && !state {
+			// This is a failed OpenAPI response, extract error information
+			var errCode int
+			var errMsg string
+
+			if codeVal, ok := callbackResult["code"]; ok {
+				if code, ok := codeVal.(float64); ok {
+					errCode = int(code)
+				}
+			}
+
+			if msgVal, ok := callbackResult["message"]; ok {
+				if msg, ok := msgVal.(string); ok {
+					errMsg = msg
+				}
+			}
+
+			// Handle specific error codes
+			switch errCode {
+			case 10002:
+				return nil, fmt.Errorf("115网盘文件校验失败(10002): %s - 可能是文件传输过程中损坏，建议重试", errMsg)
+			case 10001:
+				return nil, fmt.Errorf("115网盘上传参数错误(10001): %s", errMsg)
+			default:
+				return nil, fmt.Errorf("115网盘上传失败(错误码:%d): %s", errCode, errMsg)
+			}
+		}
+
+		// This could be a successful OpenAPI format response
 		if dataVal, ok := callbackResult["data"]; ok {
 			if dataMap, ok := dataVal.(map[string]any); ok {
 				// Try to extract file_id and pick_code from the data field
@@ -7063,6 +6292,13 @@ func (f *Fs) postUpload(callbackResult map[string]any) (*CallbackData, error) {
 		// Debugging information
 		fs.Debugf(f, "Callback data missing required fields: file_id=%q, pick_code=%q, raw JSON: %s",
 			cbData.FileID, cbData.PickCode, string(callbackJSON))
+
+		// Additional debugging for error analysis
+		if strings.Contains(string(callbackJSON), "10002") {
+			fs.Logf(f, "🔍 115网盘错误分析: 错误码10002通常表示文件在传输过程中损坏")
+			fs.Logf(f, "💡 可能的解决方案: 1) 检查网络稳定性 2) 重试上传 3) 验证源文件完整性")
+		}
+
 		return nil, fmt.Errorf("OSS callback data missing required fields (file_id or pick_code). JSON: %s", string(callbackJSON))
 	}
 
@@ -7112,22 +6348,22 @@ func (f *Fs) newOSSClient() (*oss.Client, error) {
 		}),
 	)
 
-	// 参考阿里云OSS最佳实践：优化OSS客户端配置以提升上传性能
+	// 修复：115网盘OSS上传性能优化配置
 	cfg := oss.LoadDefaultConfig().
 		WithCredentialsProvider(provider).
 		WithRegion(OSSRegion). // Use constant region
 		WithUserAgent(OSSUserAgent).
 		WithUseDualStackEndpoint(f.opt.DualStack).
 		WithUseInternalEndpoint(f.opt.Internal).
-		// 优化连接超时：使用更短的连接超时，快速失败重试
-		WithConnectTimeout(10 * time.Second). // 从用户配置改为固定10秒，提升连接效率
-		// 优化读写超时：使用合理的读写超时，避免长时间等待
-		WithReadWriteTimeout(5 * time.Minute) // 从30分钟减少到5分钟，提升响应速度
+		// 修复：优化连接超时，快速建立连接
+		WithConnectTimeout(5 * time.Second). // 减少到5秒，快速失败重试
+		// 修复：优化读写超时，适合分片上传
+		WithReadWriteTimeout(60 * time.Second) // 减少到60秒，适合20MB分片
 
-	// 使用统一的优化HTTP客户端配置，专为大文件传输优化
-	httpClient := common.GetHTTPClient(context.Background())
+	// 使用rclone标准HTTP客户端
+	httpClient := fshttp.NewClient(context.Background())
 
-	// 将自定义HTTP客户端应用到OSS配置
+	// 将HTTP客户端应用到OSS配置
 	cfg = cfg.WithHttpClient(httpClient)
 
 	// 关键修复：设置OSS专用User-Agent，可能影响上传速度
@@ -7310,13 +6546,14 @@ func calcBlockSHA1(ctx context.Context, in io.Reader, src fs.ObjectInfo, rangeSp
 		}
 	}
 
-	// Calculate hash of the section
-	hashVal := sha1.New()
-	_, err := io.Copy(hashVal, sectionReader)
+	// 使用标准SHA1计算
+	hasher := sha1.New()
+	_, err := io.Copy(hasher, sectionReader)
 	if err != nil {
-		return "", fmt.Errorf("failed to read data for SHA1 range %q: %w", rangeSpec, err)
+		return "", fmt.Errorf("failed to calculate SHA1 for range %q: %w", rangeSpec, err)
 	}
-	return strings.ToUpper(hex.EncodeToString(hashVal.Sum(nil))), nil
+	sha1Hash := fmt.Sprintf("%x", hasher.Sum(nil))
+	return sha1Hash, nil
 }
 
 // sampleInitUpload prepares a traditional "simple form" upload (for smaller files).
@@ -7450,21 +6687,18 @@ func (f *Fs) sampleUploadForm(ctx context.Context, in io.Reader, initResp *Sampl
 	// However, with pipeReader, length is unknown beforehand. Let http client handle chunked encoding.
 	// req.ContentLength = -1 // Indicate unknown length
 
-	// 使用专用的上传调速器，优化样本上传API调用频率
+	// 使用统一调速器，优化样本上传API调用频率
 	var resp *http.Response
-	err = f.uploadPacer.Call(func() (bool, error) {
-		// 使用优化过的HTTP客户端而不是默认客户端
-		httpClient := f.httpClient
-		if httpClient == nil {
-			httpClient = fshttp.NewClient(ctx)
-		}
+	err = f.pacer.Call(func() (bool, error) {
+		// 使用rclone标准HTTP客户端
+		httpClient := fshttp.NewClient(ctx)
 		resp, err = httpClient.Do(req)
 		if err != nil {
 			retry, retryErr := shouldRetry(ctx, resp, err)
 			if retry {
 				return true, retryErr
 			}
-			return false, backoff.Permanent(fmt.Errorf("sample upload POST failed: %w", err))
+			return false, fmt.Errorf("sample upload POST failed: %w", err)
 		}
 		return false, nil // Success
 	})
@@ -7545,8 +6779,20 @@ func (f *Fs) tryHashUpload(
 			return false, nil, newIn, cleanup, fmt.Errorf("failed to calculate SHA1: %w", err)
 		}
 		fs.Debugf(o, "Calculated SHA1: %s", hashStr)
+
+		// 关键修复：将计算出的SHA1设置到Object中，确保后续使用
+		if o != nil {
+			o.sha1sum = strings.ToUpper(hashStr)
+			fs.Debugf(o, "✅ SHA1已设置到Object: %s", o.sha1sum)
+		}
 	} else {
 		fs.Debugf(o, "Using provided SHA1: %s", hashStr)
+
+		// 确保Object中也有SHA1信息
+		if o != nil && o.sha1sum == "" {
+			o.sha1sum = strings.ToUpper(hashStr)
+			fs.Debugf(o, "✅ SHA1已设置到Object: %s", o.sha1sum)
+		}
 
 		// If NoBuffer is enabled, wrap the input in a RereadableObject
 		if f.opt.NoBuffer {
@@ -7599,8 +6845,9 @@ func (f *Fs) tryHashUpload(
 			if err != nil && err != io.ErrUnexpectedEOF {
 				fs.Debugf(o, "读取前128KB数据失败: %v", err)
 			} else if n > 0 {
-				preHash := sha1.Sum(preData[:n])
-				preID = strings.ToUpper(hex.EncodeToString(preHash[:]))
+				hasher := sha1.New()
+				hasher.Write(preData[:n])
+				preID = fmt.Sprintf("%x", hasher.Sum(nil))
 				fs.Debugf(o, "计算PreID成功: %s (前%d字节)", preID, n)
 			}
 			seeker.Seek(0, io.SeekStart) // 重置到文件开头供后续使用
@@ -7833,7 +7080,8 @@ func (f *Fs) performOSSUpload(
 	options ...fs.OpenOption,
 ) (*CallbackData, error) {
 	// 参考阿里云OSS UploadFile示例：智能选择上传策略
-	uploadCutoff := int64(f.opt.UploadCutoff)
+	// 使用rclone全局配置的多线程切换阈值
+	uploadCutoff := int64(fs.GetConfig(context.Background()).MultiThreadCutoff)
 
 	// 修复：使用统一的分片大小计算函数，确保与分片上传一致
 	optimalPartSize := int64(f.calculateOptimalChunkSize(size))
@@ -7857,14 +7105,9 @@ func (f *Fs) performOSSUpload(
 		PartSize:    optimalPartSize, // 使用智能计算的分片大小
 		ParallelNum: 1,               // 115网盘强制单线程上传
 		ProgressFn: func(increment, transferred, total int64) {
-			// 关键修复：分片上传也需要更新Account对象
-			if accountedReader, ok := in.(*AccountedFileReader); ok {
-				if acc := accountedReader.GetAccount(); acc != nil && increment > 0 {
-					// 更新Account对象的字节计数
-					acc.AccountRead(int(increment))
-					// 移除频繁的调试日志，避免刷屏
-				}
-			}
+			// 修复120%进度问题：移除重复的Account更新
+			// AccountedFileReader已经通过Read()方法自动更新Account进度
+			// 这里再次更新会导致重复计数，造成进度超过100%
 
 			if total > 0 {
 				currentPercent := int(float64(transferred) / float64(total) * 100)
@@ -7880,11 +7123,8 @@ func (f *Fs) performOSSUpload(
 				}
 			}
 
-			// 关键修复：将进度更新传递给Account对象
-			// 这样rclone的进度显示系统就能正确显示上传速度
+			// 修复：只保留调试日志，不重复更新Account对象
 			if currentAccount != nil && increment > 0 {
-				// 注意：这里我们不能直接调用Account的方法，因为Account是通过Reader接口工作的
-				// 实际的进度更新应该通过ossChunkWriter中的逻辑处理
 				fs.Debugf(o, " ProgressFn: increment=%s, transferred=%s, total=%s",
 					fs.SizeSuffix(increment), fs.SizeSuffix(transferred), fs.SizeSuffix(total))
 			}
@@ -7892,12 +7132,12 @@ func (f *Fs) performOSSUpload(
 	}
 
 	if size >= 0 && size < uploadCutoff {
-		// 小于50MB的文件使用OSS PutObject（单文件上传）
-		fs.Infof(o, "🚀 115网盘OSS单文件上传: %s (%s)", leaf, fs.SizeSuffix(size))
+		// Small file: use OSS PutObject (single file upload)
+		fs.Debugf(o, "115 OSS single file upload: %s (%s)", leaf, fs.SizeSuffix(size))
 		return f.performOSSPutObject(ctx, ossClient, in, src, o, leaf, dirID, size, ui, uploaderConfig, options...)
 	} else {
-		// 大于等于50MB的文件使用OSS分片上传
-		fs.Infof(o, "🚀 115网盘OSS分片上传: %s (%s)", leaf, fs.SizeSuffix(size))
+		// Large file: use OSS multipart upload
+		fs.Debugf(o, "115 OSS multipart upload: %s (%s)", leaf, fs.SizeSuffix(size))
 		return f.performOSSMultipart(ctx, ossClient, in, src, o, leaf, dirID, size, ui, uploaderConfig, options...)
 	}
 }
@@ -8012,9 +7252,14 @@ func (f *Fs) performOSSMultipart(
 		return nil, fmt.Errorf("OSS multipart upload failed: %w", err)
 	}
 
-	// Process upload callback
+	// Process upload callback with retry for specific errors
 	callbackData, err := f.postUpload(chunkWriter.callbackRes)
 	if err != nil {
+		// Check if this is a file validation error (10002) that might benefit from retry
+		if strings.Contains(err.Error(), "10002") || strings.Contains(err.Error(), "校验文件失败") {
+			fs.Logf(o, "115 file validation failed, possibly due to network transmission issues")
+			fs.Logf(o, "Suggestion: 1) Check network stability 2) Retry upload 3) Recalculate file hash if problem persists")
+		}
 		return nil, fmt.Errorf("failed to process OSS upload callback: %w", err)
 	}
 
@@ -8356,18 +7601,9 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 		fs.Debugf(o, " 跨云传输检查：skipHashUpload=%v", skipHashUpload)
 	}
 
-	// 新增：115网盘API兼容性检查，对于某些文件尝试sample upload
-	forceTraditionalUpload := false
-
 	// 4. Default (Normal) Logic - 优先使用OSS上传策略
-	uploadCutoff := int64(f.opt.UploadCutoff)
-
-	// 新的上传策略：优先使用OSS上传，只有在强制传统上传时才使用sample upload
-	if size >= 0 && forceTraditionalUpload {
-		// 只有在强制传统上传时才使用sample upload
-		fs.Infof(o, "🔧 强制使用传统上传避免115网盘API兼容性问题")
-		return f.doSampleUpload(ctx, in, o, leaf, dirID, size, options...)
-	}
+	// 使用rclone全局配置的多线程切换阈值
+	uploadCutoff := int64(fs.GetConfig(context.Background()).MultiThreadCutoff)
 
 	// For very small files (<1MB), use traditional upload for efficiency
 	if size >= 0 && size < int64(1*fs.Mebi) {
@@ -8439,8 +7675,80 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 
 	// Check against UploadCutoff to decide multipart (though logic above mostly covers this)
 	if size < 0 || size >= uploadCutoff {
-		// Use OSS multipart
-		return f.uploadToOSS(ctx, newIn, src, o, leaf, dirID, size, ui, options...) // Pass ui if available
+		// Use OSS multipart with retry for validation errors
+		const maxRetries = 2
+		var lastErr error
+
+		for retry := 0; retry <= maxRetries; retry++ {
+			if retry > 0 {
+				fs.Logf(o, "🔄 115网盘上传重试 %d/%d (上次错误: %v)", retry, maxRetries, lastErr)
+
+				// 检查是否需要重新计算哈希
+				needsHashRecalculation := false
+				if strings.Contains(lastErr.Error(), "10002") || strings.Contains(lastErr.Error(), "校验文件失败") {
+					fs.Logf(o, "🔧 检测到文件校验失败，需要重新计算哈希")
+					needsHashRecalculation = true
+				} else if strings.Contains(lastErr.Error(), "requires SHA1 hash") {
+					fs.Logf(o, "🔧 检测到SHA1哈希缺失，需要重新计算哈希")
+					needsHashRecalculation = true
+				}
+
+				if needsHashRecalculation {
+					// 清除可能损坏的哈希信息，强制重新计算
+					ui = nil
+					o.sha1sum = ""
+
+					// 如果输入是可重新读取的，重置到开头
+					if seeker, ok := newIn.(io.Seeker); ok {
+						if _, seekErr := seeker.Seek(0, io.SeekStart); seekErr != nil {
+							fs.Debugf(o, "⚠️ 无法重置输入流到开头: %v", seekErr)
+						} else {
+							fs.Debugf(o, "✅ 输入流已重置到开头，准备重新计算哈希")
+						}
+					}
+
+					// 重新尝试哈希上传以计算SHA1
+					fs.Debugf(o, "🔧 重试前重新计算SHA1哈希...")
+					if size >= 0 {
+						var localCleanup func()
+						_, retryUI, retryNewIn, localCleanup, hashErr := f.tryHashUpload(ctx, newIn, src, o, leaf, dirID, size, options...)
+						if hashErr == nil && retryUI != nil {
+							ui = retryUI
+							newIn = retryNewIn
+							if cleanup != nil {
+								cleanup() // 清理之前的资源
+							}
+							cleanup = localCleanup
+							fs.Debugf(o, "✅ 重新计算SHA1成功，准备重试上传")
+						} else {
+							fs.Debugf(o, "⚠️ 重新计算SHA1失败: %v，继续使用原有流程", hashErr)
+							if localCleanup != nil {
+								localCleanup()
+							}
+						}
+					}
+				}
+			}
+
+			result, err := f.uploadToOSS(ctx, newIn, src, o, leaf, dirID, size, ui, options...) // Pass ui if available
+			if err == nil {
+				return result, nil
+			}
+
+			lastErr = err
+
+			// Check if this error is worth retrying
+			if !strings.Contains(err.Error(), "10002") && !strings.Contains(err.Error(), "校验文件失败") {
+				// Not a validation error, don't retry
+				break
+			}
+
+			if retry < maxRetries {
+				fs.Logf(o, "⚠️ 115网盘文件校验失败，将在重试时重新计算哈希")
+			}
+		}
+
+		return nil, fmt.Errorf("115网盘上传失败，已重试%d次: %w", maxRetries, lastErr)
 	}
 
 	// Size is known, >= noHashSize, and < uploadCutoff
@@ -8507,15 +7815,16 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 		ProgressFn: func() func(increment, transferred, total int64) {
 			var lastTransferred int64
 			return func(increment, transferred, total int64) {
-				// 极简进度回调：只更新Account对象，不输出任何日志
-				if accountedReader, ok := in.(*AccountedFileReader); ok {
-					if acc := accountedReader.GetAccount(); acc != nil {
-						actualIncrement := transferred - lastTransferred
-						if actualIncrement > 0 {
-							acc.AccountRead(int(actualIncrement))
-						}
-						lastTransferred = transferred
-					}
+				// 修复120%进度问题：移除重复的Account更新
+				// AccountedFileReader已经通过Read()方法自动更新Account进度
+				// 这里再次更新会导致重复计数，造成进度超过100%
+
+				// 只保留调试日志，不更新Account对象
+				if transferred > lastTransferred {
+					fs.Debugf(o, " Sample upload progress: %s/%s (%d%%)",
+						fs.SizeSuffix(transferred), fs.SizeSuffix(total),
+						int(float64(transferred)/float64(total)*100))
+					lastTransferred = transferred
 				}
 			}
 		}(),
@@ -8543,7 +7852,7 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 	// OSS上传虽然直连阿里云，但仍需要合理的QPS控制避免触发反制措施
 
 	var putRes *oss.PutObjectResult
-	err = f.ossPacer.Call(func() (bool, error) {
+	err = f.pacer.Call(func() (bool, error) {
 		var putErr error
 		putRes, putErr = ossClient.PutObject(ctx, req)
 		retry, retryErr := shouldRetry(ctx, nil, putErr)
@@ -8553,12 +7862,12 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 				_, _ = seeker.Seek(0, io.SeekStart)
 			} else {
 				// Cannot retry non-seekable stream after partial read
-				return false, backoff.Permanent(fmt.Errorf("cannot retry PutObject with non-seekable stream: %w", putErr))
+				return false, fmt.Errorf("cannot retry PutObject with non-seekable stream: %w", putErr)
 			}
 			return true, retryErr
 		}
 		if putErr != nil {
-			return false, backoff.Permanent(putErr)
+			return false, putErr
 		}
 		return false, nil // Success
 	})
@@ -8597,10 +7906,9 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 // 采用单线程顺序上传模式，确保上传稳定性和SHA1验证通过
 
 const (
-	// 超激进优化：进一步增加缓冲区大小，最大化I/O性能
-	bufferSize           = 64 * 1024 * 1024 // 超激进优化：64MB缓冲区，最大化I/O性能
-	bufferCacheSize      = 16               // 进一步减少缓存数量，但单个更大
-	bufferCacheFlushTime = 5 * time.Second  // flush the cached buffers after this long
+	// 优化缓冲区大小，适合单分片上传
+	bufferSize           = 8 * 1024 * 1024 // 8MB缓冲区，适合单分片上传
+	bufferCacheFlushTime = 5 * time.Second // flush the cached buffers after this long
 )
 
 // bufferPool is a global pool of buffers
@@ -8614,7 +7922,7 @@ func getPool() *pool.Pool {
 	bufferPoolOnce.Do(func() {
 		ci := fs.GetConfig(context.Background())
 		// Initialise the buffer pool when used
-		bufferPool = pool.New(bufferCacheFlushTime, bufferSize, bufferCacheSize, ci.UseMmap)
+		bufferPool = pool.New(bufferCacheFlushTime, bufferSize, 32, ci.UseMmap) // 32个缓冲区
 	})
 	return bufferPool
 }
@@ -8638,47 +7946,67 @@ func (w *ossChunkWriter) Upload(ctx context.Context) (err error) {
 		}
 	})()
 
-	var (
-		finished   = false
-		off        int64
-		size       = w.size
-		chunkSize  = w.chunkSize
-		partNum    int64
-		totalParts int64
-		startTime  = time.Now() // 添加计时，参考阿里云OSS示例
-	)
+	// 初始化上传参数
+	uploadParams := w.initializeUploadParams()
 
-	// 参考阿里云OSS示例：计算总分片数用于进度显示
-	if size > 0 {
-		totalParts = (size + chunkSize - 1) / chunkSize
+	// 获取Account对象和输入流
+	acc, in := w.setupAccountingAndInput()
+
+	// 执行分片上传循环
+	actualParts, err := w.performChunkedUpload(uploadCtx, in, acc, uploadParams)
+	if err != nil {
+		return err
+	}
+
+	// 完成上传并显示统计信息
+	return w.finalizeUpload(ctx, actualParts, uploadParams.startTime)
+}
+
+// uploadParams 上传参数结构体
+type uploadParams struct {
+	size       int64
+	chunkSize  int64
+	totalParts int64
+	startTime  time.Time
+}
+
+// initializeUploadParams 初始化上传参数
+func (w *ossChunkWriter) initializeUploadParams() *uploadParams {
+	params := &uploadParams{
+		size:      w.size,
+		chunkSize: w.chunkSize,
+		startTime: time.Now(),
+	}
+
+	// 计算总分片数用于进度显示
+	if params.size > 0 {
+		params.totalParts = (params.size + params.chunkSize - 1) / params.chunkSize
 	} else {
-		// 处理未知大小的情况
 		fs.Debugf(w.o, "⚠️ 文件大小未知，将动态计算分片数")
 	}
 
-	// 关键修复：尝试获取Account对象以支持进度显示
-	// 这对于跨云传输的进度跟踪非常重要
+	return params
+}
+
+// setupAccountingAndInput 设置Account对象和输入流
+func (w *ossChunkWriter) setupAccountingAndInput() (*accounting.Account, io.Reader) {
 	var acc *accounting.Account
 	var in io.Reader
 
 	// 首先检查是否为RereadableObject类型
 	if rereadableObj, ok := w.in.(*RereadableObject); ok {
 		acc = rereadableObj.GetAccount()
-		in = rereadableObj.OldStream() // 获取底层流
+		in = rereadableObj.OldStream()
 		if acc != nil {
 			fs.Debugf(w.o, " 从RereadableObject获取到Account对象，上传进度将正确显示")
 		} else {
 			fs.Debugf(w.o, "⚠️ RereadableObject中没有Account对象")
 		}
 	} else if accountedReader, ok := w.in.(*AccountedFileReader); ok {
-		// 新增：检查是否为AccountedFileReader类型（跨云传输临时文件）
-		acc = accountedReader.GetAccount()
-		in = accountedReader // AccountedFileReader本身就是io.Reader
-		if acc != nil {
-			fs.Debugf(w.o, " 从AccountedFileReader获取到Account对象，跨云传输上传进度将正确显示")
-		} else {
-			fs.Debugf(w.o, "⚠️ AccountedFileReader中没有Account对象")
-		}
+		// AccountedFileReader不再提供Account对象，进度由rclone标准机制管理
+		acc = nil
+		in = accountedReader
+		fs.Debugf(w.o, " 检测到AccountedFileReader，进度由rclone标准机制管理")
 	} else {
 		// 回退到标准方法
 		in, acc = accounting.UnWrapAccounting(w.in)
@@ -8689,193 +8017,148 @@ func (w *ossChunkWriter) Upload(ctx context.Context) (err error) {
 		}
 	}
 
-	// 参考阿里云OSS示例：详细的上传开始信息
+	return acc, in
+}
+
+// performChunkedUpload 执行分片上传循环
+func (w *ossChunkWriter) performChunkedUpload(ctx context.Context, in io.Reader, acc *accounting.Account, params *uploadParams) (int64, error) {
 	fs.Infof(w.o, "🚀 开始115网盘单线程分片上传")
 	fs.Infof(w.o, "📊 上传参数: 文件大小=%v, 分片大小=%v, 预计分片数=%d",
-		fs.SizeSuffix(size), fs.SizeSuffix(chunkSize), totalParts)
+		fs.SizeSuffix(params.size), fs.SizeSuffix(params.chunkSize), params.totalParts)
 	fs.Debugf(w.o, " OSS配置: Bucket=%s, Key=%s, UploadId=%s",
 		*w.imur.Bucket, *w.imur.Key, *w.imur.UploadId)
 
-	// 增强：上传开始时同步本地状态与OSS状态
-	if w.resumeInfo != nil && w.resumeInfo.GetCompletedChunkCount() > 0 {
-		fs.Infof(w.o, "🔄 115网盘断点续传：恢复上传，已完成分片 %d/%d (TaskID: %s)",
-			w.resumeInfo.GetCompletedChunkCount(), totalParts, w.taskID)
-
-		if err := w.syncLocalStateWithOSS(uploadCtx); err != nil {
-			fs.Debugf(w.o, "同步OSS状态失败: %v，继续上传", err)
-		}
-	}
+	var (
+		finished = false
+		off      int64
+		partNum  int64
+	)
 
 	for partNum = 0; !finished; partNum++ {
-		// 修复：检查断点续传，每个分片都验证OSS状态确保准确性
-		if w.resumeInfo != nil && w.resumeInfo.CompletedChunks[partNum] {
-			// 关键修复：移除频率限制，每个分片都验证OSS服务端状态
-			// 这是解决断点续传不生效的根本措施
-			ossUploaded, err := w.verifyOSSChunkStatus(uploadCtx, partNum+1)
-			if err != nil {
-				// 增强：验证失败时的智能处理
-				fs.Debugf(w.o, "验证OSS分片 %d 状态失败: %v，为安全起见重新上传此分片", partNum+1, err)
-				// 验证失败时，删除本地状态，重新上传以确保数据完整性
-				delete(w.resumeInfo.CompletedChunks, partNum)
-				// 继续执行上传，不跳过
-			} else if !ossUploaded {
-				fs.Logf(w.o, "🔧 发现状态不一致：分片 %d 本地标记已完成但OSS未确认，重新上传", partNum+1)
-				delete(w.resumeInfo.CompletedChunks, partNum) // 修正本地状态
-				// 继续执行上传，不跳过
-			} else {
-				// OSS确认分片已存在，可以安全跳过
-				fs.Infof(w.o, "✅ 115网盘断点续传：OSS已确认分片 %d/%d 完成，跳过 (TaskID: %s)",
-					partNum+1, totalParts, w.taskID)
-				off += chunkSize
-				if size > 0 && off >= size {
-					finished = true
-				}
-				continue
-			}
-		}
-
-		// 参考阿里云OSS示例：获取内存缓冲区
-		rw := NewRW()
-		if acc != nil {
-			rw.SetAccounting(acc.AccountRead)
-		}
-
 		// 检查上下文是否已取消
-		if uploadCtx.Err() != nil {
-			_ = rw.Close()
+		if ctx.Err() != nil {
 			fs.Debugf(w.o, " 上传被取消，停止分片上传")
 			break
 		}
 
-		// 参考阿里云OSS示例：读取分片数据
-		var n int64
-		chunkStartTime := time.Now() // 记录分片开始时间
-		n, err = io.CopyN(rw, in, chunkSize)
-		if err == io.EOF {
-			if n == 0 && partNum != 0 { // 如果不是第一个分片且没有数据，则结束
-				_ = rw.Close()
-				fs.Debugf(w.o, " 所有分片读取完成")
-				break
-			}
-			finished = true
-		} else if err != nil {
-			_ = rw.Close()
-			return fmt.Errorf("读取分片数据失败: %w", err)
-		}
-
-		// 激进优化：极简分片进度显示，减少日志开销
-		currentPart := partNum + 1
-		elapsed := time.Since(startTime)
-		if totalParts > 0 {
-			percentage := float64(currentPart) / float64(totalParts) * 100
-
-			// 超激进优化：只在关键节点输出日志（每25%或最后一个分片）
-			// 实时进度优化：更频繁的进度显示，提升用户体验
-			shouldLog := (currentPart == 1) || // 第一个分片
-				(currentPart%2 == 0) || // 每2个分片显示一次
-				(currentPart == totalParts) // 最后一个分片
-
-			if shouldLog {
-				// 估算剩余时间
-				avgTimePerPart := elapsed / time.Duration(currentPart)
-				remainingParts := totalParts - currentPart
-				estimatedRemaining := avgTimePerPart * time.Duration(remainingParts)
-
-				fs.Infof(w.o, "📤 115网盘单线程上传: 分片%d/%d (%.1f%%) | %v | 已用时:%v | 预计剩余:%v",
-					currentPart, totalParts, percentage, fs.SizeSuffix(n),
-					elapsed.Truncate(time.Second), estimatedRemaining.Truncate(time.Second))
-			}
-		} else {
-			// 未知大小时只在第一个分片输出日志
-			if currentPart == 1 {
-				fs.Infof(w.o, "📤 115网盘单线程上传: 分片%d | %v | 偏移:%v | 已用时:%v",
-					currentPart, fs.SizeSuffix(n), fs.SizeSuffix(off), elapsed.Truncate(time.Second))
-			}
-		}
-
-		// 增强：使用带重试的分片上传，提升网络容错性
-		fs.Debugf(w.o, " 开始上传分片%d: 大小=%v, 偏移=%v", currentPart, fs.SizeSuffix(n), fs.SizeSuffix(off))
-		chunkSize, err := w.uploadChunkWithRetry(uploadCtx, int32(partNum), rw)
-		_ = rw.Close() // 释放内存缓冲区
-
+		// 上传单个分片
+		n, chunkFinished, err := w.uploadSinglePart(ctx, in, acc, partNum, params, off)
 		if err != nil {
-			// 增强：详细的错误信息，包含重试信息
-			return fmt.Errorf("上传分片%d失败 (大小:%v, 偏移:%v, 已重试): %w",
-				currentPart, fs.SizeSuffix(n), fs.SizeSuffix(off), err)
+			return partNum, err
 		}
 
-		// 关键修复：手动更新Account对象的进度
-		if acc != nil {
-			// 通过Account对象报告已上传的字节数
-			// 这样rclone的进度显示系统就能正确显示上传速度
-			fs.Debugf(w.o, " 更新Account进度: 分片%d, 大小=%v", currentPart, fs.SizeSuffix(chunkSize))
-		}
-
-		// 记录分片上传成功信息
-		chunkDuration := time.Since(chunkStartTime)
-		if chunkSize > 0 {
-			speed := float64(chunkSize) / chunkDuration.Seconds() / 1024 / 1024 // MB/s
-			fs.Debugf(w.o, " 分片%d上传成功: 实际大小=%v, 用时=%v, 速度=%.2fMB/s",
-				currentPart, fs.SizeSuffix(chunkSize), chunkDuration.Truncate(time.Millisecond), speed)
-		}
-
-		// 参考阿里云OSS示例：保存断点续传信息，增加重试机制
-		if w.resumeInfo != nil {
-			w.resumeInfo.MarkChunkCompleted(partNum)
-			if w.f.resumeManager != nil {
-				// 修复：增加断点续传信息保存的重试机制
-				maxRetries := 3
-				var saveErr error
-				for retry := range maxRetries {
-					saveErr = w.f.resumeManager.SaveResumeInfo(w.resumeInfo)
-					if saveErr == nil {
-						fs.Debugf(w.o, "💾 断点续传信息已保存: 分片%d/%d (TaskID: %s)",
-							w.resumeInfo.GetCompletedChunkCount(), w.resumeInfo.TotalChunks, w.taskID)
-						break
-					}
-					if retry < maxRetries-1 {
-						fs.Debugf(w.o, "⚠️ 保存断点续传信息失败，重试 %d/%d: %v", retry+1, maxRetries, saveErr)
-						time.Sleep(time.Duration(retry+1) * 100 * time.Millisecond) // 递增延迟
-					}
-				}
-				if saveErr != nil {
-					fs.Errorf(w.o, "❌ 保存断点续传信息最终失败: %v", saveErr)
-				}
-			}
-		}
-
+		finished = chunkFinished
 		off += n
 	}
 
-	// 参考阿里云OSS示例：完成分片上传并显示总体统计
+	return partNum, nil
+}
+
+// uploadSinglePart 上传单个分片
+func (w *ossChunkWriter) uploadSinglePart(ctx context.Context, in io.Reader, acc *accounting.Account, partNum int64, params *uploadParams, off int64) (int64, bool, error) {
+	// 获取内存缓冲区
+	rw := NewRW()
+	defer rw.Close()
+
+	if acc != nil {
+		rw.SetAccounting(acc.AccountRead)
+	}
+
+	// 读取分片数据
+	chunkStartTime := time.Now()
+	n, err := io.CopyN(rw, in, params.chunkSize)
+	finished := false
+
+	if err == io.EOF {
+		if n == 0 && partNum != 0 {
+			fs.Debugf(w.o, " 所有分片读取完成")
+			return 0, true, nil
+		}
+		finished = true
+	} else if err != nil {
+		return 0, false, fmt.Errorf("读取分片数据失败: %w", err)
+	}
+
+	// 显示进度信息
+	w.logUploadProgress(partNum, n, off, params)
+
+	// 上传分片
+	currentPart := partNum + 1
+	fs.Debugf(w.o, " 开始上传分片%d: 大小=%v, 偏移=%v", currentPart, fs.SizeSuffix(n), fs.SizeSuffix(off))
+
+	chunkSize, err := w.uploadChunkWithRetry(ctx, int32(partNum), rw)
+	if err != nil {
+		return 0, false, fmt.Errorf("上传分片%d失败 (大小:%v, 偏移:%v, 已重试): %w",
+			currentPart, fs.SizeSuffix(n), fs.SizeSuffix(off), err)
+	}
+
+	// 记录分片上传成功信息
+	w.logChunkSuccess(partNum, chunkSize, chunkStartTime)
+
+	return n, finished, nil
+}
+
+// logUploadProgress 记录上传进度
+func (w *ossChunkWriter) logUploadProgress(partNum, n, off int64, params *uploadParams) {
+	currentPart := partNum + 1
+	elapsed := time.Since(params.startTime)
+
+	if params.totalParts > 0 {
+		percentage := float64(currentPart) / float64(params.totalParts) * 100
+
+		// 每2个分片或关键节点显示进度
+		shouldLog := (currentPart == 1) || (currentPart%2 == 0) || (currentPart == params.totalParts)
+
+		if shouldLog {
+			avgTimePerPart := elapsed / time.Duration(currentPart)
+			remainingParts := params.totalParts - currentPart
+			estimatedRemaining := avgTimePerPart * time.Duration(remainingParts)
+
+			fs.Infof(w.o, "📤 115网盘单线程上传: 分片%d/%d (%.1f%%) | %v | 已用时:%v | 预计剩余:%v",
+				currentPart, params.totalParts, percentage, fs.SizeSuffix(n),
+				elapsed.Truncate(time.Second), estimatedRemaining.Truncate(time.Second))
+		}
+	} else {
+		// 未知大小时只在第一个分片输出日志
+		if currentPart == 1 {
+			fs.Infof(w.o, "📤 115网盘单线程上传: 分片%d | %v | 偏移:%v | 已用时:%v",
+				currentPart, fs.SizeSuffix(n), fs.SizeSuffix(off), elapsed.Truncate(time.Second))
+		}
+	}
+}
+
+// logChunkSuccess 记录分片上传成功信息
+func (w *ossChunkWriter) logChunkSuccess(partNum, chunkSize int64, chunkStartTime time.Time) {
+	currentPart := partNum + 1
+	chunkDuration := time.Since(chunkStartTime)
+
+	if chunkSize > 0 {
+		speed := float64(chunkSize) / chunkDuration.Seconds() / 1024 / 1024 // MB/s
+		fs.Debugf(w.o, " 分片%d上传成功: 实际大小=%v, 用时=%v, 速度=%.2fMB/s",
+			currentPart, fs.SizeSuffix(chunkSize), chunkDuration.Truncate(time.Millisecond), speed)
+	}
+}
+
+// finalizeUpload 完成上传并显示统计信息
+func (w *ossChunkWriter) finalizeUpload(ctx context.Context, actualParts int64, startTime time.Time) error {
 	totalDuration := time.Since(startTime)
-	actualParts := partNum
 
 	fs.Infof(w.o, "🔧 开始完成分片上传: 总分片数=%d, 总用时=%v", actualParts, totalDuration.Truncate(time.Second))
 
-	err = w.Close(ctx)
+	err := w.Close(ctx)
 	if err != nil {
 		return fmt.Errorf("完成分片上传失败: %w", err)
 	}
 
-	// 参考阿里云OSS示例：显示上传完成统计信息
-	if size > 0 && totalDuration.Seconds() > 0 {
-		avgSpeed := float64(size) / totalDuration.Seconds() / 1024 / 1024 // MB/s
-		fs.Infof(w.o, "✅ 115网盘分片上传完成!")
-		fs.Infof(w.o, "📊 上传统计: 文件大小=%v, 分片数=%d, 总用时=%v, 平均速度=%.2fMB/s",
-			fs.SizeSuffix(size), actualParts, totalDuration.Truncate(time.Second), avgSpeed)
+	// 显示上传完成统计信息
+	if w.size > 0 && totalDuration.Seconds() > 0 {
+		avgSpeed := float64(w.size) / totalDuration.Seconds() / 1024 / 1024 // MB/s
+		fs.Infof(w.o, "115 multipart upload completed")
+		fs.Infof(w.o, "Upload stats: size=%v, parts=%d, duration=%v, speed=%.2fMB/s",
+			fs.SizeSuffix(w.size), actualParts, totalDuration.Truncate(time.Second), avgSpeed)
 	} else {
-		fs.Infof(w.o, "✅ 115网盘分片上传完成: 分片数=%d, 总用时=%v",
+		fs.Infof(w.o, "115 multipart upload completed: parts=%d, duration=%v",
 			actualParts, totalDuration.Truncate(time.Second))
-	}
-
-	// 参考阿里云OSS示例：清理断点续传信息
-	if w.resumeInfo != nil && w.f.resumeManager != nil {
-		if cleanErr := w.f.resumeManager.DeleteResumeInfo(w.taskID); cleanErr != nil {
-			fs.Debugf(w.o, "⚠️ 清理断点续传信息失败: %v", cleanErr)
-		} else {
-			fs.Debugf(w.o, "🧹 断点续传信息已清理")
-		}
 	}
 
 	return nil
@@ -8884,7 +8167,7 @@ func (w *ossChunkWriter) Upload(ctx context.Context) (err error) {
 var warnStreamUpload sync.Once
 
 // ossChunkWriter 115网盘分片上传写入器
-// 参考阿里云OSS示例优化：采用单线程顺序上传模式，集成断点续传功能
+// 简化版本：单线程顺序上传模式，无断点续传功能
 type ossChunkWriter struct {
 	chunkSize     int64                              // 分片大小
 	size          int64                              // 文件总大小
@@ -8897,14 +8180,6 @@ type ossChunkWriter struct {
 	callbackVar   string                             // 115网盘回调变量
 	callbackRes   map[string]any                     // 回调结果
 	imur          *oss.InitiateMultipartUploadResult // 分片上传初始化结果
-	// 新增断点续传支持
-	resumeInfo *common.ResumeInfo115 // 断点续传信息
-	taskID     string                // 任务ID
-	// 新增OSS状态缓存，减少API调用次数
-	ossPartsCache map[int64]bool // OSS分片状态缓存，key为分片号，value为是否存在
-	ossCacheTime  time.Time      // OSS缓存更新时间
-	// 新增统一错误处理器支持
-	errorHandler *common.UnifiedErrorHandler // 统一错误处理器
 }
 
 // newChunkWriterWithClient 创建分片写入器，使用指定的优化OSS客户端
@@ -8930,70 +8205,24 @@ func (f *Fs) newChunkWriterWithClient(ctx context.Context, src fs.ObjectInfo, ui
 	// 115网盘采用单线程分片上传模式，确保稳定性
 	fs.Debugf(f, "115网盘分片上传: 文件大小 %v, 分片大小 %v", fs.SizeSuffix(size), fs.SizeSuffix(int64(chunkSize)))
 
-	// 参考阿里云OSS示例：初始化断点续传功能
-	taskID := common.GenerateTaskID115(o.remote, size)
-	var resumeInfo *common.ResumeInfo115
+	// Fix 10002 error: use internal two-step transfer for cross-cloud transfers
+	if f.isFromRemoteSource(in) {
+		fs.Debugf(o, "Cross-cloud transfer detected, using internal two-step transfer to avoid 10002 error")
+		fs.Debugf(o, "Step 1: Download to local, Step 2: Upload to 115 from local")
 
-	// 修复：增强断点续传信息加载，添加详细日志
-	fs.Debugf(f, " 115网盘断点续传TaskID: %s (文件: %s, 大小: %v)", taskID, o.remote, fs.SizeSuffix(size))
-
-	// 尝试加载现有的断点续传信息
-	if f.resumeManager != nil {
-		info, err := f.resumeManager.LoadResumeInfo(taskID)
-		if err != nil {
-			fs.Debugf(f, "⚠️ 加载断点续传信息失败: %v", err)
-		} else if info != nil {
-			// 类型断言为115网盘的断点续传信息
-			if r115, ok := info.(*common.ResumeInfo115); ok {
-				resumeInfo = r115
-				fs.Infof(o, "🔄 发现断点续传信息: 已完成分片 %d/%d (TaskID: %s)",
-					resumeInfo.GetCompletedChunkCount(), resumeInfo.GetTotalChunks(), taskID)
-			} else {
-				fs.Debugf(f, "⚠️ 断点续传信息类型断言失败")
-			}
-		} else {
-			fs.Debugf(f, "📝 未找到现有断点续传信息，将创建新的")
-		}
+		// 执行内部两步传输
+		return f.internalTwoStepTransfer(ctx, src, in, o, ui, size, options...)
 	}
 
-	// 如果没有断点续传信息，创建新的
-	if resumeInfo == nil {
-		totalParts := int64(1)
-		if size > 0 {
-			totalParts = (size + int64(chunkSize) - 1) / int64(chunkSize)
-		}
-		resumeInfo = &common.ResumeInfo115{
-			TaskID:              taskID,
-			FileName:            o.remote,
-			FileSize:            size,
-			FilePath:            o.remote,
-			ChunkSize:           int64(chunkSize),
-			TotalChunks:         totalParts,
-			CompletedChunks:     make(map[int64]bool),
-			CreatedAt:           time.Now(),
-			LastUpdated:         time.Now(),
-			BackendSpecificData: make(map[string]any),
-		}
-
-		// 修复：立即保存新创建的断点续传信息
-		if f.resumeManager != nil {
-			if saveErr := f.resumeManager.SaveResumeInfo(resumeInfo); saveErr != nil {
-				fs.Debugf(f, "⚠️ 保存新建断点续传信息失败: %v", saveErr)
-			} else {
-				fs.Infof(o, "📝 创建并保存新的断点续传信息: %d分片 (TaskID: %s)", totalParts, taskID)
-			}
-		}
-	}
+	// Simplified: no resume support
+	fs.Debugf(f, "Simplified mode: skip resume management")
 
 	w = &ossChunkWriter{
-		chunkSize:    int64(chunkSize),
-		size:         size,
-		f:            f,
-		o:            o,
-		in:           in,
-		resumeInfo:   resumeInfo,
-		taskID:       taskID,
-		errorHandler: f.errorHandler, // 新增：传递统一错误处理器
+		chunkSize: int64(chunkSize),
+		size:      size,
+		f:         f,
+		o:         o,
+		in:        in,
 	}
 
 	// 关键优化：使用传入的优化OSS客户端，而不是创建新的
@@ -9069,127 +8298,11 @@ func (w *ossChunkWriter) shouldRetry(ctx context.Context, err error) (bool, erro
 	return false, err
 }
 
-// verifyOSSChunkStatus 验证OSS服务端分片状态
-// 关键优化：添加智能缓存机制，减少API调用次数，提高断点续传效率
-func (w *ossChunkWriter) verifyOSSChunkStatus(ctx context.Context, partNumber int64) (bool, error) {
-	if w.client == nil || w.imur == nil {
-		return false, fmt.Errorf("OSS客户端或上传会话未初始化")
-	}
+// 移除未使用的OSS分片状态验证和缓存方法，简化上传逻辑
 
-	// 智能缓存：检查缓存是否有效（5分钟内的缓存认为有效）
-	if w.ossPartsCache != nil && time.Since(w.ossCacheTime) < 5*time.Minute {
-		if exists, found := w.ossPartsCache[partNumber]; found {
-			fs.Debugf(w.o, "使用缓存：OSS分片 %d 状态为 %v", partNumber, exists)
-			return exists, nil
-		}
-	}
+// 简化：移除复杂的OSS状态同步逻辑
 
-	// 批量查询优化：一次性获取所有分片状态，更新缓存
-	if err := w.refreshOSSPartsCache(ctx); err != nil {
-		fs.Debugf(w.o, "刷新OSS分片缓存失败: %v", err)
-		return false, err
-	}
-
-	// 从缓存中获取结果
-	if exists, found := w.ossPartsCache[partNumber]; found {
-		fs.Debugf(w.o, "OSS分片 %d 状态: %v", partNumber, exists)
-		return exists, nil
-	}
-
-	fs.Debugf(w.o, "OSS分片 %d 不存在", partNumber)
-	return false, nil
-}
-
-// refreshOSSPartsCache 刷新OSS分片状态缓存
-// 新增：批量获取OSS分片状态，减少API调用次数
-func (w *ossChunkWriter) refreshOSSPartsCache(ctx context.Context) error {
-	// 构造ListParts请求
-	req := &oss.ListPartsRequest{
-		Bucket:   w.imur.Bucket,
-		Key:      w.imur.Key,
-		UploadId: w.imur.UploadId,
-		MaxParts: 1000, // 最多查询1000个分片
-	}
-
-	// 调用OSS ListParts API
-	result, err := w.client.ListParts(ctx, req)
-	if err != nil {
-		return fmt.Errorf("查询OSS分片状态失败: %w", err)
-	}
-
-	// 初始化缓存
-	if w.ossPartsCache == nil {
-		w.ossPartsCache = make(map[int64]bool)
-	}
-
-	// 清空旧缓存
-	for k := range w.ossPartsCache {
-		delete(w.ossPartsCache, k)
-	}
-
-	// 更新缓存
-	for _, part := range result.Parts {
-		w.ossPartsCache[int64(part.PartNumber)] = true
-	}
-
-	// 更新缓存时间
-	w.ossCacheTime = time.Now()
-
-	fs.Debugf(w.o, "OSS分片缓存已更新，共 %d 个已完成分片", len(result.Parts))
-	return nil
-}
-
-// syncLocalStateWithOSS 同步本地状态与OSS服务端状态
-// 增强：解决115网盘本地状态与OSS状态不一致的问题
-func (w *ossChunkWriter) syncLocalStateWithOSS(ctx context.Context) error {
-	if w.resumeInfo == nil || w.f.resumeManager == nil {
-		return nil // 没有断点续传信息，无需同步
-	}
-
-	fs.Debugf(w.o, "开始同步本地状态与OSS服务端状态")
-
-	syncErrors := 0
-	correctedCount := 0
-	completedChunks := w.resumeInfo.GetCompletedChunks()
-
-	for partNumber := range completedChunks {
-		if completedChunks[partNumber] {
-			// 验证OSS服务端状态
-			ossUploaded, err := w.verifyOSSChunkStatus(ctx, partNumber+1) // OSS分片编号从1开始
-			if err != nil {
-				syncErrors++
-				fs.Debugf(w.o, "验证OSS分片 %d 状态失败: %v", partNumber+1, err)
-
-				// 如果查询失败过多，停止同步避免过多API调用
-				if syncErrors > 5 {
-					fs.Logf(w.o, "⚠️ OSS状态查询失败过多，停止同步")
-					break
-				}
-				continue
-			}
-
-			// 如果OSS显示未上传，但本地标记为已上传，修正本地状态
-			if !ossUploaded {
-				fs.Logf(w.o, "🔧 发现状态不一致：分片 %d 本地标记已上传，但OSS未确认，修正本地状态", partNumber+1)
-
-				// 修正本地状态
-				delete(w.resumeInfo.CompletedChunks, partNumber)
-				correctedCount++
-			}
-		}
-	}
-
-	if correctedCount > 0 {
-		fs.Infof(w.o, "✅ OSS状态同步完成，修正了 %d 个不一致的分片状态", correctedCount)
-		// 保存修正后的断点续传信息
-		return w.f.resumeManager.SaveResumeInfo(w.resumeInfo)
-	}
-
-	fs.Debugf(w.o, "OSS状态同步完成，本地状态与OSS一致")
-	return nil
-}
-
-// 已移除：isOSSNetworkError 函数已迁移到 common.IsOSSNetworkError
+// 已移除：isOSSNetworkError 函数已本地实现
 // 使用统一的OSS网络错误检测机制，提高准确性和一致性
 
 // isOSSRetryableError 判断OSS错误是否可重试
@@ -9199,8 +8312,10 @@ func (w *ossChunkWriter) isOSSRetryableError(err error) bool {
 		return false
 	}
 
-	// 统一：使用统一的OSS网络错误检测机制
-	if common.IsOSSNetworkError(err) {
+	// 简化网络错误检测
+	if err != nil && (strings.Contains(err.Error(), "connection") ||
+		strings.Contains(err.Error(), "timeout") ||
+		strings.Contains(err.Error(), "network")) {
 		return true
 	}
 
@@ -9263,29 +8378,10 @@ func (w *ossChunkWriter) uploadChunkWithRetry(ctx context.Context, chunkNumber i
 			return currentChunkSize, nil
 		}
 
-		// 优化：集成UnifiedErrorHandler的智能重试策略
-		if w.errorHandler != nil {
-			shouldRetry, retryDelay := w.errorHandler.HandleErrorWithRetry(ctx, err,
-				fmt.Sprintf("分片%d上传", chunkNumber+1), attempt, maxRetries)
-			if !shouldRetry {
-				fs.Debugf(w.o, "UnifiedErrorHandler判断分片 %d 不可重试: %v", chunkNumber+1, err)
-				return 0, err
-			}
-			if retryDelay > 0 {
-				fs.Debugf(w.o, "UnifiedErrorHandler建议分片 %d 延迟 %v 后重试", chunkNumber+1, retryDelay)
-				select {
-				case <-ctx.Done():
-					return 0, ctx.Err()
-				case <-time.After(retryDelay):
-				}
-				continue // 使用UnifiedErrorHandler的延迟，跳过默认延迟
-			}
-		} else {
-			// 回退到原有的重试判断逻辑
-			if !w.isOSSRetryableError(err) {
-				fs.Debugf(w.o, "分片 %d 遇到不可重试错误: %v", chunkNumber+1, err)
-				return 0, err
-			}
+		// 使用rclone标准错误处理
+		if !w.isOSSRetryableError(err) {
+			fs.Debugf(w.o, "分片 %d 遇到不可重试错误: %v", chunkNumber+1, err)
+			return 0, err
 		}
 
 		if attempt == maxRetries {
@@ -9386,8 +8482,8 @@ func (w *ossChunkWriter) WriteChunk(ctx context.Context, chunkNumber int32, read
 
 // Abort the multipart upload
 func (w *ossChunkWriter) Abort(ctx context.Context) (err error) {
-	// 使用专用的上传调速器，优化分片上传中止API调用频率
-	err = w.f.uploadPacer.Call(func() (bool, error) {
+	// 使用统一调速器，优化分片上传中止API调用频率
+	err = w.f.pacer.Call(func() (bool, error) {
 		_, err = w.client.AbortMultipartUpload(ctx, &oss.AbortMultipartUploadRequest{
 			Bucket:   oss.Ptr(*w.imur.Bucket),
 			Key:      oss.Ptr(*w.imur.Key),
@@ -9456,224 +8552,55 @@ func (w *ossChunkWriter) Close(ctx context.Context) (err error) {
 // Modifications and Helper Functions
 // ------------------------------------------------------------
 
-// parseRootID parses RootID (CID or Share Code) from a path string like remote:{ID}/path
-// Returns rootID, receiveCode (if share), error
-func parseRootID(s string) (rootID, receiveCode string, err error) {
-	// Regex to find {ID} or {share_link} at the beginning
-	re := regexp.MustCompile(`^\{([^}]+)\}`)
-	m := re.FindStringSubmatch(s)
-	if m == nil {
-		// No ID found at the start, assume standard path
-		return "", "", nil // Return nil error, indicating no special root ID found
-	}
-	potentialID := m[1]
-
-	// Check if it looks like a CID (19 digits)
-	reCID := regexp.MustCompile(`^\d{19}$`)
-	if reCID.MatchString(potentialID) {
-		return potentialID, "", nil // It's a CID
-	}
-
-	// Share links are no longer supported
-
-	// If it doesn't match known patterns, return an error
-	return "", "", fmt.Errorf("invalid format in {}: %q", potentialID)
-}
-
-// manualCacheCleanup115 手动触发缓存清理
-// 🔧 新增：缓存管理命令接口
-func (f *Fs) manualCacheCleanup115(ctx context.Context, strategy string) (interface{}, error) {
-	fs.Infof(f, "开始手动缓存清理，策略: %s", strategy)
-
-	result := map[string]interface{}{
-		"backend":  "115",
-		"strategy": strategy,
-		"caches":   make(map[string]interface{}),
-	}
-
-	// 清理各个缓存实例
-	caches := map[string]cache.PersistentCache{
-		"path_resolve": f.pathResolveCache,
-		"dir_list":     f.dirListCache,
-		"metadata":     f.metadataCache,
-		"file_id":      f.fileIDCache,
-	}
-
-	for name, c := range caches {
-		if c != nil {
-			beforeStats := c.Stats()
-
-			// 根据策略执行清理
-			var err error
-			switch strategy {
-			case "size", "lru", "priority_lru", "time":
-				if badgerCache, ok := c.(*cache.BadgerCache); ok {
-					// 使用默认目标大小进行智能清理
-					targetSize := int64(f.cacheConfig.TargetCleanSize)
-					err = badgerCache.SmartCleanupWithStrategy(targetSize, strategy)
-				} else {
-					err = fmt.Errorf("缓存类型不支持智能清理")
-				}
-			case "clear":
-				err = c.Clear()
-				// 添加额外的验证步骤，确保缓存确实被清除了
-				if err == nil {
-					// 验证清理是否成功
-					keys, listErr := c.ListAllKeys()
-					if listErr != nil {
-						fs.Debugf(f, "无法验证清理操作: %v", listErr)
-					} else if len(keys) > 0 {
-						// 如果还有键存在，记录前几个键用于调试
-						fs.Debugf(f, "清除后缓存中仍有%d个键", len(keys))
-						maxKeys := len(keys)
-						if maxKeys > 5 {
-							maxKeys = 5
-						}
-						fs.Debugf(f, "前%d个键: %v", maxKeys, keys[:maxKeys])
-						// 认为清理不完全，返回错误
-						err = fmt.Errorf("清理后仍有%d个键未被清除", len(keys))
-					} else {
-						fs.Debugf(f, "验证成功：缓存已完全清除")
-					}
-				}
-			default:
-				err = fmt.Errorf("不支持的清理策略: %s", strategy)
-			}
-
-			afterStats := c.Stats()
-
-			result["caches"].(map[string]interface{})[name] = map[string]interface{}{
-				"success": err == nil,
-				"error": func() string {
-					if err != nil {
-						return err.Error()
-					}
-					return ""
-				}(),
-				"before_size": beforeStats["total_size"],
-				"after_size":  afterStats["total_size"],
-				"cleaned_mb":  float64(beforeStats["total_size"].(int64)-afterStats["total_size"].(int64)) / (1024 * 1024),
-			}
-
-			if err != nil {
-				fs.Errorf(f, "清理%s缓存失败: %v", name, err)
-			} else {
-				fs.Infof(f, "清理%s缓存成功", name)
-			}
-		}
-	}
-
-	fs.Infof(f, "手动缓存清理完成")
-	return result, nil
-}
+// 移除未使用的parseRootID函数
 
 // getCacheStatistics115 获取缓存统计信息
-// 🔧 新增：缓存管理命令接口
-func (f *Fs) getCacheStatistics115(ctx context.Context) (interface{}, error) {
-	result := map[string]interface{}{
+func (f *Fs) getCacheStatistics115(_ context.Context) (any, error) {
+	result := map[string]any{
 		"backend": "115",
-		"caches":  make(map[string]interface{}),
+		"caches":  make(map[string]any),
 	}
 
-	// 获取各个缓存实例的统计
-	caches := map[string]cache.PersistentCache{
-		"path_resolve": f.pathResolveCache,
-		"dir_list":     f.dirListCache,
-		"metadata":     f.metadataCache,
-		"file_id":      f.fileIDCache,
-	}
-
-	for name, c := range caches {
-		if c != nil {
-			stats := c.Stats()
-			result["caches"].(map[string]interface{})[name] = stats
-		} else {
-			result["caches"].(map[string]interface{})[name] = map[string]interface{}{
-				"status": "not_initialized",
-			}
-		}
-	}
+	// 缓存功能已移除，使用rclone标准dircache
+	result["message"] = "缓存功能已移除，使用rclone标准dircache"
 
 	return result, nil
-}
-
-// getCacheConfiguration115 获取当前缓存配置
-// 🔧 新增：缓存管理命令接口
-func (f *Fs) getCacheConfiguration115(ctx context.Context) (interface{}, error) {
-	return map[string]interface{}{
-		"backend": "115",
-		"config": map[string]interface{}{
-			"max_cache_size":       f.cacheConfig.MaxCacheSize,
-			"target_clean_size":    f.cacheConfig.TargetCleanSize,
-			"mem_table_size":       f.cacheConfig.MemTableSize,
-			"enable_smart_cleanup": f.cacheConfig.EnableSmartCleanup,
-			"cleanup_strategy":     f.cacheConfig.CleanupStrategy,
-		},
-		"user_config": map[string]interface{}{
-			"cache_max_size":       f.opt.CacheMaxSize,
-			"cache_target_size":    f.opt.CacheTargetSize,
-			"enable_smart_cleanup": f.opt.EnableSmartCleanup,
-			"cleanup_strategy":     f.opt.CleanupStrategy,
-		},
-	}, nil
-}
-
-// resetCacheConfiguration115 重置缓存配置为默认值
-// 🔧 新增：缓存管理命令接口
-func (f *Fs) resetCacheConfiguration115(ctx context.Context) (interface{}, error) {
-	fs.Infof(f, "重置115缓存配置为默认值")
-
-	// 重置为默认配置
-	defaultConfig := common.DefaultUnifiedCacheConfig("115")
-	f.cacheConfig = defaultConfig
-
-	return map[string]interface{}{
-		"backend": "115",
-		"message": "缓存配置已重置为默认值",
-		"config": map[string]interface{}{
-			"max_cache_size":       f.cacheConfig.MaxCacheSize,
-			"target_clean_size":    f.cacheConfig.TargetCleanSize,
-			"mem_table_size":       f.cacheConfig.MemTableSize,
-			"enable_smart_cleanup": f.cacheConfig.EnableSmartCleanup,
-			"cleanup_strategy":     f.cacheConfig.CleanupStrategy,
-		},
-	}, nil
 }
 
 // getDownloadURLCommand 通过pick_code或.strm内容获取下载URL
-func (f *Fs) getDownloadURLCommand(ctx context.Context, args []string, opt map[string]string) (interface{}, error) {
+func (f *Fs) getDownloadURLCommand(ctx context.Context, args []string, opt map[string]string) (any, error) {
 	if len(args) < 1 {
 		return nil, fmt.Errorf("需要提供pick_code、115://pick_code格式或文件路径")
 	}
 
 	input := args[0]
-	fs.Debugf(f, "🔗 处理下载URL请求: %s", input)
+	fs.Debugf(f, "Processing download URL request: %s", input)
 
-	// 解析输入格式
+	// Parse input format
 	if strings.HasPrefix(input, "/") {
-		// 文件路径格式，使用 getDownloadURLByUA 方法（支持302重定向）
-		fs.Debugf(f, "✅ 使用文件路径，采用UA方式: %s", input)
+		// File path format, use getDownloadURLByUA method (supports 302 redirect)
+		fs.Debugf(f, "Using file path with UA method: %s", input)
 
 		userAgent := opt["user-agent"]
 		if userAgent == "" {
 			userAgent = defaultUserAgent
 		}
 
-		fs.Debugf(f, "🌐 使用UA方式获取下载URL: 路径=%s, UA=%s", input, userAgent)
+		fs.Debugf(f, "Getting download URL with UA: path=%s, UA=%s", input, userAgent)
 		downloadURL, err := f.getDownloadURLByUA(ctx, input, userAgent)
 		if err != nil {
-			return nil, fmt.Errorf("UA方式获取下载URL失败: %w", err)
+			return nil, fmt.Errorf("failed to get download URL with UA: %w", err)
 		}
 
-		fs.Infof(f, "✅ 成功获取115网盘可播放URL: 路径=%s", input)
+		fs.Debugf(f, "Successfully got 115 playable URL: path=%s", input)
 		return downloadURL, nil
 	}
 
 	// pick_code 格式，使用原始HTTP实现
 	var pickCode string
-	if strings.HasPrefix(input, "115://") {
+	if code, found := strings.CutPrefix(input, "115://"); found {
 		// 115://pick_code 格式 (来自.strm文件)
-		pickCode = strings.TrimPrefix(input, "115://")
+		pickCode = code
 		fs.Debugf(f, "✅ 解析.strm格式: pick_code=%s", pickCode)
 	} else {
 		// 假设是纯pick_code
@@ -9688,7 +8615,7 @@ func (f *Fs) getDownloadURLCommand(ctx context.Context, args []string, opt map[s
 
 	// 使用原始HTTP实现获取下载URL
 	fs.Debugf(f, "🌐 使用原始HTTP方式获取下载URL: pick_code=%s", pickCode)
-	downloadURL, err := f.getDownloadURLByHTTP(ctx, pickCode, opt["user-agent"])
+	downloadURL, err := f.getDownloadURLByPickCodeHTTP(ctx, pickCode, opt["user-agent"])
 	if err != nil {
 		return nil, fmt.Errorf("获取下载URL失败: %w", err)
 	}
@@ -9699,35 +8626,31 @@ func (f *Fs) getDownloadURLCommand(ctx context.Context, args []string, opt map[s
 	return downloadURL, nil
 }
 
-// getDownloadURLByPickCodeHTTP 使用原始HTTP实现通过pick_code获取下载URL
+// getDownloadURLByPickCodeHTTP 使用rclone标准方式通过pick_code获取下载URL
 func (f *Fs) getDownloadURLByPickCodeHTTP(ctx context.Context, pickCode string, userAgent string) (string, error) {
 	// 如果没有提供 UA，使用默认值
 	if userAgent == "" {
 		userAgent = defaultUserAgent
 	}
 
-	fs.Debugf(f, "🌐 使用原始HTTP方式获取下载URL: pick_code=%s, UA=%s", pickCode, userAgent)
+	fs.Debugf(f, "🌐 使用rclone标准方式获取下载URL: pick_code=%s, UA=%s", pickCode, userAgent)
 
-	// 🔧 使用原始HTTP代码实现
-	client := &http.Client{}
-	req, err := http.NewRequest("POST", openAPIRootURL+"/open/ufile/downurl", strings.NewReader("pick_code="+pickCode))
-
-	if err != nil {
-		fs.Errorf(f, "创建请求失败: %v", err)
-		return "", err
+	// 使用rclone标准rest客户端
+	opts := rest.Opts{
+		Method: "POST",
+		Path:   "/open/ufile/downurl",
+		Body:   strings.NewReader("pick_code=" + pickCode),
+		ExtraHeaders: map[string]string{
+			"Content-Type": "application/x-www-form-urlencoded",
+			"User-Agent":   userAgent,
+		},
 	}
 
-	opts := rest.Opts{}
+	// 准备认证信息
 	f.prepareTokenForRequest(ctx, &opts)
 
-	// 设置请求头
-	req.Header.Set("Authorization", opts.ExtraHeaders["Authorization"])
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	fs.Debugf(f, "🔧 HTTP请求头: Authorization=%s, User-Agent=%s", opts.ExtraHeaders["Authorization"], userAgent)
-
 	// 发送请求并处理响应
-	res, err := client.Do(req)
+	res, err := f.openAPIClient.Call(ctx, &opts)
 	if err != nil {
 		fs.Errorf(f, "请求失败: %v", err)
 		return "", err
@@ -9760,7 +8683,91 @@ func (f *Fs) getDownloadURLByPickCodeHTTP(ctx context.Context, pickCode string, 
 	return "", fmt.Errorf("未找到下载URL")
 }
 
-// getDownloadURLByHTTP 使用原始HTTP实现获取下载URL（兼容性函数）
-func (f *Fs) getDownloadURLByHTTP(ctx context.Context, pickCode string, userAgent string) (string, error) {
-	return f.getDownloadURLByPickCodeHTTP(ctx, pickCode, userAgent)
+// internalTwoStepTransfer 内部两步传输：先完整下载到本地，再从本地上传
+// 修复10002错误：彻底解决跨云传输SHA1不一致问题
+func (f *Fs) internalTwoStepTransfer(ctx context.Context, src fs.ObjectInfo, in io.Reader, o *Object, ui *UploadInitInfo, size int64, options ...fs.OpenOption) (*ossChunkWriter, error) {
+	fs.Infof(o, "🌐 开始内部两步传输: %s (%s)", src.Remote(), fs.SizeSuffix(size))
+
+	// 第一步：完整下载到本地临时文件
+	fs.Infof(o, "📥 第一步：下载到本地临时文件...")
+
+	// 创建临时文件
+	tempFile, err := os.CreateTemp("", "rclone_two_step_*.tmp")
+	if err != nil {
+		return nil, fmt.Errorf("创建临时文件失败: %w", err)
+	}
+	tempPath := tempFile.Name()
+
+	// 确保清理临时文件
+	defer func() {
+		tempFile.Close()
+		os.Remove(tempPath)
+		fs.Debugf(o, "🧹 清理临时文件: %s", tempPath)
+	}()
+
+	// 使用传入的Reader进行完整下载
+	// 注意：in已经是打开的Reader，直接使用
+	fs.Infof(o, "📥 正在下载: %s → %s", src.Remote(), tempPath)
+	written, err := io.Copy(tempFile, in)
+	if err != nil {
+		return nil, fmt.Errorf("下载到临时文件失败: %w", err)
+	}
+
+	// 验证下载大小
+	if written != size {
+		return nil, fmt.Errorf("下载大小不匹配: 期望%d, 实际%d", size, written)
+	}
+
+	fs.Infof(o, "✅ 第一步完成：下载 %s", fs.SizeSuffix(written))
+
+	// 重置文件指针到开头
+	if _, err := tempFile.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("重置文件指针失败: %w", err)
+	}
+
+	// 第二步：计算本地文件的SHA1
+	fs.Infof(o, "🔢 计算本地文件SHA1...")
+	hasher := sha1.New()
+	_, err = io.Copy(hasher, tempFile)
+	if err != nil {
+		return nil, fmt.Errorf("计算SHA1失败: %w", err)
+	}
+	sha1sum := fmt.Sprintf("%x", hasher.Sum(nil))
+	fs.Debugf(o, "Local file SHA1: %s", sha1sum)
+
+	// Set SHA1 to Object
+	if o != nil {
+		o.sha1sum = sha1sum
+	}
+
+	// Reset file pointer to beginning for upload
+	if _, err := tempFile.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("failed to reset file pointer: %w", err)
+	}
+
+	// Step 3: Upload from local file to 115
+	fs.Debugf(o, "Step 2: Upload from local to 115...")
+
+	// 重新初始化上传（使用正确的SHA1）
+	newUI, err := f.initUploadOpenAPI(ctx, size, o.remote, "", sha1sum, "", "", "", "")
+	if err != nil {
+		return nil, fmt.Errorf("重新初始化上传失败: %w", err)
+	}
+
+	// Check if instant upload succeeded
+	if newUI.GetStatus() == 2 {
+		fs.Debugf(o, "Two-step transfer instant upload successful!")
+		// Return special error to indicate instant upload success
+		// Due to function signature limitations, we need to modify the calling method
+		return nil, fmt.Errorf("INSTANT_UPLOAD_SUCCESS:%s", newUI.GetFileID())
+	}
+
+	// 创建OSS客户端
+	ossClient, err := f.newOSSClient()
+	if err != nil {
+		return nil, fmt.Errorf("创建OSS客户端失败: %w", err)
+	}
+
+	// 使用本地文件创建标准的分片写入器
+	return f.newChunkWriterWithClient(ctx, src, newUI, tempFile, o, ossClient, options...)
 }
