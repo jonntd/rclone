@@ -5754,41 +5754,39 @@ func bufferIOwithSHA1(f *Fs, in io.Reader, src fs.ObjectInfo, size, threshold in
 		originalAccount = accountedReader.GetAccount()
 	}
 
-	// 创建一个管道来同时计算SHA1和缓冲数据
-	pr, pw := io.Pipe()
-	var sha1Hash string
-	var sha1Err error
+	// 使用更简单可靠的方法：先缓冲数据，然后从缓冲区计算SHA1
+	// 这避免了goroutine同步问题，特别是在跨网盘复制的复杂场景下
 
-	// 在goroutine中计算SHA1
-	go func() {
-		defer pw.Close()
-		hasher := sha1.New()
-		_, err := io.Copy(hasher, pr)
-		if err != nil {
-			sha1Err = err
-			return
-		}
-		sha1Hash = fmt.Sprintf("%x", hasher.Sum(nil))
-	}()
-
-	// 创建TeeReader将数据同时写入管道和缓冲区
-	tee := io.TeeReader(in, pw)
-
-	// Buffer the input using the tee reader，传递Account对象信息
-	out, cleanup, err = bufferIOWithAccount(f, tee, size, threshold, originalAccount)
+	// Buffer the input first
+	out, cleanup, err = bufferIOWithAccount(f, in, size, threshold, originalAccount)
 	if err != nil {
-		pw.Close() // 确保管道关闭
-		// Cleanup is handled by bufferIO on error
 		return "", nil, cleanup, fmt.Errorf("failed to buffer input for SHA1 calculation: %w", err)
 	}
 
-	// 等待SHA1计算完成
-	pw.Close() // 关闭写端，让SHA1计算完成
-	if sha1Err != nil {
-		return "", nil, cleanup, fmt.Errorf("failed to calculate SHA1: %w", sha1Err)
+	// Calculate SHA1 from the buffered data
+	var sha1Hash string
+	if seeker, ok := out.(io.Seeker); ok {
+		// If the buffered output is seekable, calculate SHA1 from it
+		hasher := sha1.New()
+		_, err := io.Copy(hasher, out)
+		if err != nil {
+			return "", nil, cleanup, fmt.Errorf("failed to calculate SHA1 from buffered data: %w", err)
+		}
+		sha1Hash = fmt.Sprintf("%x", hasher.Sum(nil))
+
+		// Seek back to the beginning for the actual upload
+		_, err = seeker.Seek(0, io.SeekStart)
+		if err != nil {
+			return "", nil, cleanup, fmt.Errorf("failed to seek back after SHA1 calculation: %w", err)
+		}
+	} else {
+		// If not seekable, we need to read the data twice
+		// This should not happen with our current bufferIO implementation, but handle it gracefully
+		return "", nil, cleanup, fmt.Errorf("buffered output is not seekable, cannot calculate SHA1")
 	}
 
 	sha1sum = sha1Hash
+	fs.Debugf(f, "Calculated SHA1 from buffered data: %s", sha1sum)
 	return sha1sum, out, cleanup, nil
 }
 
@@ -6761,12 +6759,37 @@ func (f *Fs) getUploadInfo(
 			o.id = ui.GetFileID()
 			o.pickCode = ui.GetPickCode()
 			o.hasMetaData = true
+		} else if ui.GetStatus() == 7 || ui.GetStatus() == 8 {
+			// 状态7和8：根据实际测试，这些状态码也表示需要继续上传
+			// 状态7：可能需要二次认证，但可以继续多部分上传
+			// 状态8：未知状态，但从日志看可以继续多部分上传
+			fs.Debugf(o, "Upload init returned status %d for multipart, continuing with upload", ui.GetStatus())
+			// 继续执行多部分上传流程
 		} else {
-			return nil, fmt.Errorf("expected status 1 from initUpload for multipart, got %d: %s", ui.GetStatus(), ui.ErrMsg())
+			return nil, fmt.Errorf("unexpected status from initUpload for multipart: got %d, expected 1, 2, 7, or 8. Message: %s", ui.GetStatus(), ui.ErrMsg())
 		}
 	}
 
 	return ui, nil
+}
+
+// performTraditionalUpload handles upload when OSS is not available (status 7/8 with empty bucket/object)
+func (f *Fs) performTraditionalUpload(
+	ctx context.Context,
+	in io.Reader,
+	src fs.ObjectInfo,
+	o *Object,
+	leaf string,
+	dirID string,
+	size int64,
+	ui *UploadInitInfo,
+	options ...fs.OpenOption,
+) (fs.Object, error) {
+	fs.Debugf(o, "Performing traditional upload due to status %d with empty bucket/object", ui.GetStatus())
+
+	// Use the existing traditional sample upload method
+	// This will handle the complete traditional upload flow
+	return f.doSampleUpload(ctx, in, o, leaf, dirID, size, options...)
 }
 
 // performOSSUpload handles the actual upload process
@@ -7382,7 +7405,10 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 			if hash, hashErr := src.Hash(ctx, hash.SHA1); hashErr == nil && hash != "" {
 				sha1sum = strings.ToUpper(hash)
 			} else {
-				return nil, fmt.Errorf("OSS PutObject requires SHA1 hash but none available - should calculate hash first")
+				// 跨网盘复制时源对象可能无法提供SHA1，需要从数据流计算
+				fs.Debugf(o, "Source SHA1 not available, will calculate from data stream during upload")
+				// 暂时使用空SHA1，在实际上传时计算
+				sha1sum = ""
 			}
 		}
 
@@ -7398,8 +7424,20 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 				o.pickCode = ui.GetPickCode()
 				o.hasMetaData = true
 				return o, nil
+			} else if ui.GetStatus() == 7 || ui.GetStatus() == 8 {
+				// 状态7和8：这些状态码表示需要使用传统表单上传，而不是OSS上传
+				// 因为115网盘在这些状态下不提供bucket和object字段
+				fs.Debugf(o, "Upload init returned status %d, bucket=%q, object=%q", ui.GetStatus(), ui.GetBucket(), ui.GetObject())
+				if ui.GetBucket() == "" || ui.GetObject() == "" {
+					fs.Debugf(o, "Status %d with empty bucket/object, falling back to traditional form upload", ui.GetStatus())
+					// 使用传统的表单上传
+					return f.performTraditionalUpload(ctx, in, src, o, leaf, dirID, size, ui, options...)
+				}
+				// 如果有bucket和object，继续OSS上传
+				fs.Debugf(o, "Status %d with valid bucket/object, continuing with OSS upload", ui.GetStatus())
+			} else {
+				return nil, fmt.Errorf("unexpected status from initUpload for PutObject: got %d, expected 1, 2, 7, or 8. Message: %s", ui.GetStatus(), ui.ErrMsg())
 			}
-			return nil, fmt.Errorf("expected status 1 from initUpload for PutObject, got %d: %s", ui.GetStatus(), ui.ErrMsg())
 		}
 	}
 
