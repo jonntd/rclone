@@ -37,7 +37,6 @@ import (
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
-	"github.com/rclone/rclone/lib/atexit"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/oauthutil"
@@ -1237,7 +1236,7 @@ const (
 	// 115 drive specificity: all APIs share the same QPS quota, need unified management to avoid 770004 errors
 	// 修复770004错误：降低QPS到安全水平
 
-	unifiedMinSleep = fs.Duration(1000 * time.Millisecond) // ~1 QPS - 保守配置，避免770004错误
+	unifiedMinSleep = fs.Duration(300 * time.Millisecond) // ~1 QPS - 保守配置，避免770004错误
 
 	maxSleep      = 2 * time.Second
 	decayConstant = 2 // bigger for slower decay, exponential
@@ -6654,9 +6653,15 @@ func (f *Fs) tryHashUpload(
 			}
 			continue // Re-evaluate the new status
 
-		case 6, 8: // Other auth-related statuses? Treat as failure for now.
-			fs.Errorf(o, "Hash upload failed with unexpected auth status %d. Message: %s", status, ui.ErrMsg())
+		case 6: // Auth-related status, treat as failure
+			fs.Errorf(o, "Hash upload failed with auth status %d. Message: %s", status, ui.ErrMsg())
 			return false, nil, newIn, cleanup, fmt.Errorf("hash upload failed with status %d: %s", status, ui.ErrMsg())
+
+		case 8: // 状态8：特殊认证状态，但可以继续上传
+			fs.Debugf(o, "Hash upload returned status 8 (special auth), continuing with upload. Message: %s", ui.ErrMsg())
+			// 状态8不是错误，而是表示需要继续上传流程
+			// 返回false表示没有秒传成功，但ui包含了继续上传所需的信息
+			return false, ui, newIn, cleanup, nil
 
 		default: // Unexpected status
 			fs.Errorf(o, "Hash upload failed with unexpected status %d. Message: %s", status, ui.ErrMsg())
@@ -7108,11 +7113,34 @@ func (f *Fs) performOSSPutObject(
 
 	// OSS PutObject configuration ready
 
-	// 超激进优化：OSS上传完全绕过QPS限制，直接上传
-	fs.Debugf(f, "OSS direct upload mode: bypass all QPS limits, maximize upload speed")
-	putRes, err := ossClient.PutObject(ctx, req)
+	// 修复：使用完整的重试机制，确保上传稳定性
+	fs.Debugf(f, "OSS PutObject with retry mechanism")
+	var putRes *oss.PutObjectResult
+	err := f.pacer.Call(func() (bool, error) {
+		var putErr error
+		putRes, putErr = ossClient.PutObject(ctx, req)
+
+		if putErr != nil {
+			retry, retryErr := shouldRetry(ctx, nil, putErr)
+			if retry {
+				// 重置流位置（如果可能）
+				if seeker, ok := in.(io.Seeker); ok {
+					if _, seekErr := seeker.Seek(0, io.SeekStart); seekErr != nil {
+						return false, fmt.Errorf("cannot reset stream for retry: %w", seekErr)
+					}
+				} else {
+					return false, fmt.Errorf("cannot retry with non-seekable stream: %w", putErr)
+				}
+				fs.Debugf(f, "Retrying OSS PutObject: %v", putErr)
+				return true, retryErr
+			}
+			return false, putErr
+		}
+		return false, nil
+	})
+
 	if err != nil {
-		fs.Errorf(f, "OSS PutObject failed: %v", err)
+		fs.Errorf(f, "OSS PutObject failed after retries: %v", err)
 		return nil, fmt.Errorf("OSS PutObject failed: %w", err)
 	}
 
@@ -7816,14 +7844,22 @@ func NewRW() *pool.RW {
 func (w *ossChunkWriter) Upload(ctx context.Context) (err error) {
 	uploadCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	defer atexit.OnError(&err, func() {
-		cancel()
-		fs.Debugf(w.o, "Cancelling chunk upload...")
-		errCancel := w.Abort(ctx)
-		if errCancel != nil {
-			fs.Debugf(w.o, "Failed to cancel chunk upload: %v", errCancel)
+
+	// 修复：确保在任何错误情况下都清理OSS资源
+	defer func() {
+		if err != nil && w.imur != nil {
+			fs.Debugf(w.o, "Upload failed, cleaning up multipart upload: %v", err)
+			// 使用独立的context进行清理，避免被取消的context影响清理操作
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cleanupCancel()
+
+			if abortErr := w.Abort(cleanupCtx); abortErr != nil {
+				fs.Errorf(w.o, "Failed to abort multipart upload: %v", abortErr)
+			} else {
+				fs.Debugf(w.o, "Successfully aborted multipart upload")
+			}
 		}
-	})()
+	}()
 
 	// 初始化上传参数
 	uploadParams := w.initializeUploadParams()
@@ -8146,9 +8182,29 @@ func (w *ossChunkWriter) shouldRetry(ctx context.Context, err error) (bool, erro
 		return true, err
 	}
 
-	// Handle OSS-specific errors
+	// Handle OSS-specific errors with detailed logging
 	if opErr, ok := err.(*oss.OperationError); ok {
-		err = opErr.Unwrap()
+		fs.Debugf(w.o, "OSS operation error: %v", opErr)
+
+		// 检查是否是可重试的错误
+		unwrappedErr := opErr.Unwrap()
+		if fserrors.ShouldRetry(unwrappedErr) {
+			return true, opErr
+		}
+
+		// 对于OSS错误，使用保守策略：大部分网络相关错误都重试
+		errStr := opErr.Error()
+		if strings.Contains(errStr, "timeout") ||
+			strings.Contains(errStr, "connection") ||
+			strings.Contains(errStr, "network") ||
+			strings.Contains(errStr, "503") ||
+			strings.Contains(errStr, "502") ||
+			strings.Contains(errStr, "500") {
+			return true, opErr
+		}
+
+		// 其他错误使用默认逻辑
+		err = unwrappedErr
 	}
 
 	if ossErr, ok := err.(*oss.ServiceError); ok {
@@ -8218,7 +8274,9 @@ func (w *ossChunkWriter) WriteChunk(ctx context.Context, chunkNumber int32, read
 
 	fs.Debugf(w.o, "Uploading chunk %d to OSS: size=%v", ossPartNumber, fs.SizeSuffix(currentChunkSize))
 
-	// Upload part to OSS
+	// Upload part to OSS with detailed error context
+	fs.Debugf(w.o, "Uploading part %d to OSS (size: %v)", ossPartNumber, fs.SizeSuffix(currentChunkSize))
+
 	res, err := w.client.UploadPart(ctx, &oss.UploadPartRequest{
 		Bucket:     oss.Ptr(*w.imur.Bucket),
 		Key:        oss.Ptr(*w.imur.Key),
@@ -8228,6 +8286,8 @@ func (w *ossChunkWriter) WriteChunk(ctx context.Context, chunkNumber int32, read
 	})
 
 	if err != nil {
+		fs.Errorf(w.o, "OSS UploadPart failed: part=%d, size=%v, error=%v",
+			ossPartNumber, fs.SizeSuffix(currentChunkSize), err)
 		return 0, fmt.Errorf("chunk %d upload failed (size: %v): %w", ossPartNumber, fs.SizeSuffix(currentChunkSize), err)
 	}
 
@@ -8283,20 +8343,24 @@ func (w *ossChunkWriter) Close(ctx context.Context) (err error) {
 		CallbackVar: oss.Ptr(w.callbackVar),
 	}
 
-	// 激进性能优化：OSS CompleteMultipartUpload完全绕过QPS限制
-	// OSS完成分片上传直连阿里云，不受115 API QPS限制
-	fs.Debugf(w.o, "OSS completing chunk upload: completely bypassing QPS limits")
+	// 修复：使用完整的重试机制，确保CompleteMultipartUpload稳定性
+	fs.Debugf(w.o, "OSS completing multipart upload with retry mechanism")
 
-	res, err = w.client.CompleteMultipartUpload(ctx, req)
+	err = w.f.pacer.Call(func() (bool, error) {
+		var completeErr error
+		res, completeErr = w.client.CompleteMultipartUpload(ctx, req)
 
-	// 简化重试逻辑：只在网络错误时重试一次
-	if err != nil {
-		shouldRetry, _ := w.shouldRetry(ctx, err)
-		if shouldRetry {
-			fs.Debugf(w.o, "OSS complete chunk upload retry: %v", err)
-			res, err = w.client.CompleteMultipartUpload(ctx, req)
+		if completeErr != nil {
+			retry, retryErr := w.shouldRetry(ctx, completeErr)
+			if retry {
+				fs.Debugf(w.o, "Retrying CompleteMultipartUpload: %v", completeErr)
+				return true, retryErr
+			}
+			return false, completeErr
 		}
-	}
+		return false, nil
+	})
+
 	if err != nil {
 		return fmt.Errorf("failed to complete multipart upload: %w", err)
 	}
