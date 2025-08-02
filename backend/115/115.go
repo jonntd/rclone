@@ -1235,8 +1235,9 @@ const (
 
 	// 115 drive unified QPS configuration - global account level limit
 	// 115 drive specificity: all APIs share the same QPS quota, need unified management to avoid 770004 errors
+	// 修复770004错误：降低QPS到安全水平
 
-	unifiedMinSleep = fs.Duration(300 * time.Millisecond) // ~20 QPS - 激进性能优化
+	unifiedMinSleep = fs.Duration(1000 * time.Millisecond) // ~1 QPS - 保守配置，避免770004错误
 
 	maxSleep      = 2 * time.Second
 	decayConstant = 2 // bigger for slower decay, exponential
@@ -1410,6 +1411,10 @@ type Fs struct {
 	loginMu       sync.Mutex
 	uploadingMu   sync.Mutex
 	isUploading   bool
+
+	// OSS服务状态缓存
+	ossUnavailableMu    sync.Mutex
+	ossUnavailableUntil time.Time
 }
 
 // isAPILimitError 检查错误是否为API限制错误
@@ -6552,7 +6557,14 @@ func (f *Fs) tryHashUpload(
 			}
 			seeker.Seek(0, io.SeekStart) // 重置到文件开头供后续使用
 		} else {
-			fs.Debugf(o, "无法计算PreID：输入流不支持Seek操作")
+			// 输入流不支持Seek，尝试从源文件计算PreID
+			fs.Debugf(o, "输入流不支持Seek操作，尝试从源文件计算PreID")
+			if preIDFromSrc, err := f.calculatePreIDFromSource(ctx, src); err == nil && preIDFromSrc != "" {
+				preID = preIDFromSrc
+				fs.Debugf(o, "从源文件计算PreID成功: %s", preID)
+			} else {
+				fs.Debugf(o, "从源文件计算PreID失败: %v", err)
+			}
 		}
 	}
 
@@ -6651,6 +6663,179 @@ func (f *Fs) tryHashUpload(
 			return false, nil, newIn, cleanup, fmt.Errorf("unexpected hash upload status %d: %s", status, ui.ErrMsg())
 		}
 	}
+}
+
+// calculatePreIDFromSource 从源文件计算PreID（前128KB的SHA1）
+func (f *Fs) calculatePreIDFromSource(ctx context.Context, src fs.ObjectInfo) (string, error) {
+	const preHashSize int64 = 128 * 1024 // 128KB
+
+	// 尝试打开源文件
+	srcObj, ok := src.(fs.Object)
+	if !ok {
+		return "", fmt.Errorf("源对象不支持读取")
+	}
+
+	reader, err := srcObj.Open(ctx)
+	if err != nil {
+		return "", fmt.Errorf("打开源文件失败: %w", err)
+	}
+	defer reader.Close()
+
+	// 读取前128KB数据
+	hashSize := min(src.Size(), preHashSize)
+	preData := make([]byte, hashSize)
+	n, err := io.ReadFull(reader, preData)
+	if err != nil && err != io.ErrUnexpectedEOF {
+		return "", fmt.Errorf("读取前128KB数据失败: %w", err)
+	}
+
+	if n == 0 {
+		return "", fmt.Errorf("无法读取任何数据")
+	}
+
+	// 计算SHA1
+	hasher := sha1.New()
+	hasher.Write(preData[:n])
+	preID := fmt.Sprintf("%x", hasher.Sum(nil))
+
+	fs.Debugf(f, "从源文件计算PreID: %s (前%d字节)", preID, n)
+	return preID, nil
+}
+
+// shouldFallbackToTraditional 检查错误是否应该降级到传统上传
+func (f *Fs) shouldFallbackToTraditional(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// 首先检查115网盘特定的错误码
+	code, _ := f.parse115ErrorCode(err)
+	if code > 0 {
+		return f.should115ErrorFallback(code)
+	}
+
+	// 检查OSS相关错误
+	errStr := err.Error()
+
+	// OSS服务不可用相关错误
+	if strings.Contains(errStr, "OSS service unavailable") ||
+		strings.Contains(errStr, "bucket not found") ||
+		strings.Contains(errStr, "invalid credentials") ||
+		strings.Contains(errStr, "invalid field, OperationInput.Bucket") ||
+		strings.Contains(errStr, "multipart upload not available") {
+		return true
+	}
+
+	// 网络相关错误
+	if strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "timeout") ||
+		strings.Contains(errStr, "network") {
+		return true
+	}
+
+	return false
+}
+
+// parse115ErrorCode 解析115网盘API错误码
+func (f *Fs) parse115ErrorCode(err error) (int, string) {
+	if err == nil {
+		return 0, ""
+	}
+
+	errStr := err.Error()
+
+	// 尝试从错误信息中提取错误码
+	re := regexp.MustCompile(`code[:\s]*(\d+)`)
+	matches := re.FindStringSubmatch(errStr)
+	if len(matches) >= 2 {
+		if code, parseErr := strconv.Atoi(matches[1]); parseErr == nil {
+			return code, errStr
+		}
+	}
+
+	return 0, errStr
+}
+
+// should115ErrorFallback 根据115网盘错误码决定是否应该降级
+func (f *Fs) should115ErrorFallback(code int) bool {
+	switch code {
+	// 认证相关错误 - 允许降级
+	case 700: // 签名认证失败
+		return true
+	case 10009: // 上传频率限制
+		return true
+	case 10002: // SHA1不匹配
+		return true
+
+	// 服务器错误 - 允许降级
+	case 500, 502, 503, 504:
+		return true
+
+	default:
+		return false
+	}
+}
+
+// markOSSUnavailable 标记OSS服务不可用
+func (f *Fs) markOSSUnavailable(duration time.Duration) {
+	f.ossUnavailableMu.Lock()
+	defer f.ossUnavailableMu.Unlock()
+	f.ossUnavailableUntil = time.Now().Add(duration)
+	fs.Debugf(f, "OSS服务标记为不可用，持续时间: %v", duration)
+}
+
+// clearOSSUnavailable 清除OSS不可用状态
+func (f *Fs) clearOSSUnavailable() {
+	f.ossUnavailableMu.Lock()
+	defer f.ossUnavailableMu.Unlock()
+	f.ossUnavailableUntil = time.Time{}
+	fs.Debugf(f, "OSS服务状态已清除，恢复可用")
+}
+
+// isOSSUnavailable 检查OSS服务是否被标记为不可用
+func (f *Fs) isOSSUnavailable() bool {
+	f.ossUnavailableMu.Lock()
+	defer f.ossUnavailableMu.Unlock()
+	return time.Now().Before(f.ossUnavailableUntil)
+}
+
+// ensureOptimalMemoryConfig 确保rclone有足够的内存配置来处理大文件上传
+// VPS友好：尊重用户的内存限制设置
+func (f *Fs) ensureOptimalMemoryConfig(fileSize int64) {
+	ci := fs.GetConfig(context.Background())
+
+	// VPS友好：如果用户已经设置了内存限制，不要强制覆盖
+	currentMaxMemory := int64(ci.BufferSize)
+	if currentMaxMemory > 0 {
+		// 用户已经设置了内存限制，尊重用户的VPS配置
+		fs.Debugf(f, "VPS模式：尊重用户内存限制 %s，文件大小 %s",
+			fs.SizeSuffix(currentMaxMemory), fs.SizeSuffix(fileSize))
+		return
+	}
+
+	// 只有在用户没有设置内存限制时，才进行自动调整
+	var requiredMemory int64
+
+	if fileSize > 0 {
+		// 对于大文件，确保有足够内存处理分片上传
+		chunkSize := int64(f.calculateOptimalChunkSize(fileSize))
+		// 需要至少2个分片的内存：当前分片 + 下一个分片
+		requiredMemory = chunkSize * 2
+
+		// 但不能超过合理的默认值
+		maxDefaultMemory := int64(256 * 1024 * 1024) // 256MB默认上限
+		if requiredMemory > maxDefaultMemory {
+			requiredMemory = maxDefaultMemory
+		}
+	} else {
+		// 未知大小文件，使用保守的默认值
+		requiredMemory = int64(128 * 1024 * 1024) // 128MB
+	}
+
+	// 设置合理的默认内存限制
+	fs.Infof(f, "115网盘自动配置：文件大小 %s，设置内存限制 %s",
+		fs.SizeSuffix(fileSize), fs.SizeSuffix(requiredMemory))
+	ci.BufferSize = fs.SizeSuffix(requiredMemory)
 }
 
 // uploadToOSS performs the actual upload to OSS using multipart via OpenAPI info.
@@ -6760,11 +6945,14 @@ func (f *Fs) getUploadInfo(
 			o.pickCode = ui.GetPickCode()
 			o.hasMetaData = true
 		} else if ui.GetStatus() == 7 || ui.GetStatus() == 8 {
-			// 状态7和8：根据实际测试，这些状态码也表示需要继续上传
-			// 状态7：可能需要二次认证，但可以继续多部分上传
-			// 状态8：未知状态，但从日志看可以继续多部分上传
-			fs.Debugf(o, "Upload init returned status %d for multipart, continuing with upload", ui.GetStatus())
-			// 继续执行多部分上传流程
+			// 状态7和8：检查是否有有效的bucket/object字段
+			fs.Debugf(o, "Upload init returned status %d for multipart, bucket=%q, object=%q", ui.GetStatus(), ui.GetBucket(), ui.GetObject())
+			if ui.GetBucket() == "" || ui.GetObject() == "" {
+				// bucket/object为空，无法进行OSS上传，返回错误让上层降级到传统上传
+				return nil, fmt.Errorf("status %d with empty bucket/object, multipart upload not available", ui.GetStatus())
+			}
+			// 有有效的bucket/object，继续多部分上传流程
+			fs.Debugf(o, "Status %d with valid bucket/object, continuing with multipart upload", ui.GetStatus())
 		} else {
 			return nil, fmt.Errorf("unexpected status from initUpload for multipart: got %d, expected 1, 2, 7, or 8. Message: %s", ui.GetStatus(), ui.ErrMsg())
 		}
@@ -7104,6 +7292,9 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 		return nil, errors.New("upload unsupported for shared filesystem")
 	}
 
+	// 关键修复：在上传开始时检查和优化内存配置
+	f.ensureOptimalMemoryConfig(src.Size())
+
 	// 设置上传标志，防止预热干扰上传
 	f.uploadingMu.Lock()
 	f.isUploading = true
@@ -7276,8 +7467,13 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 			// Use sample upload if within limit or size unknown
 			return f.doSampleUpload(ctx, newIn, o, leaf, dirID, size, options...)
 		}
-		// Size > streamLimit: Use OSS multipart
-		return f.uploadToOSS(ctx, newIn, src, o, leaf, dirID, size, ui, options...) // Pass ui in case init was already done
+		// Size > streamLimit: Try OSS multipart, fallback to sample upload if OSS not available
+		result, err := f.uploadToOSS(ctx, newIn, src, o, leaf, dirID, size, ui, options...)
+		if err != nil && f.shouldFallbackToTraditional(err) {
+			fs.Debugf(o, "OSS multipart failed (%v), falling back to sample upload", err)
+			return f.doSampleUpload(ctx, newIn, o, leaf, dirID, size, options...)
+		}
+		return result, err
 	}
 
 	// 3. UploadHashOnly flag
@@ -7376,8 +7572,13 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 
 	// Check against UploadCutoff to decide multipart (though logic above mostly covers this)
 	if size < 0 || size >= uploadCutoff {
-		// Use OSS multipart upload with standard retry logic
-		return f.uploadToOSS(ctx, newIn, src, o, leaf, dirID, size, ui, options...)
+		// Try OSS multipart upload, fallback to sample upload if OSS not available
+		result, err := f.uploadToOSS(ctx, newIn, src, o, leaf, dirID, size, ui, options...)
+		if err != nil && f.shouldFallbackToTraditional(err) {
+			fs.Debugf(o, "OSS multipart failed (%v), falling back to sample upload", err)
+			return f.doSampleUpload(ctx, newIn, o, leaf, dirID, size, options...)
+		}
+		return result, err
 	}
 
 	// Size is known, >= noHashSize, and < uploadCutoff
@@ -7550,10 +7751,10 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 // 采用单线程顺序上传模式，确保上传稳定性和SHA1验证通过
 
 const (
-	// 内存优化：防止大文件上传卡死
-	// 50MB缓冲区：100MB分片只需2个缓冲区，避免内存竞争
-	bufferSize           = 50 * 1024 * 1024 // 50MB缓冲区，防止内存卡死
-	bufferCacheFlushTime = 5 * time.Second  // 缓冲区清理时间
+	// VPS优化：使用256MB缓冲区，适合小内存环境
+	// 256MB缓冲区：能处理200MB分片，适合大部分文件上传
+	bufferSize           = 256 * 1024 * 1024 // 256MB缓冲区，VPS友好
+	bufferCacheFlushTime = 5 * time.Second   // 缓冲区清理时间
 )
 
 // bufferPool is a global pool of buffers
@@ -7566,9 +7767,41 @@ var (
 func getPool() *pool.Pool {
 	bufferPoolOnce.Do(func() {
 		ci := fs.GetConfig(context.Background())
-		// 内存优化：16个50MB缓冲区，防止大文件上传卡死
-		// 总内存使用：16 × 50MB = 800MB，足够处理多个大分片
-		bufferPool = pool.New(bufferCacheFlushTime, bufferSize, 16, ci.UseMmap) // 16个50MB缓冲区
+
+		// VPS友好：根据用户的--max-buffer-memory设置动态调整
+		maxMemory := int64(ci.BufferSize)
+
+		// 计算合适的缓冲区配置
+		actualBufferSize := int64(bufferSize) // 默认256MB
+		bufferCount := 4                      // 默认4个
+
+		// 如果用户设置了内存限制，智能调整配置
+		if maxMemory > 0 {
+			// 根据用户内存限制调整缓冲区大小和数量
+			if maxMemory <= 64*1024*1024 { // ≤64MB：超低配VPS
+				actualBufferSize = 16 * 1024 * 1024 // 16MB缓冲区
+				bufferCount = 2                     // 2个 = 32MB总内存
+			} else if maxMemory <= 128*1024*1024 { // ≤128MB：低配VPS
+				actualBufferSize = 32 * 1024 * 1024 // 32MB缓冲区
+				bufferCount = 2                     // 2个 = 64MB总内存
+			} else if maxMemory <= 256*1024*1024 { // ≤256MB：中配VPS
+				actualBufferSize = 64 * 1024 * 1024 // 64MB缓冲区
+				bufferCount = 2                     // 2个 = 128MB总内存
+			} else if maxMemory <= 512*1024*1024 { // ≤512MB：高配VPS
+				actualBufferSize = 128 * 1024 * 1024 // 128MB缓冲区
+				bufferCount = 2                      // 2个 = 256MB总内存
+			}
+			// 否则使用默认的256MB × 4个配置
+
+			fs.Infof(nil, "115网盘VPS优化：用户内存限制 %s，使用 %s × %d 缓冲区",
+				fs.SizeSuffix(maxMemory), fs.SizeSuffix(actualBufferSize), bufferCount)
+		}
+
+		// 创建缓冲区池
+		bufferPool = pool.New(bufferCacheFlushTime, int(actualBufferSize), bufferCount, ci.UseMmap)
+		totalMemory := actualBufferSize * int64(bufferCount)
+		fs.Debugf(nil, "115网盘缓冲区池：%s × %d = %s 总内存",
+			fs.SizeSuffix(actualBufferSize), bufferCount, fs.SizeSuffix(totalMemory))
 	})
 	return bufferPool
 }
@@ -7709,7 +7942,9 @@ func (w *ossChunkWriter) uploadSinglePart(ctx context.Context, in io.Reader, acc
 
 	// 读取分片数据
 	chunkStartTime := time.Now()
+	fs.Debugf(w.o, "开始读取分片 %d，目标大小: %s", partNum+1, fs.SizeSuffix(params.chunkSize))
 	n, err := io.CopyN(rw, in, params.chunkSize)
+	fs.Debugf(w.o, "分片 %d 读取完成，实际大小: %s，耗时: %v", partNum+1, fs.SizeSuffix(n), time.Since(chunkStartTime))
 	finished := false
 
 	if err == io.EOF {
