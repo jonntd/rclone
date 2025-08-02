@@ -1241,13 +1241,13 @@ const (
 	maxSleep      = 2 * time.Second
 	decayConstant = 2 // bigger for slower decay, exponential
 
-	maxUploadSize       = 115 * fs.Gibi // 115 GiB from https://proapi.115.com/app/uploadinfo (or OpenAPI equivalent)
-	maxUploadParts      = 10000         // Part number must be an integer between 1 and 10000, inclusive.
-	defaultChunkSize    = 20 * fs.Mebi  // Reference OpenList: set to 20MB, consistent with OpenList
-	minChunkSize        = 100 * fs.Kibi
-	maxChunkSize        = 5 * fs.Gibi      // Max part size for OSS
-	defaultUploadCutoff = 50 * fs.Mebi     // 参考rclone_mod：设置为50MB，与源码保持一致
-	defaultNohashSize   = 100 * fs.Mebi    // Set to 100MB, small files prefer traditional upload
+	maxUploadSize       = 115 * fs.Gibi    // 115 GiB from https://proapi.115.com/app/uploadinfo (or OpenAPI equivalent)
+	maxUploadParts      = 10000            // Part number must be an integer between 1 and 10000, inclusive.
+	defaultChunkSize    = 20 * fs.Mebi     // Reference OpenList: set to 20MB, consistent with OpenList
+	minChunkSize        = 100 * fs.Kibi    // 最小分片大小：100KB
+	maxChunkSize        = 5 * fs.Gibi      // 最大分片大小：5GB（OSS限制）
+	defaultUploadCutoff = 50 * fs.Mebi     // 默认上传切换阈值：50MB
+	defaultNohashSize   = 100 * fs.Mebi    // 无哈希上传阈值：100MB，小文件优先传统上传
 	StreamUploadLimit   = 5 * fs.Gibi      // Max size for sample/streamed upload (traditional)
 	maxUploadCutoff     = 5 * fs.Gibi      // maximum allowed size for singlepart uploads (OSS PutObject limit)
 	tokenRefreshWindow  = 10 * time.Minute // Refresh token 10 minutes before expiry
@@ -2595,7 +2595,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.features = (&fs.Features{
 		DuplicateFiles:          false,
 		CanHaveEmptyDirectories: true,
-		NoMultiThreading:        true, // Keep true as downloads might still use traditional API
+		NoMultiThreading:        true, // 115网盘使用单线程上传
 	}).Fill(ctx, f)
 
 	// Setting appVer (needed for traditional calls)
@@ -4404,8 +4404,8 @@ func (dp *DownloadProgress) GetProgressInfo() (percentage float64, avgSpeed floa
 	return percentage, avgSpeed, peakSpeed, eta, dp.completedChunks, dp.totalChunks, dp.downloadedBytes, dp.totalBytes
 }
 
-// calculateOptimalChunkSize intelligently calculates upload chunk size for 115 drive
-// Use larger chunk sizes to reduce chunk count and improve overall transfer efficiency
+// calculateOptimalChunkSize 智能计算115网盘上传分片大小
+// 基于文件大小选择最优分片策略，提高传输效率
 func (f *Fs) calculateOptimalChunkSize(fileSize int64) fs.SizeSuffix {
 	// Based on 2MB/s target speed optimization: use larger chunks to reduce API call overhead
 	// Larger chunks can better utilize network bandwidth and reduce inter-chunk overhead
@@ -7550,9 +7550,10 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 // 采用单线程顺序上传模式，确保上传稳定性和SHA1验证通过
 
 const (
-	// 优化缓冲区大小，适合单分片上传
-	bufferSize           = 8 * 1024 * 1024 // 8MB缓冲区，适合单分片上传
-	bufferCacheFlushTime = 5 * time.Second // flush the cached buffers after this long
+	// 内存优化：防止大文件上传卡死
+	// 50MB缓冲区：100MB分片只需2个缓冲区，避免内存竞争
+	bufferSize           = 50 * 1024 * 1024 // 50MB缓冲区，防止内存卡死
+	bufferCacheFlushTime = 5 * time.Second  // 缓冲区清理时间
 )
 
 // bufferPool is a global pool of buffers
@@ -7565,8 +7566,9 @@ var (
 func getPool() *pool.Pool {
 	bufferPoolOnce.Do(func() {
 		ci := fs.GetConfig(context.Background())
-		// Initialise the buffer pool when used
-		bufferPool = pool.New(bufferCacheFlushTime, bufferSize, 32, ci.UseMmap) // 32个缓冲区
+		// 内存优化：16个50MB缓冲区，防止大文件上传卡死
+		// 总内存使用：16 × 50MB = 800MB，足够处理多个大分片
+		bufferPool = pool.New(bufferCacheFlushTime, bufferSize, 16, ci.UseMmap) // 16个50MB缓冲区
 	})
 	return bufferPool
 }
@@ -7915,6 +7917,12 @@ func (w *ossChunkWriter) shouldRetry(ctx context.Context, err error) (bool, erro
 	}
 
 	if ossErr, ok := err.(*oss.ServiceError); ok {
+		// 处理PartAlreadyExist错误：分片已存在，不需要重试
+		if ossErr.Code == "PartAlreadyExist" {
+			fs.Debugf(w.o, "分片已存在，跳过重试: %v", err)
+			return false, nil // 不重试，视为成功
+		}
+
 		// Don't retry authentication errors
 		if ossErr.StatusCode == 403 && (ossErr.Code == "InvalidAccessKeyId" || ossErr.Code == "SecurityTokenExpired") {
 			return false, fserrors.FatalError(err)
