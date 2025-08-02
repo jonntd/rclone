@@ -1232,11 +1232,8 @@ const (
 	tradUserAgent      = "Mozilla/5.0 115Browser/27.0.7.5" // Keep for traditional login mimicry?
 	defaultUserAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
 
-	// 115 drive unified QPS configuration - global account level limit
-	// 115 drive specificity: all APIs share the same QPS quota, need unified management to avoid 770004 errors
-	// 修复770004错误：降低QPS到安全水平
-
-	unifiedMinSleep = fs.Duration(300 * time.Millisecond) // ~1 QPS - 保守配置，避免770004错误
+	// 🚦 115网盘统一QPS控制：全局账户级别限制，避免770004错误
+	unifiedMinSleep = fs.Duration(300 * time.Millisecond) // ~3 QPS - 平衡性能与稳定性
 
 	maxSleep      = 2 * time.Second
 	decayConstant = 2 // bigger for slower decay, exponential
@@ -1321,6 +1318,26 @@ func init() {
 			Default:  defaultNohashSize,
 			Advanced: true,
 		}, {
+			Name: "upload_cutoff",
+			Help: `切换到分片上传的文件大小阈值。
+
+大于此大小的文件将使用分片上传。小于此大小的文件将使用OSS PutObject单文件上传。
+
+最小值为0，最大值为5 GiB。`,
+			Default:  defaultUploadCutoff,
+			Advanced: true,
+		}, {
+			Name: "chunk_size",
+			Help: `分片上传时的分片大小。
+
+当上传大于upload_cutoff的文件或未知大小的文件时，将使用此分片大小进行分片上传。
+
+注意：每个传输会在内存中缓冲此大小的数据块。
+
+最小值为100 KiB，最大值为5 GiB。`,
+			Default:  defaultChunkSize,
+			Advanced: true,
+		}, {
 			Name:     "max_upload_parts",
 			Help:     `分片上传中的最大分片数量。`,
 			Default:  maxUploadParts,
@@ -1370,6 +1387,8 @@ type Options struct {
 	OnlyStream          bool          `config:"only_stream"`
 	FastUpload          bool          `config:"fast_upload"`
 	NohashSize          fs.SizeSuffix `config:"nohash_size"`
+	UploadCutoff        fs.SizeSuffix `config:"upload_cutoff"`
+	ChunkSize           fs.SizeSuffix `config:"chunk_size"`
 	MaxUploadParts      int           `config:"max_upload_parts"`
 
 	Internal  bool                 `config:"internal"`
@@ -3749,13 +3768,17 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 	}
 	// Return hash immediately if known, otherwise read metadata
 	if o.hasMetaData || o.sha1sum != "" {
-		return o.sha1sum, nil
+		// 关键修复：rclone期望小写哈希值，但115网盘内部使用大写
+		// 对外返回小写，对内保持大写用于API调用
+		return strings.ToLower(o.sha1sum), nil
 	}
 	err := o.readMetaData(ctx)
 	if err != nil {
 		return "", fmt.Errorf("failed to read metadata for Hash: %w", err)
 	}
-	return o.sha1sum, nil
+	// 关键修复：rclone期望小写哈希值，但115网盘内部使用大写
+	// 对外返回小写，对内保持大写用于API调用
+	return strings.ToLower(o.sha1sum), nil
 }
 
 // ID returns the ID of the Object
@@ -4411,6 +4434,15 @@ func (dp *DownloadProgress) GetProgressInfo() (percentage float64, avgSpeed floa
 // calculateOptimalChunkSize 智能计算115网盘上传分片大小
 // 基于文件大小选择最优分片策略，提高传输效率
 func (f *Fs) calculateOptimalChunkSize(fileSize int64) fs.SizeSuffix {
+	// 如果用户配置了chunk_size，优先使用用户配置
+	userChunkSize := int64(f.opt.ChunkSize)
+	if userChunkSize > 0 {
+		// 用户明确配置了分片大小，直接使用
+		fs.Debugf(f, "使用用户配置的分片大小: %s", fs.SizeSuffix(userChunkSize))
+		return fs.SizeSuffix(f.normalizeChunkSize(userChunkSize))
+	}
+
+	// 用户未配置，使用智能分片策略
 	// Based on 2MB/s target speed optimization: use larger chunks to reduce API call overhead
 	// Larger chunks can better utilize network bandwidth and reduce inter-chunk overhead
 	var partSize int64
@@ -4432,6 +4464,7 @@ func (f *Fs) calculateOptimalChunkSize(fileSize int64) fs.SizeSuffix {
 		partSize = 2 * 1024 * 1024 * 1024 // 2GB分片
 	}
 
+	fs.Debugf(f, "智能分片策略: 文件大小 %s -> 分片大小 %s", fs.SizeSuffix(fileSize), fs.SizeSuffix(partSize))
 	return fs.SizeSuffix(f.normalizeChunkSize(partSize))
 }
 
@@ -6258,7 +6291,8 @@ func calcBlockSHA1(ctx context.Context, in io.Reader, src fs.ObjectInfo, rangeSp
 	if err != nil {
 		return "", fmt.Errorf("failed to calculate SHA1 for range %q: %w", rangeSpec, err)
 	}
-	sha1Hash := fmt.Sprintf("%x", hasher.Sum(nil))
+	// 关键修复：sign_val需要大写SHA1，根据115网盘官方API文档要求
+	sha1Hash := fmt.Sprintf("%X", hasher.Sum(nil))
 	return sha1Hash, nil
 }
 
@@ -6471,7 +6505,7 @@ func (f *Fs) tryHashUpload(
 		}
 	}()
 
-	fs.Debugf(o, "Attempting hash upload (秒传) via OpenAPI...")
+	fs.Infof(o, "⚡ 尝试秒传 (文件已存在则跳过上传)...")
 
 	// 1. Get SHA1 hash
 	hashStr, err := src.Hash(ctx, hash.SHA1)
@@ -6531,7 +6565,8 @@ func (f *Fs) tryHashUpload(
 			}
 		}
 	}
-	o.sha1sum = strings.ToLower(hashStr) // Store hash in object
+	// 关键修复：115网盘使用大写SHA1，保持一致性以支持秒传功能
+	o.sha1sum = strings.ToUpper(hashStr) // Store hash in object (uppercase for 115 API consistency)
 
 	// 2. Calculate PreID (128KB SHA1) as required by 115网盘官方API
 	var preID string
@@ -6551,7 +6586,8 @@ func (f *Fs) tryHashUpload(
 			} else if n > 0 {
 				hasher := sha1.New()
 				hasher.Write(preData[:n])
-				preID = fmt.Sprintf("%x", hasher.Sum(nil))
+				// 关键修复：PreID也需要大写格式，与115网盘API保持一致
+				preID = fmt.Sprintf("%X", hasher.Sum(nil))
 				fs.Debugf(o, "计算PreID成功: %s (前%d字节)", preID, n)
 			}
 			seeker.Seek(0, io.SeekStart) // 重置到文件开头供后续使用
@@ -6579,8 +6615,8 @@ func (f *Fs) tryHashUpload(
 		status := ui.GetStatus()
 		switch status {
 		case 2: // 秒传 success!
-			fs.Infof(o, "Instant upload successful! File already exists on server, no need to re-upload")
-			fs.Debugf(o, "Hash upload (秒传) successful.")
+			fs.Infof(o, "🎉 秒传成功！文件已存在服务器，无需重复上传")
+			fs.Debugf(o, "✅ 秒传完成")
 			// Mark accounting as server-side copy
 			reader, _ := accounting.UnWrap(newIn)
 			if acc, ok := reader.(*accounting.Account); ok && acc != nil {
@@ -6604,7 +6640,7 @@ func (f *Fs) tryHashUpload(
 			return true, ui, newIn, cleanup, nil // Found = true
 
 		case 1: // Non-秒传, need actual upload
-			fs.Debugf(o, "Hash upload (秒传) not available (status 1). Proceeding with normal upload.")
+			fs.Infof(o, "📤 秒传不可用，开始正常上传")
 			return false, ui, newIn, cleanup, nil // Found = false
 
 		case 7: // Need secondary auth (sign_check)
@@ -6701,7 +6737,8 @@ func (f *Fs) calculatePreIDFromSource(ctx context.Context, src fs.ObjectInfo) (s
 	// 计算SHA1
 	hasher := sha1.New()
 	hasher.Write(preData[:n])
-	preID := fmt.Sprintf("%x", hasher.Sum(nil))
+	// 关键修复：PreID需要大写格式，与115网盘API保持一致
+	preID := fmt.Sprintf("%X", hasher.Sum(nil))
 
 	fs.Debugf(f, "从源文件计算PreID: %s (前%d字节)", preID, n)
 	return preID, nil
@@ -6857,7 +6894,7 @@ func (f *Fs) uploadToOSS(
 	fs.Debugf(o, "Starting OSS multipart upload...")
 
 	// Initialize upload and get upload info if not provided
-	uploadInfo, err := f.getUploadInfo(ctx, ui, leaf, dirID, size, o)
+	uploadInfo, err := f.getUploadInfo(ctx, ui, leaf, dirID, size, o, in, src)
 	if err != nil {
 		return nil, err
 	}
@@ -6907,6 +6944,8 @@ func (f *Fs) getUploadInfo(
 	leaf, dirID string,
 	size int64,
 	o *Object,
+	in io.Reader,
+	src fs.ObjectInfo,
 ) (*UploadInitInfo, error) {
 	// If upload info is already provided, use it
 	if ui != nil {
@@ -6942,28 +6981,65 @@ func (f *Fs) getUploadInfo(
 		return nil, fmt.Errorf("initUploadOpenAPI returned nil UploadInitInfo")
 	}
 
-	// Handle unexpected status
-	if ui.GetStatus() != 1 {
-		if ui.GetStatus() == 2 { // Instant upload success (秒传)
-			fs.Logf(o, "Warning: initUpload without hash resulted in 秒传 (status 2), handling...")
+	// Handle response status with authentication loop
+	signKey, signVal := "", ""
+	for {
+		status := ui.GetStatus()
+		switch status {
+		case 2: // 秒传 success!
+			fs.Infof(o, "🎉 Multipart upload: 秒传成功！文件已存在服务器")
 			o.id = ui.GetFileID()
 			o.pickCode = ui.GetPickCode()
 			o.hasMetaData = true
-		} else if ui.GetStatus() == 7 || ui.GetStatus() == 8 {
-			// 状态7和8：检查是否有有效的bucket/object字段
-			fs.Debugf(o, "Upload init returned status %d for multipart, bucket=%q, object=%q", ui.GetStatus(), ui.GetBucket(), ui.GetObject())
+			return ui, nil
+
+		case 1: // Non-秒传, need actual upload
+			fs.Debugf(o, "📤 Multipart upload: 秒传不可用，继续OSS上传")
+			// Check if we have valid OSS credentials
 			if ui.GetBucket() == "" || ui.GetObject() == "" {
-				// bucket/object为空，无法进行OSS上传，返回错误让上层降级到传统上传
-				return nil, fmt.Errorf("status %d with empty bucket/object, multipart upload not available", ui.GetStatus())
+				return nil, fmt.Errorf("status 1 with empty bucket/object, multipart upload not available")
 			}
-			// 有有效的bucket/object，继续多部分上传流程
-			fs.Debugf(o, "Status %d with valid bucket/object, continuing with multipart upload", ui.GetStatus())
-		} else {
-			return nil, fmt.Errorf("unexpected status from initUpload for multipart: got %d, expected 1, 2, 7, or 8. Message: %s", ui.GetStatus(), ui.ErrMsg())
+			return ui, nil
+
+		case 7: // Need secondary auth (sign_check)
+			fs.Debugf(o, "Multipart upload requires secondary auth (status 7). Calculating range SHA1...")
+			signKey = ui.GetSignKey()
+			signCheckRange := ui.GetSignCheck()
+			if signKey == "" || signCheckRange == "" {
+				return nil, errors.New("multipart upload status 7 but sign_key or sign_check missing")
+			}
+			// Calculate SHA1 for the specified range
+			var err error
+			signVal, err = calcBlockSHA1(ctx, in, src, signCheckRange)
+			if err != nil {
+				return nil, fmt.Errorf("failed to calculate SHA1 for range %q: %w", signCheckRange, err)
+			}
+			fs.Debugf(o, "Calculated range SHA1: %s for range %s", signVal, signCheckRange)
+
+			// Retry initUpload with sign_key and sign_val
+			ui, err = f.initUploadOpenAPI(ctx, size, leaf, dirID, sha1sum, "", "", signKey, signVal)
+			if err != nil {
+				return nil, fmt.Errorf("multipart upload retry with signature failed: %w", err)
+			}
+			continue // Re-evaluate the new status
+
+		case 8: // 状态8：特殊认证状态，但可以继续上传
+			fs.Debugf(o, "Multipart upload returned status 8 (special auth), checking OSS credentials")
+			// Check if we have valid OSS credentials
+			if ui.GetBucket() == "" || ui.GetObject() == "" {
+				return nil, fmt.Errorf("status 8 with empty bucket/object, multipart upload not available")
+			}
+			return ui, nil
+
+		case 6: // Auth-related status, treat as failure
+			fs.Errorf(o, "Multipart upload failed with auth status %d. Message: %s", status, ui.ErrMsg())
+			return nil, fmt.Errorf("multipart upload failed with status %d: %s", status, ui.ErrMsg())
+
+		default: // Unexpected status
+			fs.Errorf(o, "Multipart upload failed with unexpected status %d. Message: %s", status, ui.ErrMsg())
+			return nil, fmt.Errorf("unexpected multipart upload status %d: %s", status, ui.ErrMsg())
 		}
 	}
-
-	return ui, nil
 }
 
 // performTraditionalUpload handles upload when OSS is not available (status 7/8 with empty bucket/object)
@@ -6997,9 +7073,8 @@ func (f *Fs) performOSSUpload(
 	ui *UploadInitInfo,
 	options ...fs.OpenOption,
 ) (*CallbackData, error) {
-	// 参考阿里云OSS UploadFile示例：智能选择上传策略
-	// 使用rclone全局配置的多线程切换阈值
-	uploadCutoff := int64(fs.GetConfig(context.Background()).MultiThreadCutoff)
+	// 🎯 智能选择上传策略：使用用户配置的切换阈值
+	uploadCutoff := int64(f.opt.UploadCutoff) // 用户配置的上传切换阈值
 
 	// 修复：使用统一的分片大小计算函数，确保与分片上传一致
 	optimalPartSize := int64(f.calculateOptimalChunkSize(size))
@@ -7049,8 +7124,8 @@ func (f *Fs) performOSSUpload(
 	}
 
 	if size >= 0 && size < uploadCutoff {
-		// Small file: use OSS PutObject (single file upload)
-		fs.Debugf(o, "115 OSS single file upload: %s (%s)", leaf, fs.SizeSuffix(size))
+		// 📤 小文件OSS单文件上传策略
+		fs.Infof(o, "📤 115网盘OSS单文件上传: %s (%s)", leaf, fs.SizeSuffix(size))
 		return f.performOSSPutObject(ctx, ossClient, in, src, o, leaf, dirID, size, ui, uploaderConfig, options...)
 	} else {
 		// Large file: use OSS multipart upload
@@ -7111,10 +7186,8 @@ func (f *Fs) performOSSPutObject(
 		}
 	}
 
-	// OSS PutObject configuration ready
-
-	// 修复：使用完整的重试机制，确保上传稳定性
-	fs.Debugf(f, "OSS PutObject with retry mechanism")
+	// 🚀 OSS单文件上传：使用完整重试机制确保稳定性
+	fs.Debugf(f, "🚀 OSS单文件上传开始: bucket=%q, object=%q", ui.GetBucket(), ui.GetObject())
 	var putRes *oss.PutObjectResult
 	err := f.pacer.Call(func() (bool, error) {
 		var putErr error
@@ -7123,15 +7196,15 @@ func (f *Fs) performOSSPutObject(
 		if putErr != nil {
 			retry, retryErr := shouldRetry(ctx, nil, putErr)
 			if retry {
-				// 重置流位置（如果可能）
+				// 🔄 重置流位置准备重试
 				if seeker, ok := in.(io.Seeker); ok {
 					if _, seekErr := seeker.Seek(0, io.SeekStart); seekErr != nil {
-						return false, fmt.Errorf("cannot reset stream for retry: %w", seekErr)
+						return false, fmt.Errorf("🚫 无法重置流进行重试: %w", seekErr)
 					}
 				} else {
-					return false, fmt.Errorf("cannot retry with non-seekable stream: %w", putErr)
+					return false, fmt.Errorf("🚫 不可重置流无法重试: %w", putErr)
 				}
-				fs.Debugf(f, "Retrying OSS PutObject: %v", putErr)
+				fs.Debugf(f, "🔄 OSS单文件上传重试: %v", putErr)
 				return true, retryErr
 			}
 			return false, putErr
@@ -7140,8 +7213,8 @@ func (f *Fs) performOSSPutObject(
 	})
 
 	if err != nil {
-		fs.Errorf(f, "OSS PutObject failed after retries: %v", err)
-		return nil, fmt.Errorf("OSS PutObject failed: %w", err)
+		fs.Errorf(f, "❌ OSS单文件上传失败: %v", err)
+		return nil, fmt.Errorf("❌ OSS单文件上传失败: %w", err)
 	}
 
 	// Process callback
@@ -7392,13 +7465,13 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 	}()
 
 	skipHashUpload := false
-	// 跨云盘传输检测：优先尝试秒传，忽略大小限制
+	// 🌐 跨云盘传输检测：优先尝试秒传，忽略大小限制
 	if f.isRemoteSource(src) && size >= 0 {
-		fs.Infof(o, "Detected cross-cloud transfer, forcing instant upload attempt...")
+		fs.Infof(o, "🌐 检测到跨云盘传输，强制尝试秒传...")
 		gotIt, _, newIn, localCleanup, err := f.tryHashUpload(ctx, in, src, o, leaf, dirID, size, options...)
 		cleanup = localCleanup // 设置清理函数
 		if err != nil {
-			fs.Logf(o, "跨云盘秒传尝试失败，回退到正常上传: %v", err)
+			fs.Logf(o, "🌐 跨云盘秒传失败，回退到正常上传: %v", err)
 			// Set flag to skip subsequent instant upload attempts
 			skipHashUpload = true
 			// Reset state, continue normal upload process
@@ -7526,9 +7599,8 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 
 	// Cross-cloud transfer check is already handled above
 
-	// 4. Default (Normal) Logic - 优先使用OSS上传策略
-	// 使用rclone全局配置的多线程切换阈值
-	uploadCutoff := int64(fs.GetConfig(context.Background()).MultiThreadCutoff)
+	// 🎯 默认上传策略：优先使用OSS上传，智能选择单文件或分片
+	uploadCutoff := int64(f.opt.UploadCutoff) // 用户配置的OSS优化阈值
 
 	// For very small files (<1MB), use traditional upload for efficiency
 	if size >= 0 && size < int64(1*fs.Mebi) {
@@ -7646,27 +7718,153 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 		if initErr != nil {
 			return nil, fmt.Errorf("failed to initialize PutObject upload: %w", initErr)
 		}
-		if ui.GetStatus() != 1 { // Should be 1 if hash upload failed/skipped
-			if ui.GetStatus() == 2 { // Unexpected 秒传
-				fs.Logf(o, "Warning: initUpload for PutObject resulted in 秒传 (status 2), handling...")
+		// 🔍 检查上传初始化状态和OSS信息
+		if ui.GetStatus() == 1 {
+			// 状态1：需要上传，检查OSS信息是否完整
+			if ui.GetBucket() == "" || ui.GetObject() == "" {
+				fs.Debugf(o, "🔧 状态1但OSS信息缺失 (bucket=%q, object=%q)，降级到传统上传",
+					ui.GetBucket(), ui.GetObject())
+				return f.performTraditionalUpload(ctx, in, src, o, leaf, dirID, size, ui, options...)
+			}
+			fs.Debugf(o, "✅ 状态1且OSS信息完整，继续OSS上传: bucket=%q, object=%q",
+				ui.GetBucket(), ui.GetObject())
+		} else if ui.GetStatus() == 2 {
+			// 状态2：意外的秒传成功
+			fs.Infof(o, "🎉 初始化时发现文件已存在，秒传成功")
+			o.id = ui.GetFileID()
+			o.pickCode = ui.GetPickCode()
+			o.hasMetaData = true
+			return o, nil
+		} else if ui.GetStatus() == 7 {
+			// 状态7：需要二次认证
+			fs.Debugf(o, "OSS PutObject requires secondary auth (status 7). Calculating range SHA1...")
+			signKey := ui.GetSignKey()
+			signCheckRange := ui.GetSignCheck()
+			if signKey == "" || signCheckRange == "" {
+				return nil, errors.New("OSS PutObject status 7 but sign_key or sign_check missing")
+			}
+
+			// 关键修复：创建可重读的对象来计算range SHA1，避免消耗原始流
+			var rereadableObj *RereadableObject
+			var signVal string
+
+			if ro, ok := in.(*RereadableObject); ok {
+				// 已经是RereadableObject，直接使用
+				rereadableObj = ro
+			} else {
+				// 创建新的RereadableObject
+				var roErr error
+				rereadableObj, roErr = NewRereadableObject(ctx, src, options...)
+				if roErr != nil {
+					return nil, fmt.Errorf("failed to create rereadable object for range SHA1: %w", roErr)
+				}
+				defer func() { _ = rereadableObj.Close() }()
+			}
+
+			// Calculate SHA1 for the specified range using rereadable object
+			signVal, err = calcBlockSHA1(ctx, rereadableObj, src, signCheckRange)
+			if err != nil {
+				return nil, fmt.Errorf("failed to calculate SHA1 for range %q: %w", signCheckRange, err)
+			}
+			fs.Debugf(o, "Calculated range SHA1: %s for range %s", signVal, signCheckRange)
+
+			// Retry initUpload with sign_key and sign_val
+			ui, err = f.initUploadOpenAPI(ctx, size, leaf, dirID, sha1sum, "", "", signKey, signVal)
+			if err != nil {
+				return nil, fmt.Errorf("OSS PutObject retry with signature failed: %w", err)
+			}
+			// Re-check the new status
+			if ui.GetStatus() == 2 {
+				// 意外触发秒传
+				fs.Infof(o, "🎉 二次认证后触发秒传成功")
 				o.id = ui.GetFileID()
 				o.pickCode = ui.GetPickCode()
 				o.hasMetaData = true
 				return o, nil
-			} else if ui.GetStatus() == 7 || ui.GetStatus() == 8 {
-				// 状态7和8：这些状态码表示需要使用传统表单上传，而不是OSS上传
-				// 因为115网盘在这些状态下不提供bucket和object字段
-				fs.Debugf(o, "Upload init returned status %d, bucket=%q, object=%q", ui.GetStatus(), ui.GetBucket(), ui.GetObject())
-				if ui.GetBucket() == "" || ui.GetObject() == "" {
-					fs.Debugf(o, "Status %d with empty bucket/object, falling back to traditional form upload", ui.GetStatus())
-					// 使用传统的表单上传
-					return f.performTraditionalUpload(ctx, in, src, o, leaf, dirID, size, ui, options...)
-				}
-				// 如果有bucket和object，继续OSS上传
-				fs.Debugf(o, "Status %d with valid bucket/object, continuing with OSS upload", ui.GetStatus())
-			} else {
-				return nil, fmt.Errorf("unexpected status from initUpload for PutObject: got %d, expected 1, 2, 7, or 8. Message: %s", ui.GetStatus(), ui.ErrMsg())
+			} else if ui.GetStatus() != 1 && ui.GetStatus() != 8 {
+				return nil, fmt.Errorf("OSS PutObject auth retry failed with status %d: %s", ui.GetStatus(), ui.ErrMsg())
 			}
+			fs.Debugf(o, "✅ 二次认证成功，状态%d，继续OSS上传", ui.GetStatus())
+		} else if ui.GetStatus() == 8 {
+			// 状态8：特殊认证状态，检查OSS信息
+			fs.Debugf(o, "🔄 状态8，检查OSS信息: bucket=%q, object=%q",
+				ui.GetBucket(), ui.GetObject())
+			if ui.GetBucket() == "" || ui.GetObject() == "" {
+				fs.Debugf(o, "🔄 状态8且OSS信息缺失，降级到传统上传")
+				return f.performTraditionalUpload(ctx, in, src, o, leaf, dirID, size, ui, options...)
+			}
+			fs.Debugf(o, "✅ 状态8且OSS信息完整，继续OSS上传")
+		} else {
+			return nil, fmt.Errorf("❌ OSS上传初始化状态异常: 状态=%d, 消息=%s",
+				ui.GetStatus(), ui.ErrMsg())
+		}
+	}
+
+	// 🎯 智能OSS策略：优先尝试获取OSS信息，必要时降级
+	if ui.GetBucket() == "" || ui.GetObject() == "" {
+		fs.Infof(o, "🔧 OSS信息缺失 (bucket=%q, object=%q, status=%d)，尝试获取完整OSS信息",
+			ui.GetBucket(), ui.GetObject(), ui.GetStatus())
+
+		// 对于状态7/8，先尝试获取OSS信息，失败后再降级
+		if ui.GetStatus() == 7 || ui.GetStatus() == 8 {
+			fs.Debugf(o, "🔍 状态%d通常无OSS信息，但仍尝试获取", ui.GetStatus())
+		}
+
+		// 🎯 策略1：尝试无SHA1初始化，强制获取OSS信息
+		fs.Debugf(o, "🎯 策略1：无SHA1初始化，强制获取OSS信息")
+		newUI, initErr := f.initUploadOpenAPI(ctx, size, leaf, dirID, "", "", "", "", "")
+		if initErr != nil {
+			fs.Debugf(o, "🎯 策略1失败: %v", initErr)
+
+			// 🎯 策略2：尝试使用正确SHA1重新初始化
+			var correctSHA1 string
+			if o.sha1sum != "" {
+				correctSHA1 = o.sha1sum
+			} else if hash, hashErr := src.Hash(ctx, hash.SHA1); hashErr == nil && hash != "" {
+				correctSHA1 = strings.ToUpper(hash)
+			}
+
+			if correctSHA1 != "" {
+				fs.Debugf(o, "🎯 策略2：使用正确SHA1重新初始化: %s", correctSHA1)
+				newUI, initErr = f.initUploadOpenAPI(ctx, size, leaf, dirID, correctSHA1, "", "", "", "")
+			}
+
+			if initErr != nil {
+				fs.Infof(o, "📋 无法获取OSS信息，使用传统上传: %v", initErr)
+				return f.performTraditionalUpload(ctx, in, src, o, leaf, dirID, size, ui, options...)
+			}
+		}
+
+		// 🔍 详细检查获取结果
+		fs.Infof(o, "🔍 详细API响应分析:")
+		fs.Infof(o, "   状态码: %d", newUI.GetStatus())
+		fs.Infof(o, "   Bucket: %q", newUI.GetBucket())
+		fs.Infof(o, "   Object: %q", newUI.GetObject())
+		fs.Infof(o, "   FileID: %q", newUI.GetFileID())
+		fs.Infof(o, "   PickCode: %q", newUI.GetPickCode())
+		fs.Infof(o, "   Callback: %q", newUI.GetCallback())
+		fs.Infof(o, "   CallbackVar: %q", newUI.GetCallbackVar())
+		fs.Infof(o, "   SignKey: %q", newUI.GetSignKey())
+		fs.Infof(o, "   SignCheck: %q", newUI.GetSignCheck())
+		fs.Infof(o, "   错误信息: %q", newUI.ErrMsg())
+
+		if newUI.GetStatus() == 2 {
+			// 意外触发秒传
+			fs.Infof(o, "🎉 获取OSS信息时触发秒传成功")
+			o.id = newUI.GetFileID()
+			o.pickCode = newUI.GetPickCode()
+			o.hasMetaData = true
+			return o, nil
+		} else if newUI.GetBucket() != "" && newUI.GetObject() != "" {
+			// 成功获取OSS信息
+			fs.Infof(o, "✅ OSS信息获取成功: bucket=%q, object=%q",
+				newUI.GetBucket(), newUI.GetObject())
+			ui = newUI // 使用新的UI信息
+		} else {
+			// 仍然无法获取OSS信息，降级到传统上传
+			fs.Infof(o, "📋 115网盘此文件不支持OSS上传 (状态%d)，使用传统上传",
+				newUI.GetStatus())
+			return f.performTraditionalUpload(ctx, in, src, o, leaf, dirID, size, ui, options...)
 		}
 	}
 
@@ -7718,8 +7916,9 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 		}
 	}
 
-	// 开始OSS单文件上传
-	fs.Infof(o, "115 starting OSS single file upload: %s (%s)", leaf, fs.SizeSuffix(size))
+	// 🚀 开始OSS单文件上传
+	fs.Infof(o, "🚀 115网盘OSS单文件上传: %s (%s), bucket=%q, object=%q",
+		leaf, fs.SizeSuffix(size), ui.GetBucket(), ui.GetObject())
 
 	// 平衡性能优化：使用OSS专用调速器，避免过度请求导致限制
 	// OSS上传虽然直连阿里云，但仍需要合理的QPS控制避免触发反制措施
@@ -7779,8 +7978,7 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 // 采用单线程顺序上传模式，确保上传稳定性和SHA1验证通过
 
 const (
-	// VPS优化：使用256MB缓冲区，适合小内存环境
-	// 256MB缓冲区：能处理200MB分片，适合大部分文件上传
+	// 💾 VPS优化缓冲区配置：256MB缓冲区，适合小内存环境
 	bufferSize           = 256 * 1024 * 1024 // 256MB缓冲区，VPS友好
 	bufferCacheFlushTime = 5 * time.Second   // 缓冲区清理时间
 )
@@ -7845,18 +8043,18 @@ func (w *ossChunkWriter) Upload(ctx context.Context) (err error) {
 	uploadCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// 修复：确保在任何错误情况下都清理OSS资源
+	// 🧹 确保失败时清理OSS资源
 	defer func() {
 		if err != nil && w.imur != nil {
-			fs.Debugf(w.o, "Upload failed, cleaning up multipart upload: %v", err)
-			// 使用独立的context进行清理，避免被取消的context影响清理操作
+			fs.Debugf(w.o, "🧹 上传失败，清理OSS分片上传: %v", err)
+			// 🔒 使用独立context进行清理，避免被取消的context影响清理操作
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cleanupCancel()
 
 			if abortErr := w.Abort(cleanupCtx); abortErr != nil {
-				fs.Errorf(w.o, "Failed to abort multipart upload: %v", abortErr)
+				fs.Errorf(w.o, "❌ 清理OSS分片上传失败: %v", abortErr)
 			} else {
-				fs.Debugf(w.o, "Successfully aborted multipart upload")
+				fs.Debugf(w.o, "✅ OSS分片上传清理成功")
 			}
 		}
 	}()
@@ -8182,17 +8380,17 @@ func (w *ossChunkWriter) shouldRetry(ctx context.Context, err error) (bool, erro
 		return true, err
 	}
 
-	// Handle OSS-specific errors with detailed logging
+	// 🔍 OSS错误详细分析和处理
 	if opErr, ok := err.(*oss.OperationError); ok {
-		fs.Debugf(w.o, "OSS operation error: %v", opErr)
+		fs.Debugf(w.o, "🔍 OSS操作错误: %v", opErr)
 
-		// 检查是否是可重试的错误
+		// ✅ 检查是否是可重试的错误
 		unwrappedErr := opErr.Unwrap()
 		if fserrors.ShouldRetry(unwrappedErr) {
 			return true, opErr
 		}
 
-		// 对于OSS错误，使用保守策略：大部分网络相关错误都重试
+		// 🛡️ OSS网络错误保守重试策略
 		errStr := opErr.Error()
 		if strings.Contains(errStr, "timeout") ||
 			strings.Contains(errStr, "connection") ||
@@ -8203,7 +8401,7 @@ func (w *ossChunkWriter) shouldRetry(ctx context.Context, err error) (bool, erro
 			return true, opErr
 		}
 
-		// 其他错误使用默认逻辑
+		// 🔄 其他错误使用默认逻辑
 		err = unwrappedErr
 	}
 
@@ -8274,8 +8472,8 @@ func (w *ossChunkWriter) WriteChunk(ctx context.Context, chunkNumber int32, read
 
 	fs.Debugf(w.o, "Uploading chunk %d to OSS: size=%v", ossPartNumber, fs.SizeSuffix(currentChunkSize))
 
-	// Upload part to OSS with detailed error context
-	fs.Debugf(w.o, "Uploading part %d to OSS (size: %v)", ossPartNumber, fs.SizeSuffix(currentChunkSize))
+	// 📤 OSS分片上传
+	fs.Debugf(w.o, "📤 上传分片 %d (大小: %v)", ossPartNumber, fs.SizeSuffix(currentChunkSize))
 
 	res, err := w.client.UploadPart(ctx, &oss.UploadPartRequest{
 		Bucket:     oss.Ptr(*w.imur.Bucket),
@@ -8286,9 +8484,9 @@ func (w *ossChunkWriter) WriteChunk(ctx context.Context, chunkNumber int32, read
 	})
 
 	if err != nil {
-		fs.Errorf(w.o, "OSS UploadPart failed: part=%d, size=%v, error=%v",
+		fs.Errorf(w.o, "❌ OSS分片上传失败: 分片=%d, 大小=%v, 错误=%v",
 			ossPartNumber, fs.SizeSuffix(currentChunkSize), err)
-		return 0, fmt.Errorf("chunk %d upload failed (size: %v): %w", ossPartNumber, fs.SizeSuffix(currentChunkSize), err)
+		return 0, fmt.Errorf("❌ 分片 %d 上传失败 (大小: %v): %w", ossPartNumber, fs.SizeSuffix(currentChunkSize), err)
 	}
 
 	// Record completed part
@@ -8343,8 +8541,8 @@ func (w *ossChunkWriter) Close(ctx context.Context) (err error) {
 		CallbackVar: oss.Ptr(w.callbackVar),
 	}
 
-	// 修复：使用完整的重试机制，确保CompleteMultipartUpload稳定性
-	fs.Debugf(w.o, "OSS completing multipart upload with retry mechanism")
+	// 🎯 OSS分片上传完成：使用完整重试机制确保稳定性
+	fs.Debugf(w.o, "🎯 OSS分片上传完成中")
 
 	err = w.f.pacer.Call(func() (bool, error) {
 		var completeErr error
@@ -8353,7 +8551,7 @@ func (w *ossChunkWriter) Close(ctx context.Context) (err error) {
 		if completeErr != nil {
 			retry, retryErr := w.shouldRetry(ctx, completeErr)
 			if retry {
-				fs.Debugf(w.o, "Retrying CompleteMultipartUpload: %v", completeErr)
+				fs.Debugf(w.o, "🔄 OSS分片上传完成重试: %v", completeErr)
 				return true, retryErr
 			}
 			return false, completeErr
@@ -8362,7 +8560,7 @@ func (w *ossChunkWriter) Close(ctx context.Context) (err error) {
 	})
 
 	if err != nil {
-		return fmt.Errorf("failed to complete multipart upload: %w", err)
+		return fmt.Errorf("❌ OSS分片上传完成失败: %w", err)
 	}
 
 	w.callbackRes = res.CallbackResult
