@@ -898,7 +898,8 @@ func (f *Fs) pathToFileID(ctx context.Context, filePath string) (string, error) 
 				break
 			}
 			for _, item := range infoList {
-				if item.Filename == part {
+				// 只处理有效文件（不在回收站且未被审核驳回）
+				if item.Trashed == 0 && item.Status < 100 && item.Filename == part {
 					currentID = strconv.FormatInt(item.FileID, 10)
 					findPart = true
 
@@ -914,6 +915,8 @@ func (f *Fs) pathToFileID(ctx context.Context, filePath string) (string, error) 
 					// 移除路径类型缓存，不再使用自定义缓存
 
 					break
+				} else if item.Filename == part {
+					fs.Debugf(f, "🗑️ pathToFileID跳过无效文件: %s (trashed=%d, status=%d)", item.Filename, item.Trashed, item.Status)
 				}
 			}
 			if findPart {
@@ -1540,6 +1543,24 @@ func parseDirID(idStr string) (int64, error) {
 
 // createParentFs 创建指向父目录的Fs实例
 func (f *Fs) createParentFs(directory string) *Fs {
+	// 获取父目录的ID作为新的rootFolderID
+	var newRootFolderID string
+	if directory == "" {
+		// 如果目录为空，使用真正的根目录ID
+		newRootFolderID = "0"
+	} else {
+		// 查找父目录的ID
+		ctx := context.Background()
+		dirID, err := f.pathToFileID(ctx, directory)
+		if err != nil {
+			fs.Debugf(f, "⚠️ createParentFs: 无法找到目录 '%s' 的ID，使用根目录ID", directory)
+			newRootFolderID = "0"
+		} else {
+			newRootFolderID = dirID
+			fs.Debugf(f, "✅ createParentFs: 目录 '%s' 的ID为 %s", directory, newRootFolderID)
+		}
+	}
+
 	tempF := &Fs{
 		name:          f.name,
 		originalName:  f.originalName,
@@ -1551,13 +1572,13 @@ func (f *Fs) createParentFs(directory string) *Fs {
 		tokenExpiry:   f.tokenExpiry,
 		tokenRenewer:  f.tokenRenewer,
 		m:             f.m,
-		rootFolderID:  f.rootFolderID,
+		rootFolderID:  newRootFolderID,
 		listPacer:     f.listPacer,
 		uploadPacer:   f.uploadPacer,
 		downloadPacer: f.downloadPacer,
 		strictPacer:   f.strictPacer,
 	}
-	tempF.dirCache = dircache.New(directory, f.rootFolderID, tempF)
+	tempF.dirCache = dircache.New(directory, newRootFolderID, tempF)
 	return tempF
 }
 
@@ -2185,8 +2206,8 @@ func (f *Fs) findPathSafe(ctx context.Context, remote string, create bool) (leaf
 		directory, filename := dircache.SplitPath(remote)
 
 		if directory != "" {
-			// 查找父目录
-			parentDirID, err := f.dirCache.FindDir(ctx, directory, create)
+			// 查找父目录，但不创建（避免创建同名文件目录）
+			parentDirID, err := f.dirCache.FindDir(ctx, directory, false)
 			if err == nil {
 				// 父目录存在，检查文件是否存在
 				foundID, found, err := f.FindLeaf(ctx, parentDirID, filename)
@@ -2194,8 +2215,15 @@ func (f *Fs) findPathSafe(ctx context.Context, remote string, create bool) (leaf
 					fs.Debugf(f, "🔧 findPathSafe: 文件 '%s' 存在，ID=%s，返回父目录信息", filename, foundID)
 					return filename, parentDirID, nil
 				}
-				fs.Debugf(f, "🔧 findPathSafe: 文件 '%s' 不存在，使用标准目录处理", filename)
+				fs.Debugf(f, "🔧 findPathSafe: 文件 '%s' 不存在，返回父目录信息用于创建文件", filename)
+				return filename, parentDirID, nil
+			} else {
+				fs.Debugf(f, "🔧 findPathSafe: 父目录 '%s' 不存在 (错误: %v)，使用标准目录处理", directory, err)
 			}
+		} else {
+			// 根目录文件，直接返回
+			fs.Debugf(f, "🔧 findPathSafe: 根目录文件 '%s'，返回根目录信息", filename)
+			return filename, f.rootFolderID, nil
 		}
 	}
 
@@ -3264,29 +3292,72 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 			fileID, found, err := f.FindLeaf(ctx, parentID, filename)
 			if err == nil && found {
-				fs.Debugf(f, "✅ FindLeaf确认文件存在: '%s' -> ID=%s，创建指向父目录的Fs", filename, fileID)
-				// 文件存在，创建指向父目录的Fs，这样NewObject就能正确找到文件
-				tempF := f.createParentFs(directory)
-				f.dirCache = tempF.dirCache
-				f.root = tempF.root
-				fs.Debugf(f, "🎯 123网盘文件存在处理: 更新Fs指向父目录 '%s'", directory)
-				return f, nil
+				// 需要检查找到的是文件还是目录
+				// 通过getFileInfo获取详细信息
+				fileInfo, err := f.getFileInfo(ctx, fileID)
+				if err == nil {
+					if fileInfo.Type == 0 { // Type=0表示文件
+						fs.Debugf(f, "✅ FindLeaf确认文件存在: '%s' -> ID=%s (Type=0, 文件)，创建指向父目录的Fs", filename, fileID)
+						// 文件存在，创建指向父目录的Fs，这样NewObject就能正确找到文件
+						tempF := f.createParentFs(directory)
+						f.dirCache = tempF.dirCache
+						f.root = tempF.root
+						fs.Debugf(f, "🎯 123网盘文件存在处理: 更新Fs指向父目录 '%s'", directory)
+						return f, nil
+					} else {
+						fs.Debugf(f, "🔧 FindLeaf找到同名目录: '%s' -> ID=%s (Type=1, 目录)，创建指向父目录的Fs", filename, fileID)
+						// 找到的是同名目录，创建指向父目录的Fs，避免路径重复
+						tempF := f.createParentFs(directory)
+						f.dirCache = tempF.dirCache
+						f.root = tempF.root
+						fs.Debugf(f, "🎯 123网盘同名目录处理: 更新Fs指向父目录 '%s'", directory)
+						return f, nil
+					}
+				} else {
+					fs.Debugf(f, "⚠️ FindLeaf获取文件信息失败: '%s' -> ID=%s, 错误: %v，继续标准处理", filename, fileID, err)
+					// 获取文件信息失败，继续标准处理
+				}
 			} else if !found && err == nil {
 				// 如果常规查找失败，尝试强制刷新
 				fs.Debugf(f, "🔄 常规FindLeaf未找到，尝试强制刷新查找文件 '%s'", filename)
 				fileID, found, err = f.findLeafWithForceRefresh(ctx, parentID, filename)
 				if err == nil && found {
-					fs.Debugf(f, "✅ 强制刷新FindLeaf确认文件存在: '%s' -> ID=%s，创建指向父目录的Fs", filename, fileID)
-					// 文件存在，创建指向父目录的Fs，这样NewObject就能正确找到文件
-					tempF := f.createParentFs(directory)
-					f.dirCache = tempF.dirCache
-					f.root = tempF.root
-					fs.Debugf(f, "🎯 123网盘文件存在处理: 更新Fs指向父目录 '%s'", directory)
-					return f, nil
+					// 需要检查找到的是文件还是目录
+					fileInfo, err := f.getFileInfo(ctx, fileID)
+					if err == nil && fileInfo.Type == 0 { // Type=0表示文件
+						fs.Debugf(f, "✅ 强制刷新FindLeaf确认文件存在: '%s' -> ID=%s (Type=0, 文件)，创建指向父目录的Fs", filename, fileID)
+						// 文件存在，创建指向父目录的Fs，这样NewObject就能正确找到文件
+						tempF := f.createParentFs(directory)
+						f.dirCache = tempF.dirCache
+						f.root = tempF.root
+						f.rootFolderID = tempF.rootFolderID
+						fs.Debugf(f, "🎯 123网盘文件存在处理: 更新Fs指向父目录 '%s'，rootFolderID=%s", directory, f.rootFolderID)
+						return f, nil
+					} else if err == nil && fileInfo.Type == 1 {
+						fs.Debugf(f, "🔧 强制刷新FindLeaf找到同名目录: '%s' -> ID=%s (Type=1, 目录)，创建指向父目录的Fs", filename, fileID)
+						// 找到的是同名目录，创建指向父目录的Fs，避免路径重复
+						tempF := f.createParentFs(directory)
+						f.dirCache = tempF.dirCache
+						f.root = tempF.root
+						f.rootFolderID = tempF.rootFolderID
+						fs.Debugf(f, "🎯 123网盘同名目录处理: 更新Fs指向父目录 '%s'，rootFolderID=%s", directory, f.rootFolderID)
+						return f, nil
+					} else {
+						fs.Debugf(f, "⚠️ 强制刷新FindLeaf获取文件信息失败: '%s' -> ID=%s, 错误: %v，继续标准处理", filename, fileID, err)
+						// 获取文件信息失败，继续标准处理
+					}
 				}
 			}
 
-			fs.Debugf(f, "🔧 FindLeaf未找到文件 '%s'，继续标准处理", filename)
+			fs.Debugf(f, "🔧 FindLeaf未找到文件 '%s'，但有文件扩展名，创建指向父目录的Fs", filename)
+			// 文件不存在，但有文件扩展名，创建指向父目录的Fs
+			// 这样rclone会在父目录中创建文件，而不是创建同名目录
+			tempF := f.createParentFs(directory)
+			f.dirCache = tempF.dirCache
+			f.root = tempF.root
+			f.rootFolderID = tempF.rootFolderID
+			fs.Debugf(f, "🎯 123网盘文件不存在处理: 创建指向父目录 '%s' 的Fs，rootFolderID=%s", directory, f.rootFolderID)
+			return f, nil
 		} else {
 			fs.Debugf(f, "🔧 父目录 '%s' 不存在 (错误: %v)，但有文件扩展名，创建指向父目录的Fs", directory, err)
 			// 父目录不存在，但有文件扩展名，创建指向父目录的Fs
@@ -3294,7 +3365,8 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			tempF := f.createParentFs(directory)
 			f.dirCache = tempF.dirCache
 			f.root = tempF.root
-			fs.Debugf(f, "🎯 123网盘父目录不存在处理: 创建指向父目录 '%s' 的Fs", directory)
+			f.rootFolderID = tempF.rootFolderID
+			fs.Debugf(f, "🎯 123网盘父目录不存在处理: 创建指向父目录 '%s' 的Fs，rootFolderID=%s", directory, f.rootFolderID)
 			return f, nil
 		}
 	}
