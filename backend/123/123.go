@@ -387,7 +387,8 @@ func (f *Fs) fileExists(ctx context.Context, parentFileID int64, fileName string
 	}
 
 	for _, file := range response.Data.FileList {
-		if file.Filename == fileName {
+		// 🔧 检查文件名匹配且文件有效（不在回收站且未被审核驳回）
+		if file.Filename == fileName && isValidFile(file) {
 			return true, nil
 		}
 	}
@@ -496,6 +497,12 @@ func (f *Fs) getParentID(ctx context.Context, fileID int64) (int64, error) {
 	return response.Data.ParentFileID, nil
 }
 
+// isValidFile 检查文件是否有效（不在回收站且未被审核驳回）
+// 根据123云盘API文档，必须过滤 trashed=1 和 status>=100 的文件
+func isValidFile(file FileListInfoRespDataV2) bool {
+	return file.Trashed == 0 && file.Status < 100
+}
+
 // fileExistsInDirectory 检查指定目录中是否存在指定名称的文件
 func (f *Fs) fileExistsInDirectory(ctx context.Context, parentID int64, fileName string) (bool, int64, error) {
 	fs.Debugf(f, "🔍 检查目录 %d 中是否存在文件: %s", parentID, fileName)
@@ -511,8 +518,9 @@ func (f *Fs) fileExistsInDirectory(ctx context.Context, parentID int64, fileName
 	}
 
 	for _, file := range response.Data.FileList {
-		if file.Filename == fileName {
-			fs.Debugf(f, "✅ 找到文件 %s，ID: %d", fileName, file.FileID)
+		// 🔧 检查文件名匹配且不在回收站且未被审核驳回
+		if file.Filename == fileName && file.Trashed == 0 && file.Status < 100 {
+			fs.Debugf(f, "✅ 找到文件 %s，ID: %d (trashed=%d, status=%d)", fileName, file.FileID, file.Trashed, file.Status)
 			return true, int64(file.FileID), nil
 		}
 	}
@@ -592,116 +600,14 @@ func (f *Fs) setCachedDownloadURL(fileID, url string) {
 	fs.Debugf(f, "💾 缓存下载URL: fileID=%s, 有效期90分钟", fileID)
 }
 
-// isLikelyFile 根据文件扩展名判断是否应该是文件而不是文件夹
-// 用于修复123网盘服务器端错误的类型标记
-func isLikelyFile(filename string) bool {
+// hasFileExtension 简单检查是否有文件扩展名（仅用于路径初始化时的启发式判断）
+// 注意：123网盘API的Type字段已经很准确，这个函数只在无法调用API时使用
+func hasFileExtension(filename string) bool {
 	if filename == "" {
 		return false
 	}
-
-	filename = strings.ToLower(filename)
-
-	// 1. 检查是否有文件扩展名（包含点且点后有内容）
-	lastDot := strings.LastIndex(filename, ".")
-	if lastDot == -1 || lastDot == len(filename)-1 {
-		// 没有扩展名或点在最后，可能是目录
-		return false
-	}
-
-	// 2. 获取扩展名
-	ext := filename[lastDot:]
-
-	// 3. 检查扩展名长度（合理的扩展名通常是2-5个字符）
-	if len(ext) < 2 || len(ext) > 6 {
-		return false
-	}
-
-	// 4. 检查扩展名是否只包含字母和数字
-	for _, char := range ext[1:] { // 跳过点
-		if !((char >= 'a' && char <= 'z') || (char >= '0' && char <= '9')) {
-			return false
-		}
-	}
-
-	// 5. 排除明显的目录名模式
-	dirPatterns := []string{
-		"temp", "tmp", "cache", "log", "logs", "backup", "backups",
-		"config", "configs", "data", "database", "db", "lib", "libs",
-		"bin", "sbin", "usr", "var", "etc", "opt", "home", "root",
-		"documents", "downloads", "desktop", "pictures", "music", "videos",
-	}
-
-	baseNameLower := strings.ToLower(filename[:lastDot])
-	for _, pattern := range dirPatterns {
-		if baseNameLower == pattern || strings.HasSuffix(baseNameLower, "_"+pattern) || strings.HasSuffix(baseNameLower, "-"+pattern) {
-			return false
-		}
-	}
-
-	// 6. 特别检查常见的文件扩展名（高置信度）
-	commonFileExts := map[string]bool{
-		// 压缩文件
-		".zip": true, ".rar": true, ".7z": true, ".tar": true, ".gz": true, ".bz2": true, ".xz": true,
-		// 文档文件
-		".pdf": true, ".doc": true, ".docx": true, ".xls": true, ".xlsx": true, ".ppt": true, ".pptx": true, ".txt": true,
-		// 图片文件
-		".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".bmp": true, ".svg": true, ".webp": true,
-		// 视频文件
-		".mp4": true, ".avi": true, ".mkv": true, ".mov": true, ".wmv": true, ".flv": true, ".webm": true, ".m4v": true,
-		// 音频文件
-		".mp3": true, ".wav": true, ".flac": true, ".aac": true, ".ogg": true, ".m4a": true,
-		// 程序文件
-		".exe": true, ".msi": true, ".dmg": true, ".pkg": true, ".deb": true, ".rpm": true, ".apk": true, ".ipa": true,
-		// 代码文件
-		".js": true, ".py": true, ".java": true, ".cpp": true, ".c": true, ".h": true, ".go": true, ".rs": true,
-		// 配置文件
-		".json": true, ".xml": true, ".yaml": true, ".yml": true, ".ini": true, ".conf": true, ".cfg": true,
-		// 其他常见文件
-		".iso": true, ".img": true, ".bin": true, ".dat": true, ".log": true, ".csv": true, ".sql": true,
-	}
-
-	if commonFileExts[ext] {
-		return true
-	}
-
-	// 7. 对于未知扩展名，如果文件名看起来像文件（包含版本号、日期等），则认为是文件
-	if containsVersionPattern123(filename) || containsDatePattern123(filename) {
-		return true
-	}
-
-	// 8. 默认情况下，有合理扩展名的都认为是文件
-	return true
-}
-
-// containsVersionPattern123 检查文件名是否包含版本号模式
-func containsVersionPattern123(filename string) bool {
-	// 匹配版本号模式：v1.2.3, 1.2.3, 2023.1, etc.
-	versionPatterns := []string{
-		`v\d+\.\d+`, `\d+\.\d+\.\d+`, `\d+\.\d+`, `20\d{2}`, `v\d+`,
-	}
-
-	for _, pattern := range versionPatterns {
-		if matched, _ := regexp.MatchString(pattern, filename); matched {
-			return true
-		}
-	}
-	return false
-}
-
-// containsDatePattern123 检查文件名是否包含日期模式
-func containsDatePattern123(filename string) bool {
-	// 匹配日期模式：2023-01-01, 20230101, 2023_01_01, etc.
-	datePatterns := []string{
-		`20\d{2}-\d{2}-\d{2}`, `20\d{2}\d{2}\d{2}`, `20\d{2}_\d{2}_\d{2}`,
-		`\d{2}-\d{2}-20\d{2}`, `\d{2}\d{2}20\d{2}`, `\d{2}_\d{2}_20\d{2}`,
-	}
-
-	for _, pattern := range datePatterns {
-		if matched, _ := regexp.MatchString(pattern, filename); matched {
-			return true
-		}
-	}
-	return false
+	// 简单检查是否有扩展名
+	return strings.Contains(filename, ".") && !strings.HasSuffix(filename, ".")
 }
 
 // isRemoteSource 检查源对象是否来自远程云盘（非本地文件）
@@ -890,6 +796,8 @@ type FileListInfoRespDataV2 struct {
 	ParentFileID int64 `json:"parentFileID"`
 	// 文件分类, 0-未知 1-音频 2-视频 3-图片
 	Category int `json:"category"`
+	// 回收站标识, 0-正常 1-在回收站 (重要：必须过滤trashed=1的文件)
+	Trashed int `json:"trashed"`
 }
 
 func (f *Fs) ListFile(ctx context.Context, parentFileID, limit int, searchData, searchMode string, lastFileID int) (*ListResponse, error) {
@@ -998,13 +906,9 @@ func (f *Fs) pathToFileID(ctx context.Context, filePath string) (string, error) 
 					// 记录找到的项目类型信息，用于后续缓存
 					isDir := (item.Type == 1) // Type: 0-文件  1-文件夹
 
-					// 🔧 修复：检查文件扩展名，纠正服务器端的错误类型标记
-					// 某些.zip等压缩文件可能被123网盘服务器错误标记为文件夹
-					fs.Debugf(f, "🔧 123网盘类型检查: '%s' Type=%d, isDir=%v, isLikelyFile=%v", part, item.Type, isDir, isLikelyFile(part))
-					if isDir && isLikelyFile(part) {
-						fs.Debugf(f, "🔧 123网盘类型修复: '%s' 服务器标记为文件夹(Type=%d)，但根据扩展名应为文件", part, item.Type)
-						isDir = false
-					}
+					// ✅ 直接使用123网盘API的Type字段，无需额外判断
+					// API的Type字段已经很准确：0=文件，1=文件夹
+					fs.Debugf(f, "✅ 123网盘API类型: '%s' Type=%d, isDir=%v", part, item.Type, isDir)
 
 					fs.Debugf(f, "pathToFileID找到项目: %s -> ID=%s, Type=%d, isDir=%v", part, currentID, item.Type, isDir)
 
@@ -2252,7 +2156,7 @@ func (f *Fs) findPathSafe(ctx context.Context, remote string, create bool) (leaf
 	fs.Debugf(f, "🔧 findPathSafe: 处理路径 '%s', create=%v", remote, create)
 
 	// 如果路径看起来像文件名，先尝试查找是否存在同名文件
-	if isLikelyFile(remote) {
+	if hasFileExtension(remote) {
 		fs.Debugf(f, "🔧 findPathSafe: 路径 '%s' 看起来是文件名，检查是否存在", remote)
 
 		// 分离目录和文件名
@@ -3326,7 +3230,7 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	// 🔧 优化：使用123网盘API精确判断文件类型
-	if normalizedRoot != "" && isLikelyFile(normalizedRoot) {
+	if normalizedRoot != "" && hasFileExtension(normalizedRoot) {
 		fs.Debugf(f, "🔧 123网盘API判断: 根路径 '%s' 看起来是文件名，尝试精确判断", normalizedRoot)
 
 		// 尝试通过FindLeaf + getFileInfo精确判断
@@ -3472,13 +3376,9 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	// Type: 0-文件  1-文件夹
 	isDir := (fileInfo.Type == 1)
 
-	// 🔧 修复：检查文件扩展名，纠正服务器端的错误类型标记
-	// 某些.zip等压缩文件可能被123网盘服务器错误标记为文件夹
-	fs.Debugf(f, "🔧 123网盘NewObject类型检查: '%s' Type=%d, isDir=%v, isLikelyFile=%v", fileInfo.Filename, fileInfo.Type, isDir, isLikelyFile(fileInfo.Filename))
-	if isDir && isLikelyFile(fileInfo.Filename) {
-		fs.Debugf(f, "🔧 123网盘NewObject类型修复: '%s' 服务器标记为文件夹(Type=%d)，但根据扩展名应为文件", fileInfo.Filename, fileInfo.Type)
-		isDir = false
-	}
+	// ✅ 直接使用123网盘API的Type字段，无需额外判断
+	// API的Type字段已经很准确：0=文件，1=文件夹
+	fs.Debugf(f, "✅ 123网盘NewObject API类型: '%s' Type=%d, isDir=%v", fileInfo.Filename, fileInfo.Type, isDir)
 
 	if isDir {
 		return nil, fs.ErrorNotAFile
@@ -4097,7 +3997,8 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (foundID string,
 
 		// Search for the leaf in current page
 		for _, file := range response.Data.FileList {
-			if file.Filename == leaf {
+			// 🔧 检查文件名匹配且不在回收站且未被审核驳回
+			if file.Filename == leaf && file.Trashed == 0 && file.Status < 100 {
 				foundID = strconv.FormatInt(file.FileID, 10)
 				found = true
 				// Cache the found item's path/ID mapping
@@ -4178,7 +4079,8 @@ func (f *Fs) findLeafWithForceRefresh(ctx context.Context, pathID, leaf string) 
 
 		// Search for the leaf in current page
 		for _, file := range response.Data.FileList {
-			if file.Filename == leaf {
+			// 🔧 检查文件名匹配且不在回收站且未被审核驳回
+			if file.Filename == leaf && file.Trashed == 0 && file.Status < 100 {
 				foundID = strconv.FormatInt(file.FileID, 10)
 				found = true
 
@@ -4508,9 +4410,10 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 			return fmt.Errorf("API error %d: %s", response.Code, response.Message)
 		}
 
-		// Collect all files
+		// 🔧 收集所有有效文件：同时检查回收站和审核状态
 		for _, file := range response.Data.FileList {
-			if file.Status < 100 { // Not trashed
+			// 必须过滤回收站文件 (trashed=1) 和审核驳回文件 (status>=100)
+			if file.Trashed == 0 && file.Status < 100 {
 				allFiles = append(allFiles, file)
 			}
 		}
@@ -4604,10 +4507,14 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 			return nil, fmt.Errorf("API error %d: %s", response.Code, response.Message)
 		}
 
-		// Filter out trashed files
+		// 🔧 完善过滤逻辑：同时检查回收站和审核状态
 		for _, file := range response.Data.FileList {
-			if file.Status < 100 { // Not trashed
+			// 必须过滤回收站文件 (trashed=1) 和审核驳回文件 (status>=100)
+			if file.Trashed == 0 && file.Status < 100 {
+				fs.Debugf(f, "✅ 文件通过过滤: %s (trashed=%d, status=%d)", file.Filename, file.Trashed, file.Status)
 				allFiles = append(allFiles, file)
+			} else {
+				fs.Debugf(f, "🗑️ 文件被过滤: %s (trashed=%d, status=%d)", file.Filename, file.Trashed, file.Status)
 			}
 		}
 
@@ -4636,13 +4543,9 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 			remote = strings.Trim(dir+"/"+cleanedFilename, "/")
 		}
 
-		// 🔧 修复：检查文件扩展名，纠正服务器端的错误类型标记
+		// ✅ 直接使用123网盘API的Type字段，无需额外判断
 		isDir := (file.Type == 1)
-		fs.Debugf(f, "🔧 123网盘List类型检查: '%s' Type=%d, isDir=%v, isLikelyFile=%v", cleanedFilename, file.Type, isDir, isLikelyFile(cleanedFilename))
-		if isDir && isLikelyFile(cleanedFilename) {
-			fs.Debugf(f, "🔧 123网盘List类型修复: '%s' 服务器标记为文件夹(Type=%d)，但根据扩展名应为文件", cleanedFilename, file.Type)
-			isDir = false
-		}
+		fs.Debugf(f, "✅ 123网盘List API类型: '%s' Type=%d, isDir=%v", cleanedFilename, file.Type, isDir)
 
 		if isDir { // Directory
 			// Cache the directory ID for future use
