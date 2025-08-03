@@ -3381,6 +3381,16 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		f.root = tempF.root
 		return f, fs.ErrorIsFile
 	}
+
+	// 确保rootFolderID正确设置为当前root目录的ID
+	if f.root != "" && f.rootFolderID == "0" {
+		rootID, err := f.dirCache.RootID(ctx, false)
+		if err == nil && rootID != "" {
+			f.rootFolderID = rootID
+			fs.Debugf(f, "🔧 NewFs更新rootFolderID: '%s' -> '%s'", "0", f.rootFolderID)
+		}
+	}
+
 	return f, nil
 }
 
@@ -3468,22 +3478,28 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		directory, filename := dircache.SplitPath(normalizedRemote)
 		fs.Debugf(f, "🔍 Put中FindLeaf检查: 目录='%s', 文件='%s'", directory, filename)
 
-		// 如果目录为空，检查当前Fs的root是否是文件路径
-		if directory == "" && hasFileExtension(f.root) {
-			// 当前Fs的root是文件路径，需要分离为目录和文件名
-			rootDirectory, rootFilename := dircache.SplitPath(f.root)
-			fs.Debugf(f, "🔧 Put检测到Fs root是文件路径: '%s' -> 目录='%s', 文件='%s'", f.root, rootDirectory, rootFilename)
+		// 如果目录为空，说明文件应该在当前Fs的root目录中创建
+		if directory == "" {
+			if hasFileExtension(f.root) {
+				// 当前Fs的root是文件路径，需要分离为目录和文件名
+				rootDirectory, rootFilename := dircache.SplitPath(f.root)
+				fs.Debugf(f, "🔧 Put检测到Fs root是文件路径: '%s' -> 目录='%s', 文件='%s'", f.root, rootDirectory, rootFilename)
 
-			// 重新设置Fs指向父目录
-			tempF := f.createParentFs(rootDirectory)
-			f.dirCache = tempF.dirCache
-			f.root = tempF.root
-			f.rootFolderID = tempF.rootFolderID
-			fs.Debugf(f, "🎯 Put重新设置Fs: 指向父目录 '%s'，rootFolderID=%s", rootDirectory, f.rootFolderID)
+				// 重新设置Fs指向父目录
+				tempF := f.createParentFs(rootDirectory)
+				f.dirCache = tempF.dirCache
+				f.root = tempF.root
+				f.rootFolderID = tempF.rootFolderID
+				fs.Debugf(f, "🎯 Put重新设置Fs: 指向父目录 '%s'，rootFolderID=%s", rootDirectory, f.rootFolderID)
 
-			// 更新directory和filename
-			directory = rootDirectory
-			filename = rootFilename
+				// 更新directory和filename
+				directory = rootDirectory
+				filename = rootFilename
+			} else {
+				// 当前Fs的root是目录路径，文件应该在这个目录中创建
+				directory = f.root
+				fs.Debugf(f, "🔧 Put检测到Fs root是目录路径: '%s'，文件='%s'将在此目录中创建", f.root, filename)
+			}
 		} else if directory != "" {
 			// 如果目录不为空，需要确保Fs指向正确的父目录
 			if f.root != directory {
@@ -3522,8 +3538,51 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	}
 
 	// Use dircache to find parent directory
-	fs.Debugf(f, "查找父目录路径: %s", normalizedRemote)
-	leaf, parentID, err := f.findPathSafe(ctx, normalizedRemote, true)
+	// 直接使用filename，父目录通过f.rootFolderID获取
+	var leaf string
+	var parentID string
+	var err error
+
+	if normalizedRemote != "" && hasFileExtension(normalizedRemote) {
+		currentDirectory, currentFilename := dircache.SplitPath(normalizedRemote)
+		if currentDirectory == "" {
+			// 如果目录为空，文件应该在当前Fs的root目录中创建
+			leaf = currentFilename
+			if hasFileExtension(f.root) {
+				// Fs root是文件路径，需要获取父目录ID
+				rootDirectory, _ := dircache.SplitPath(f.root)
+				if rootDirectory != "" {
+					parentID, err = f.dirCache.FindDir(ctx, rootDirectory, true)
+				} else {
+					parentID = f.rootFolderID
+				}
+			} else {
+				// Fs root是目录路径，需要确保目录存在
+				if f.root != "" {
+					// 使用dirCache.FindDir创建目录（如果不存在）
+					parentID, err = f.dirCache.FindDir(ctx, f.root, true)
+					if err != nil {
+						fs.Debugf(f, "❌ Put创建目录失败: %v，使用根目录", err)
+						parentID = "0"
+					} else {
+						fs.Debugf(f, "🔧 Put成功获取/创建目录: '%s' -> ID='%s'", f.root, parentID)
+					}
+				} else {
+					parentID = f.rootFolderID
+					fs.Debugf(f, "🔧 Put使用Fs的rootFolderID: '%s'", parentID)
+				}
+			}
+			fs.Debugf(f, "🔧 Put直接处理: 文件='%s', 父目录ID='%s'", leaf, parentID)
+		} else {
+			// 有目录路径，使用标准处理
+			fs.Debugf(f, "查找父目录路径: %s", normalizedRemote)
+			leaf, parentID, err = f.findPathSafe(ctx, normalizedRemote, true)
+		}
+	} else {
+		// 标准处理
+		fs.Debugf(f, "查找父目录路径: %s", normalizedRemote)
+		leaf, parentID, err = f.findPathSafe(ctx, normalizedRemote, true)
+	}
 	if err != nil {
 		fs.Errorf(f, "❌ 查找父目录失败: %v", err)
 		return nil, err
