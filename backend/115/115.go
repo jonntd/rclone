@@ -2733,19 +2733,48 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		err = f.dirCache.FindRoot(ctx, false)
 	}
 
-	// 如果FindRoot失败且root不为空，尝试创建目录
-	if err != nil && f.root != "" {
-		fs.Debugf(f, "🔧 115网盘NewFs FindRoot失败，尝试创建目录: '%s'", f.root)
-		createdID, createErr := f.dirCache.FindDir(ctx, f.root, true)
-		if createErr == nil {
-			fs.Debugf(f, "🔧 115网盘NewFs成功创建目录: '%s' -> ID='%s'", f.root, createdID)
-			// 重新尝试FindRoot
-			err = f.dirCache.FindRoot(ctx, false)
-			if err == nil {
-				fs.Debugf(f, "✅ 115网盘NewFs重新FindRoot成功")
+	// ✅ 精确的文件检测：优先检测源路径是否为文件（在创建目录之前）
+	if err != nil && f.root != "" && hasFileExtension(f.root) {
+		directory, filename := dircache.SplitPath(f.root)
+		fs.Debugf(f, "🔍 115网盘文件检测: 目录='%s', 文件='%s'", directory, filename)
+
+		// 尝试检测这是否是一个文件路径
+		if directory != "" {
+			// 创建临时Fs来检测文件
+			tempF := *f
+			tempF.dirCache = dircache.New(directory, f.rootFolderID, &tempF)
+			tempF.root = directory
+
+			// 尝试初始化父目录
+			tempErr := tempF.dirCache.FindRoot(ctx, false)
+			if tempErr == nil {
+				// 父目录存在，检查文件是否存在
+				rootID, rootErr := tempF.dirCache.RootID(ctx, false)
+				if rootErr == nil {
+					// 使用listAll来查找并检查文件类型
+					var foundFile *File
+					found, listErr := tempF.listAll(ctx, rootID, 1150, false, false, func(item *File) bool {
+						decodedName := tempF.opt.Enc.ToStandardName(item.FileNameBest())
+						if decodedName == filename {
+							foundFile = item
+							return true // Found it
+						}
+						return false // Keep looking
+					})
+					if listErr == nil && found && foundFile != nil {
+						// 检查找到的是文件还是目录
+						if !foundFile.IsDir() {
+							// 找到的是文件，设置Fs指向父目录
+							fs.Debugf(f, "✅ 115网盘文件检测: '%s' 是文件，设置Fs指向父目录", filename)
+							f.dirCache = tempF.dirCache
+							f.root = tempF.root
+							f.rootFolderID = rootID
+							fs.Debugf(f, "🎯 115网盘文件处理: 设置Fs指向父目录 '%s'，rootFolderID=%s", directory, f.rootFolderID)
+							return f, fs.ErrorIsFile
+						}
+					}
+				}
 			}
-		} else {
-			fs.Debugf(f, "❌ 115网盘NewFs创建目录失败: %v", createErr)
 		}
 	}
 
@@ -2798,6 +2827,22 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		f.root = tempF.root
 		f.fileObj = &obj // Store the file object for single file operations
 		return f, fs.ErrorIsFile
+	}
+
+	// 如果不是文件路径，且FindRoot失败，尝试创建目录
+	if err != nil && f.root != "" {
+		fs.Debugf(f, "🔧 115网盘NewFs 非文件路径，尝试创建目录: '%s'", f.root)
+		createdID, createErr := f.dirCache.FindDir(ctx, f.root, true)
+		if createErr == nil {
+			fs.Debugf(f, "🔧 115网盘NewFs成功创建目录: '%s' -> ID='%s'", f.root, createdID)
+			// 重新尝试FindRoot
+			err = f.dirCache.FindRoot(ctx, false)
+			if err == nil {
+				fs.Debugf(f, "✅ 115网盘NewFs重新FindRoot成功")
+			}
+		} else {
+			fs.Debugf(f, "❌ 115网盘NewFs创建目录失败: %v", createErr)
+		}
 	}
 
 	return f, nil
@@ -7377,6 +7422,15 @@ func (f *Fs) isRemoteSource(src fs.ObjectInfo) bool {
 	}
 
 	return isRemote
+}
+
+// hasFileExtension 简单检查是否有文件扩展名（仅用于路径初始化时的启发式判断）
+func hasFileExtension(filename string) bool {
+	if filename == "" {
+		return false
+	}
+	// 简单检查是否有扩展名
+	return strings.Contains(filename, ".") && !strings.HasSuffix(filename, ".")
 }
 
 // isLikelyFile 智能判断是否应该是文件而不是文件夹
