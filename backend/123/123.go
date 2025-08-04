@@ -3307,11 +3307,65 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		}
 	}
 
-	// 移除自定义文件检测逻辑，使用rclone标准处理
-	// rclone的标准处理已经能够正确处理文件路径
-
-	// Find the root directory
+	// Find the root directory first
 	err = f.dirCache.FindRoot(ctx, false)
+
+	// 如果FindRoot失败且root不为空，尝试创建目录并更新rootFolderID
+	if err != nil && f.root != "" && f.rootFolderID == "0" {
+		fs.Debugf(f, "🔧 NewFs FindRoot失败，尝试创建目录: '%s'", f.root)
+		// 使用createDirectory而不是dirCache.FindDir，避免创建嵌套目录
+		createdID, createErr := f.createDirectory(ctx, "0", f.root)
+		if createErr == nil {
+			f.rootFolderID = createdID
+			fs.Debugf(f, "🔧 NewFs成功创建目录: '%s' -> ID='%s'", f.root, f.rootFolderID)
+			// 重新初始化dirCache以使用新的rootFolderID
+			f.dirCache = dircache.New(f.root, f.rootFolderID, f)
+			// 重新尝试FindRoot
+			err = f.dirCache.FindRoot(ctx, false)
+			if err == nil {
+				fs.Debugf(f, "✅ NewFs重新FindRoot成功")
+			}
+		} else {
+			fs.Debugf(f, "❌ NewFs创建目录失败: %v", createErr)
+		}
+	}
+
+	// ✅ 精确的文件检测：在dirCache初始化后检测源路径是否为文件
+	if err != nil && normalizedRoot != "" && hasFileExtension(normalizedRoot) {
+		directory, filename := dircache.SplitPath(normalizedRoot)
+		fs.Debugf(f, "🔍 123网盘文件检测: 目录='%s', 文件='%s'", directory, filename)
+
+		// 尝试检测这是否是一个文件路径
+		if directory != "" {
+			// 创建临时Fs来检测文件
+			tempF := *f
+			tempF.dirCache = dircache.New(directory, f.rootFolderID, &tempF)
+			tempF.root = directory
+
+			// 尝试初始化父目录
+			tempErr := tempF.dirCache.FindRoot(ctx, false)
+			if tempErr == nil {
+				// 父目录存在，检查文件是否存在
+				rootID, rootErr := tempF.dirCache.RootID(ctx, false)
+				if rootErr == nil {
+					fileID, found, findErr := tempF.FindLeaf(ctx, rootID, filename)
+					if findErr == nil && found {
+						// 检查找到的是文件还是目录
+						fileInfo, infoErr := tempF.getFileInfo(ctx, fileID)
+						if infoErr == nil && fileInfo.Type == 0 {
+							// 找到的是文件，设置Fs指向父目录
+							fs.Debugf(f, "✅ 123网盘文件检测: '%s' 是文件 (Type=0)，设置Fs指向父目录", filename)
+							f.dirCache = tempF.dirCache
+							f.root = tempF.root
+							f.rootFolderID = rootID
+							fs.Debugf(f, "🎯 123网盘文件处理: 设置Fs指向父目录 '%s'，rootFolderID=%s", directory, f.rootFolderID)
+							return f, fs.ErrorIsFile
+						}
+					}
+				}
+			}
+		}
+	}
 
 	if err != nil {
 		// Assume it is a file (标准rclone模式，与Google Drive、115网盘一致)
@@ -3349,14 +3403,7 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return f, fs.ErrorIsFile
 	}
 
-	// 确保rootFolderID正确设置为当前root目录的ID
-	if f.root != "" && f.rootFolderID == "0" {
-		rootID, err := f.dirCache.RootID(ctx, false)
-		if err == nil && rootID != "" {
-			f.rootFolderID = rootID
-			fs.Debugf(f, "🔧 NewFs更新rootFolderID: '%s' -> '%s'", "0", f.rootFolderID)
-		}
-	}
+	// rootFolderID修复逻辑已移到FindRoot之后，此处不再需要
 
 	return f, nil
 }
@@ -3526,12 +3573,16 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 			} else {
 				// Fs root是目录路径，检查rootFolderID是否有效
 				if f.rootFolderID == "0" && f.root != "" {
-					// rootFolderID为0说明目录不存在，需要创建
-					parentID, err = f.dirCache.FindDir(ctx, f.root, true)
+					// rootFolderID为0说明NewFs没有正确设置目录，需要在Put中创建
+					fs.Debugf(f, "🔧 Put检测到rootFolderID为0，需要创建目录: '%s'", f.root)
+
+					// 直接使用API创建目录，而不是dirCache.FindDir
+					createdDirID, err := f.createDirectory(ctx, "0", f.root)
 					if err != nil {
 						fs.Debugf(f, "❌ Put创建目录失败: %v，使用根目录", err)
 						parentID = "0"
 					} else {
+						parentID = createdDirID
 						fs.Debugf(f, "🔧 Put成功创建目录: '%s' -> ID='%s'", f.root, parentID)
 					}
 				} else {
