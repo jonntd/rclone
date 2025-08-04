@@ -3317,8 +3317,8 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		// 保持rootFolderID为"0"，让Put知道需要创建目录
 	}
 
-	// ✅ 精确的文件检测：在dirCache初始化后检测源路径是否为文件
-	if err != nil && normalizedRoot != "" && hasFileExtension(normalizedRoot) {
+	// ✅ 精确的文件检测：检测源路径是否为文件（无论FindRoot是否成功）
+	if normalizedRoot != "" && hasFileExtension(normalizedRoot) {
 		directory, filename := dircache.SplitPath(normalizedRoot)
 		fs.Debugf(f, "🔍 123网盘文件检测: 目录='%s', 文件='%s'", directory, filename)
 

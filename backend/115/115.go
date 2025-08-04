@@ -2733,6 +2733,22 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		err = f.dirCache.FindRoot(ctx, false)
 	}
 
+	// 如果FindRoot失败且root不为空，尝试创建目录
+	if err != nil && f.root != "" {
+		fs.Debugf(f, "🔧 115网盘NewFs FindRoot失败，尝试创建目录: '%s'", f.root)
+		createdID, createErr := f.dirCache.FindDir(ctx, f.root, true)
+		if createErr == nil {
+			fs.Debugf(f, "🔧 115网盘NewFs成功创建目录: '%s' -> ID='%s'", f.root, createdID)
+			// 重新尝试FindRoot
+			err = f.dirCache.FindRoot(ctx, false)
+			if err == nil {
+				fs.Debugf(f, "✅ 115网盘NewFs重新FindRoot成功")
+			}
+		} else {
+			fs.Debugf(f, "❌ 115网盘NewFs创建目录失败: %v", createErr)
+		}
+	}
+
 	if err != nil {
 		// Assume it is a file
 		newRoot, remote := dircache.SplitPath(f.root)
@@ -2744,9 +2760,26 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		// Make new Fs which is the parent
 		err = tempF.dirCache.FindRoot(ctx, false)
 		if err != nil {
-			fs.Debugf(f, "🔧 115网盘文件路径处理: 父目录 '%s' 不存在，返回原始Fs", newRoot)
-			// No root so return old f
-			return f, nil
+			fs.Debugf(f, "🔧 115网盘文件路径处理: 父目录 '%s' 不存在，尝试创建", newRoot)
+			// 尝试创建父目录
+			if newRoot != "" {
+				createdID, createErr := tempF.dirCache.FindDir(ctx, newRoot, true)
+				if createErr == nil {
+					fs.Debugf(f, "🔧 115网盘成功创建父目录: '%s' -> ID='%s'", newRoot, createdID)
+					// 重新尝试FindRoot
+					err = tempF.dirCache.FindRoot(ctx, false)
+					if err != nil {
+						fs.Debugf(f, "🔧 115网盘创建目录后FindRoot仍失败: %v", err)
+						return f, nil
+					}
+				} else {
+					fs.Debugf(f, "🔧 115网盘创建父目录失败: %v，返回原始Fs", createErr)
+					return f, nil
+				}
+			} else {
+				fs.Debugf(f, "🔧 115网盘父目录为空，返回原始Fs")
+				return f, nil
+			}
 		}
 
 		fs.Debugf(f, "🔧 115网盘文件路径处理: 父目录 '%s' 存在，尝试查找文件 '%s'", newRoot, remote)
