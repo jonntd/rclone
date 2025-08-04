@@ -3310,24 +3310,11 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Find the root directory first
 	err = f.dirCache.FindRoot(ctx, false)
 
-	// 如果FindRoot失败且root不为空，尝试创建目录并更新rootFolderID
-	if err != nil && f.root != "" && f.rootFolderID == "0" {
-		fs.Debugf(f, "🔧 NewFs FindRoot失败，尝试创建目录: '%s'", f.root)
-		// 使用createDirectory而不是dirCache.FindDir，避免创建嵌套目录
-		createdID, createErr := f.createDirectory(ctx, "0", f.root)
-		if createErr == nil {
-			f.rootFolderID = createdID
-			fs.Debugf(f, "🔧 NewFs成功创建目录: '%s' -> ID='%s'", f.root, f.rootFolderID)
-			// 重新初始化dirCache以使用新的rootFolderID
-			f.dirCache = dircache.New(f.root, f.rootFolderID, f)
-			// 重新尝试FindRoot
-			err = f.dirCache.FindRoot(ctx, false)
-			if err == nil {
-				fs.Debugf(f, "✅ NewFs重新FindRoot成功")
-			}
-		} else {
-			fs.Debugf(f, "❌ NewFs创建目录失败: %v", createErr)
-		}
+	// 如果FindRoot失败，不在NewFs中创建目录，让Put处理
+	// 这避免了嵌套目录的问题
+	if err != nil && f.root != "" {
+		fs.Debugf(f, "🔧 NewFs FindRoot失败，路径'%s'不存在，将在Put中处理目录创建", f.root)
+		// 保持rootFolderID为"0"，让Put知道需要创建目录
 	}
 
 	// ✅ 精确的文件检测：在dirCache初始化后检测源路径是否为文件
@@ -3573,17 +3560,38 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 			} else {
 				// Fs root是目录路径，检查rootFolderID是否有效
 				if f.rootFolderID == "0" && f.root != "" {
-					// rootFolderID为0说明NewFs没有正确设置目录，需要在Put中创建
-					fs.Debugf(f, "🔧 Put检测到rootFolderID为0，需要创建目录: '%s'", f.root)
+					// rootFolderID为0说明目录不存在，需要创建完整路径
+					fs.Debugf(f, "🔧 Put检测到rootFolderID为0，需要创建目录路径: '%s'", f.root)
 
-					// 直接使用API创建目录，而不是dirCache.FindDir
-					createdDirID, err := f.createDirectory(ctx, "0", f.root)
+					// 使用dirCache.FindDir创建完整路径（从根目录开始）
+					// 创建一个临时的根目录Fs来避免嵌套
+					tempF := &Fs{
+						name:          f.name,
+						originalName:  f.originalName,
+						root:          "", // 空root表示根目录
+						opt:           f.opt,
+						features:      f.features,
+						rst:           f.rst,
+						token:         f.token,
+						tokenExpiry:   f.tokenExpiry,
+						tokenRenewer:  f.tokenRenewer,
+						m:             f.m,
+						rootFolderID:  "0", // 根目录ID
+						listPacer:     f.listPacer,
+						uploadPacer:   f.uploadPacer,
+						downloadPacer: f.downloadPacer,
+						strictPacer:   f.strictPacer,
+					}
+					tempF.dirCache = dircache.New("", "0", tempF)
+
+					// 使用临时Fs创建完整路径
+					createdID, err := tempF.dirCache.FindDir(ctx, f.root, true)
 					if err != nil {
-						fs.Debugf(f, "❌ Put创建目录失败: %v，使用根目录", err)
+						fs.Debugf(f, "❌ Put创建目录路径失败: %v，使用根目录", err)
 						parentID = "0"
 					} else {
-						parentID = createdDirID
-						fs.Debugf(f, "🔧 Put成功创建目录: '%s' -> ID='%s'", f.root, parentID)
+						parentID = createdID
+						fs.Debugf(f, "🔧 Put成功创建目录路径: '%s' -> ID='%s'", f.root, parentID)
 					}
 				} else {
 					// rootFolderID有效，直接使用
