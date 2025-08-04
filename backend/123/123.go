@@ -3307,41 +3307,8 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		}
 	}
 
-	// ✅ 精确的文件检测：只检测源路径是否为文件，返回ErrorIsFile
-	if normalizedRoot != "" && hasFileExtension(normalizedRoot) {
-		directory, filename := dircache.SplitPath(normalizedRoot)
-		fs.Debugf(f, "🔍 123网盘文件检测: 目录='%s', 文件='%s'", directory, filename)
-
-		// 尝试检测这是否是一个文件路径
-		if directory != "" {
-			parentID, err := f.pathToFileID(ctx, directory)
-			if err == nil {
-				// 父目录存在，检查文件是否存在
-				fileID, found, err := f.FindLeaf(ctx, parentID, filename)
-				if err == nil && found {
-					// 检查找到的是文件还是目录
-					fileInfo, err := f.getFileInfo(ctx, fileID)
-					if err == nil && fileInfo.Type == 0 {
-						// 找到的是文件，创建指向父目录的Fs
-						fs.Debugf(f, "✅ 123网盘文件检测: '%s' 是文件 (Type=0)，创建指向父目录的Fs", filename)
-						tempF := f.createParentFs(directory)
-						f.dirCache = tempF.dirCache
-						f.root = tempF.root
-						f.rootFolderID = tempF.rootFolderID
-						fs.Debugf(f, "🎯 123网盘文件处理: 设置Fs指向父目录 '%s'，rootFolderID=%s", directory, f.rootFolderID)
-						return f, fs.ErrorIsFile
-					} else if err == nil && fileInfo.Type == 1 {
-						// 找到的是目录，使用标准处理
-						fs.Debugf(f, "🔧 123网盘文件检测: '%s' 是目录 (Type=1)，使用标准处理", filename)
-					}
-				} else {
-					fs.Debugf(f, "🔍 123网盘文件检测: 文件 '%s' 不存在，使用标准处理", filename)
-				}
-			} else {
-				fs.Debugf(f, "🔍 123网盘文件检测: 父目录 '%s' 不存在，使用标准处理", directory)
-			}
-		}
-	}
+	// 移除自定义文件检测逻辑，使用rclone标准处理
+	// rclone的标准处理已经能够正确处理文件路径
 
 	// Find the root directory
 	err = f.dirCache.FindRoot(ctx, false)
@@ -3557,17 +3524,18 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 					parentID = f.rootFolderID
 				}
 			} else {
-				// Fs root是目录路径，需要确保目录存在
-				if f.root != "" {
-					// 使用dirCache.FindDir创建目录（如果不存在）
+				// Fs root是目录路径，检查rootFolderID是否有效
+				if f.rootFolderID == "0" && f.root != "" {
+					// rootFolderID为0说明目录不存在，需要创建
 					parentID, err = f.dirCache.FindDir(ctx, f.root, true)
 					if err != nil {
 						fs.Debugf(f, "❌ Put创建目录失败: %v，使用根目录", err)
 						parentID = "0"
 					} else {
-						fs.Debugf(f, "🔧 Put成功获取/创建目录: '%s' -> ID='%s'", f.root, parentID)
+						fs.Debugf(f, "🔧 Put成功创建目录: '%s' -> ID='%s'", f.root, parentID)
 					}
 				} else {
+					// rootFolderID有效，直接使用
 					parentID = f.rootFolderID
 					fs.Debugf(f, "🔧 Put使用Fs的rootFolderID: '%s'", parentID)
 				}
