@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -20,6 +21,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/rclone/rclone/lib/cache"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/oauthutil"
@@ -144,6 +146,7 @@ type Fs struct {
 	// 缓存系统
 	parentDirCache   map[int64]time.Time  // 缓存已验证的父目录ID和验证时间
 	downloadURLCache map[string]CachedURL // 下载URL缓存
+	listFileCache    *cache.Cache         // ListFile结果缓存
 	cacheMu          sync.RWMutex         // 保护缓存的读写锁
 
 	// 性能和速率限制 - 根据123网盘API限流表精确优化的调速器
@@ -599,15 +602,8 @@ func (f *Fs) setCachedDownloadURL(fileID, url string) {
 	fs.Debugf(f, "💾 缓存下载URL: fileID=%s, 有效期90分钟", fileID)
 }
 
-// hasFileExtension 简单检查是否有文件扩展名（仅用于路径初始化时的启发式判断）
-// 注意：123网盘API的Type字段已经很准确，这个函数只在无法调用API时使用
-func hasFileExtension(filename string) bool {
-	if filename == "" {
-		return false
-	}
-	// 简单检查是否有扩展名
-	return strings.Contains(filename, ".") && !strings.HasSuffix(filename, ".")
-}
+// 🔧 移除非标准的启发式文件判断函数
+// 遵循Google Drive、OneDrive等主流网盘的做法：完全信任服务器返回的类型标识
 
 // isRemoteSource 检查源对象是否来自远程云盘（非本地文件）
 // 使用rclone标准的Features.IsLocal方法进行检测
@@ -802,7 +798,17 @@ type FileListInfoRespDataV2 struct {
 func (f *Fs) ListFile(ctx context.Context, parentFileID, limit int, searchData, searchMode string, lastFileID int) (*ListResponse, error) {
 	fs.Debugf(f, "📋 调用ListFile，参数：parentFileID=%d, limit=%d, lastFileID=%d", parentFileID, limit, lastFileID)
 
-	// 移除缓存查询，直接调用API
+	// 🔧 性能优化：智能ListFile缓存（带失效机制）
+	// 只缓存简单的列表查询（无搜索、无分页）
+	if searchData == "" && searchMode == "" && lastFileID == 0 && limit == 100 {
+		cacheKey := fmt.Sprintf("listfile_%d", parentFileID)
+		if cached, found := f.listFileCache.GetMaybe(cacheKey); found {
+			if result, ok := cached.(*ListResponse); ok {
+				fs.Debugf(f, "🎯 ListFile缓存命中: parentFileID=%d", parentFileID)
+				return result, nil
+			}
+		}
+	}
 
 	// 构造查询参数
 	params := url.Values{}
@@ -833,9 +839,76 @@ func (f *Fs) ListFile(ctx context.Context, parentFileID, limit int, searchData, 
 
 	fs.Debugf(f, "✅ ListFile API响应: code=%d, message=%s, fileCount=%d", result.Code, result.Message, len(result.Data.FileList))
 
-	// 移除缓存保存，不再使用自定义缓存
+	// 🔧 性能优化：智能缓存存储（带失效机制）
+	if searchData == "" && searchMode == "" && lastFileID == 0 && limit == 100 {
+		cacheKey := fmt.Sprintf("listfile_%d", parentFileID)
+		f.listFileCache.Put(cacheKey, &result)
+		fs.Debugf(f, "💾 ListFile结果已缓存: parentFileID=%d", parentFileID)
+	}
 
 	return &result, nil
+}
+
+// listFileDirectAPI 直接调用API获取文件列表，绕过缓存（用于强制刷新）
+func (f *Fs) listFileDirectAPI(ctx context.Context, parentFileID, limit int, searchData, searchMode string, lastFileID int) (*ListResponse, error) {
+	fs.Debugf(f, "🌐 直接API调用ListFile，参数：parentFileID=%d, limit=%d, lastFileID=%d", parentFileID, limit, lastFileID)
+
+	// 构建API参数
+	params := url.Values{}
+	params.Set("limit", strconv.Itoa(limit))
+	params.Set("parentFileId", strconv.Itoa(parentFileID))
+	if lastFileID > 0 {
+		params.Set("lastFileId", strconv.Itoa(lastFileID))
+	}
+	if searchData != "" {
+		params.Set("searchData", searchData)
+	}
+	if searchMode != "" {
+		params.Set("searchMode", searchMode)
+	}
+
+	// 直接调用API，不使用缓存
+	var result ListResponse
+	err := f.makeAPICallWithRest(ctx, "/api/v2/file/list?"+params.Encode(), "GET", nil, &result)
+	if err != nil {
+		return nil, fmt.Errorf("ListFile API调用失败: %w", err)
+	}
+
+	fs.Debugf(f, "🌐 直接API调用成功: code=%d, message=%s, fileCount=%d", result.Code, result.Message, len(result.Data.FileList))
+	return &result, nil
+}
+
+// clearListFileCache 清除指定父目录的ListFile缓存
+func (f *Fs) clearListFileCache(parentFileID int64, reason string) {
+	cacheKey := fmt.Sprintf("listfile_%d", parentFileID)
+	if f.listFileCache.Delete(cacheKey) {
+		fs.Debugf(f, "🗑️ 清除ListFile缓存: parentFileID=%d (%s)", parentFileID, reason)
+	}
+}
+
+// clearListFileCacheByPath 根据路径清除相关的ListFile缓存
+func (f *Fs) clearListFileCacheByPath(ctx context.Context, dirPath string, reason string) {
+	if dirPath == "" {
+		dirPath = "/"
+	}
+
+	// 清除父目录的缓存
+	parentDir := path.Dir(dirPath)
+	if parentDir == "." {
+		parentDir = ""
+	}
+
+	parentID, err := f.dirCache.FindDir(ctx, parentDir, false)
+	if err == nil {
+		if parentFileID, err2 := strconv.ParseInt(parentID, 10, 64); err2 == nil {
+			f.clearListFileCache(parentFileID, reason)
+		}
+	}
+
+	// 如果是根目录操作，也清除根目录缓存
+	if parentDir == "" || parentDir == "/" {
+		f.clearListFileCache(0, reason)
+	}
 }
 
 func (f *Fs) pathToFileID(ctx context.Context, filePath string) (string, error) {
@@ -2226,34 +2299,7 @@ func (f *Fs) completeUploadWithResultAndSize(ctx context.Context, preuploadID st
 func (f *Fs) findPathSafe(ctx context.Context, remote string, create bool) (leaf, directoryID string, err error) {
 	fs.Debugf(f, "🔧 findPathSafe: 处理路径 '%s', create=%v", remote, create)
 
-	// 如果路径看起来像文件名，先尝试查找是否存在同名文件
-	if hasFileExtension(remote) {
-		fs.Debugf(f, "🔧 findPathSafe: 路径 '%s' 看起来是文件名，检查是否存在", remote)
-
-		// 分离目录和文件名
-		directory, filename := dircache.SplitPath(remote)
-
-		if directory != "" {
-			// 查找父目录，如果create=true则允许创建
-			parentDirID, err := f.dirCache.FindDir(ctx, directory, create)
-			if err == nil {
-				// 父目录存在，检查文件是否存在
-				foundID, found, err := f.FindLeaf(ctx, parentDirID, filename)
-				if err == nil && found {
-					fs.Debugf(f, "🔧 findPathSafe: 文件 '%s' 存在，ID=%s，返回父目录信息", filename, foundID)
-					return filename, parentDirID, nil
-				}
-				fs.Debugf(f, "🔧 findPathSafe: 文件 '%s' 不存在，返回父目录信息用于创建文件", filename)
-				return filename, parentDirID, nil
-			} else {
-				fs.Debugf(f, "🔧 findPathSafe: 父目录 '%s' 不存在 (错误: %v)，使用标准目录处理", directory, err)
-			}
-		} else {
-			// 根目录文件，直接返回
-			fs.Debugf(f, "🔧 findPathSafe: 根目录文件 '%s'，返回根目录信息", filename)
-			return filename, f.rootFolderID, nil
-		}
-	}
+	// 🔧 移除启发式文件检测，使用标准rclone流程
 
 	// 使用标准的FindPath处理
 	fs.Debugf(f, "🔧 findPathSafe: 使用标准FindPath处理路径 '%s'", remote)
@@ -2915,6 +2961,9 @@ func (f *Fs) singleStepUpload(ctx context.Context, data []byte, parentFileID int
 		fs.Debugf(f, "✅ 单步上传: 实际上传成功, FileID: %d, 耗时: %v, 速度: %.2f MB/s", uploadResp.Data.FileID, duration, speed)
 	}
 
+	// 🔧 缓存一致性修复：清除父目录的ListFile缓存
+	f.clearListFileCache(parentFileID, "文件上传成功")
+
 	// 返回Object
 	return f.createObject(fileName, uploadResp.Data.FileID, int64(len(data)), md5Hash, time.Now(), false), nil
 }
@@ -3242,6 +3291,7 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		m:                m,
 		parentDirCache:   make(map[int64]time.Time),  // 初始化父目录缓存
 		downloadURLCache: make(map[string]CachedURL), // 初始化下载URL缓存
+		listFileCache:    cache.New(),                // 初始化ListFile结果缓存
 		rootFolderID:     opt.RootFolderID,
 		rst:              rest.NewClient(client).SetRoot(openAPIRootURL),
 	}
@@ -3307,81 +3357,27 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		}
 	}
 
-	// Find the root directory first
+	// 🔧 标准rclone模式：遵循Google Drive等主流网盘的简单模式
+	// Find the current root
 	err = f.dirCache.FindRoot(ctx, false)
 
-	// 如果FindRoot失败，不在NewFs中创建目录，让Put处理
-	// 这避免了嵌套目录的问题
-	if err != nil && f.root != "" {
-		fs.Debugf(f, "🔧 NewFs FindRoot失败，路径'%s'不存在，将在Put中处理目录创建", f.root)
-		// 保持rootFolderID为"0"，让Put知道需要创建目录
-	}
-
-	// ✅ 精确的文件检测：检测源路径是否为文件（无论FindRoot是否成功）
-	if normalizedRoot != "" && hasFileExtension(normalizedRoot) {
-		directory, filename := dircache.SplitPath(normalizedRoot)
-		fs.Debugf(f, "🔍 123网盘文件检测: 目录='%s', 文件='%s'", directory, filename)
-
-		// 尝试检测这是否是一个文件路径
-		if directory != "" {
-			// 创建临时Fs来检测文件
-			tempF := *f
-			tempF.dirCache = dircache.New(directory, f.rootFolderID, &tempF)
-			tempF.root = directory
-
-			// 尝试初始化父目录
-			tempErr := tempF.dirCache.FindRoot(ctx, false)
-			if tempErr == nil {
-				// 父目录存在，检查文件是否存在
-				rootID, rootErr := tempF.dirCache.RootID(ctx, false)
-				if rootErr == nil {
-					fileID, found, findErr := tempF.FindLeaf(ctx, rootID, filename)
-					if findErr == nil && found {
-						// 检查找到的是文件还是目录
-						fileInfo, infoErr := tempF.getFileInfo(ctx, fileID)
-						if infoErr == nil && fileInfo.Type == 0 {
-							// 找到的是文件，设置Fs指向父目录
-							fs.Debugf(f, "✅ 123网盘文件检测: '%s' 是文件 (Type=0)，设置Fs指向父目录", filename)
-							f.dirCache = tempF.dirCache
-							f.root = tempF.root
-							f.rootFolderID = rootID
-							fs.Debugf(f, "🎯 123网盘文件处理: 设置Fs指向父目录 '%s'，rootFolderID=%s", directory, f.rootFolderID)
-							return f, fs.ErrorIsFile
-						}
-					}
-				}
-			}
-		}
-	}
-
 	if err != nil {
-		// Assume it is a file (标准rclone模式，与Google Drive、115网盘一致)
-		fs.Debugf(f, "🔧 123网盘标准处理: 目录查找失败，假设 '%s' 是文件路径", f.root)
-
+		// Assume it is a file (标准rclone模式)
 		newRoot, remote := dircache.SplitPath(f.root)
-		fs.Debugf(f, "🔧 123网盘标准处理: 分离路径 '%s' -> 目录='%s', 文件='%s'", f.root, newRoot, remote)
-
 		tempF := *f
 		tempF.dirCache = dircache.New(newRoot, f.rootFolderID, &tempF)
 		tempF.root = newRoot
-
 		// Make new Fs which is the parent
 		err = tempF.dirCache.FindRoot(ctx, false)
 		if err != nil {
-			fs.Debugf(f, "🔧 123网盘标准处理: 父目录 '%s' 不存在，返回原始Fs", newRoot)
 			// No root so return old f
 			return f, nil
 		}
-
-		fs.Debugf(f, "🔧 123网盘标准处理: 父目录 '%s' 存在，尝试查找文件 '%s'", newRoot, remote)
 		_, err := tempF.NewObject(ctx, remote)
 		if err != nil {
-			fs.Debugf(f, "🔧 123网盘标准处理: 文件 '%s' 不存在，错误: %v，返回原始Fs", remote, err)
-			// unable to find file so return old f
+			// unable to list folder so return old f
 			return f, nil
 		}
-
-		fs.Debugf(f, "✅ 123网盘标准处理: 文件 '%s' 存在，返回ErrorIsFile", remote)
 		// XXX: update the old f here instead of returning tempF, since
 		// `features` were already filled with functions having *f as a receiver.
 		// See https://github.com/rclone/rclone/issues/2182
@@ -3389,8 +3385,6 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		f.root = tempF.root
 		return f, fs.ErrorIsFile
 	}
-
-	// rootFolderID修复逻辑已移到FindRoot之后，此处不再需要
 
 	return f, nil
 }
@@ -3468,180 +3462,35 @@ func (f *Fs) Precision() time.Duration {
 
 // Put uploads the object.
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	fs.Debugf(f, "📤 调用Put: %s", src.Remote())
-
-	// 规范化远程路径
-	normalizedRemote := normalizePath(src.Remote())
-	fs.Debugf(f, "Put操作规范化路径: %s -> %s", src.Remote(), normalizedRemote)
-
-	// ✅ 在Put中应用完整的FindLeaf逻辑，处理目标路径冲突和目录创建
-	if normalizedRemote != "" && hasFileExtension(normalizedRemote) {
-		directory, filename := dircache.SplitPath(normalizedRemote)
-		fs.Debugf(f, "🔍 Put中FindLeaf检查: 目录='%s', 文件='%s'", directory, filename)
-
-		// 如果目录为空，说明文件应该在当前Fs的root目录中创建
-		if directory == "" {
-			if hasFileExtension(f.root) {
-				// 当前Fs的root是文件路径，需要分离为目录和文件名
-				rootDirectory, rootFilename := dircache.SplitPath(f.root)
-				fs.Debugf(f, "🔧 Put检测到Fs root是文件路径: '%s' -> 目录='%s', 文件='%s'", f.root, rootDirectory, rootFilename)
-
-				// 重新设置Fs指向父目录
-				tempF := f.createParentFs(rootDirectory)
-				f.dirCache = tempF.dirCache
-				f.root = tempF.root
-				f.rootFolderID = tempF.rootFolderID
-				fs.Debugf(f, "🎯 Put重新设置Fs: 指向父目录 '%s'，rootFolderID=%s", rootDirectory, f.rootFolderID)
-
-				// 更新directory和filename
-				directory = rootDirectory
-				filename = rootFilename
-			} else {
-				// 当前Fs的root是目录路径，文件应该在这个目录中创建
-				directory = f.root
-				fs.Debugf(f, "🔧 Put检测到Fs root是目录路径: '%s'，文件='%s'将在此目录中创建", f.root, filename)
-			}
-		} else if directory != "" {
-			// 如果目录不为空，需要确保Fs指向正确的父目录
-			if f.root != directory {
-				fs.Debugf(f, "🔧 Put检测到Fs root不匹配: 当前='%s', 需要='%s'，重新设置Fs", f.root, directory)
-				// 重新设置Fs指向正确的父目录
-				tempF := f.createParentFs(directory)
-				f.dirCache = tempF.dirCache
-				f.root = tempF.root
-				f.rootFolderID = tempF.rootFolderID
-				fs.Debugf(f, "🎯 Put重新设置Fs: 指向父目录 '%s'，rootFolderID=%s", directory, f.rootFolderID)
-			}
-		}
-
-		// 检查是否有同名目录冲突（只有当directory不为空时）
-		if directory != "" {
-			parentID, err := f.pathToFileID(ctx, directory)
-			if err == nil {
-				fs.Debugf(f, "🔍 父目录存在，检查同名冲突: 父目录ID='%s', 文件名='%s'", parentID, filename)
-
-				fileID, found, err := f.FindLeaf(ctx, parentID, filename)
-				if err == nil && found {
-					// 检查找到的是文件还是目录
-					fileInfo, err := f.getFileInfo(ctx, fileID)
-					if err == nil && fileInfo.Type == 1 {
-						// 找到同名目录，这是冲突情况
-						fs.Debugf(f, "🚨 Put检测到同名目录冲突: '%s' -> ID=%s (Type=1, 目录)", filename, fileID)
-						// 为了安全起见，我们返回错误
-						return nil, fmt.Errorf("目标路径存在同名目录，无法创建文件: %s", filename)
-					} else if err == nil && fileInfo.Type == 0 {
-						fs.Debugf(f, "✅ Put检测到同名文件: '%s' -> ID=%s (Type=0, 文件)，将覆盖", filename, fileID)
-						// 同名文件，正常覆盖
-					}
-				}
-			}
-		}
-	}
-
-	// Use dircache to find parent directory
-	// 直接使用filename，父目录通过f.rootFolderID获取
-	var leaf string
-	var parentID string
-	var err error
-
-	if normalizedRemote != "" && hasFileExtension(normalizedRemote) {
-		currentDirectory, currentFilename := dircache.SplitPath(normalizedRemote)
-		if currentDirectory == "" {
-			// 如果目录为空，文件应该在当前Fs的root目录中创建
-			leaf = currentFilename
-			if hasFileExtension(f.root) {
-				// Fs root是文件路径，需要获取父目录ID
-				rootDirectory, _ := dircache.SplitPath(f.root)
-				if rootDirectory != "" {
-					parentID, err = f.dirCache.FindDir(ctx, rootDirectory, true)
-				} else {
-					parentID = f.rootFolderID
-				}
-			} else {
-				// Fs root是目录路径，检查rootFolderID是否有效
-				if f.rootFolderID == "0" && f.root != "" {
-					// rootFolderID为0说明目录不存在，需要创建完整路径
-					fs.Debugf(f, "🔧 Put检测到rootFolderID为0，需要创建目录路径: '%s'", f.root)
-
-					// 使用dirCache.FindDir创建完整路径（从根目录开始）
-					// 创建一个临时的根目录Fs来避免嵌套
-					tempF := &Fs{
-						name:          f.name,
-						originalName:  f.originalName,
-						root:          "", // 空root表示根目录
-						opt:           f.opt,
-						features:      f.features,
-						rst:           f.rst,
-						token:         f.token,
-						tokenExpiry:   f.tokenExpiry,
-						tokenRenewer:  f.tokenRenewer,
-						m:             f.m,
-						rootFolderID:  "0", // 根目录ID
-						listPacer:     f.listPacer,
-						uploadPacer:   f.uploadPacer,
-						downloadPacer: f.downloadPacer,
-						strictPacer:   f.strictPacer,
-					}
-					tempF.dirCache = dircache.New("", "0", tempF)
-
-					// 使用临时Fs创建完整路径
-					createdID, err := tempF.dirCache.FindDir(ctx, f.root, true)
-					if err != nil {
-						fs.Debugf(f, "❌ Put创建目录路径失败: %v，使用根目录", err)
-						parentID = "0"
-					} else {
-						parentID = createdID
-						fs.Debugf(f, "🔧 Put成功创建目录路径: '%s' -> ID='%s'", f.root, parentID)
-					}
-				} else {
-					// rootFolderID有效，直接使用
-					parentID = f.rootFolderID
-					fs.Debugf(f, "🔧 Put使用Fs的rootFolderID: '%s'", parentID)
-				}
-			}
-			fs.Debugf(f, "🔧 Put直接处理: 文件='%s', 父目录ID='%s'", leaf, parentID)
-		} else {
-			// 有目录路径，使用标准处理
-			fs.Debugf(f, "查找父目录路径: %s", normalizedRemote)
-			leaf, parentID, err = f.findPathSafe(ctx, normalizedRemote, true)
-		}
-	} else {
-		// 标准处理
-		fs.Debugf(f, "查找父目录路径: %s", normalizedRemote)
-		leaf, parentID, err = f.findPathSafe(ctx, normalizedRemote, true)
-	}
-	if err != nil {
-		fs.Errorf(f, "❌ 查找父目录失败: %v", err)
+	// 🔧 标准rclone模式：遵循Google Drive等主流网盘的简单模式
+	existingObj, err := f.NewObject(ctx, src.Remote())
+	switch err {
+	case nil:
+		return existingObj, existingObj.Update(ctx, in, src, options...)
+	case fs.ErrorObjectNotFound:
+		// Not found so create it
+		return f.PutUnchecked(ctx, in, src, options...)
+	default:
 		return nil, err
 	}
-	fileName := leaf
-	fs.Debugf(f, "找到父目录ID: %s, 文件名: %s", parentID, fileName)
+}
+
+// PutUnchecked uploads the object without checking for existence first.
+func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	// 规范化远程路径
+	normalizedRemote := normalizePath(src.Remote())
+
+	// 使用标准rclone流程：通过dirCache.FindPath处理路径
+	leaf, parentID, err := f.dirCache.FindPath(ctx, normalizedRemote, true)
+	if err != nil {
+		return nil, err
+	}
 
 	// 验证并清理文件名
-	cleanedFileName, warning := validateAndCleanFileName(fileName)
+	fileName, warning := validateAndCleanFileName(leaf)
 	if warning != nil {
 		fs.Logf(f, "⚠️ 文件名验证警告: %v", warning)
-		fileName = cleanedFileName
 	}
-
-	// 🔧 修复：检查文件是否已经存在，避免重复创建
-	fs.Debugf(f, "🔧 Put检查文件是否存在: %s", normalizedRemote)
-	existingObj, err := f.NewObject(ctx, normalizedRemote)
-	if err == nil {
-		// 文件已存在，使用Update更新而不是创建新文件
-		fs.Debugf(f, "🔧 Put发现文件已存在，使用Update更新: %s", normalizedRemote)
-		err := existingObj.Update(ctx, in, src, options...)
-		if err != nil {
-			return nil, err
-		}
-		return existingObj, nil
-	} else if err != fs.ErrorObjectNotFound {
-		// 其他错误，返回错误
-		fs.Debugf(f, "🔧 Put检查文件存在性时出错: %v", err)
-		return nil, fmt.Errorf("failed to check if file exists: %w", err)
-	}
-	// 文件不存在，继续创建新文件
-	fs.Debugf(f, "🔧 Put确认文件不存在，创建新文件: %s", normalizedRemote)
 
 	// Convert parentID to int64
 	parentFileID, err := parseParentID(parentID)
@@ -3649,48 +3498,8 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		return nil, fmt.Errorf("解析父目录ID失败: %w", err)
 	}
 
-	// 验证parentFileID是否真的存在
-	fs.Debugf(f, "验证父目录ID %d 是否存在", parentFileID)
-	exists, err := f.verifyParentFileID(ctx, parentFileID)
-	if err != nil {
-		fs.Errorf(f, "❌ 验证父目录ID失败: %v", err)
-		// 尝试清理缓存并重新查找
-		fs.Debugf(f, "清理目录缓存并重试")
-		f.dirCache.ResetRoot()
-		_, parentID, err = f.dirCache.FindPath(ctx, normalizedRemote, true)
-		if err != nil {
-			return nil, fmt.Errorf("重新查找父目录失败: %w", err)
-		}
-		parentFileID, err = parseParentID(parentID)
-		if err != nil {
-			return nil, fmt.Errorf("重新解析父目录ID失败: %w", err)
-		}
-		fs.Debugf(f, "重新找到父目录ID: %d", parentFileID)
-	} else if !exists {
-		fs.Errorf(f, "⚠️ 父目录ID %d 不存在，尝试重建目录缓存", parentFileID)
-		// 清理缓存并重新查找
-		f.dirCache.ResetRoot()
-		_, parentID, err = f.dirCache.FindPath(ctx, normalizedRemote, true)
-		if err != nil {
-			return nil, fmt.Errorf("重建目录缓存后查找失败: %w", err)
-		}
-		parentFileID, err = parseParentID(parentID)
-		if err != nil {
-			return nil, fmt.Errorf("重建后解析父目录ID失败: %w", err)
-		}
-		fs.Debugf(f, "重建后找到父目录ID: %d", parentFileID)
-	} else {
-		fs.Debugf(f, "父目录ID %d 验证成功", parentFileID)
-	}
-
 	// Use streaming optimization for cross-cloud transfers
-	obj, err := f.streamingPut(ctx, in, src, parentFileID, fileName)
-
-	if err == nil {
-		// 移除缓存清理
-	}
-
-	return obj, err
+	return f.streamingPut(ctx, in, src, parentFileID, fileName)
 }
 
 // Fs returns the parent Fs
@@ -4287,9 +4096,9 @@ func (f *Fs) findLeafWithForceRefresh(ctx context.Context, pathID, leaf string) 
 		}
 
 		var response *ListResponse
-		// Use list pacer for rate limiting, force refresh by calling API directly（limit=100是API最大限制）
+		// 🔧 强制刷新：绕过缓存直接调用API
 		err = f.listPacer.Call(func() (bool, error) {
-			response, err = f.ListFile(ctx, int(parentFileID), 100, "", "", lastFileIDInt)
+			response, err = f.listFileDirectAPI(ctx, int(parentFileID), 100, "", "", lastFileIDInt)
 			if err != nil {
 				return shouldRetry(ctx, nil, err)
 			}
@@ -4348,6 +4157,12 @@ func (f *Fs) findLeafWithForceRefresh(ctx context.Context, pathID, leaf string) 
 // Used by dircache.
 func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, err error) {
 	fs.Debugf(f, "创建目录: pathID=%s, leaf=%s", pathID, leaf)
+
+	// 🔧 缓存一致性修复：在目录创建前清除相关的ListFile缓存
+	// 这确保目录创建时使用最新的API数据，而不是缓存的旧数据
+	if parentFileID, err := strconv.ParseInt(pathID, 10, 64); err == nil {
+		f.clearListFileCache(parentFileID, "目录创建前-CreateDir")
+	}
 
 	// 验证参数
 	if leaf == "" {
@@ -4800,11 +4615,12 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	fs.Debugf(f, "调用创建目录: %s", dir)
 
+	// 🔧 缓存一致性修复：在目录创建前清除相关的ListFile缓存
+	// 这确保目录创建时使用最新的API数据，而不是缓存的旧数据
+	f.clearListFileCacheByPath(ctx, dir, "目录创建前")
+
 	// Use dircache to create the directory
 	_, err := f.dirCache.FindDir(ctx, dir, true)
-	if err == nil {
-		// 移除缓存清理
-	}
 	return err
 }
 
@@ -4833,7 +4649,8 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	// Remove from cache
 	f.dirCache.FlushDir(dir)
 
-	// 移除缓存清理
+	// 🔧 缓存一致性修复：清除相关的ListFile缓存
+	f.clearListFileCacheByPath(ctx, dir, "目录删除")
 
 	return nil
 }
@@ -4999,7 +4816,10 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		}
 	}
 
-	// 移除缓存清理
+	// 🔧 缓存一致性修复：清除相关的ListFile缓存
+	// 清除源目录和目标目录的缓存
+	f.clearListFileCacheByPath(ctx, path.Dir(srcObj.Remote()), "文件移动-源目录")
+	f.clearListFileCacheByPath(ctx, path.Dir(remote), "文件移动-目标目录")
 
 	// Return the moved object
 	return &Object{

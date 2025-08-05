@@ -405,17 +405,8 @@ type File struct {
 func (f *File) IsDir() bool {
 	// OpenAPI uses fc=0 for folder, file_category="0" in details
 	// Traditional uses fid="" for folder
-	isDir := f.IsFolder == 0 || (f.FID == "" && f.CID != "")
-
-	// 🔧 修复：检查文件扩展名，纠正服务器端的错误类型标记
-	// 某些.zip等压缩文件可能被115网盘服务器错误标记为文件夹
-	if isDir && isLikelyFile(f.FileNameBest()) {
-		// 这里不能直接使用fs.Debugf，因为这是File结构体的方法
-		// 修复逻辑：如果服务器标记为目录但有文件扩展名，则认为是文件
-		return false
-	}
-
-	return isDir
+	// 🔧 标准rclone做法：完全信任服务器返回的类型标识，与Google Drive、OneDrive等一致
+	return f.IsFolder == 0 || (f.FID == "" && f.CID != "")
 }
 
 // ID returns the best identifier (File ID or Category ID)
@@ -2705,143 +2696,56 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Initialize directory cache
 	f.dirCache = dircache.New(f.root, f.rootFolderID, f)
 
-	// 🔧 优化：使用115网盘API精确判断文件类型
-	if f.root != "" {
-		// 使用115网盘API查询路径信息
-		pathInfo, pathErr := f.getPathInfo(ctx, f.root)
-		if pathErr == nil && pathInfo.FileCategory == "1" {
-			fs.Debugf(f, "🔧 115网盘API确认: 根路径 '%s' 是文件 (file_category=1)，使用标准文件处理逻辑", f.root)
-			// API确认是文件，强制进入文件处理逻辑
-			err = errors.New("API confirmed file path")
-		} else if pathErr == nil && pathInfo.FileCategory == "0" {
-			fs.Debugf(f, "🔧 115网盘API确认: 根路径 '%s' 是文件夹 (file_category=0)，使用目录处理逻辑", f.root)
-			// API确认是文件夹，使用正常目录处理
-			err = f.dirCache.FindRoot(ctx, false)
-		} else {
-			fs.Debugf(f, "🔧 115网盘API查询失败: 根路径 '%s'，错误: %v，回退到启发式判断", f.root, pathErr)
-			// API查询失败，回退到启发式判断
-			if isLikelyFile(f.root) {
-				fs.Debugf(f, "🔧 115网盘启发式判断: 根路径 '%s' 看起来是文件名，使用标准文件处理逻辑", f.root)
-				err = errors.New("heuristic file processing")
-			} else {
-				// Find the current root
-				err = f.dirCache.FindRoot(ctx, false)
-			}
-		}
-	} else {
-		// Find the current root
-		err = f.dirCache.FindRoot(ctx, false)
-	}
-
-	// ✅ 精确的文件检测：优先检测源路径是否为文件（在创建目录之前）
-	if err != nil && f.root != "" && hasFileExtension(f.root) {
-		directory, filename := dircache.SplitPath(f.root)
-		fs.Debugf(f, "🔍 115网盘文件检测: 目录='%s', 文件='%s'", directory, filename)
-
-		// 尝试检测这是否是一个文件路径
-		if directory != "" {
-			// 创建临时Fs来检测文件
-			tempF := *f
-			tempF.dirCache = dircache.New(directory, f.rootFolderID, &tempF)
-			tempF.root = directory
-
-			// 尝试初始化父目录
-			tempErr := tempF.dirCache.FindRoot(ctx, false)
-			if tempErr == nil {
-				// 父目录存在，检查文件是否存在
-				rootID, rootErr := tempF.dirCache.RootID(ctx, false)
-				if rootErr == nil {
-					// 使用listAll来查找并检查文件类型
-					var foundFile *File
-					found, listErr := tempF.listAll(ctx, rootID, 1150, false, false, func(item *File) bool {
-						decodedName := tempF.opt.Enc.ToStandardName(item.FileNameBest())
-						if decodedName == filename {
-							foundFile = item
-							return true // Found it
-						}
-						return false // Keep looking
-					})
-					if listErr == nil && found && foundFile != nil {
-						// 检查找到的是文件还是目录
-						if !foundFile.IsDir() {
-							// 找到的是文件，设置Fs指向父目录
-							fs.Debugf(f, "✅ 115网盘文件检测: '%s' 是文件，设置Fs指向父目录", filename)
-							f.dirCache = tempF.dirCache
-							f.root = tempF.root
-							f.rootFolderID = rootID
-							fs.Debugf(f, "🎯 115网盘文件处理: 设置Fs指向父目录 '%s'，rootFolderID=%s", directory, f.rootFolderID)
-							return f, fs.ErrorIsFile
-						}
-					}
-				}
-			}
-		}
-	}
+	// 🔧 优化的rclone模式：结合标准模式和115网盘特性
+	// Find the current root
+	err = f.dirCache.FindRoot(ctx, false)
 
 	if err != nil {
-		// Assume it is a file
+		// Assume it is a file (标准rclone模式)
 		newRoot, remote := dircache.SplitPath(f.root)
-		fs.Debugf(f, "🔧 115网盘文件路径处理: 分离路径 '%s' -> 目录='%s', 文件='%s'", f.root, newRoot, remote)
-
 		tempF := *f
 		tempF.dirCache = dircache.New(newRoot, f.rootFolderID, &tempF)
 		tempF.root = newRoot
 		// Make new Fs which is the parent
 		err = tempF.dirCache.FindRoot(ctx, false)
 		if err != nil {
-			fs.Debugf(f, "🔧 115网盘文件路径处理: 父目录 '%s' 不存在，尝试创建", newRoot)
-			// 尝试创建父目录
-			if newRoot != "" {
-				createdID, createErr := tempF.dirCache.FindDir(ctx, newRoot, true)
-				if createErr == nil {
-					fs.Debugf(f, "🔧 115网盘成功创建父目录: '%s' -> ID='%s'", newRoot, createdID)
-					// 重新尝试FindRoot
-					err = tempF.dirCache.FindRoot(ctx, false)
-					if err != nil {
-						fs.Debugf(f, "🔧 115网盘创建目录后FindRoot仍失败: %v", err)
-						return f, nil
-					}
-				} else {
-					fs.Debugf(f, "🔧 115网盘创建父目录失败: %v，返回原始Fs", createErr)
-					return f, nil
-				}
-			} else {
-				fs.Debugf(f, "🔧 115网盘父目录为空，返回原始Fs")
-				return f, nil
-			}
-		}
-
-		fs.Debugf(f, "🔧 115网盘文件路径处理: 父目录 '%s' 存在，尝试查找文件 '%s'", newRoot, remote)
-		obj, err := tempF.NewObject(ctx, remote)
-		if err != nil {
-			fs.Debugf(f, "🔧 115网盘文件路径处理: 文件 '%s' 不存在，错误: %v", remote, err)
-			// unable to find file so return old f
+			// No root so return old f
 			return f, nil
 		}
-
-		fs.Debugf(f, "🔧 115网盘文件路径处理: 文件 '%s' 存在，返回ErrorIsFile", remote)
+		_, err := tempF.NewObject(ctx, remote)
+		if err != nil {
+			// unable to list folder so return old f
+			return f, nil
+		}
 		// XXX: update the old f here instead of returning tempF, since
 		// `features` were already filled with functions having *f as a receiver.
 		// See https://github.com/rclone/rclone/issues/2182
 		f.dirCache = tempF.dirCache
 		f.root = tempF.root
-		f.fileObj = &obj // Store the file object for single file operations
 		return f, fs.ErrorIsFile
-	}
-
-	// 如果不是文件路径，且FindRoot失败，尝试创建目录
-	if err != nil && f.root != "" {
-		fs.Debugf(f, "🔧 115网盘NewFs 非文件路径，尝试创建目录: '%s'", f.root)
-		createdID, createErr := f.dirCache.FindDir(ctx, f.root, true)
-		if createErr == nil {
-			fs.Debugf(f, "🔧 115网盘NewFs成功创建目录: '%s' -> ID='%s'", f.root, createdID)
-			// 重新尝试FindRoot
-			err = f.dirCache.FindRoot(ctx, false)
-			if err == nil {
-				fs.Debugf(f, "✅ 115网盘NewFs重新FindRoot成功")
+	} else {
+		// 🔧 115网盘特殊处理：即使FindRoot成功，也要检查是否是文件路径
+		// 这是115网盘的特殊需求，因为115网盘的目录结构特殊
+		if strings.Contains(f.root, ".") && !strings.HasSuffix(f.root, ".") {
+			newRoot, remote := dircache.SplitPath(f.root)
+			tempF := *f
+			tempF.dirCache = dircache.New(newRoot, f.rootFolderID, &tempF)
+			tempF.root = newRoot
+			// Make new Fs which is the parent
+			err = tempF.dirCache.FindRoot(ctx, false)
+			if err != nil {
+				// No root so return old f
+				return f, nil
 			}
-		} else {
-			fs.Debugf(f, "❌ 115网盘NewFs创建目录失败: %v", createErr)
+			_, err := tempF.NewObject(ctx, remote)
+			if err != nil {
+				// File doesn't exist, return original f as directory
+				return f, nil
+			}
+			// File exists, return as file
+			f.dirCache = tempF.dirCache
+			f.root = tempF.root
+			return f, fs.ErrorIsFile
 		}
 	}
 
@@ -2858,11 +2762,12 @@ type PathInfo struct {
 }
 
 // PathInfoResponse 115网盘路径信息API响应
+// 🔧 修复：API可能返回数组或对象，需要灵活处理
 type PathInfoResponse struct {
-	State   bool     `json:"state"`
-	Code    int      `json:"code"`
-	Message string   `json:"message"`
-	Data    PathInfo `json:"data"`
+	State   bool        `json:"state"`
+	Code    int         `json:"code"`
+	Message string      `json:"message"`
+	Data    interface{} `json:"data"` // 使用interface{}来处理数组或对象
 }
 
 // getPathInfo 使用115网盘API获取路径信息，判断是文件还是文件夹
@@ -2891,19 +2796,76 @@ func (f *Fs) getPathInfo(ctx context.Context, path string) (*PathInfo, error) {
 		return nil, fmt.Errorf("API returned error: %s (Code: %d)", response.Message, response.Code)
 	}
 
-	fs.Debugf(f, "🔧 115网盘getPathInfo成功: 路径='%s', file_category='%s', file_name='%s', size=%d bytes",
-		path, response.Data.FileCategory, response.Data.FileName, response.Data.SizeByte)
+	// 🔧 处理API返回的数据，可能是数组或对象
+	var pathInfo *PathInfo
 
-	// 转换为PathInfo结构
-	pathInfo := &PathInfo{
-		FileCategory: response.Data.FileCategory,
-		FileName:     response.Data.FileName,
-		FileID:       response.Data.FileID,
-		Size:         response.Data.Size,
-		SizeByte:     response.Data.SizeByte,
+	switch data := response.Data.(type) {
+	case map[string]interface{}:
+		// 单个对象
+		pathInfo = &PathInfo{
+			FileCategory: getStringFromInterface(data["file_category"]),
+			FileName:     getStringFromInterface(data["file_name"]),
+			FileID:       getStringFromInterface(data["file_id"]),
+			Size:         getStringFromInterface(data["size"]),
+			SizeByte:     getInt64FromInterface(data["size_byte"]),
+		}
+		fs.Debugf(f, "🔧 115网盘getPathInfo成功(对象): 路径='%s', file_category='%s', file_name='%s', size=%d bytes",
+			path, pathInfo.FileCategory, pathInfo.FileName, pathInfo.SizeByte)
+	case []interface{}:
+		// 数组，取第一个元素
+		if len(data) > 0 {
+			if firstItem, ok := data[0].(map[string]interface{}); ok {
+				pathInfo = &PathInfo{
+					FileCategory: getStringFromInterface(firstItem["file_category"]),
+					FileName:     getStringFromInterface(firstItem["file_name"]),
+					FileID:       getStringFromInterface(firstItem["file_id"]),
+					Size:         getStringFromInterface(firstItem["size"]),
+					SizeByte:     getInt64FromInterface(firstItem["size_byte"]),
+				}
+				fs.Debugf(f, "🔧 115网盘getPathInfo成功(数组): 路径='%s', file_category='%s', file_name='%s', size=%d bytes",
+					path, pathInfo.FileCategory, pathInfo.FileName, pathInfo.SizeByte)
+			} else {
+				return nil, fmt.Errorf("unexpected array item type in API response")
+			}
+		} else {
+			return nil, fmt.Errorf("empty array in API response")
+		}
+	default:
+		return nil, fmt.Errorf("unexpected data type in API response: %T", data)
 	}
 
 	return pathInfo, nil
+}
+
+// 辅助函数：从interface{}中安全获取字符串
+func getStringFromInterface(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return fmt.Sprintf("%v", v)
+}
+
+// 辅助函数：从interface{}中安全获取int64
+func getInt64FromInterface(v interface{}) int64 {
+	if v == nil {
+		return 0
+	}
+	switch val := v.(type) {
+	case int64:
+		return val
+	case int:
+		return int64(val)
+	case float64:
+		return int64(val)
+	case string:
+		if i, err := strconv.ParseInt(val, 10, 64); err == nil {
+			return i
+		}
+	}
+	return 0
 }
 
 // isFromRemoteSource 判断输入流是否来自远程源（用于跨云传输检测）
@@ -2979,6 +2941,22 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 // FindLeaf finds a directory or file leaf in the parent folder pathID.
 // Used by dircache.
 func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (foundID string, found bool, err error) {
+	// 🔧 性能优化：首先检查dirCache是否已有结果
+	parentPath, ok := f.dirCache.GetInv(pathID)
+	if ok {
+		var itemPath string
+		if parentPath == "" {
+			itemPath = leaf
+		} else {
+			itemPath = path.Join(parentPath, leaf)
+		}
+		// 检查是否已缓存
+		if cachedID, found := f.dirCache.Get(itemPath); found {
+			fs.Debugf(f, "🎯 FindLeaf缓存命中: %s -> ID=%s", leaf, cachedID)
+			return cachedID, true, nil
+		}
+	}
+
 	// 🔧 优化：设置固定的limit为1150，最大化性能
 	listChunk := 1150 // 115网盘OpenAPI的最大限制
 	found, err = f.listAll(ctx, pathID, listChunk, false, false, func(item *File) bool {
@@ -3015,24 +2993,29 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (foundID string,
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
 	fs.Debugf(f, "📋 List调用，目录: %q", dir)
 
-	// 🔧 修复：检查是否为文件名，避免将文件当作目录列出
-	if dir != "" && isLikelyFile(dir) {
-		fs.Debugf(f, "🔧 115网盘List修复: '%s' 看起来是文件名，不应该被列出为目录", dir)
-		return nil, fs.ErrorDirNotFound
-	}
-
-	dirID, err := f.dirCache.FindDir(ctx, dir, false)
-	if err != nil {
-		// If it's an API limit error, log details and return
-		if fserrors.IsRetryError(err) {
-			fs.Debugf(f, "🔄 List遇到API限制错误，目录: %q, 错误: %v", dir, err)
+	// 🔧 处理空目录路径：当dir为空时，使用dirCache的根目录ID
+	var dirID string
+	if dir == "" {
+		// 使用dirCache的根目录ID，这是当前Fs对象所代表的目录
+		dirID, err = f.dirCache.RootID(ctx, false)
+		if err != nil {
+			fs.Debugf(f, "❌ List获取根目录ID失败: %v", err)
 			return nil, err
 		}
-		fs.Debugf(f, "❌ List查找目录失败，目录: %q, 错误: %v", dir, err)
-		return nil, err
+		fs.Debugf(f, "✅ List使用当前根目录ID: %s", dirID)
+	} else {
+		dirID, err = f.dirCache.FindDir(ctx, dir, false)
+		if err != nil {
+			// If it's an API limit error, log details and return
+			if fserrors.IsRetryError(err) {
+				fs.Debugf(f, "🔄 List遇到API限制错误，目录: %q, 错误: %v", dir, err)
+				return nil, err
+			}
+			fs.Debugf(f, "❌ List查找目录失败，目录: %q, 错误: %v", dir, err)
+			return nil, err
+		}
+		fs.Debugf(f, "✅ List找到目录ID: %s，目录: %q", dirID, dir)
 	}
-
-	fs.Debugf(f, "✅ List找到目录ID: %s，目录: %q", dirID, dir)
 
 	// Call API to get directory listing
 	var fileList []File
@@ -3083,29 +3066,17 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 
 // Put uploads the object.
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	fs.Debugf(f, "📤 调用Put: %s", src.Remote())
-
-	// 🔧 修复：检查文件是否已经存在，避免重复创建和误导性消息
-	fs.Debugf(f, "🔧 Put检查文件是否存在: %s", src.Remote())
+	// 🔧 标准rclone模式：遵循Google Drive等主流网盘的简单模式
 	existingObj, err := f.NewObject(ctx, src.Remote())
-	if err == nil {
-		// 文件已存在，使用Update更新而不是创建新文件
-		fs.Debugf(f, "🔧 Put发现文件已存在，使用Update更新: %s", src.Remote())
-		err := existingObj.Update(ctx, in, src, options...)
-		if err != nil {
-			return nil, err
-		}
-		return existingObj, nil
-	} else if err != fs.ErrorObjectNotFound {
-		// 其他错误，返回错误
-		fs.Debugf(f, "🔧 Put检查文件存在性时出错: %v", err)
-		return nil, fmt.Errorf("failed to check if file exists: %w", err)
+	switch err {
+	case nil:
+		return existingObj, existingObj.Update(ctx, in, src, options...)
+	case fs.ErrorObjectNotFound:
+		// Not found so create it
+		return f.PutUnchecked(ctx, in, src, options...)
+	default:
+		return nil, err
 	}
-	// 文件不存在，继续创建新文件
-	fs.Debugf(f, "🔧 Put确认文件不存在，创建新文件: %s", src.Remote())
-
-	// 使用PutUnchecked进行实际上传
-	return f.PutUnchecked(ctx, in, src, options...)
 }
 
 // PutUnchecked uploads the object without checking for existence first.
@@ -3626,12 +3597,10 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *File, 
 
 	fs.Debugf(f, " readMetaDataForPath: FindPath成功, leaf=%q, dirID=%q", leaf, dirID)
 
-	// 验证目录ID是否有效
+	// 🔧 处理空目录ID：当dirID为空时，使用当前Fs的rootFolderID
 	if dirID == "" {
-		fs.Errorf(f, "❌ readMetaDataForPath: 目录ID为空, 路径: %q, 叶节点: %q", path, leaf)
-		// Clean up potentially corrupted cache
-		f.dirCache.Flush()
-		return nil, fmt.Errorf("invalid directory ID for path %q", path)
+		dirID = f.rootFolderID
+		fs.Debugf(f, "🔧 readMetaDataForPath: 使用根目录ID: %s, 路径: %q, 叶节点: %q", dirID, path, leaf)
 	}
 
 	// List the directory and find the leaf
@@ -7424,126 +7393,8 @@ func (f *Fs) isRemoteSource(src fs.ObjectInfo) bool {
 	return isRemote
 }
 
-// hasFileExtension 简单检查是否有文件扩展名（仅用于路径初始化时的启发式判断）
-func hasFileExtension(filename string) bool {
-	if filename == "" {
-		return false
-	}
-	// 简单检查是否有扩展名
-	return strings.Contains(filename, ".") && !strings.HasSuffix(filename, ".")
-}
-
-// isLikelyFile 智能判断是否应该是文件而不是文件夹
-// 用于修复115网盘服务器端错误的类型标记
-func isLikelyFile(filename string) bool {
-	if filename == "" {
-		return false
-	}
-
-	filename = strings.ToLower(filename)
-
-	// 1. 检查是否有文件扩展名（包含点且点后有内容）
-	lastDot := strings.LastIndex(filename, ".")
-	if lastDot == -1 || lastDot == len(filename)-1 {
-		// 没有扩展名或点在最后，可能是目录
-		return false
-	}
-
-	// 2. 获取扩展名
-	ext := filename[lastDot:]
-
-	// 3. 检查扩展名长度（合理的扩展名通常是2-5个字符）
-	if len(ext) < 2 || len(ext) > 6 {
-		return false
-	}
-
-	// 4. 检查扩展名是否只包含字母和数字
-	for _, char := range ext[1:] { // 跳过点
-		if !((char >= 'a' && char <= 'z') || (char >= '0' && char <= '9')) {
-			return false
-		}
-	}
-
-	// 5. 排除明显的目录名模式
-	dirPatterns := []string{
-		"temp", "tmp", "cache", "log", "logs", "backup", "backups",
-		"config", "configs", "data", "database", "db", "lib", "libs",
-		"bin", "sbin", "usr", "var", "etc", "opt", "home", "root",
-		"documents", "downloads", "desktop", "pictures", "music", "videos",
-	}
-
-	baseNameLower := strings.ToLower(filename[:lastDot])
-	for _, pattern := range dirPatterns {
-		if baseNameLower == pattern || strings.HasSuffix(baseNameLower, "_"+pattern) || strings.HasSuffix(baseNameLower, "-"+pattern) {
-			return false
-		}
-	}
-
-	// 6. 特别检查常见的文件扩展名（高置信度）
-	commonFileExts := map[string]bool{
-		// 压缩文件
-		".zip": true, ".rar": true, ".7z": true, ".tar": true, ".gz": true, ".bz2": true, ".xz": true,
-		// 文档文件
-		".pdf": true, ".doc": true, ".docx": true, ".xls": true, ".xlsx": true, ".ppt": true, ".pptx": true, ".txt": true,
-		// 图片文件
-		".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".bmp": true, ".svg": true, ".webp": true,
-		// 视频文件
-		".mp4": true, ".avi": true, ".mkv": true, ".mov": true, ".wmv": true, ".flv": true, ".webm": true, ".m4v": true,
-		// 音频文件
-		".mp3": true, ".wav": true, ".flac": true, ".aac": true, ".ogg": true, ".m4a": true,
-		// 程序文件
-		".exe": true, ".msi": true, ".dmg": true, ".pkg": true, ".deb": true, ".rpm": true, ".apk": true, ".ipa": true,
-		// 代码文件
-		".js": true, ".py": true, ".java": true, ".cpp": true, ".c": true, ".h": true, ".go": true, ".rs": true,
-		// 配置文件
-		".json": true, ".xml": true, ".yaml": true, ".yml": true, ".ini": true, ".conf": true, ".cfg": true,
-		// 其他常见文件
-		".iso": true, ".img": true, ".bin": true, ".dat": true, ".log": true, ".csv": true, ".sql": true,
-	}
-
-	if commonFileExts[ext] {
-		return true
-	}
-
-	// 7. 对于未知扩展名，如果文件名看起来像文件（包含版本号、日期等），则认为是文件
-	if containsVersionPattern(filename) || containsDatePattern(filename) {
-		return true
-	}
-
-	// 8. 默认情况下，有合理扩展名的都认为是文件
-	return true
-}
-
-// containsVersionPattern 检查文件名是否包含版本号模式
-func containsVersionPattern(filename string) bool {
-	// 匹配版本号模式：v1.2.3, 1.2.3, 2023.1, etc.
-	versionPatterns := []string{
-		`v\d+\.\d+`, `\d+\.\d+\.\d+`, `\d+\.\d+`, `20\d{2}`, `v\d+`,
-	}
-
-	for _, pattern := range versionPatterns {
-		if matched, _ := regexp.MatchString(pattern, filename); matched {
-			return true
-		}
-	}
-	return false
-}
-
-// containsDatePattern 检查文件名是否包含日期模式
-func containsDatePattern(filename string) bool {
-	// 匹配日期模式：2023-01-01, 20230101, 2023_01_01, etc.
-	datePatterns := []string{
-		`20\d{2}-\d{2}-\d{2}`, `20\d{2}\d{2}\d{2}`, `20\d{2}_\d{2}_\d{2}`,
-		`\d{2}-\d{2}-20\d{2}`, `\d{2}\d{2}20\d{2}`, `\d{2}_\d{2}_20\d{2}`,
-	}
-
-	for _, pattern := range datePatterns {
-		if matched, _ := regexp.MatchString(pattern, filename); matched {
-			return true
-		}
-	}
-	return false
-}
+// 🔧 移除非标准的启发式文件判断函数
+// 遵循Google Drive、OneDrive等主流网盘的做法：完全信任服务器返回的类型标识
 
 // checkExistingTempFile 检查是否已有完整的临时下载文件，避免重复下载
 func (f *Fs) checkExistingTempFile(src fs.ObjectInfo) (io.Reader, int64, func()) {
