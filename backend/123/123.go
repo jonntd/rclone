@@ -1182,8 +1182,9 @@ func (f *Fs) getDownloadURLCommand(ctx context.Context, args []string, opt map[s
 	var err error
 
 	// Parse input format
-	if fileID, found := strings.CutPrefix(input, "123://"); found {
+	if extractedID, found := strings.CutPrefix(input, "123://"); found {
 		// 123://fileId format (from .strm files)
+		fileID = extractedID
 		fs.Debugf(f, "📱 解析.strm格式: fileId=%s", fileID)
 	} else if strings.HasPrefix(input, "/") {
 		// File path format, needs conversion to fileId

@@ -8707,9 +8707,10 @@ func (f *Fs) getDownloadURLByPickCodeHTTP(ctx context.Context, pickCode string, 
 
 	// 使用rclone标准rest客户端
 	opts := rest.Opts{
-		Method: "POST",
-		Path:   "/open/ufile/downurl",
-		Body:   strings.NewReader("pick_code=" + pickCode),
+		Method:  "POST",
+		RootURL: openAPIRootURL, // 🔧 修复：设置RootURL
+		Path:    "/open/ufile/downurl",
+		Body:    strings.NewReader("pick_code=" + pickCode),
 		ExtraHeaders: map[string]string{
 			"Content-Type": "application/x-www-form-urlencoded",
 			"User-Agent":   userAgent,
@@ -8717,7 +8718,10 @@ func (f *Fs) getDownloadURLByPickCodeHTTP(ctx context.Context, pickCode string, 
 	}
 
 	// 准备认证信息
-	f.prepareTokenForRequest(ctx, &opts)
+	err := f.prepareTokenForRequest(ctx, &opts)
+	if err != nil {
+		return "", fmt.Errorf("failed to prepare token: %w", err)
+	}
 
 	// 发送请求并处理响应
 	res, err := f.openAPIClient.Call(ctx, &opts)
