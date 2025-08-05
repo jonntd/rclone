@@ -746,6 +746,10 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 		// 🔗 新增：通过fileId获取下载URL
 		return f.getDownloadURLCommand(ctx, arg, opt)
 
+	case "refresh-cache":
+		// 🔄 新增：刷新目录缓存
+		return f.refreshCacheCommand(ctx, arg, opt)
+
 	default:
 		return nil, fs.ErrorCommandNotFound
 	}
@@ -1240,6 +1244,44 @@ func (f *Fs) getDownloadURLCommand(ctx context.Context, args []string, opt map[s
 		fs.Debugf(f, "✅ 获取下载URL成功: fileId=%s", fileID)
 		return downloadURL, nil
 	}
+}
+
+// refreshCacheCommand 刷新目录缓存
+func (f *Fs) refreshCacheCommand(ctx context.Context, args []string, opt map[string]string) (any, error) {
+	fs.Infof(f, "🔄 开始刷新缓存...")
+
+	// 清除内存中的listFileCache
+	f.listFileCache.Clear()
+	fs.Infof(f, "✅ 已清除ListFile缓存")
+
+	// 清除持久化dirCache
+	if err := f.dirCache.ForceRefreshPersistent(); err != nil {
+		fs.Logf(f, "⚠️ 清除持久化缓存失败: %v", err)
+	} else {
+		fs.Infof(f, "✅ 已清除持久化dirCache")
+	}
+
+	// 重置dirCache
+	f.dirCache.Flush()
+	fs.Infof(f, "✅ 已重置内存dirCache")
+
+	// 如果指定了路径，尝试重新构建该路径的缓存
+	if len(args) > 0 && args[0] != "" {
+		targetPath := args[0]
+		fs.Infof(f, "🔄 重新构建路径缓存: %s", targetPath)
+
+		// 尝试查找目录以重新构建缓存
+		if _, err := f.dirCache.FindDir(ctx, targetPath, false); err != nil {
+			fs.Logf(f, "⚠️ 重新构建路径缓存失败: %v", err)
+		} else {
+			fs.Infof(f, "✅ 路径缓存重新构建成功: %s", targetPath)
+		}
+	}
+
+	return map[string]any{
+		"status":  "success",
+		"message": "缓存刷新完成",
+	}, nil
 }
 
 // validateDuration 验证时间配置不为负数
@@ -3338,8 +3380,17 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		SlowHash:                false,
 	}).Fill(ctx, f)
 
-	// Initialize directory cache
-	f.dirCache = dircache.New(normalizedRoot, f.rootFolderID, f)
+	// Initialize directory cache with persistent support
+	configData := map[string]string{
+		"root_folder_id": f.rootFolderID,
+		"endpoint":       openAPIRootURL,
+	}
+	f.dirCache = dircache.NewWithPersistent(normalizedRoot, f.rootFolderID, f, "123", configData)
+
+	// 检查持久化缓存是否过期
+	if expired, err := f.dirCache.IsExpiredPersistent(); err == nil && expired {
+		fs.Debugf(f, "🔄 持久化缓存已过期，将在首次使用时重新构建")
+	}
 
 	// Initialize authentication
 	tokenLoaded := loadTokenFromConfig(f, m)

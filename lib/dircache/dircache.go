@@ -12,6 +12,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/rclone/rclone/fs"
 )
@@ -29,6 +30,10 @@ type DirCache struct {
 	rootID       string     // ID of the root directory
 	rootParentID string     // ID of the root's parent directory
 	foundRoot    bool       // Whether we have found the root or not
+
+	// 🔧 持久化缓存支持
+	persistentCache *PersistentCache // 持久化缓存实例
+	persistEnabled  bool             // 是否启用持久化
 }
 
 // DirCacher describes an interface for doing the low level directory work
@@ -54,11 +59,42 @@ type DirCacher interface {
 // The cache is safe for concurrent use
 func New(root string, trueRootID string, fs DirCacher) *DirCache {
 	d := &DirCache{
-		trueRootID: trueRootID,
-		root:       root,
-		fs:         fs,
+		trueRootID:     trueRootID,
+		root:           root,
+		fs:             fs,
+		persistEnabled: false, // 默认禁用持久化
 	}
 	d.Flush()
+	d.ResetRoot()
+	return d
+}
+
+// NewWithPersistent creates a DirCache with persistent cache support
+func NewWithPersistent(root string, trueRootID string, fs DirCacher, backend string, configData map[string]string) *DirCache {
+	d := &DirCache{
+		trueRootID:     trueRootID,
+		root:           root,
+		fs:             fs,
+		persistEnabled: true,
+	}
+
+	// 创建持久化缓存实例
+	if pc, err := NewPersistentCache(backend, configData); err == nil {
+		d.persistentCache = pc
+		// 尝试从磁盘加载缓存
+		if cache, invCache, err := pc.LoadFromDisk(); err == nil && len(cache) > 0 {
+			d.cache = cache
+			d.invCache = invCache
+			// 成功加载持久化缓存
+		} else {
+			d.Flush()
+		}
+	} else {
+		// 持久化缓存初始化失败，使用内存缓存
+		d.persistEnabled = false
+		d.Flush()
+	}
+
 	d.ResetRoot()
 	return d
 }
@@ -116,6 +152,28 @@ func (dc *DirCache) Put(path, id string) {
 	dc.cache[path] = id
 	dc.invCache[id] = path
 	dc.cacheMu.Unlock()
+
+	// 🔧 持久化缓存：异步保存到磁盘
+	if dc.persistEnabled && dc.persistentCache != nil {
+		go func() {
+			// 创建缓存副本以避免并发问题
+			dc.cacheMu.RLock()
+			cacheCopy := make(map[string]string, len(dc.cache))
+			invCacheCopy := make(map[string]string, len(dc.invCache))
+			for k, v := range dc.cache {
+				cacheCopy[k] = v
+			}
+			for k, v := range dc.invCache {
+				invCacheCopy[k] = v
+			}
+			dc.cacheMu.RUnlock()
+
+			// 保存到磁盘
+			if err := dc.persistentCache.SaveToDisk(cacheCopy, invCacheCopy); err != nil {
+				fs.Debugf(nil, "⚠️ 持久化缓存保存失败: %v", err)
+			}
+		}()
+	}
 }
 
 // Flush the cache of all data
@@ -124,6 +182,59 @@ func (dc *DirCache) Flush() {
 	dc.cache = make(map[string]string)
 	dc.invCache = make(map[string]string)
 	dc.cacheMu.Unlock()
+}
+
+// FlushPersistent flushes both memory and persistent cache
+func (dc *DirCache) FlushPersistent() {
+	dc.Flush()
+	if dc.persistEnabled && dc.persistentCache != nil {
+		// 清空持久化缓存
+		if err := dc.persistentCache.SaveToDisk(make(map[string]string), make(map[string]string)); err != nil {
+			fs.Debugf(nil, "⚠️ 清空持久化缓存失败: %v", err)
+		}
+	}
+}
+
+// SetPersistentTTL sets the TTL for persistent cache
+func (dc *DirCache) SetPersistentTTL(ttl time.Duration) {
+	if dc.persistEnabled && dc.persistentCache != nil {
+		dc.persistentCache.SetTTL(ttl)
+	}
+}
+
+// EnablePersistent enables or disables persistent cache
+func (dc *DirCache) EnablePersistent(enabled bool) {
+	dc.persistEnabled = enabled
+	if dc.persistentCache != nil {
+		dc.persistentCache.SetEnabled(enabled)
+	}
+}
+
+// CleanExpiredPersistent cleans expired persistent cache files
+func (dc *DirCache) CleanExpiredPersistent() error {
+	if dc.persistEnabled && dc.persistentCache != nil {
+		return dc.persistentCache.CleanExpired()
+	}
+	return nil
+}
+
+// ForceRefreshPersistent forces a refresh of persistent cache
+func (dc *DirCache) ForceRefreshPersistent() error {
+	if dc.persistEnabled && dc.persistentCache != nil {
+		// Clear memory cache
+		dc.Flush()
+		// Force refresh persistent cache
+		return dc.persistentCache.ForceRefresh()
+	}
+	return nil
+}
+
+// IsExpiredPersistent checks if persistent cache is expired
+func (dc *DirCache) IsExpiredPersistent() (bool, error) {
+	if dc.persistEnabled && dc.persistentCache != nil {
+		return dc.persistentCache.IsExpired()
+	}
+	return true, nil
 }
 
 // SetRootIDAlias sets the rootID to that passed in. This assumes that

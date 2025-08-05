@@ -2693,8 +2693,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		f.rootFolderID = "0"
 	}
 
-	// Initialize directory cache
-	f.dirCache = dircache.New(f.root, f.rootFolderID, f)
+	// Initialize directory cache with persistent support
+	configData := map[string]string{
+		"root_folder_id": f.rootFolderID,
+		"endpoint":       openAPIRootURL,
+	}
+	f.dirCache = dircache.NewWithPersistent(f.root, f.rootFolderID, f, "115", configData)
 
 	// 🔧 优化的rclone模式：结合标准模式和115网盘特性
 	// Find the current root
@@ -3740,6 +3744,10 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 	case "get-download-url":
 		// New: Get download URL via pick_code
 		return f.getDownloadURLCommand(ctx, arg, opt)
+
+	case "refresh-cache":
+		// 🔄 新增：刷新目录缓存
+		return f.refreshCacheCommand(ctx, arg, opt)
 
 	default:
 		return nil, fs.ErrorCommandNotFound
@@ -8694,6 +8702,40 @@ func (f *Fs) getDownloadURLCommand(ctx context.Context, args []string, opt map[s
 
 	// 返回下载URL字符串（与getdownloadurlua保持一致）
 	return downloadURL, nil
+}
+
+// refreshCacheCommand 刷新目录缓存
+func (f *Fs) refreshCacheCommand(ctx context.Context, args []string, opt map[string]string) (any, error) {
+	fs.Infof(f, "🔄 开始刷新缓存...")
+
+	// 清除持久化dirCache
+	if err := f.dirCache.ForceRefreshPersistent(); err != nil {
+		fs.Logf(f, "⚠️ 清除持久化缓存失败: %v", err)
+	} else {
+		fs.Infof(f, "✅ 已清除持久化dirCache")
+	}
+
+	// 重置dirCache
+	f.dirCache.Flush()
+	fs.Infof(f, "✅ 已重置内存dirCache")
+
+	// 如果指定了路径，尝试重新构建该路径的缓存
+	if len(args) > 0 && args[0] != "" {
+		targetPath := args[0]
+		fs.Infof(f, "🔄 重新构建路径缓存: %s", targetPath)
+
+		// 尝试查找目录以重新构建缓存
+		if _, err := f.dirCache.FindDir(ctx, targetPath, false); err != nil {
+			fs.Logf(f, "⚠️ 重新构建路径缓存失败: %v", err)
+		} else {
+			fs.Infof(f, "✅ 路径缓存重新构建成功: %s", targetPath)
+		}
+	}
+
+	return map[string]any{
+		"status":  "success",
+		"message": "缓存刷新完成",
+	}, nil
 }
 
 // getDownloadURLByPickCodeHTTP 使用rclone标准方式通过pick_code获取下载URL
