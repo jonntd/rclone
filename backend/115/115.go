@@ -2959,22 +2959,35 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (foundID string,
 
 	// 🔧 优化：设置固定的limit为1150，最大化性能
 	listChunk := 1150 // 115网盘OpenAPI的最大限制
+
+	// 🔧 性能优化：批量缓存机制，类似123网盘的实现
+	parentPath, parentPathOk := f.dirCache.GetInv(pathID)
+
 	found, err = f.listAll(ctx, pathID, listChunk, false, false, func(item *File) bool {
 		// Compare with decoded name to handle special characters correctly
 		decodedName := f.opt.Enc.ToStandardName(item.FileNameBest())
+
+		// 🔧 批量缓存：缓存所有找到的目录项
+		if item.IsDir() && parentPathOk {
+			var itemPath string
+			if parentPath == "" {
+				itemPath = decodedName
+			} else {
+				itemPath = path.Join(parentPath, decodedName)
+			}
+			f.dirCache.Put(itemPath, item.ID())
+			fs.Debugf(f, "📦 批量缓存: %s -> ID=%s", decodedName, item.ID())
+		}
+
 		if decodedName == leaf {
 			// 检查找到的项目是否为目录
 			if item.IsDir() {
 				// 这是目录，返回目录ID
 				foundID = item.ID()
-				// Cache the found item's path/ID mapping (only for directories)
-				parentPath, ok := f.dirCache.GetInv(pathID)
-				if ok {
-					itemPath := path.Join(parentPath, leaf)
-					f.dirCache.Put(itemPath, foundID)
-				}
+				fs.Debugf(f, "✅ FindLeaf找到目标: %s -> ID=%s, Type=目录", leaf, foundID)
 			} else {
 				foundID = "" // 明确设置为空，表示找到的是文件而不是目录
+				fs.Debugf(f, "✅ FindLeaf找到目标: %s -> Type=文件", leaf)
 			}
 			return true // Stop searching
 		}
