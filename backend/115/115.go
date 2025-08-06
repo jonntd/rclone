@@ -620,11 +620,12 @@ type SizeInfo struct {
 
 // DownloadURL represents the URL structure from both APIs
 type DownloadURL struct {
-	URL     string         `json:"url"`              // Present in both
-	Client  Int            `json:"client,omitempty"` // Traditional
-	Desc    string         `json:"desc,omitempty"`   // Traditional
-	OssID   string         `json:"oss_id,omitempty"` // Traditional
-	Cookies []*http.Cookie // Added manually after request
+	URL       string         `json:"url"`              // Present in both
+	Client    Int            `json:"client,omitempty"` // Traditional
+	Desc      string         `json:"desc,omitempty"`   // Traditional
+	OssID     string         `json:"oss_id,omitempty"` // Traditional
+	Cookies   []*http.Cookie // Added manually after request
+	CreatedAt time.Time      `json:"created_at"` // 创建时间，用于fallback过期检测
 }
 
 func (u *DownloadURL) UnmarshalJSON(data []byte) error {
@@ -639,12 +640,19 @@ func (u *DownloadURL) UnmarshalJSON(data []byte) error {
 		// Try unmarshalling just as a string if object fails (OpenAPI might simplify)
 		var urlStr string
 		if strErr := json.Unmarshal(data, &urlStr); strErr == nil {
-			*u = DownloadURL{URL: urlStr}
+			*u = DownloadURL{
+				URL:       urlStr,
+				CreatedAt: time.Now(), // 设置创建时间用于fallback过期检测
+			}
 			return nil
 		}
 		return err // Return original error if string unmarshal also fails
 	}
 	*u = DownloadURL(aux)
+	// 确保从JSON解析的DownloadURL也有创建时间
+	if u.CreatedAt.IsZero() {
+		u.CreatedAt = time.Now()
+	}
 	return nil
 }
 
@@ -670,37 +678,51 @@ func (u *DownloadURL) expiry() time.Time {
 
 // expired reports whether the token is expired.
 func (u *DownloadURL) expired() bool {
+	// 策略1：首先尝试现有的URL解析逻辑（保持不变）
 	expiry := u.expiry()
-	if expiry.IsZero() {
-		return false // Assume non-expiring if no expiry found
+	if !expiry.IsZero() {
+		// 修复：115网盘URL有效期通常4-5分钟，使用更合理的缓冲时间
+		now := time.Now()
+		timeUntilExpiry := expiry.Sub(now)
+
+		// 🔍 调试信息：记录过期检测详情
+		fs.Debugf(nil, "🔍 115网盘URL过期检查(URL解析): 当前时间=%v, 过期时间=%v, 剩余时间=%v",
+			now.Format("15:04:05"), expiry.Format("15:04:05"), timeUntilExpiry)
+
+		// 如果URL已经过期，直接返回true
+		if timeUntilExpiry <= 0 {
+			fs.Debugf(nil, "⚠️ 115网盘URL已过期(URL解析)")
+			return true
+		}
+
+		// 根据剩余时间选择缓冲策略
+		var expiryDelta time.Duration
+		if timeUntilExpiry < 2*time.Minute {
+			expiryDelta = 15 * time.Second // 短期URL使用15秒缓冲
+		} else {
+			expiryDelta = 30 * time.Second // 长期URL使用30秒缓冲
+		}
+
+		isExpired := timeUntilExpiry <= expiryDelta
+		fs.Debugf(nil, "🔍 115网盘URL过期决策(URL解析): 缓冲区=%v, 已过期=%v", expiryDelta, isExpired)
+
+		return isExpired
 	}
 
-	// 修复：115网盘URL有效期通常4-5分钟，使用更合理的缓冲时间
-	now := time.Now()
-	timeUntilExpiry := expiry.Sub(now)
+	// 策略2：URL解析失败时的fallback - 使用创建时间 + 4分钟
+	if !u.CreatedAt.IsZero() {
+		timeSinceCreated := time.Since(u.CreatedAt)
+		fallbackExpired := timeSinceCreated > 4*time.Minute
 
-	// 🔍 调试信息：记录过期检测详情
-	fs.Debugf(nil, "🔍 115网盘URL过期检查: 当前时间=%v, 过期时间=%v, 剩余时间=%v",
-		now.Format("15:04:05"), expiry.Format("15:04:05"), timeUntilExpiry)
+		fs.Debugf(nil, "🔍 115网盘URL过期检查(fallback): 创建时间=%v, 已存在时间=%v, 已过期=%v",
+			u.CreatedAt.Format("15:04:05"), timeSinceCreated, fallbackExpired)
 
-	// 如果URL已经过期，直接返回true
-	if timeUntilExpiry <= 0 {
-		fs.Debugf(nil, "⚠️ 115网盘URL已过期")
-		return true
+		return fallbackExpired
 	}
 
-	// 根据剩余时间选择缓冲策略
-	var expiryDelta time.Duration
-	if timeUntilExpiry < 2*time.Minute {
-		expiryDelta = 15 * time.Second // 短期URL使用15秒缓冲
-	} else {
-		expiryDelta = 30 * time.Second // 长期URL使用30秒缓冲
-	}
-
-	isExpired := timeUntilExpiry <= expiryDelta
-	fs.Debugf(nil, "🔍 115网盘URL过期决策: 缓冲区=%v, 已过期=%v", expiryDelta, isExpired)
-
-	return isExpired
+	// 策略3：最后的fallback - 假设不过期（保持原有行为）
+	fs.Debugf(nil, "🔍 115网盘URL过期检查(最后fallback): 假设不过期")
+	return false
 }
 
 // Valid reports whether u is non-nil and is not expired.
@@ -5205,7 +5227,11 @@ func (f *Fs) getDownloadURLWithForce(ctx context.Context, pickCode string, force
 	fs.Debugf(f, "✅ 115网盘成功获取下载URL: pickCode=%s, fileName=%s, fileSize=%d",
 		pickCode, downInfo.FileName, int64(downInfo.FileSize))
 
-	return &downInfo.URL, nil
+	// 设置创建时间，用于fallback过期检测
+	downloadURL := downInfo.URL
+	downloadURL.CreatedAt = time.Now()
+
+	return &downloadURL, nil
 }
 
 // validateAndCorrectPickCode 验证并修正pickCode格式
@@ -6192,9 +6218,9 @@ func (f *Fs) newOSSClient() (*oss.Client, error) {
 		WithUseDualStackEndpoint(f.opt.DualStack).
 		WithUseInternalEndpoint(f.opt.Internal).
 		// 修复：优化连接超时，快速建立连接
-		WithConnectTimeout(5 * time.Second). // 减少到5秒，快速失败重试
-		// 修复：优化读写超时，适合分片上传
-		WithReadWriteTimeout(60 * time.Second) // 减少到60秒，适合20MB分片
+		WithConnectTimeout(10 * time.Second). // 增加到10秒，避免连接超时
+		// 修复：优化读写超时，适合大文件上传
+		WithReadWriteTimeout(300 * time.Second) // 增加到300秒（5分钟），适合大文件上传
 
 	// 使用rclone标准HTTP客户端
 	httpClient := fshttp.NewClient(context.Background())
@@ -7959,7 +7985,7 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 		Body:        newIn, // Use potentially buffered reader
 		Callback:    oss.Ptr(ui.GetCallback()),
 		CallbackVar: oss.Ptr(ui.GetCallbackVar()),
-		// 平衡优化：使用极简进度回调，保持rclone进度跟踪但最小化开销
+		// 修复进度回调：确保total参数有效，避免负数或零值导致的异常
 		ProgressFn: func() func(increment, transferred, total int64) {
 			var lastTransferred int64
 			return func(increment, transferred, total int64) {
@@ -7969,9 +7995,24 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 
 				// 只保留调试日志，不更新Account对象
 				if transferred > lastTransferred {
-					fs.Debugf(o, "📊 示例上传进度: %s/%s (%d%%)",
-						fs.SizeSuffix(transferred), fs.SizeSuffix(total),
-						int(float64(transferred)/float64(total)*100))
+					// 修复：检查total参数有效性，避免除零或负数
+					var percentage int
+					if total > 0 {
+						percentage = int(float64(transferred) / float64(total) * 100)
+					} else {
+						// 如果total无效，使用文件大小作为参考
+						if size > 0 {
+							percentage = int(float64(transferred) / float64(size) * 100)
+						} else {
+							percentage = 0
+						}
+					}
+
+					fs.Debugf(o, "📊 OSS上传进度: %s/%s (%d%%) [文件大小: %s]",
+						fs.SizeSuffix(transferred),
+						fs.SizeSuffix(max(total, size)),
+						percentage,
+						fs.SizeSuffix(size))
 					lastTransferred = transferred
 				}
 			}

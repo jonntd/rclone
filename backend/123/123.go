@@ -144,10 +144,15 @@ type Fs struct {
 	rootFolderID string           // 根文件夹的ID
 
 	// 缓存系统
-	parentDirCache   map[int64]time.Time  // 缓存已验证的父目录ID和验证时间
-	downloadURLCache map[string]CachedURL // 下载URL缓存
-	listFileCache    *cache.Cache         // ListFile结果缓存
-	cacheMu          sync.RWMutex         // 保护缓存的读写锁
+	parentDirCache   map[int64]time.Time // 缓存已验证的父目录ID和验证时间
+	downloadURLCache sync.Map            // 下载URL缓存 (map[string]CachedURL) - 使用sync.Map提升并发性能
+	listFileCache    *cache.Cache        // ListFile结果缓存
+	cacheMu          sync.RWMutex        // 保护parentDirCache的读写锁
+
+	// 上传域名缓存
+	uploadDomain    string       // 缓存的上传域名
+	uploadDomainExp time.Time    // 上传域名过期时间
+	uploadDomainMu  sync.RWMutex // 保护上传域名缓存的读写锁
 
 	// 性能和速率限制 - 根据123网盘API限流表精确优化的调速器
 	listPacer     *fs.Pacer // 文件列表API的调速器（10 QPS）
@@ -565,22 +570,18 @@ func normalizePath(path string) string {
 
 // getCachedDownloadURL 获取缓存的下载URL
 func (f *Fs) getCachedDownloadURL(fileID string) (string, bool) {
-	f.cacheMu.RLock()
-	defer f.cacheMu.RUnlock()
-
-	cached, exists := f.downloadURLCache[fileID]
+	// 使用sync.Map的Load方法，无需外部锁保护
+	value, exists := f.downloadURLCache.Load(fileID)
 	if !exists {
 		return "", false
 	}
 
+	cached := value.(CachedURL)
+
 	// 检查是否过期（根据123网盘API文档，下载URL有效期为2小时）
 	if time.Now().After(cached.ExpiresAt) {
-		// 过期了，需要清理
-		go func() {
-			f.cacheMu.Lock()
-			delete(f.downloadURLCache, fileID)
-			f.cacheMu.Unlock()
-		}()
+		// 过期了，异步清理（sync.Map的Delete是并发安全的）
+		go f.downloadURLCache.Delete(fileID)
 		return "", false
 	}
 
@@ -590,16 +591,16 @@ func (f *Fs) getCachedDownloadURL(fileID string) (string, bool) {
 
 // setCachedDownloadURL 设置下载URL缓存
 func (f *Fs) setCachedDownloadURL(fileID, url string) {
-	f.cacheMu.Lock()
-	defer f.cacheMu.Unlock()
-
-	// 下载URL缓存1.5小时（充分利用2小时有效期，留0.5小时安全边际）
-	f.downloadURLCache[fileID] = CachedURL{
+	// 下载URL缓存100分钟（优化TTL，更好利用2小时API有效期，留20分钟安全边际）
+	cached := CachedURL{
 		URL:       url,
-		ExpiresAt: time.Now().Add(90 * time.Minute),
+		ExpiresAt: time.Now().Add(100 * time.Minute),
 	}
 
-	fs.Debugf(f, "💾 缓存下载URL: fileID=%s, 有效期90分钟", fileID)
+	// 使用sync.Map的Store方法，无需外部锁保护
+	f.downloadURLCache.Store(fileID, cached)
+
+	fs.Debugf(f, "💾 缓存下载URL: fileID=%s, 有效期100分钟", fileID)
 }
 
 // 🔧 移除非标准的启发式文件判断函数
@@ -2179,38 +2180,12 @@ func (f *Fs) uploadPartWithMultipart(ctx context.Context, preuploadID string, pa
 }
 
 // uploadPartDirectly 直接上传分片，不包含重试逻辑
-// 关键修复：将重试逻辑从业务逻辑中分离
+// 关键修复：将重试逻辑从业务逻辑中分离，修复multipart数据在重试时丢失的问题
 func (f *Fs) uploadPartDirectly(ctx context.Context, preuploadID string, partNumber int64, chunkHash string, data []byte) error {
-	// 修复：移除 uploadPacer.Call，直接执行，重试由统一管理器处理
 	// 获取上传域名
 	uploadDomain, err := f.getUploadDomain(ctx)
 	if err != nil {
 		return fmt.Errorf("获取上传域名失败: %w", err)
-	}
-
-	// 创建multipart表单数据
-	var buf bytes.Buffer
-	writer := multipart.NewWriter(&buf)
-
-	// 添加表单字段
-	writer.WriteField("preuploadID", preuploadID)
-	writer.WriteField("sliceNo", fmt.Sprintf("%d", partNumber))
-	writer.WriteField("sliceMD5", chunkHash)
-
-	// 添加文件数据
-	part, err := writer.CreateFormFile("slice", fmt.Sprintf("chunk_%d", partNumber))
-	if err != nil {
-		return fmt.Errorf("创建表单文件字段失败: %w", err)
-	}
-
-	_, err = part.Write(data)
-	if err != nil {
-		return fmt.Errorf("写入分片数据失败: %w", err)
-	}
-
-	err = writer.Close()
-	if err != nil {
-		return fmt.Errorf("关闭multipart writer失败: %w", err)
 	}
 
 	// 使用上传域名进行multipart上传
@@ -2223,24 +2198,88 @@ func (f *Fs) uploadPartDirectly(ctx context.Context, preuploadID string, partNum
 	uploadCtx, cancel := context.WithTimeout(ctx, 5*time.Minute) // 每个分片最多5分钟
 	defer cancel()
 
-	// 使用上传域名调用分片上传API
-	err = f.makeAPICallWithRestMultipartToDomain(uploadCtx, uploadDomain, "/upload/v2/file/slice", "POST", &buf, writer.FormDataContentType(), &response)
-	if err != nil {
-		return fmt.Errorf("上传分片数据失败: %w", err)
-	}
+	// 根据端点获取适当的调速器
+	pacer := f.getPacerForEndpoint("/upload/v2/file/slice")
 
-	if response.Code != 0 {
-		return fmt.Errorf("分片上传API错误 %d: %s", response.Code, response.Message)
-	}
+	// 修复关键问题：在pacer重试循环内重新创建multipart数据
+	return pacer.Call(func() (bool, error) {
+		// 每次重试都重新创建multipart表单数据，避免body被消耗的问题
+		var buf bytes.Buffer
+		writer := multipart.NewWriter(&buf)
 
-	fs.Debugf(f, "✅ 分片 %d 上传成功", partNumber)
-	return nil
+		// 添加表单字段
+		writer.WriteField("preuploadID", preuploadID)
+		writer.WriteField("sliceNo", fmt.Sprintf("%d", partNumber))
+		writer.WriteField("sliceMD5", chunkHash)
+
+		// 添加文件数据
+		part, err := writer.CreateFormFile("slice", fmt.Sprintf("chunk_%d", partNumber))
+		if err != nil {
+			return false, fmt.Errorf("创建表单文件字段失败: %w", err)
+		}
+
+		_, err = part.Write(data)
+		if err != nil {
+			return false, fmt.Errorf("写入分片数据失败: %w", err)
+		}
+
+		err = writer.Close()
+		if err != nil {
+			return false, fmt.Errorf("关闭multipart writer失败: %w", err)
+		}
+
+		// 直接使用rest客户端，避免嵌套的pacer调用
+		opts := rest.Opts{
+			Method:  "POST",
+			RootURL: uploadDomain,
+			Path:    "/upload/v2/file/slice",
+			Body:    &buf,
+			ExtraHeaders: map[string]string{
+				"Content-Type":  writer.FormDataContentType(),
+				"Authorization": "Bearer " + f.token,
+				"Platform":      "open_platform",
+				"User-Agent":    f.opt.UserAgent,
+			},
+		}
+
+		resp, err := f.rst.Call(uploadCtx, &opts)
+		if err != nil {
+			// 检查是否需要重试
+			if fserrors.ShouldRetry(err) {
+				fs.Debugf(f, "🔄 分片 %d 上传失败，将重试: %v", partNumber, err)
+				return true, err
+			}
+			return false, fmt.Errorf("上传分片数据失败: %w", err)
+		}
+		defer resp.Body.Close()
+
+		// 检查响应状态
+		if resp.StatusCode >= 400 {
+			body, _ := io.ReadAll(resp.Body)
+			return false, fmt.Errorf("分片上传HTTP错误 %d: %s", resp.StatusCode, string(body))
+		}
+
+		// 解析响应
+		err = json.NewDecoder(resp.Body).Decode(&response)
+		if err != nil {
+			return false, fmt.Errorf("解析分片上传响应失败: %w", err)
+		}
+
+		if response.Code != 0 {
+			return false, fmt.Errorf("分片上传API错误 %d: %s", response.Code, response.Message)
+		}
+
+		fs.Debugf(f, "✅ 分片 %d 上传成功", partNumber)
+		return false, nil
+	})
 }
 
 // uploadPartWithRetry 带增强重试机制的分片上传
 func (f *Fs) uploadPartWithRetry(ctx context.Context, preuploadID string, partNumber int64, chunkHash string, data []byte) error {
 	maxRetries := 3
 	baseDelay := 1 * time.Second
+
+	fs.Debugf(f, "🚀 开始上传分片 %d，大小: %d bytes，MD5: %s", partNumber, len(data), chunkHash)
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
@@ -2250,20 +2289,39 @@ func (f *Fs) uploadPartWithRetry(ctx context.Context, preuploadID string, partNu
 			time.Sleep(delay)
 		}
 
+		// 记录每次尝试的开始时间
+		attemptStart := time.Now()
+		fs.Debugf(f, "📤 分片 %d 尝试 %d/%d 开始", partNumber, attempt+1, maxRetries)
+
 		err := f.uploadPartWithMultipart(ctx, preuploadID, partNumber, chunkHash, data)
 		if err == nil {
+			duration := time.Since(attemptStart)
+			fs.Debugf(f, "✅ 分片 %d 上传成功，耗时: %v，速度: %s/s",
+				partNumber, duration, fs.SizeSuffix(int64(float64(len(data))/duration.Seconds())))
 			return nil
 		}
 
+		// 详细记录错误信息
+		duration := time.Since(attemptStart)
+		fs.Debugf(f, "❌ 分片 %d 尝试 %d/%d 失败，耗时: %v，错误: %v",
+			partNumber, attempt+1, maxRetries, duration, err)
+
 		// 检查是否应该重试
 		if !fserrors.ShouldRetry(err) {
-			fs.Debugf(f, "❌ 分片 %d 上传失败，不可重试: %v", partNumber, err)
-			return err
+			fs.Errorf(f, "❌ 分片 %d 上传失败，不可重试的错误: %v", partNumber, err)
+			return fmt.Errorf("分片 %d 上传失败，不可重试: %w", partNumber, err)
+		}
+
+		// 检查上下文是否被取消
+		if ctx.Err() != nil {
+			fs.Errorf(f, "❌ 分片 %d 上传被取消: %v", partNumber, ctx.Err())
+			return fmt.Errorf("分片 %d 上传被取消: %w", partNumber, ctx.Err())
 		}
 
 		fs.Debugf(f, "⚠️ 分片 %d 上传失败，将重试: %v", partNumber, err)
 	}
 
+	fs.Errorf(f, "❌ 分片 %d 上传最终失败，已重试 %d 次", partNumber, maxRetries)
 	return fmt.Errorf("分片 %d 上传失败，已重试 %d 次", partNumber, maxRetries)
 }
 
@@ -2330,6 +2388,13 @@ func (f *Fs) completeUploadWithResultAndSize(ctx context.Context, preuploadID st
 
 		// Handle API errors
 		if response.Code != 0 {
+			// 特殊处理"文件正在校验中"错误 - 这是正常的等待状态
+			if response.Code == 20103 {
+				fs.Debugf(f, "⏳ 文件正在校验中，继续等待 (尝试 %d/%d): %s", attempt+1, maxRetries, response.Message)
+				continue
+			}
+
+			// 其他错误直接返回
 			fs.Debugf(f, "❌ 上传验证失败: API错误 %d: %s", response.Code, response.Message)
 			return nil, fmt.Errorf("upload verification failed: API error %d: %s", response.Code, response.Message)
 		}
@@ -2760,19 +2825,45 @@ func (f *Fs) uploadChunksSingleThreaded(ctx context.Context, srcObj fs.Object, c
 	totalChunks := (fileSize + chunkSize - 1) / chunkSize
 	overallHasher := md5.New()
 
-	fs.Debugf(f, "使用单线程分片上传")
+	fs.Debugf(f, "🌊 开始单线程分片上传: 文件=%s, 总大小=%s, 分片数=%d, 分片大小=%s",
+		fileName, fs.SizeSuffix(fileSize), totalChunks, fs.SizeSuffix(chunkSize))
 
-	// 简化的分片上传循环，无断点续传
+	uploadStart := time.Now()
+
+	// 增强的分片上传循环，带详细错误处理
 	for chunkIndex := int64(0); chunkIndex < totalChunks; chunkIndex++ {
 		partNumber := chunkIndex + 1
 
-		// 上传分片
-		if err := f.uploadSingleChunkWithStream(ctx, srcObj, overallHasher, preuploadID, chunkIndex, chunkSize, fileSize, totalChunks); err != nil {
-			return nil, fmt.Errorf("上传分片 %d 失败: %w", partNumber, err)
+		// 检查上下文是否被取消
+		if ctx.Err() != nil {
+			fs.Errorf(f, "❌ 分片上传被取消: %v", ctx.Err())
+			return nil, fmt.Errorf("分片上传被取消: %w", ctx.Err())
 		}
 
-		fs.Debugf(f, "✅ 分片 %d/%d 上传完成", partNumber, totalChunks)
+		chunkStart := time.Now()
+		fs.Debugf(f, "📤 开始上传分片 %d/%d", partNumber, totalChunks)
+
+		// 上传分片
+		if err := f.uploadSingleChunkWithStream(ctx, srcObj, overallHasher, preuploadID, chunkIndex, chunkSize, fileSize, totalChunks); err != nil {
+			fs.Errorf(f, "❌ 分片 %d/%d 上传失败: %v", partNumber, totalChunks, err)
+			return nil, fmt.Errorf("上传分片 %d/%d 失败: %w", partNumber, totalChunks, err)
+		}
+
+		chunkDuration := time.Since(chunkStart)
+		uploadedBytes := (chunkIndex + 1) * chunkSize
+		if uploadedBytes > fileSize {
+			uploadedBytes = fileSize
+		}
+
+		progress := float64(uploadedBytes) / float64(fileSize) * 100
+		fs.Debugf(f, "✅ 分片 %d/%d 上传完成，耗时: %v，总进度: %.1f%%",
+			partNumber, totalChunks, chunkDuration, progress)
 	}
+
+	totalUploadTime := time.Since(uploadStart)
+	avgSpeed := float64(fileSize) / totalUploadTime.Seconds()
+	fs.Debugf(f, "🎯 所有分片上传完成，总耗时: %v，平均速度: %s/s",
+		totalUploadTime, fs.SizeSuffix(int64(avgSpeed)))
 
 	// 完成上传并返回结果
 	return f.finalizeChunkedUpload(ctx, createResp, overallHasher, fileSize, fileName, preuploadID)
@@ -3036,6 +3127,18 @@ func (f *Fs) validateAndCleanFileNameUnified(fileName string) (cleanedName strin
 
 // getUploadDomain 获取上传域名，支持动态获取和缓存
 func (f *Fs) getUploadDomain(ctx context.Context) (string, error) {
+	// 检查缓存是否有效
+	f.uploadDomainMu.RLock()
+	if f.uploadDomain != "" && time.Now().Before(f.uploadDomainExp) {
+		domain := f.uploadDomain
+		f.uploadDomainMu.RUnlock()
+		fs.Debugf(f, "🎯 上传域名缓存命中: %s", domain)
+		return domain, nil
+	}
+	f.uploadDomainMu.RUnlock()
+
+	// 缓存过期或不存在，重新获取
+	fs.Debugf(f, "🔄 上传域名缓存过期，重新获取")
 
 	// 尝试动态获取上传域名 - 使用正确的API路径
 	var response struct {
@@ -3051,8 +3154,13 @@ func (f *Fs) getUploadDomain(ctx context.Context) (string, error) {
 		domain := response.Data[0] // 取第一个域名
 		fs.Debugf(f, "✅ 动态获取上传域名成功: %s", domain)
 
-		fs.Debugf(f, "✅ 上传域名获取成功，不使用缓存: %s", domain)
+		// 缓存域名，有效期10分钟
+		f.uploadDomainMu.Lock()
+		f.uploadDomain = domain
+		f.uploadDomainExp = time.Now().Add(10 * time.Minute)
+		f.uploadDomainMu.Unlock()
 
+		fs.Debugf(f, "💾 上传域名已缓存10分钟: %s", domain)
 		return domain, nil
 	}
 
@@ -3063,14 +3171,15 @@ func (f *Fs) getUploadDomain(ctx context.Context) (string, error) {
 		"https://openapi-upload.123pan.com", // 备用域名
 	}
 
-	// 简单的健康检查：选择第一个可用的域名
-	for _, domain := range defaultDomains {
-		// 这里可以添加简单的连通性检查
-		fs.Debugf(f, "🌐 使用默认上传域名: %s", domain)
-		return domain, nil
-	}
+	// 选择第一个默认域名，并缓存较短时间（2分钟）
+	domain := defaultDomains[0]
+	f.uploadDomainMu.Lock()
+	f.uploadDomain = domain
+	f.uploadDomainExp = time.Now().Add(2 * time.Minute) // 默认域名缓存时间较短
+	f.uploadDomainMu.Unlock()
 
-	return defaultDomains[0], nil
+	fs.Debugf(f, "🌐 使用默认上传域名并缓存2分钟: %s", domain)
+	return domain, nil
 }
 
 // deleteFile 通过移动到回收站来删除文件
@@ -3332,9 +3441,9 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		root:             normalizedRoot,
 		opt:              *opt,
 		m:                m,
-		parentDirCache:   make(map[int64]time.Time),  // 初始化父目录缓存
-		downloadURLCache: make(map[string]CachedURL), // 初始化下载URL缓存
-		listFileCache:    cache.New(),                // 初始化ListFile结果缓存
+		parentDirCache:   make(map[int64]time.Time), // 初始化父目录缓存
+		downloadURLCache: sync.Map{},                // 初始化下载URL缓存 - 使用sync.Map提升并发性能
+		listFileCache:    cache.New(),               // 初始化ListFile结果缓存
 		rootFolderID:     opt.RootFolderID,
 		rst:              rest.NewClient(client).SetRoot(openAPIRootURL),
 	}
