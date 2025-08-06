@@ -15,6 +15,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -113,6 +114,9 @@ type Options struct {
 	UploadPacerMinSleep   fs.Duration `config:"upload_pacer_min_sleep"`
 	DownloadPacerMinSleep fs.Duration `config:"download_pacer_min_sleep"`
 	StrictPacerMinSleep   fs.Duration `config:"strict_pacer_min_sleep"`
+
+	// 流式哈希传输模式选项
+	StreamHashMode bool `config:"stream_hash_mode"`
 
 	// 编码配置
 	Enc encoder.MultiEncoder `config:"encoding"` // 文件名编码设置
@@ -676,6 +680,14 @@ func init() {
 			Name:     "strict_pacer_min_sleep",
 			Help:     "严格API调用（move, delete等）之间的最小等待时间。",
 			Default:  fileMoveMinSleep,
+			Advanced: true,
+		}, {
+			Name: "stream_hash_mode",
+			Help: `启用流式哈希计算模式，用于跨云传输时节省本地存储空间。
+- false: 使用传统模式（默认）
+- true: 先流式计算文件哈希尝试秒传，失败后再流式上传
+适用于本地存储空间有限的环境。`,
+			Default:  false,
 			Advanced: true,
 		}, {
 			Name:     config.ConfigEncoding,
@@ -2349,9 +2361,22 @@ func (f *Fs) completeUploadWithResultAndSize(ctx context.Context, preuploadID st
 		} `json:"data"`
 	}
 
-	// Use simple polling strategy with reasonable defaults
-	maxRetries := 300 // 10 minutes max
-	interval := 2 * time.Second
+	// 优化的轮询策略：根据文件大小调整等待时间
+	var maxRetries int
+	var interval time.Duration
+
+	if fileSize <= 100*1024*1024 { // 100MB以下
+		maxRetries = 120 // 4分钟
+		interval = 2 * time.Second
+	} else if fileSize <= 1024*1024*1024 { // 1GB以下
+		maxRetries = 300 // 10分钟
+		interval = 2 * time.Second
+	} else { // 1GB以上
+		maxRetries = 600 // 20分钟
+		interval = 2 * time.Second
+	}
+
+	fs.Debugf(f, "🔄 开始轮询上传完成状态，最大等待时间: %v", time.Duration(maxRetries)*interval)
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
@@ -2374,7 +2399,7 @@ func (f *Fs) completeUploadWithResultAndSize(ctx context.Context, preuploadID st
 		}
 
 		if response.Code == 0 && response.Data.Completed {
-			fs.Debugf(f, "✅ 上传验证成功完成 (尝试: %d/%d)", attempt+1, maxRetries)
+			fs.Infof(f, "✅ 上传验证成功完成 (耗时: %v)", time.Duration(attempt)*interval)
 			return &UploadCompleteResult{
 				FileID: response.Data.FileID,
 				Etag:   response.Data.Etag,
@@ -2382,15 +2407,27 @@ func (f *Fs) completeUploadWithResultAndSize(ctx context.Context, preuploadID st
 		}
 
 		if response.Code == 0 && !response.Data.Completed {
-			fs.Debugf(f, "🔄 服务器返回completed=false，继续轮询 (尝试 %d/%d)", attempt+1, maxRetries)
+			// 每30秒显示一次进度信息
+			if attempt%15 == 0 && attempt > 0 {
+				elapsed := time.Duration(attempt) * interval
+				fs.Infof(f, "⏳ 123网盘服务器正在处理文件，已等待: %v", elapsed)
+			} else {
+				fs.Debugf(f, "🔄 服务器返回completed=false，继续轮询 (尝试 %d/%d)", attempt+1, maxRetries)
+			}
 			continue
 		}
 
 		// Handle API errors
 		if response.Code != 0 {
 			// 特殊处理"文件正在校验中"错误 - 这是正常的等待状态
-			if response.Code == 20103 {
-				fs.Debugf(f, "⏳ 文件正在校验中，继续等待 (尝试 %d/%d): %s", attempt+1, maxRetries, response.Message)
+			if response.Code == 20103 || strings.Contains(response.Message, "文件正在校验中") {
+				// 每30秒显示一次进度信息
+				if attempt%15 == 0 && attempt > 0 {
+					elapsed := time.Duration(attempt) * interval
+					fs.Infof(f, "⏳ 123网盘服务器正在校验文件，已等待: %v", elapsed)
+				} else {
+					fs.Debugf(f, "⏳ 文件正在校验中，继续等待 (尝试 %d/%d): %s", attempt+1, maxRetries, response.Message)
+				}
 				continue
 			}
 
@@ -2624,15 +2661,20 @@ func (f *Fs) uploadFileInChunksSimplified(ctx context.Context, srcObj fs.Object,
 }
 
 // handleCrossCloudTransfer 统一的跨云传输处理函数
-// 采用内部两步传输策略，彻底解决跨云传输问题
+// 支持传统模式和流式哈希模式
 func (f *Fs) handleCrossCloudTransfer(ctx context.Context, in io.Reader, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
 	fileSize := src.Size()
-	fs.Debugf(f, "🔄 开始内部两步传输: %s (%s)", fileName, fs.SizeSuffix(fileSize))
 
-	// Use internal two-step transfer to avoid cross-cloud transfer issues
-	fs.Debugf(f, "📥 步骤1: 下载到本地, 📤 步骤2: 从本地上传到123")
-
-	return f.internalTwoStepTransfer(ctx, in, src, parentFileID, fileName)
+	// 检查是否启用流式哈希模式
+	if f.opt.StreamHashMode {
+		fs.Infof(f, "🌊 启用流式哈希模式: %s (%s)", fileName, fs.SizeSuffix(fileSize))
+		return f.smartStreamHashTransfer(ctx, src, parentFileID, fileName)
+	} else {
+		fs.Debugf(f, "🔄 使用传统两步传输: %s (%s)", fileName, fs.SizeSuffix(fileSize))
+		// Use internal two-step transfer to avoid cross-cloud transfer issues
+		fs.Debugf(f, "📥 步骤1: 下载到本地, 📤 步骤2: 从本地上传到123")
+		return f.internalTwoStepTransfer(ctx, in, src, parentFileID, fileName)
+	}
 }
 
 // internalTwoStepTransfer 内部两步传输：下载到本地临时文件，然后上传到123网盘
@@ -3719,14 +3761,20 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	// 跨云传输优化：检测大文件并启用多线程下载
 	// 检查是否已经有禁用并发下载选项，避免重复并发
 	hasDisableOption := false
+	hasRangeOption := false
 	for _, option := range options {
 		if option.String() == "DisableConcurrentDownload" {
 			hasDisableOption = true
 			break
 		}
+		// 修复：检查是否有Range请求，Range请求不应该使用并发下载
+		if _, ok := option.(*fs.RangeOption); ok {
+			hasRangeOption = true
+		}
 	}
 
-	if !hasDisableOption && o.size >= 10*1024*1024 { // 10MB阈值
+	// 修复：Range请求不使用并发下载，避免下载整个文件
+	if !hasDisableOption && !hasRangeOption && o.size >= 10*1024*1024 { // 10MB阈值
 		return o.openWithConcurrency(ctx, options...)
 	}
 
@@ -5145,7 +5193,248 @@ func (oi *ObjectInfo) Hash(ctx context.Context, t fshash.Type) (string, error) {
 	return "", fshash.ErrUnsupported
 }
 
+// smartStreamHashTransfer 智能流式哈希传输
+// 根据文件大小选择最优策略：小文件内存缓存，大文件流式哈希计算
+func (f *Fs) smartStreamHashTransfer(ctx context.Context, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
+	fileSize := src.Size()
+
+	// 智能策略选择：与123网盘API限制保持一致
+	// 小文件（≤100MB）：内存缓存 + 单步上传API
+	// 大文件（>100MB）：流式哈希 + 分片上传API
+	if fileSize <= 100*1024*1024 { // 100MB以下使用内存缓存
+		fs.Infof(f, "📝 小文件使用内存缓存模式: %s", fs.SizeSuffix(fileSize))
+		return f.memoryHashTransfer(ctx, src, parentFileID, fileName)
+	} else {
+		fs.Infof(f, "🌊 大文件使用流式哈希模式: %s", fs.SizeSuffix(fileSize))
+		return f.streamHashTransfer(ctx, src, parentFileID, fileName)
+	}
+}
+
+// memoryHashTransfer 小文件内存缓存哈希传输
+func (f *Fs) memoryHashTransfer(ctx context.Context, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
+	// 转换为fs.Object以便调用Open方法
+	srcObj, ok := src.(fs.Object)
+	if !ok {
+		return nil, fmt.Errorf("source is not a valid fs.Object")
+	}
+
+	// 打开源文件
+	srcReader, err := srcObj.Open(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open source file: %w", err)
+	}
+	defer srcReader.Close()
+
+	// 读取整个文件到内存并计算MD5
+	data, err := io.ReadAll(srcReader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file data: %w", err)
+	}
+
+	// 计算MD5哈希
+	hasher := md5.New()
+	hasher.Write(data)
+	md5Hash := fmt.Sprintf("%x", hasher.Sum(nil))
+
+	fs.Infof(f, "📊 内存哈希计算完成: %s, MD5: %s", fs.SizeSuffix(int64(len(data))), md5Hash)
+
+	// 小文件直接使用单步上传API（包含秒传检查）
+	fs.Infof(f, "📤 小文件使用单步上传API（支持秒传）")
+	return f.singleStepUpload(ctx, data, parentFileID, fileName, md5Hash)
+}
+
 // Removed unused functions: getHTTPClient, getAdaptiveTimeout, detectNetworkSpeed, getOptimalConcurrency, getOptimalChunkSize
+
+// streamHashTransfer 大文件流式哈希传输
+func (f *Fs) streamHashTransfer(ctx context.Context, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
+	// 转换为fs.Object以便调用Open方法
+	srcObj, ok := src.(fs.Object)
+	if !ok {
+		return nil, fmt.Errorf("source is not a valid fs.Object")
+	}
+
+	// 第一遍：流式计算MD5哈希
+	fs.Infof(f, "🔄 第一遍：流式计算文件哈希...")
+
+	srcReader, err := srcObj.Open(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open source file for hash calculation: %w", err)
+	}
+	defer srcReader.Close()
+
+	// 流式计算MD5，不保存数据
+	hasher := md5.New()
+	buffer := make([]byte, 64*1024) // 64KB缓冲区
+
+	for {
+		n, err := srcReader.Read(buffer)
+		if n > 0 {
+			hasher.Write(buffer[:n])
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to read data for hash calculation: %w", err)
+		}
+	}
+
+	md5Hash := fmt.Sprintf("%x", hasher.Sum(nil))
+	fs.Infof(f, "📊 流式哈希计算完成: MD5: %s", md5Hash)
+
+	// 尝试秒传
+	createResp, err := f.createUpload(ctx, parentFileID, fileName, md5Hash, src.Size())
+	if err != nil {
+		return nil, fmt.Errorf("failed to create upload session: %w", err)
+	}
+
+	if createResp.Data.Reuse {
+		fs.Infof(f, "🚀 流式哈希计算后秒传成功！")
+		return f.createObject(fileName, createResp.Data.FileID, src.Size(), md5Hash, time.Now(), false), nil
+	}
+
+	// 秒传失败，第二遍：重新下载并流式上传
+	fs.Infof(f, "⬆️ 秒传失败，第二遍：重新下载并流式上传")
+	return f.streamUploadWithSession(ctx, srcObj, createResp, fileName, md5Hash)
+}
+
+// uploadFromMemory 函数已删除，小文件现在直接使用 singleStepUpload API
+
+// streamUploadWithSession 使用已有会话进行边下边传
+func (f *Fs) streamUploadWithSession(ctx context.Context, srcObj fs.Object, createResp *UploadCreateResp, fileName, md5Hash string) (*Object, error) {
+	fileSize := srcObj.Size()
+	serverChunkSize := createResp.Data.SliceSize // 使用服务器指定的分片大小
+
+	// 检查是否需要分片上传（与流式哈希模式的阈值保持一致）
+	if fileSize <= 100*1024*1024 { // 100MB阈值，与smartStreamHashTransfer保持一致
+		// 小文件：不应该走到这里，因为小文件应该直接使用 singleStepUpload
+		// 但如果走到这里，说明是从分片上传流程过来的，需要继续使用分片上传完成
+		fs.Infof(f, "📤 边下边传：小文件继续使用分片上传流程（已创建分片上传会话）")
+
+		// 下载整个文件
+		srcReader, err := srcObj.Open(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open source file for single upload: %w", err)
+		}
+		defer srcReader.Close()
+
+		data, err := io.ReadAll(srcReader)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read file data for single upload: %w", err)
+		}
+
+		// 使用分片上传API（因为已经创建了分片上传会话）
+		err = f.uploadSinglePart(ctx, createResp.Data.PreuploadID, data)
+		if err != nil {
+			return nil, fmt.Errorf("failed to upload single part: %w", err)
+		}
+
+		// 完成上传并获取真实文件ID
+		result, err := f.completeUploadWithResultAndSize(ctx, createResp.Data.PreuploadID, fileSize)
+		if err != nil {
+			return nil, fmt.Errorf("failed to complete single upload: %w", err)
+		}
+
+		return f.createObject(fileName, result.FileID, fileSize, md5Hash, time.Now(), false), nil
+	} else {
+		// 大文件：真正的边下边传实现
+		fs.Infof(f, "📤 真正的边下边传：文件大小=%s，服务器分片大小=%s",
+			fs.SizeSuffix(fileSize), fs.SizeSuffix(serverChunkSize))
+
+		totalChunks := (fileSize + serverChunkSize - 1) / serverChunkSize
+		fs.Infof(f, "🔢 总分片数: %d", totalChunks)
+
+		// 真正的边下边传：每次只处理一个分片
+		for chunkIndex := int64(0); chunkIndex < totalChunks; chunkIndex++ {
+			// 计算当前分片的范围
+			start := chunkIndex * serverChunkSize
+			end := start + serverChunkSize - 1
+			if end >= fileSize {
+				end = fileSize - 1
+			}
+			actualChunkSize := end - start + 1
+
+			fs.Infof(f, "📥 下载分片 %d/%d: 范围=%d-%d, 大小=%s",
+				chunkIndex+1, totalChunks, start, end, fs.SizeSuffix(actualChunkSize))
+
+			// 下载当前分片
+			chunkData, err := f.downloadChunkRange(ctx, srcObj, start, end)
+			if err != nil {
+				return nil, fmt.Errorf("下载分片 %d 失败: %w", chunkIndex, err)
+			}
+
+			fs.Infof(f, "📤 上传分片 %d/%d: 大小=%s",
+				chunkIndex+1, totalChunks, fs.SizeSuffix(int64(len(chunkData))))
+
+			// 立即上传当前分片
+			err = f.uploadSingleChunk(ctx, createResp.Data.PreuploadID, int(chunkIndex), chunkData)
+			if err != nil {
+				return nil, fmt.Errorf("上传分片 %d 失败: %w", chunkIndex, err)
+			}
+
+			fs.Infof(f, "✅ 分片 %d/%d 边下边传完成，内存占用: %s → 已释放",
+				chunkIndex+1, totalChunks, fs.SizeSuffix(int64(len(chunkData))))
+
+			// 立即释放内存
+			chunkData = nil
+			// 强制垃圾回收，确保内存释放
+			if chunkIndex%5 == 4 { // 每5个分片强制GC一次
+				runtime.GC()
+			}
+		}
+
+		fs.Infof(f, "🎯 所有分片边下边传完成，开始完成上传")
+
+		// 完成上传并获取真实文件ID
+		result, err := f.completeUploadWithResultAndSize(ctx, createResp.Data.PreuploadID, fileSize)
+		if err != nil {
+			return nil, fmt.Errorf("完成上传失败: %w", err)
+		}
+
+		fs.Infof(f, "🎉 边下边传成功完成！文件ID: %d", result.FileID)
+		return f.createObject(fileName, result.FileID, fileSize, md5Hash, time.Now(), false), nil
+	}
+}
+
+// downloadChunkRange 下载源文件的指定范围数据
+func (f *Fs) downloadChunkRange(ctx context.Context, srcObj fs.Object, start, end int64) ([]byte, error) {
+	// 使用Range请求下载指定分片
+	options := []fs.OpenOption{
+		&fs.RangeOption{Start: start, End: end},
+	}
+
+	reader, err := srcObj.Open(ctx, options...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open source with range %d-%d: %w", start, end, err)
+	}
+	defer reader.Close()
+
+	// 读取分片数据
+	chunkData, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read chunk data: %w", err)
+	}
+
+	fs.Debugf(f, "📥 下载分片完成: 范围=%d-%d, 大小=%s", start, end, fs.SizeSuffix(int64(len(chunkData))))
+	return chunkData, nil
+}
+
+// uploadSingleChunk 上传单个分片到123网盘
+func (f *Fs) uploadSingleChunk(ctx context.Context, preuploadID string, chunkIndex int, chunkData []byte) error {
+	// 计算分片MD5
+	chunkHash := fmt.Sprintf("%x", md5.Sum(chunkData))
+	partNumber := int64(chunkIndex + 1) // 123网盘分片编号从1开始
+
+	// 使用现有的分片上传API
+	err := f.uploadPartWithMultipart(ctx, preuploadID, partNumber, chunkHash, chunkData)
+	if err != nil {
+		return fmt.Errorf("failed to upload chunk %d: %w", chunkIndex, err)
+	}
+
+	fs.Debugf(f, "📤 上传分片完成: 索引=%d, 分片号=%d, 大小=%s, MD5=%s",
+		chunkIndex, partNumber, fs.SizeSuffix(int64(len(chunkData))), chunkHash)
+	return nil
+}
 
 // measureNetworkLatency removed - use reasonable default latency
 // This function is no longer needed as we simplified network detection

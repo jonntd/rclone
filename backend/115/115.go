@@ -1386,6 +1386,14 @@ func init() {
 			Advanced: true,
 			Help:     "跳过上传时的磁盘缓冲。",
 		}, {
+			Name: "stream_hash_mode",
+			Help: `启用流式哈希计算模式，用于跨云传输时节省本地存储空间。
+- false: 使用传统模式（默认）
+- true: 先流式计算文件哈希尝试秒传，失败后再流式上传
+适用于本地存储空间有限的环境。`,
+			Default:  false,
+			Advanced: true,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -1413,6 +1421,7 @@ type Options struct {
 	UploadCutoff        fs.SizeSuffix `config:"upload_cutoff"`
 	ChunkSize           fs.SizeSuffix `config:"chunk_size"`
 	MaxUploadParts      int           `config:"max_upload_parts"`
+	StreamHashMode      bool          `config:"stream_hash_mode"`
 
 	Internal  bool                 `config:"internal"`
 	DualStack bool                 `config:"dual_stack"`
@@ -3036,14 +3045,22 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	var dirID string
 	if dir == "" {
 		// 使用dirCache的根目录ID，这是当前Fs对象所代表的目录
-		dirID, err = f.dirCache.RootID(ctx, false)
+		// 修复：如果根目录不存在，尝试创建它
+		dirID, err = f.dirCache.RootID(ctx, true) // create = true
 		if err != nil {
 			fs.Debugf(f, "❌ List获取根目录ID失败: %v", err)
-			return nil, err
+			// 如果仍然失败，尝试刷新缓存后重试
+			f.dirCache.Flush()
+			dirID, err = f.dirCache.RootID(ctx, true)
+			if err != nil {
+				fs.Debugf(f, "❌ List刷新缓存后仍然失败: %v", err)
+				return nil, err
+			}
 		}
 		fs.Debugf(f, "✅ List使用当前根目录ID: %s", dirID)
 	} else {
-		dirID, err = f.dirCache.FindDir(ctx, dir, false)
+		// 修复：如果目录不存在，尝试创建它
+		dirID, err = f.dirCache.FindDir(ctx, dir, true) // create = true
 		if err != nil {
 			// If it's an API limit error, log details and return
 			if fserrors.IsRetryError(err) {
@@ -3051,7 +3068,13 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 				return nil, err
 			}
 			fs.Debugf(f, "❌ List查找目录失败，目录: %q, 错误: %v", dir, err)
-			return nil, err
+			// 尝试刷新缓存后重试
+			f.dirCache.FlushDir(dir)
+			dirID, err = f.dirCache.FindDir(ctx, dir, true)
+			if err != nil {
+				fs.Debugf(f, "❌ List刷新缓存后仍然失败，目录: %q, 错误: %v", dir, err)
+				return nil, err
+			}
 		}
 		fs.Debugf(f, "✅ List找到目录ID: %s，目录: %q", dirID, dir)
 	}
@@ -3132,7 +3155,14 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 	// Handle cross-cloud transfers
 	if f.isRemoteSource(src) {
 		fs.Debugf(f, "☁️ 检测到跨云传输: %s -> 115 (大小: %s)", src.Fs().Name(), fs.SizeSuffix(src.Size()))
-		return f.crossCloudUploadWithLocalCache(ctx, in, src, remote, options...)
+
+		// 检查是否启用流式哈希模式
+		if f.opt.StreamHashMode {
+			fs.Infof(f, "🌊 启用流式哈希模式: %s (%s)", remote, fs.SizeSuffix(src.Size()))
+			return f.smartStreamHashTransfer115(ctx, src, remote, options...)
+		} else {
+			return f.crossCloudUploadWithLocalCache(ctx, in, src, remote, options...)
+		}
 	}
 
 	// Call the main upload function
@@ -3629,6 +3659,8 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *File, 
 			return nil, err
 		}
 		if err == fs.ErrorDirNotFound {
+			// 修复：在跨云传输时，目录可能不存在，这是正常情况
+			fs.Debugf(f, " readMetaDataForPath: 目录不存在，路径: %q", path)
 			return nil, fs.ErrorObjectNotFound
 		}
 		return nil, err
@@ -3971,7 +4003,12 @@ func (o *Object) Remote() string {
 func (o *Object) ModTime(ctx context.Context) time.Time {
 	err := o.readMetaData(ctx)
 	if err != nil {
-		fs.Logf(o, "failed to read metadata for ModTime: %v", err)
+		// 在跨云传输时，目标文件不存在是正常情况，降级为调试信息
+		if err == fs.ErrorObjectNotFound {
+			fs.Debugf(o, "目标文件不存在，ModTime将使用零值: %v", err)
+		} else {
+			fs.Logf(o, "failed to read metadata for ModTime: %v", err)
+		}
 		// Return a zero time instead of Now() as Precision is NotSupported
 		return time.Time{}
 	}
@@ -6721,7 +6758,12 @@ func (f *Fs) tryHashUpload(
 				preID = preIDFromSrc
 				fs.Debugf(o, "从源文件计算PreID成功: %s", preID)
 			} else {
-				fs.Debugf(o, "从源文件计算PreID失败: %v", err)
+				// 在跨云传输时，源文件元数据读取失败是正常情况
+				if strings.Contains(err.Error(), "object not found") || strings.Contains(err.Error(), "failed to read metadata") {
+					fs.Debugf(o, "跨云传输时源文件元数据不可用，PreID将为空: %v", err)
+				} else {
+					fs.Debugf(o, "从源文件计算PreID失败: %v", err)
+				}
 			}
 		}
 	}
@@ -8927,4 +8969,244 @@ func (f *Fs) internalTwoStepTransfer(ctx context.Context, src fs.ObjectInfo, in 
 
 	// 使用本地文件创建标准的分片写入器
 	return f.newChunkWriterWithClient(ctx, src, newUI, tempFile, o, ossClient, options...)
+}
+
+// smartStreamHashTransfer115 115网盘智能流式哈希传输
+// 根据文件大小选择最优策略：小文件内存缓存，大文件流式哈希计算
+func (f *Fs) smartStreamHashTransfer115(ctx context.Context, src fs.ObjectInfo, remote string, options ...fs.OpenOption) (fs.Object, error) {
+	fileSize := src.Size()
+
+	// 智能策略选择
+	if fileSize <= 100*1024*1024 { // 100MB以下使用内存缓存
+		fs.Infof(f, "📝 小文件使用内存缓存模式: %s", fs.SizeSuffix(fileSize))
+		return f.memoryHashTransfer115(ctx, src, remote, options...)
+	} else {
+		fs.Infof(f, "🌊 大文件使用流式哈希模式: %s", fs.SizeSuffix(fileSize))
+		return f.streamHashTransfer115(ctx, src, remote, options...)
+	}
+}
+
+// memoryHashTransfer115 115网盘小文件内存缓存哈希传输
+func (f *Fs) memoryHashTransfer115(ctx context.Context, src fs.ObjectInfo, remote string, options ...fs.OpenOption) (fs.Object, error) {
+	// 转换为fs.Object以便调用Open方法
+	srcObj, ok := src.(fs.Object)
+	if !ok {
+		return nil, fmt.Errorf("source is not a valid fs.Object")
+	}
+
+	// 打开源文件
+	srcReader, err := srcObj.Open(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open source file: %w", err)
+	}
+	defer srcReader.Close()
+
+	// 读取整个文件到内存并计算SHA1
+	data, err := io.ReadAll(srcReader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file data: %w", err)
+	}
+
+	// 计算SHA1哈希（115网盘需要SHA1）
+	hasher := sha1.New()
+	hasher.Write(data)
+	sha1Hash := fmt.Sprintf("%X", hasher.Sum(nil)) // 115网盘需要大写SHA1
+
+	fs.Infof(f, "📊 内存哈希计算完成: %s, SHA1: %s", fs.SizeSuffix(int64(len(data))), sha1Hash)
+
+	// 尝试秒传
+	leaf, dirID, err := f.dirCache.FindPath(ctx, remote, true)
+	if err != nil {
+		return nil, err
+	}
+
+	// 创建对象用于上传
+	o := &Object{
+		fs:      f,
+		remote:  remote,
+		size:    int64(len(data)),
+		sha1sum: sha1Hash,
+	}
+
+	// 尝试哈希上传（秒传）
+	gotIt, _, _, cleanup, err := f.tryHashUpload(ctx, bytes.NewReader(data), src, o, leaf, dirID, int64(len(data)), options...)
+	if cleanup != nil {
+		defer cleanup()
+	}
+
+	if err == nil && gotIt {
+		fs.Infof(f, "🚀 内存哈希计算后秒传成功！")
+		return o, nil
+	}
+
+	// 秒传失败，使用内存数据直接上传
+	fs.Infof(f, "⬆️ 秒传失败，使用内存数据上传")
+	return f.uploadFromMemory115(ctx, data, o, leaf, dirID, options...)
+}
+
+// streamHashTransfer115 115网盘大文件流式哈希传输
+func (f *Fs) streamHashTransfer115(ctx context.Context, src fs.ObjectInfo, remote string, options ...fs.OpenOption) (fs.Object, error) {
+	// 转换为fs.Object以便调用Open方法
+	srcObj, ok := src.(fs.Object)
+	if !ok {
+		return nil, fmt.Errorf("source is not a valid fs.Object")
+	}
+
+	// 第一遍：流式计算SHA1哈希
+	fs.Infof(f, "🔄 第一遍：流式计算文件哈希...")
+
+	srcReader, err := srcObj.Open(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open source file for hash calculation: %w", err)
+	}
+	defer srcReader.Close()
+
+	// 流式计算SHA1，不保存数据
+	hasher := sha1.New()
+	buffer := make([]byte, 64*1024) // 64KB缓冲区
+
+	for {
+		n, err := srcReader.Read(buffer)
+		if n > 0 {
+			hasher.Write(buffer[:n])
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to read data for hash calculation: %w", err)
+		}
+	}
+
+	sha1Hash := fmt.Sprintf("%X", hasher.Sum(nil)) // 115网盘需要大写SHA1
+	fs.Infof(f, "📊 流式哈希计算完成: SHA1: %s", sha1Hash)
+
+	// 尝试秒传
+	leaf, dirID, err := f.dirCache.FindPath(ctx, remote, true)
+	if err != nil {
+		return nil, err
+	}
+
+	// 创建对象用于上传
+	o := &Object{
+		fs:      f,
+		remote:  remote,
+		size:    src.Size(),
+		sha1sum: sha1Hash,
+	}
+
+	// 尝试秒传：直接使用已计算的SHA1哈希调用initUploadOpenAPI
+	fs.Infof(f, "🔍 尝试使用已计算SHA1进行秒传...")
+	ui, err := f.initUploadOpenAPI(ctx, src.Size(), leaf, dirID, sha1Hash, "", "", "", "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to init upload for instant upload: %w", err)
+	}
+
+	// 检查秒传状态
+	if ui.GetStatus() == 2 {
+		fs.Infof(f, "🚀 流式哈希计算后秒传成功！")
+		// 设置对象的元数据
+		o.id = ui.GetFileID()
+		o.pickCode = ui.GetPickCode()
+		o.hasMetaData = true
+		return o, nil
+	}
+
+	// 处理需要二次验证的情况（状态7）
+	if ui.GetStatus() == 7 {
+		fs.Infof(f, "🔐 需要二次验证，计算签名...")
+		signKey := ui.GetSignKey()
+		signCheckRange := ui.GetSignCheck()
+
+		// 计算指定范围的SHA1
+		signVal, err := f.calculateRangeHashFromSource(ctx, srcObj, signCheckRange)
+		if err != nil {
+			return nil, fmt.Errorf("failed to calculate range hash for verification: %w", err)
+		}
+
+		// 重新提交带签名的请求
+		ui, err = f.initUploadOpenAPI(ctx, src.Size(), leaf, dirID, sha1Hash, "", "", signKey, signVal)
+		if err != nil {
+			return nil, fmt.Errorf("failed to retry upload with signature: %w", err)
+		}
+
+		// 再次检查秒传状态
+		if ui.GetStatus() == 2 {
+			fs.Infof(f, "🚀 二次验证后秒传成功！")
+			o.id = ui.GetFileID()
+			o.pickCode = ui.GetPickCode()
+			o.hasMetaData = true
+			return o, nil
+		}
+	}
+
+	// 秒传失败，第二遍：重新下载并流式上传
+	fs.Infof(f, "⬆️ 秒传失败，第二遍：重新下载并流式上传")
+	return f.streamUploadWithHash115(ctx, srcObj, o, leaf, dirID, sha1Hash, nil, options...)
+}
+
+// uploadFromMemory115 115网盘从内存数据上传文件
+func (f *Fs) uploadFromMemory115(ctx context.Context, data []byte, o *Object, leaf, dirID string, options ...fs.OpenOption) (fs.Object, error) {
+	// 使用现有的上传逻辑，传入内存数据
+	return f.upload(ctx, bytes.NewReader(data), o, o.remote, options...)
+}
+
+// streamUploadWithHash115 115网盘使用已计算哈希进行流式上传
+func (f *Fs) streamUploadWithHash115(ctx context.Context, srcObj fs.Object, o *Object, leaf, dirID, sha1Hash string, in io.Reader, options ...fs.OpenOption) (fs.Object, error) {
+	// 如果没有输入流，重新打开源文件
+	if in == nil {
+		srcReader, err := srcObj.Open(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to reopen source file for upload: %w", err)
+		}
+		defer srcReader.Close()
+		in = srcReader
+	}
+
+	// 使用现有的上传逻辑
+	return f.upload(ctx, in, o, o.remote, options...)
+}
+
+// calculateRangeHashFromSource 从源对象计算指定范围的SHA1哈希
+// 修复：使用Range请求只下载指定范围，避免完整下载
+func (f *Fs) calculateRangeHashFromSource(ctx context.Context, srcObj fs.Object, rangeSpec string) (string, error) {
+	var start, end int64
+	// OpenAPI range is "start-end" (inclusive)
+	if n, err := fmt.Sscanf(rangeSpec, "%d-%d", &start, &end); err != nil || n != 2 {
+		return "", fmt.Errorf("invalid range spec format %q: %w", rangeSpec, err)
+	}
+	if start < 0 || end < start {
+		return "", fmt.Errorf("invalid range spec values %q", rangeSpec)
+	}
+	length := end - start + 1
+
+	fs.Debugf(f, "🔐 计算二次验证范围SHA1: 范围=%s, 字节=%d-%d, 长度=%s",
+		rangeSpec, start, end, fs.SizeSuffix(length))
+
+	// 关键修复：使用Range请求只下载指定范围
+	rangeOption := &fs.RangeOption{Start: start, End: end}
+	srcReader, err := srcObj.Open(ctx, rangeOption)
+	if err != nil {
+		return "", fmt.Errorf("failed to open source file with range %s: %w", rangeSpec, err)
+	}
+	defer srcReader.Close()
+
+	// 直接读取Range请求返回的数据
+	hasher := sha1.New()
+	bytesRead, err := io.Copy(hasher, srcReader)
+	if err != nil {
+		return "", fmt.Errorf("failed to read range data for hash: %w", err)
+	}
+
+	fs.Debugf(f, "✅ 二次验证范围SHA1计算完成: 实际读取=%s, 预期长度=%s",
+		fs.SizeSuffix(bytesRead), fs.SizeSuffix(length))
+
+	if bytesRead != length {
+		fs.Debugf(f, "⚠️ 读取长度不匹配，但继续计算SHA1: 实际=%d, 预期=%d", bytesRead, length)
+	}
+
+	sha1Hash := fmt.Sprintf("%X", hasher.Sum(nil))
+	fs.Debugf(f, "🔐 二次验证SHA1: %s (范围: %s)", sha1Hash, rangeSpec)
+
+	return sha1Hash, nil
 }
