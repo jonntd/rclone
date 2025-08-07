@@ -61,9 +61,6 @@ const (
 	// 根据123网盘API限流表优化的上传分片QPS
 	uploadV2SliceMinSleep = 20 * time.Millisecond // 50 QPS 用于 upload/v2/file/slice (API限流表最高值)
 
-	maxSleep      = 30 * time.Second // 429退避的最大睡眠时间
-	decayConstant = 2
-
 	// 文件上传相关常量 - 根据123网盘OpenAPI文档
 	singleStepUploadLimit = 1024 * 1024 * 1024 // 1GB - V2版本单步上传API的文件大小限制
 	maxMemoryBufferSize   = 1024 * 1024 * 1024 // 1GB - 内存缓冲的最大大小（从512MB提升）
@@ -95,6 +92,14 @@ const (
 	PreloadQueueCapacity    = 1000 // 预加载队列容量
 	MaxHotFiles             = 100  // 最大热点文件数
 	HotFileCleanupBatchSize = 20   // 热点文件清理批次大小
+
+	// CDN故障转移默认配置（无需用户配置）
+	defaultMaxCDNRetries = 3 // 默认CDN重试最大次数
+
+	// 下载相关常量
+	defaultDownloadChunkSize   = 50 * 1024 * 1024 // 50MB 默认下载分片大小
+	defaultDownloadConcurrency = 6                // 默认下载并发数
+	minFileSizeForConcurrency  = 10 * 1024 * 1024 // 10MB 启用并发下载的最小文件大小
 )
 
 // Options 定义此后端的配置选项
@@ -117,6 +122,9 @@ type Options struct {
 
 	// 流式哈希传输模式选项
 	StreamHashMode bool `config:"stream_hash_mode"`
+
+	// CDN故障转移配置选项（默认启用，无需用户配置）
+	// EnableCDNFailover、MaxCDNRetries等已设为合理默认值
 
 	// 编码配置
 	Enc encoder.MultiEncoder `config:"encoding"` // 文件名编码设置
@@ -170,13 +178,16 @@ type Fs struct {
 	dirCache *dircache.DirCache
 }
 
-// ProgressReadCloser 包装ReadCloser以提供进度跟踪和资源管理
+// ProgressReadCloser 包装ReadCloser以提供123网盘下载进度跟踪和资源管理
 type ProgressReadCloser struct {
 	io.ReadCloser
 	fs              *Fs
+	object          *Object
 	totalSize       int64
 	transferredSize int64
-	startTime       time.Time // 下载开始时间
+	startTime       time.Time
+	lastLogTime     time.Time
+	lastLogPercent  int
 }
 
 // Read 实现io.Reader接口，同时更新进度
@@ -184,15 +195,108 @@ func (prc *ProgressReadCloser) Read(p []byte) (n int, err error) {
 	n, err = prc.ReadCloser.Read(p)
 	if n > 0 {
 		prc.transferredSize += int64(n)
-		// rclone内置的accounting会自动处理进度跟踪
+
+		// 计算进度百分比
+		var percentage int
+		if prc.totalSize > 0 {
+			percentage = int(float64(prc.transferredSize) / float64(prc.totalSize) * 100)
+		}
+
+		now := time.Now()
+		// 减少日志频率：只在进度变化超过10%或时间间隔超过5秒时输出日志
+		shouldLog := (percentage >= prc.lastLogPercent+10) ||
+			(now.Sub(prc.lastLogTime) > 5*time.Second) ||
+			(prc.transferredSize == prc.totalSize) ||
+			(percentage == 100)
+
+		if shouldLog {
+			elapsed := now.Sub(prc.startTime)
+			var speed float64
+			if elapsed.Seconds() > 0 {
+				speed = float64(prc.transferredSize) / elapsed.Seconds() / 1024 / 1024 // MB/s
+			}
+
+			fs.Debugf(prc.object, "📥 123下载进度: %s/%s (%d%%) 速度: %.2f MB/s",
+				fs.SizeSuffix(prc.transferredSize),
+				fs.SizeSuffix(prc.totalSize),
+				percentage,
+				speed)
+			prc.lastLogTime = now
+			prc.lastLogPercent = percentage
+		}
 	}
 	return n, err
 }
 
 // Close 实现io.Closer接口，同时清理资源
 func (prc *ProgressReadCloser) Close() error {
+	// 输出最终下载统计
+	elapsed := time.Since(prc.startTime)
+	var avgSpeed float64
+	if elapsed.Seconds() > 0 {
+		avgSpeed = float64(prc.transferredSize) / elapsed.Seconds() / 1024 / 1024 // MB/s
+	}
+
+	fs.Debugf(prc.object, "✅ 123下载完成: %s, 耗时: %v, 平均速度: %.2f MB/s",
+		fs.SizeSuffix(prc.transferredSize),
+		elapsed.Truncate(time.Second),
+		avgSpeed)
+
 	// 关闭底层ReadCloser
 	return prc.ReadCloser.Close()
+}
+
+// TwoStepProgressReader 用于内部两步传输的进度跟踪
+type TwoStepProgressReader struct {
+	io.Reader
+	totalSize       int64
+	transferredSize int64
+	startTime       time.Time
+	lastLogTime     time.Time
+	lastLogPercent  int
+	stepName        string
+	fileName        string
+	fs              *Fs
+}
+
+// Read 实现io.Reader接口，同时更新进度
+func (tpr *TwoStepProgressReader) Read(p []byte) (n int, err error) {
+	n, err = tpr.Reader.Read(p)
+	if n > 0 {
+		tpr.transferredSize += int64(n)
+
+		// 计算进度百分比
+		var percentage int
+		if tpr.totalSize > 0 {
+			percentage = int(float64(tpr.transferredSize) / float64(tpr.totalSize) * 100)
+		}
+
+		now := time.Now()
+		// 减少日志频率：只在进度变化超过10%或时间间隔超过5秒时输出日志
+		shouldLog := (percentage >= tpr.lastLogPercent+10) ||
+			(now.Sub(tpr.lastLogTime) > 5*time.Second) ||
+			(tpr.transferredSize == tpr.totalSize) ||
+			(percentage == 100)
+
+		if shouldLog {
+			elapsed := now.Sub(tpr.startTime)
+			var speed float64
+			if elapsed.Seconds() > 0 {
+				speed = float64(tpr.transferredSize) / elapsed.Seconds() / 1024 / 1024 // MB/s
+			}
+
+			fs.Debugf(tpr.fs, "📥 %s进度: %s/%s (%d%%) 速度: %.2f MB/s [%s]",
+				tpr.stepName,
+				fs.SizeSuffix(tpr.transferredSize),
+				fs.SizeSuffix(tpr.totalSize),
+				percentage,
+				speed,
+				tpr.fileName)
+			tpr.lastLogTime = now
+			tpr.lastLogPercent = percentage
+		}
+	}
+	return n, err
 }
 
 // Object 描述123网盘中的文件或文件夹对象
@@ -321,22 +425,6 @@ func cleanFileName(name string) string {
 	return cleaned
 }
 
-// validateAndCleanFileName 验证并清理文件名的便捷函数
-// 如果验证失败，返回清理后的文件名和警告信息
-func validateAndCleanFileName(name string) (cleanedName string, warning error) {
-	// 首先尝试验证原始文件名
-	if err := validateFileName(name); err == nil {
-		return name, nil
-	}
-
-	// 如果验证失败，清理文件名
-	cleanedName = cleanFileName(name)
-
-	// 返回清理后的文件名和警告信息
-	warning = fmt.Errorf("文件名已自动清理：原始名称 '%s' -> 清理后名称 '%s'", name, cleanedName)
-	return cleanedName, warning
-}
-
 // generateUniqueFileName 生成唯一的文件名，避免冲突
 func (f *Fs) generateUniqueFileName(ctx context.Context, parentFileID int64, baseName string) (string, error) {
 	// 首先检查原始文件名是否存在
@@ -445,7 +533,7 @@ func (f *Fs) verifyParentFileID(ctx context.Context, parentFileID int64) (bool, 
 
 // getCorrectParentFileID 获取上传API认可的正确父目录ID
 // 统一版本：为单步上传和分片上传提供一致的父目录ID修复策略
-func (f *Fs) getCorrectParentFileID(ctx context.Context, cachedParentID int64) (int64, error) {
+func (f *Fs) getCorrectParentFileID(ctx context.Context, cachedParentID int64) int64 {
 	fs.Debugf(f, "🔧 统一父目录ID修复策略，缓存ID: %d", cachedParentID)
 
 	// Strategy 1: Re-acquire directory structure
@@ -462,7 +550,7 @@ func (f *Fs) getCorrectParentFileID(ctx context.Context, cachedParentID int64) (
 	exists, err := f.verifyParentFileID(ctx, cachedParentID)
 	if err == nil && exists {
 		fs.Debugf(f, "✅ 缓存清理后原始目录ID %d 验证成功", cachedParentID)
-		return cachedParentID, nil
+		return cachedParentID
 	}
 
 	// Strategy 3: Try to verify if root directory is available
@@ -470,12 +558,12 @@ func (f *Fs) getCorrectParentFileID(ctx context.Context, cachedParentID int64) (
 	rootExists, err := f.verifyParentFileID(ctx, 0)
 	if err == nil && rootExists {
 		fs.Debugf(f, "✅ 根目录验证成功，用作回退方案")
-		return 0, nil
+		return 0
 	}
 
 	// Strategy 4: Force fallback to root directory
 	fs.Debugf(f, "❌ 所有验证策略失败，强制使用根目录 (parentFileID: 0)")
-	return 0, nil
+	return 0
 }
 
 // getParentID 获取文件或目录的父目录ID
@@ -532,7 +620,7 @@ func (f *Fs) fileExistsInDirectory(ctx context.Context, parentID int64, fileName
 		// 🔧 检查文件名匹配且不在回收站且未被审核驳回
 		if file.Filename == fileName && file.Trashed == 0 && file.Status < 100 {
 			fs.Debugf(f, "✅ 找到文件 %s，ID: %d (trashed=%d, status=%d)", fileName, file.FileID, file.Trashed, file.Status)
-			return true, int64(file.FileID), nil
+			return true, file.FileID, nil
 		}
 	}
 
@@ -605,6 +693,12 @@ func (f *Fs) setCachedDownloadURL(fileID, url string) {
 	f.downloadURLCache.Store(fileID, cached)
 
 	fs.Debugf(f, "💾 缓存下载URL: fileID=%s, 有效期100分钟", fileID)
+}
+
+// invalidateDownloadURL 使指定文件的下载URL缓存失效
+func (f *Fs) invalidateDownloadURL(fileID string) {
+	f.downloadURLCache.Delete(fileID)
+	fs.Debugf(f, "🗑️ 已清除下载URL缓存: fileID=%s", fileID)
 }
 
 // 🔧 移除非标准的启发式文件判断函数
@@ -761,7 +855,7 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 
 	case "refresh-cache":
 		// 🔄 新增：刷新目录缓存
-		return f.refreshCacheCommand(ctx, arg, opt)
+		return f.refreshCacheCommand(ctx, arg)
 
 	default:
 		return nil, fs.ErrorCommandNotFound
@@ -973,7 +1067,7 @@ func (f *Fs) pathToFileID(ctx context.Context, filePath string) (string, error) 
 			err = f.listPacer.Call(func() (bool, error) {
 				response, err = f.ListFile(ctx, parentFileID, 100, "", "", lastFileIDInt)
 				if err != nil {
-					return shouldRetry(ctx, nil, err)
+					return shouldRetry(err)
 				}
 				return false, nil
 			})
@@ -1159,7 +1253,7 @@ type UserInfoResp struct {
 
 func (f *Fs) getDownloadURLByUA(ctx context.Context, filePath string, userAgent string) (string, error) {
 	// Ensure token is valid before making API calls
-	err := f.refreshTokenIfNecessary(ctx, false, false)
+	err := f.refreshTokenIfNecessary(false, false)
 	if err != nil {
 		return "", err
 	}
@@ -1249,18 +1343,17 @@ func (f *Fs) getDownloadURLCommand(ctx context.Context, args []string, opt map[s
 		}
 		fs.Debugf(f, "✅ 使用自定义UA获取下载URL成功: fileId=%s", fileID)
 		return downloadURL, nil
-	} else {
-		downloadURL, err := f.getDownloadURL(ctx, fileID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get download URL: %w", err)
-		}
-		fs.Debugf(f, "✅ 获取下载URL成功: fileId=%s", fileID)
-		return downloadURL, nil
 	}
+	downloadURL, err := f.getDownloadURL(ctx, fileID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get download URL: %w", err)
+	}
+	fs.Debugf(f, "✅ 获取下载URL成功: fileId=%s", fileID)
+	return downloadURL, nil
 }
 
 // refreshCacheCommand 刷新目录缓存
-func (f *Fs) refreshCacheCommand(ctx context.Context, args []string, opt map[string]string) (any, error) {
+func (f *Fs) refreshCacheCommand(ctx context.Context, args []string) (any, error) {
 	fs.Infof(f, "🔄 开始刷新缓存...")
 
 	// 清除内存中的listFileCache
@@ -1355,11 +1448,11 @@ func validateOptions(opt *Options) error {
 }
 
 // createPacer 创建pacer的工厂函数，减少重复配置代码
-func createPacer(ctx context.Context, minSleep, maxSleep time.Duration, decayConstant float64) *fs.Pacer {
+func createPacer(ctx context.Context, minSleep time.Duration) *fs.Pacer {
 	return fs.NewPacer(ctx, pacer.NewDefault(
 		pacer.MinSleep(minSleep),
-		pacer.MaxSleep(maxSleep),
-		pacer.DecayConstant(decayConstant)))
+		pacer.MaxSleep(30*time.Second),
+		pacer.DecayConstant(2)))
 }
 
 // normalizeOptions 标准化和修正配置选项
@@ -1384,12 +1477,87 @@ func normalizeOptions(opt *Options) {
 	if opt.UserAgent == "" {
 		opt.UserAgent = "rclone/" + fs.Version
 	}
+
+	// CDN故障转移功能已设置为合理的默认值，无需用户配置
 }
 
 // shouldRetry 根据响应和错误确定是否重试API调用（本地实现，替代common包）
-func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
+func shouldRetry(err error) (bool, error) {
 	// 使用rclone标准的重试判断
 	return fserrors.ShouldRetry(err), err
+}
+
+// isConnectionTimeout 检查错误是否为连接超时
+func isConnectionTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+
+	// 检查常见的连接超时错误模式
+	timeoutPatterns := []string{
+		"dial tcp",
+		"connect: connection timed out",
+		"i/o timeout",
+		"context deadline exceeded",
+		"connection timeout",
+		"timeout",
+	}
+
+	for _, pattern := range timeoutPatterns {
+		if strings.Contains(errStr, pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// openWithCDNFailover 带CDN故障转移的文件打开方法
+func (o *Object) openWithCDNFailover(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	// CDN故障转移默认启用
+
+	var lastErr error
+	maxRetries := defaultMaxCDNRetries
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		fs.Debugf(o, "🔄 CDN故障转移尝试 %d/%d", attempt+1, maxRetries)
+
+		rc, err := o.openNormal(ctx, options...)
+		if err == nil {
+			if attempt > 0 {
+				fs.Infof(o, "✅ CDN故障转移成功 (尝试 %d/%d)", attempt+1, maxRetries)
+			}
+			return rc, nil
+		}
+
+		// 检查是否为CDN连接超时
+		if isConnectionTimeout(err) {
+			fs.Debugf(o, "🔄 检测到CDN连接超时，刷新下载URL (尝试 %d/%d): %v",
+				attempt+1, maxRetries, err)
+
+			// 强制刷新下载URL以获取新的CDN节点
+			o.fs.invalidateDownloadURL(o.id)
+			lastErr = err
+
+			// 如果不是最后一次尝试，继续重试
+			if attempt < maxRetries-1 {
+				// 添加短暂延迟，避免过于频繁的重试
+				time.Sleep(time.Duration(attempt+1) * time.Second)
+				continue
+			}
+		} else {
+			// 非连接超时错误，直接返回
+			fs.Debugf(o, "❌ 非CDN超时错误，停止故障转移: %v", err)
+			return nil, err
+		}
+
+		lastErr = err
+	}
+
+	fs.Errorf(o, "❌ CDN故障转移失败，已尝试 %d 次", maxRetries)
+	return nil, fmt.Errorf("CDN failover exhausted after %d attempts: %w", maxRetries, lastErr)
 }
 
 // makeAPICallWithRest 使用rclone标准rest客户端进行API调用，自动集成QPS限制
@@ -1400,15 +1568,15 @@ func (f *Fs) makeAPICallWithRest(ctx context.Context, endpoint string, method st
 	// Safety check: ensure rest client is initialized
 	if f.rst == nil {
 		fs.Debugf(f, "🔧 Rest客户端未初始化，尝试重新创建")
-		// Recreate rest client using rclone standard HTTP client
-		client := fshttp.NewClient(context.Background())
+		// 使用rclone标准方法重新创建rest客户端
+		client := fshttp.NewClient(ctx) // 使用传入的context而不是background
 		f.rst = rest.NewClient(client).SetRoot(openAPIRootURL)
 		fs.Debugf(f, "✅ Rest客户端重新创建成功")
 	}
 
 	// Check token validity with reduced frequency
 	if f.token == "" || time.Now().After(f.tokenExpiry.Add(-tokenRefreshWindow)) {
-		err := f.refreshTokenIfNecessary(ctx, false, false)
+		err := f.refreshTokenIfNecessary(false, false)
 		if err != nil {
 			return fmt.Errorf("刷新令牌失败: %w", err)
 		}
@@ -1422,10 +1590,7 @@ func (f *Fs) makeAPICallWithRest(ctx context.Context, endpoint string, method st
 	if strings.Contains(endpoint, "/upload/v2/file/slice") ||
 		strings.Contains(endpoint, "/upload/v2/file/single/create") {
 		// 只有分片上传和单步上传使用上传域名（官方文档明确说明）
-		uploadDomain, err := f.getUploadDomain(ctx)
-		if err != nil {
-			return fmt.Errorf("获取上传域名失败: %w", err)
-		}
+		uploadDomain := f.getUploadDomain(ctx)
 		baseURL = uploadDomain
 	} else {
 		// 其他API（包括create、upload_complete）使用标准API域名
@@ -1454,7 +1619,7 @@ func (f *Fs) makeAPICallWithRest(ctx context.Context, endpoint string, method st
 		if resp != nil && resp.StatusCode == http.StatusUnauthorized {
 			fs.Debugf(f, "🔐 收到401错误，强制刷新token")
 			// 强制刷新token，忽略时间检查
-			refreshErr := f.refreshTokenIfNecessary(ctx, true, true)
+			refreshErr := f.refreshTokenIfNecessary(true, true)
 			if refreshErr != nil {
 				fs.Errorf(f, "刷新token失败: %v", refreshErr)
 				return false, fmt.Errorf("身份验证失败: %w", refreshErr)
@@ -1465,7 +1630,7 @@ func (f *Fs) makeAPICallWithRest(ctx context.Context, endpoint string, method st
 			return true, nil // 重试
 		}
 
-		return shouldRetry(ctx, resp, err)
+		return shouldRetry(err)
 	})
 
 	if err != nil {
@@ -1480,7 +1645,7 @@ func (f *Fs) makeAPICallWithRestMultipartToDomain(ctx context.Context, domain st
 	fs.Debugf(f, "📤 向域名发起multipart API调用: %s %s %s", method, domain, endpoint)
 
 	// 确保令牌在进行API调用前有效
-	err := f.refreshTokenIfNecessary(ctx, false, false)
+	err := f.refreshTokenIfNecessary(false, false)
 	if err != nil {
 		return fmt.Errorf("刷新令牌失败: %w", err)
 	}
@@ -1516,7 +1681,7 @@ func (f *Fs) makeAPICallWithRestMultipartToDomain(ctx context.Context, domain st
 			}
 			return false, fmt.Errorf("API调用失败: %w", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		// 检查响应状态
 		if resp.StatusCode >= 400 {
@@ -1526,7 +1691,7 @@ func (f *Fs) makeAPICallWithRestMultipartToDomain(ctx context.Context, domain st
 			if resp.StatusCode == http.StatusUnauthorized {
 				fs.Debugf(f, "🔐 收到401错误，强制刷新token")
 				// 强制刷新token，忽略时间检查
-				refreshErr := f.refreshTokenIfNecessary(ctx, true, true)
+				refreshErr := f.refreshTokenIfNecessary(true, true)
 				if refreshErr != nil {
 					fs.Errorf(f, "❌ 刷新token失败: %v", refreshErr)
 					return false, fmt.Errorf("身份验证失败: %w", refreshErr)
@@ -1623,131 +1788,15 @@ func parseFileID(idStr string) (int64, error) {
 	return id, nil
 }
 
-// parseFileIDWithContext 带上下文的文件ID转换函数，提供更详细的错误信息
-func parseFileIDWithContext(idStr, context string) (int64, error) {
-	id, err := parseFileID(idStr)
-	if err != nil {
-		return 0, fmt.Errorf("%s: %w", context, err)
-	}
-	return id, nil
-}
-
-// parseParentID 解析父目录ID字符串为int64
-// 专门用于父目录ID转换，提供更明确的错误信息
-func parseParentID(idStr string) (int64, error) {
-	if idStr == "" {
-		return 0, fmt.Errorf("父目录ID不能为空")
-	}
-
-	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("无效的父目录ID格式: %s", idStr)
-	}
-
-	if id < 0 {
-		return 0, fmt.Errorf("父目录ID不能为负数: %d", id)
-	}
-
-	return id, nil
-}
-
-// parseDirID 解析目录ID字符串为int64
-// 专门用于目录ID转换，提供更明确的错误信息
-func parseDirID(idStr string) (int64, error) {
-	if idStr == "" {
-		return 0, fmt.Errorf("目录ID不能为空")
-	}
-
-	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("无效的目录ID格式: %s", idStr)
-	}
-
-	if id < 0 {
-		return 0, fmt.Errorf("目录ID不能为负数: %d", id)
-	}
-
-	return id, nil
-}
-
-// createParentFs 创建指向父目录的Fs实例
-func (f *Fs) createParentFs(directory string) *Fs {
-	// 获取父目录的ID作为新的rootFolderID
-	var newRootFolderID string
-	if directory == "" {
-		// 如果目录为空，使用真正的根目录ID
-		newRootFolderID = "0"
-	} else {
-		// 查找父目录的ID，如果不存在则创建
-		ctx := context.Background()
-		dirID, err := f.pathToFileID(ctx, directory)
-		if err != nil {
-			fs.Debugf(f, "⚠️ createParentFs: 目录 '%s' 不存在，尝试创建", directory)
-			// 使用dirCache创建目录
-			tempF := &Fs{
-				name:          f.name,
-				originalName:  f.originalName,
-				root:          "",
-				opt:           f.opt,
-				features:      f.features,
-				rst:           f.rst,
-				token:         f.token,
-				tokenExpiry:   f.tokenExpiry,
-				tokenRenewer:  f.tokenRenewer,
-				m:             f.m,
-				rootFolderID:  "0",
-				listPacer:     f.listPacer,
-				uploadPacer:   f.uploadPacer,
-				downloadPacer: f.downloadPacer,
-				strictPacer:   f.strictPacer,
-			}
-			tempF.dirCache = dircache.New("", "0", tempF)
-
-			// 创建目录
-			createdDirID, err := tempF.dirCache.FindDir(ctx, directory, true)
-			if err != nil {
-				fs.Debugf(f, "❌ createParentFs: 创建目录 '%s' 失败: %v，使用根目录ID", directory, err)
-				newRootFolderID = "0"
-			} else {
-				newRootFolderID = createdDirID
-				fs.Debugf(f, "✅ createParentFs: 成功创建目录 '%s'，ID为 %s", directory, newRootFolderID)
-			}
-		} else {
-			newRootFolderID = dirID
-			fs.Debugf(f, "✅ createParentFs: 目录 '%s' 的ID为 %s", directory, newRootFolderID)
-		}
-	}
-
-	tempF := &Fs{
-		name:          f.name,
-		originalName:  f.originalName,
-		root:          directory,
-		opt:           f.opt,
-		features:      f.features,
-		rst:           f.rst,
-		token:         f.token,
-		tokenExpiry:   f.tokenExpiry,
-		tokenRenewer:  f.tokenRenewer,
-		m:             f.m,
-		rootFolderID:  newRootFolderID,
-		listPacer:     f.listPacer,
-		uploadPacer:   f.uploadPacer,
-		downloadPacer: f.downloadPacer,
-		strictPacer:   f.strictPacer,
-	}
-	tempF.dirCache = dircache.New(directory, newRootFolderID, tempF)
-	return tempF
-}
-
 // getFileInfo 根据ID获取文件的详细信息
 func (f *Fs) getFileInfo(ctx context.Context, fileID string) (*FileListInfoRespDataV2, error) {
 	fs.Debugf(f, "📋 getFileInfo开始: fileID=%s", fileID)
 
 	// 验证文件ID
-	_, err := parseFileIDWithContext(fileID, "获取文件信息")
+	_, err := parseFileID(fileID)
 	if err != nil {
 		fs.Debugf(f, "❌ getFileInfo文件ID验证失败: %v", err)
-		return nil, err
+		return nil, fmt.Errorf("获取文件信息: %w", err)
 	}
 
 	// 使用文件详情API - 已迁移到rclone标准方法
@@ -1829,9 +1878,9 @@ func (f *Fs) createDirectory(ctx context.Context, parentID, name string) (string
 	}
 
 	// 将父目录ID转换为int64
-	parentFileID, err := parseParentID(parentID)
+	parentFileID, err := parseFileID(parentID)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("父目录ID无效: %w", err)
 	}
 
 	// 首先检查目录是否已存在，避免不必要的API调用
@@ -1972,10 +2021,7 @@ func (f *Fs) createUpload(ctx context.Context, parentFileID int64, filename, eta
 		fs.Debugf(f, "Chunked upload: pre-verification found parent ID %d does not exist, trying to get correct parent ID", parentFileID)
 
 		// Use unified parent ID repair strategy
-		realParentFileID, err := f.getCorrectParentFileID(ctx, parentFileID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to re-acquire correct parent ID: %w", err)
-		}
+		realParentFileID := f.getCorrectParentFileID(ctx, parentFileID)
 
 		if realParentFileID != parentFileID {
 			fs.Debugf(f, "Chunked upload: found correct parent ID: %d (original ID: %d), using correct ID to continue upload", realParentFileID, parentFileID)
@@ -2016,10 +2062,7 @@ func (f *Fs) createUpload(ctx context.Context, parentFileID int64, filename, eta
 
 		// Use unified parent ID repair strategy consistent with single-step upload
 		fs.Debugf(f, "Using unified parent ID repair strategy")
-		correctParentID, err := f.getCorrectParentFileID(ctx, parentFileID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get correct parent ID: %w", err)
-		}
+		correctParentID := f.getCorrectParentFileID(ctx, parentFileID)
 
 		// If got different parent ID, retry creating upload session
 		if correctParentID != parentFileID {
@@ -2057,11 +2100,11 @@ func (f *Fs) createUpload(ctx context.Context, parentFileID int64, filename, eta
 
 // uploadFile 使用上传会话上传文件内容
 func (f *Fs) uploadFile(ctx context.Context, in io.Reader, createResp *UploadCreateResp, size int64) error {
-	return f.uploadFileWithPath(ctx, in, createResp, size, "")
+	return f.uploadFileWithPath(ctx, in, createResp, size)
 }
 
 // uploadFileWithPath 使用上传会话上传文件内容，支持断点续传
-func (f *Fs) uploadFileWithPath(ctx context.Context, in io.Reader, createResp *UploadCreateResp, size int64, filePath string) error {
+func (f *Fs) uploadFileWithPath(ctx context.Context, in io.Reader, createResp *UploadCreateResp, size int64) error {
 	// 确定块大小
 	chunkSize := createResp.Data.SliceSize
 	if chunkSize <= 0 {
@@ -2195,10 +2238,7 @@ func (f *Fs) uploadPartWithMultipart(ctx context.Context, preuploadID string, pa
 // 关键修复：将重试逻辑从业务逻辑中分离，修复multipart数据在重试时丢失的问题
 func (f *Fs) uploadPartDirectly(ctx context.Context, preuploadID string, partNumber int64, chunkHash string, data []byte) error {
 	// 获取上传域名
-	uploadDomain, err := f.getUploadDomain(ctx)
-	if err != nil {
-		return fmt.Errorf("获取上传域名失败: %w", err)
-	}
+	uploadDomain := f.getUploadDomain(ctx)
 
 	// 使用上传域名进行multipart上传
 	var response struct {
@@ -2220,9 +2260,9 @@ func (f *Fs) uploadPartDirectly(ctx context.Context, preuploadID string, partNum
 		writer := multipart.NewWriter(&buf)
 
 		// 添加表单字段
-		writer.WriteField("preuploadID", preuploadID)
-		writer.WriteField("sliceNo", fmt.Sprintf("%d", partNumber))
-		writer.WriteField("sliceMD5", chunkHash)
+		_ = writer.WriteField("preuploadID", preuploadID)
+		_ = writer.WriteField("sliceNo", fmt.Sprintf("%d", partNumber))
+		_ = writer.WriteField("sliceMD5", chunkHash)
 
 		// 添加文件数据
 		part, err := writer.CreateFormFile("slice", fmt.Sprintf("chunk_%d", partNumber))
@@ -2263,7 +2303,7 @@ func (f *Fs) uploadPartDirectly(ctx context.Context, preuploadID string, partNum
 			}
 			return false, fmt.Errorf("上传分片数据失败: %w", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		// 检查响应状态
 		if resp.StatusCode >= 400 {
@@ -2392,7 +2432,7 @@ func (f *Fs) completeUploadWithResultAndSize(ctx context.Context, preuploadID st
 			fs.Debugf(f, "❌ 上传完成API调用失败 (尝试 %d/%d): %v", attempt+1, maxRetries, err)
 
 			// Use standard retry logic
-			if retry, _ := shouldRetry(ctx, nil, err); retry {
+			if retry, _ := shouldRetry(err); retry {
 				continue
 			}
 			return nil, fmt.Errorf("upload verification failed: %w", err)
@@ -2469,10 +2509,9 @@ func (f *Fs) streamingPut(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 	if fileSize <= singleStepUploadLimit { // 1GB threshold per API spec
 		fs.Debugf(f, "📋 统一上传策略选择: 单步上传 - File ≤ 1GB (%s), using single-step upload API", fs.SizeSuffix(fileSize))
 		return f.directSmallFileUpload(ctx, in, src, parentFileID, fileName)
-	} else {
-		fs.Debugf(f, "📋 统一上传策略选择: 分片上传 - File > 1GB (%s), using chunked upload API", fs.SizeSuffix(fileSize))
-		return f.directLargeFileUpload(ctx, in, src, parentFileID, fileName)
 	}
+	fs.Debugf(f, "📋 统一上传策略选择: 分片上传 - File > 1GB (%s), using chunked upload API", fs.SizeSuffix(fileSize))
+	return f.directLargeFileUpload(ctx, in, src, parentFileID, fileName)
 }
 
 // directSmallFileUpload 直接上传小文件（≤1GB），使用单步上传API
@@ -2653,7 +2692,7 @@ func (f *Fs) uploadFileInChunksSimplified(ctx context.Context, srcObj fs.Object,
 	// If instant upload triggered, return success
 	if createResp.Data.Reuse {
 		fs.Debugf(f, "🚀 分片上传过程中触发秒传")
-		return f.createObject(fileName, createResp.Data.FileID, fileSize, "", time.Now(), false), nil
+		return f.createObject(fileName, createResp.Data.FileID, fileSize, "", time.Now()), nil
 	}
 
 	// Start chunked streaming upload using optimal chunk size
@@ -2669,22 +2708,21 @@ func (f *Fs) handleCrossCloudTransfer(ctx context.Context, in io.Reader, src fs.
 	if f.opt.StreamHashMode {
 		fs.Infof(f, "🌊 启用流式哈希模式: %s (%s)", fileName, fs.SizeSuffix(fileSize))
 		return f.smartStreamHashTransfer(ctx, src, parentFileID, fileName)
-	} else {
-		fs.Debugf(f, "🔄 使用传统两步传输: %s (%s)", fileName, fs.SizeSuffix(fileSize))
-		// Use internal two-step transfer to avoid cross-cloud transfer issues
-		fs.Debugf(f, "📥 步骤1: 下载到本地, 📤 步骤2: 从本地上传到123")
-		return f.internalTwoStepTransfer(ctx, in, src, parentFileID, fileName)
 	}
+	fs.Infof(f, "🔄 开始两步传输: %s (%s)", fileName, fs.SizeSuffix(fileSize))
+	fs.Infof(f, "📥 步骤1: 下载到本地 → 📤 步骤2: 上传到123网盘")
+	return f.internalTwoStepTransfer(ctx, in, src, parentFileID, fileName)
 }
 
 // internalTwoStepTransfer 内部两步传输：下载到本地临时文件，然后上传到123网盘
 // 这是处理跨云传输最可靠的方法，避免了流式传输的复杂性
 func (f *Fs) internalTwoStepTransfer(ctx context.Context, in io.Reader, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
+	transferStartTime := time.Now()
 	fileSize := src.Size()
-	fs.Debugf(f, "🔄 开始内部两步传输: %s (%s)", fileName, fs.SizeSuffix(fileSize))
+	fs.Infof(f, "🚀 开始两步传输: %s (%s)", fileName, fs.SizeSuffix(fileSize))
 
 	// Step 1: 下载到临时文件
-	fs.Debugf(f, "📥 步骤1: 从源下载到临时文件...")
+	fs.Infof(f, "📥 步骤1: 正在下载...")
 
 	// 创建临时文件
 	tempFile, err := os.CreateTemp("", "rclone-123-transfer-*.tmp")
@@ -2692,8 +2730,14 @@ func (f *Fs) internalTwoStepTransfer(ctx context.Context, in io.Reader, src fs.O
 		return nil, fmt.Errorf("创建临时文件失败: %w", err)
 	}
 	defer func() {
-		tempFile.Close()
-		os.Remove(tempFile.Name())
+		if tempFile != nil {
+			if closeErr := tempFile.Close(); closeErr != nil {
+				fs.Debugf(f, "⚠️ 关闭临时文件失败: %v", closeErr)
+			}
+			if removeErr := os.Remove(tempFile.Name()); removeErr != nil {
+				fs.Debugf(f, "⚠️ 删除临时文件失败: %v", removeErr)
+			}
+		}
 	}()
 
 	// 获取源文件的Reader
@@ -2712,13 +2756,26 @@ func (f *Fs) internalTwoStepTransfer(ctx context.Context, in io.Reader, src fs.O
 			return nil, fmt.Errorf("源对象不支持Open操作")
 		}
 	}
-	defer srcReader.Close()
+	defer func() { _ = srcReader.Close() }()
 
-	// 下载到临时文件，同时计算MD5
+	// 下载到临时文件，同时计算MD5，并显示下载进度
 	hasher := md5.New()
 	multiWriter := io.MultiWriter(tempFile, hasher)
 
-	written, err := io.Copy(multiWriter, srcReader)
+	// 创建进度包装器来显示Step 1下载进度
+	progressReader := &TwoStepProgressReader{
+		Reader:          srcReader,
+		totalSize:       fileSize,
+		transferredSize: 0,
+		startTime:       time.Now(),
+		lastLogTime:     time.Time{},
+		lastLogPercent:  -1,
+		stepName:        "Step 1: 下载",
+		fileName:        fileName,
+		fs:              f,
+	}
+
+	written, err := io.Copy(multiWriter, progressReader)
 	if err != nil {
 		return nil, fmt.Errorf("下载到临时文件失败: %w", err)
 	}
@@ -2729,10 +2786,10 @@ func (f *Fs) internalTwoStepTransfer(ctx context.Context, in io.Reader, src fs.O
 
 	// 计算MD5
 	md5sum := fmt.Sprintf("%x", hasher.Sum(nil))
-	fs.Debugf(f, "✅ 步骤1完成: 已下载 %s, MD5: %s", fs.SizeSuffix(written), md5sum)
+	fs.Infof(f, "✅ 步骤1完成: 已下载 %s", fs.SizeSuffix(written))
 
 	// Step 2: 从临时文件上传到123网盘
-	fs.Debugf(f, "📤 步骤2: 从本地上传到123...")
+	fs.Infof(f, "📤 步骤2: 正在上传...")
 
 	// 重置文件指针到开始
 	_, err = tempFile.Seek(0, 0)
@@ -2748,7 +2805,18 @@ func (f *Fs) internalTwoStepTransfer(ctx context.Context, in io.Reader, src fs.O
 	}
 
 	// 使用统一上传函数，此时源已经是本地数据
-	return f.putWithKnownMD5(ctx, tempFile, localSrc, parentFileID, fileName, md5sum)
+	result, err := f.putWithKnownMD5(ctx, tempFile, localSrc, parentFileID, fileName, md5sum)
+	if err != nil {
+		return nil, err
+	}
+
+	// 显示两步传输总体统计
+	totalDuration := time.Since(transferStartTime)
+	avgSpeed := float64(fileSize) / totalDuration.Seconds()
+	fs.Infof(f, "🎉 两步传输完成: %s | ⏱️ 总用时 %v | 🚀 平均 %s/s",
+		fs.SizeSuffix(fileSize), totalDuration.Truncate(time.Second), fs.SizeSuffix(int64(avgSpeed)))
+
+	return result, nil
 }
 
 // localFileInfo 本地文件信息结构体，用于内部两步传输
@@ -2835,7 +2903,7 @@ func (f *Fs) putWithKnownMD5WithOptions(ctx context.Context, in io.Reader, src f
 	// 这是最理想的情况：无需实际传输数据
 	if createResp.Data.Reuse {
 		fs.Debugf(f, "🚀 文件秒传成功，MD5: %s", md5Hash)
-		return f.createObject(fileName, createResp.Data.FileID, src.Size(), md5Hash, time.Now(), false), nil
+		return f.createObject(fileName, createResp.Data.FileID, src.Size(), md5Hash, time.Now()), nil
 	}
 
 	// 秒传失败，需要实际上传文件数据
@@ -2848,7 +2916,7 @@ func (f *Fs) putWithKnownMD5WithOptions(ctx context.Context, in io.Reader, src f
 	// 返回上传成功的文件对象
 	// 注意：使用实际的文件名而不是src.Remote()，因为src.Remote()可能包含.partial后缀
 	// 而实际上传到123网盘的文件名是fileName（已去除.partial后缀）
-	return f.createObject(fileName, createResp.Data.FileID, src.Size(), md5Hash, time.Now(), false), nil
+	return f.createObject(fileName, createResp.Data.FileID, src.Size(), md5Hash, time.Now()), nil
 }
 
 // uploadFileInChunks 简化的分片流式上传，使用rclone标准重试机制
@@ -2867,12 +2935,14 @@ func (f *Fs) uploadChunksSingleThreaded(ctx context.Context, srcObj fs.Object, c
 	totalChunks := (fileSize + chunkSize - 1) / chunkSize
 	overallHasher := md5.New()
 
-	fs.Debugf(f, "🌊 开始单线程分片上传: 文件=%s, 总大小=%s, 分片数=%d, 分片大小=%s",
+	fs.Infof(f, "🌊 开始单线程分片上传: 文件=%s, 总大小=%s, 分片数=%d, 分片大小=%s",
 		fileName, fs.SizeSuffix(fileSize), totalChunks, fs.SizeSuffix(chunkSize))
 
 	uploadStart := time.Now()
+	var lastProgressTime time.Time
+	var lastProgressPercent int
 
-	// 增强的分片上传循环，带详细错误处理
+	// 增强的分片上传循环，带详细错误处理和进度跟踪
 	for chunkIndex := int64(0); chunkIndex < totalChunks; chunkIndex++ {
 		partNumber := chunkIndex + 1
 
@@ -2898,8 +2968,31 @@ func (f *Fs) uploadChunksSingleThreaded(ctx context.Context, srcObj fs.Object, c
 		}
 
 		progress := float64(uploadedBytes) / float64(fileSize) * 100
-		fs.Debugf(f, "✅ 分片 %d/%d 上传完成，耗时: %v，总进度: %.1f%%",
-			partNumber, totalChunks, chunkDuration, progress)
+		progressPercent := int(progress)
+		now := time.Now()
+
+		// 智能进度显示：每完成一个分片或进度变化超过10%时显示
+		shouldShowProgress := (progressPercent >= lastProgressPercent+10) ||
+			(now.Sub(lastProgressTime) > 10*time.Second) ||
+			(chunkIndex == totalChunks-1) // 最后一个分片
+
+		if shouldShowProgress {
+			elapsed := now.Sub(uploadStart)
+			var avgSpeed float64
+			if elapsed.Seconds() > 0 {
+				avgSpeed = float64(uploadedBytes) / elapsed.Seconds() / 1024 / 1024 // MB/s
+			}
+
+			fs.Infof(f, "📊 123分片上传进度: %d/%d分片 (%d%%) %s/%s 速度: %.2f MB/s [%s]",
+				partNumber, totalChunks, progressPercent,
+				fs.SizeSuffix(uploadedBytes), fs.SizeSuffix(fileSize),
+				avgSpeed, fileName)
+			lastProgressTime = now
+			lastProgressPercent = progressPercent
+		}
+
+		fs.Debugf(f, "✅ 分片 %d/%d 上传完成，耗时: %v",
+			partNumber, totalChunks, chunkDuration)
 	}
 
 	totalUploadTime := time.Since(uploadStart)
@@ -2908,11 +3001,11 @@ func (f *Fs) uploadChunksSingleThreaded(ctx context.Context, srcObj fs.Object, c
 		totalUploadTime, fs.SizeSuffix(int64(avgSpeed)))
 
 	// 完成上传并返回结果
-	return f.finalizeChunkedUpload(ctx, createResp, overallHasher, fileSize, fileName, preuploadID)
+	return f.finalizeChunkedUpload(ctx, overallHasher, fileSize, fileName, preuploadID)
 }
 
 // finalizeChunkedUpload 完成分片上传并返回结果
-func (f *Fs) finalizeChunkedUpload(ctx context.Context, _ *UploadCreateResp, hasher hash.Hash, fileSize int64, fileName, preuploadID string) (*Object, error) {
+func (f *Fs) finalizeChunkedUpload(ctx context.Context, hasher hash.Hash, fileSize int64, fileName, preuploadID string) (*Object, error) {
 	// 计算最终MD5
 	finalMD5 := fmt.Sprintf("%x", hasher.Sum(nil))
 
@@ -2930,7 +3023,7 @@ func (f *Fs) finalizeChunkedUpload(ctx context.Context, _ *UploadCreateResp, has
 	}
 
 	// 返回成功的文件对象，使用服务器返回的文件ID
-	return f.createObject(fileName, result.FileID, fileSize, finalMD5, time.Now(), false), nil
+	return f.createObject(fileName, result.FileID, fileSize, finalMD5, time.Now()), nil
 }
 
 // uploadSingleChunkWithStream 使用流式方式上传单个分片
@@ -2950,7 +3043,7 @@ func (f *Fs) uploadSingleChunkWithStream(ctx context.Context, srcObj fs.Object, 
 	if err != nil {
 		return fmt.Errorf("打开分片 %d 源文件流失败: %w", partNumber, err)
 	}
-	defer chunkReader.Close()
+	defer func() { _ = chunkReader.Close() }()
 
 	// 创建临时文件用于此分片（只需要分片大小的存储）
 	tempFile, err := os.CreateTemp("", fmt.Sprintf("rclone-123pan-chunk-%d-*", partNumber))
@@ -2958,8 +3051,8 @@ func (f *Fs) uploadSingleChunkWithStream(ctx context.Context, srcObj fs.Object, 
 		return fmt.Errorf("创建分片 %d 临时文件失败: %w", partNumber, err)
 	}
 	defer func() {
-		tempFile.Close()
-		os.Remove(tempFile.Name())
+		_ = tempFile.Close()
+		_ = os.Remove(tempFile.Name())
 	}()
 
 	// 创建分片MD5计算器
@@ -3060,20 +3153,17 @@ func (f *Fs) singleStepUpload(ctx context.Context, data []byte, parentFileID int
 	}
 
 	// 获取上传域名
-	uploadDomain, err := f.getUploadDomain(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("获取上传域名失败: %w", err)
-	}
+	uploadDomain := f.getUploadDomain(ctx)
 
 	// 创建multipart表单数据
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
 
 	// 添加表单字段
-	writer.WriteField("parentFileID", fmt.Sprintf("%d", parentFileID))
-	writer.WriteField("filename", fileName)
-	writer.WriteField("etag", md5Hash)
-	writer.WriteField("size", fmt.Sprintf("%d", len(data)))
+	_ = writer.WriteField("parentFileID", fmt.Sprintf("%d", parentFileID))
+	_ = writer.WriteField("filename", fileName)
+	_ = writer.WriteField("etag", md5Hash)
+	_ = writer.WriteField("size", fmt.Sprintf("%d", len(data)))
 
 	// 添加文件数据
 	fileWriter, err := writer.CreateFormFile("file", fileName)
@@ -3106,10 +3196,7 @@ func (f *Fs) singleStepUpload(ctx context.Context, data []byte, parentFileID int
 
 			// Unified parent ID verification logic: try to get correct parent ID
 			fs.Debugf(f, "🔧 使用统一父目录ID修复策略")
-			correctParentID, err := f.getCorrectParentFileID(ctx, parentFileID)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get correct parent ID: %w", err)
-			}
+			correctParentID := f.getCorrectParentFileID(ctx, parentFileID)
 
 			// If got different parent ID, retry single-step upload
 			if correctParentID != parentFileID {
@@ -3141,7 +3228,7 @@ func (f *Fs) singleStepUpload(ctx context.Context, data []byte, parentFileID int
 	f.clearListFileCache(parentFileID, "文件上传成功")
 
 	// 返回Object
-	return f.createObject(fileName, uploadResp.Data.FileID, int64(len(data)), md5Hash, time.Now(), false), nil
+	return f.createObject(fileName, uploadResp.Data.FileID, int64(len(data)), md5Hash, time.Now()), nil
 }
 
 // validateAndCleanFileNameUnified 统一的验证和清理入口点
@@ -3168,14 +3255,14 @@ func (f *Fs) validateAndCleanFileNameUnified(fileName string) (cleanedName strin
 }
 
 // getUploadDomain 获取上传域名，支持动态获取和缓存
-func (f *Fs) getUploadDomain(ctx context.Context) (string, error) {
+func (f *Fs) getUploadDomain(ctx context.Context) string {
 	// 检查缓存是否有效
 	f.uploadDomainMu.RLock()
 	if f.uploadDomain != "" && time.Now().Before(f.uploadDomainExp) {
 		domain := f.uploadDomain
 		f.uploadDomainMu.RUnlock()
 		fs.Debugf(f, "🎯 上传域名缓存命中: %s", domain)
-		return domain, nil
+		return domain
 	}
 	f.uploadDomainMu.RUnlock()
 
@@ -3203,7 +3290,7 @@ func (f *Fs) getUploadDomain(ctx context.Context) (string, error) {
 		f.uploadDomainMu.Unlock()
 
 		fs.Debugf(f, "💾 上传域名已缓存10分钟: %s", domain)
-		return domain, nil
+		return domain
 	}
 
 	// 如果动态获取失败，使用默认域名
@@ -3221,7 +3308,7 @@ func (f *Fs) getUploadDomain(ctx context.Context) (string, error) {
 	f.uploadDomainMu.Unlock()
 
 	fs.Debugf(f, "🌐 使用默认上传域名并缓存2分钟: %s", domain)
-	return domain, nil
+	return domain
 }
 
 // deleteFile 通过移动到回收站来删除文件
@@ -3335,7 +3422,7 @@ func (f *Fs) handlePartialFileConflict(ctx context.Context, fileID int64, partia
 		// 如果存在的文件就是当前文件（可能已经重命名成功）
 		if existingFileID == fileID {
 			fs.Debugf(f, "文件已成功重命名，返回成功对象")
-			return f.createObject(targetName, fileID, -1, "", time.Now(), false), nil
+			return f.createObject(targetName, fileID, -1, "", time.Now()), nil
 		}
 
 		// 存在不同的同名文件，生成唯一名称
@@ -3439,7 +3526,7 @@ func (f *Fs) createObjectFromUpload(fileName string, fileSize int64, md5Hash str
 }
 
 // createObject 通用的Object创建函数，统一所有Object创建逻辑
-func (f *Fs) createObject(remote string, fileID int64, size int64, md5Hash string, modTime time.Time, isDir bool) *Object {
+func (f *Fs) createObject(remote string, fileID int64, size int64, md5Hash string, modTime time.Time) *Object {
 	return &Object{
 		fs:          f,
 		remote:      remote,
@@ -3448,7 +3535,7 @@ func (f *Fs) createObject(remote string, fileID int64, size int64, md5Hash strin
 		size:        size,
 		md5sum:      md5Hash,
 		modTime:     modTime,
-		isDir:       isDir,
+		isDir:       false,
 	}
 }
 
@@ -3491,26 +3578,26 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	// Initialize pacers
-	f.listPacer = createPacer(ctx, listV2APIMinSleep, maxSleep, decayConstant)
+	f.listPacer = createPacer(ctx, listV2APIMinSleep)
 	strictPacerSleep := fileMoveMinSleep
 	if opt.StrictPacerMinSleep > 0 {
 		strictPacerSleep = time.Duration(opt.StrictPacerMinSleep)
 	}
-	f.strictPacer = createPacer(ctx, strictPacerSleep, maxSleep, decayConstant)
+	f.strictPacer = createPacer(ctx, strictPacerSleep)
 	uploadPacerSleep := uploadV2SliceMinSleep // 使用上传API的默认限制
 	if opt.UploadPacerMinSleep > 0 {
 		uploadPacerSleep = time.Duration(opt.UploadPacerMinSleep)
 	}
-	f.uploadPacer = createPacer(ctx, uploadPacerSleep, maxSleep, decayConstant)
+	f.uploadPacer = createPacer(ctx, uploadPacerSleep)
 	downloadPacerSleep := downloadInfoMinSleep // 使用下载API的默认限制
 	if opt.DownloadPacerMinSleep > 0 {
 		downloadPacerSleep = time.Duration(opt.DownloadPacerMinSleep)
 	}
-	f.downloadPacer = createPacer(ctx, downloadPacerSleep, maxSleep, decayConstant)
+	f.downloadPacer = createPacer(ctx, downloadPacerSleep)
 
 	// 根据123网盘API限流表初始化新增的pacer
-	f.batchPacer = createPacer(ctx, 200*time.Millisecond, maxSleep, decayConstant) // 5 QPS for batch operations
-	f.tokenPacer = createPacer(ctx, 1*time.Second, maxSleep, decayConstant)        // 1 QPS for token operations
+	f.batchPacer = createPacer(ctx, 200*time.Millisecond) // 5 QPS for batch operations
+	f.tokenPacer = createPacer(ctx, 1*time.Second)        // 1 QPS for token operations
 
 	// 移除复杂的缓存和统一组件初始化，使用rclone标准组件
 
@@ -3544,7 +3631,7 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	// Initialize authentication
-	tokenLoaded := loadTokenFromConfig(f, m)
+	tokenLoaded := loadTokenFromConfig(f)
 	fs.Debugf(f, "从配置加载令牌: %v（过期时间 %v）", tokenLoaded, f.tokenExpiry)
 
 	var tokenRefreshNeeded bool
@@ -3555,7 +3642,7 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	if tokenRefreshNeeded {
-		if err := f.refreshTokenIfNecessary(ctx, true, false); err != nil {
+		if err := f.refreshTokenIfNecessary(true, false); err != nil {
 			return nil, fmt.Errorf("初始化认证失败: %w", err)
 		}
 	}
@@ -3567,9 +3654,32 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if err != nil {
 		// Assume it is a file (标准rclone模式)
 		newRoot, remote := dircache.SplitPath(f.root)
-		tempF := *f
-		tempF.dirCache = dircache.New(newRoot, f.rootFolderID, &tempF)
-		tempF.root = newRoot
+		// 修复：避免锁复制，创建新的Fs实例而不是复制
+		tempF := &Fs{
+			name:             f.name,
+			originalName:     f.originalName,
+			root:             newRoot,
+			opt:              f.opt,
+			features:         f.features,
+			rst:              f.rst,
+			token:            f.token,
+			tokenExpiry:      f.tokenExpiry,
+			tokenRenewer:     f.tokenRenewer,
+			m:                f.m,
+			rootFolderID:     f.rootFolderID,
+			parentDirCache:   make(map[int64]time.Time),
+			downloadURLCache: sync.Map{},
+			listFileCache:    cache.New(),
+			uploadDomain:     f.uploadDomain,
+			uploadDomainExp:  f.uploadDomainExp,
+			listPacer:        f.listPacer,
+			strictPacer:      f.strictPacer,
+			uploadPacer:      f.uploadPacer,
+			downloadPacer:    f.downloadPacer,
+			batchPacer:       f.batchPacer,
+			tokenPacer:       f.tokenPacer,
+		}
+		tempF.dirCache = dircache.New(newRoot, f.rootFolderID, tempF)
 		// Make new Fs which is the parent
 		err = tempF.dirCache.FindRoot(ctx, false)
 		if err != nil {
@@ -3588,6 +3698,9 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		f.root = tempF.root
 		return f, fs.ErrorIsFile
 	}
+
+	// 初始化CDN故障转移（默认启用）
+	fs.Debugf(f, "🔄 CDN故障转移已启用: 最大重试=%d", defaultMaxCDNRetries)
 
 	return f, nil
 }
@@ -3653,7 +3766,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	}
 
 	fileIDInt, _ := strconv.ParseInt(fileID, 10, 64)
-	o := f.createObject(objectRemote, fileIDInt, fileInfo.Size, fileInfo.Etag, time.Now(), false)
+	o := f.createObject(objectRemote, fileIDInt, fileInfo.Size, fileInfo.Etag, time.Now())
 
 	return o, nil
 }
@@ -3690,13 +3803,13 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 	}
 
 	// 验证并清理文件名
-	fileName, warning := validateAndCleanFileName(leaf)
+	fileName, warning := f.validateAndCleanFileNameUnified(leaf)
 	if warning != nil {
 		fs.Logf(f, "⚠️ 文件名验证警告: %v", warning)
 	}
 
 	// Convert parentID to int64
-	parentFileID, err := parseParentID(parentID)
+	parentFileID, err := parseFileID(parentID)
 	if err != nil {
 		return nil, fmt.Errorf("解析父目录ID失败: %w", err)
 	}
@@ -3774,91 +3887,12 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	}
 
 	// 修复：Range请求不使用并发下载，避免下载整个文件
-	if !hasDisableOption && !hasRangeOption && o.size >= 10*1024*1024 { // 10MB阈值
+	if !hasDisableOption && !hasRangeOption && o.size >= minFileSizeForConcurrency { // 使用常量定义的阈值
 		return o.openWithConcurrency(ctx, options...)
 	}
 
-	var resp *http.Response
-
-	// Use pacer for download with retry (use strict pacer for download URL requests)
-	err := o.fs.strictPacer.Call(func() (bool, error) {
-		// Get download URL (may need refresh)
-		downloadURL, err := o.fs.getDownloadURL(ctx, o.id)
-		if err != nil {
-			return shouldRetry(ctx, nil, err)
-		}
-
-		// Create HTTP request
-		req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
-		if err != nil {
-			return false, fmt.Errorf("failed to create download request: %w", err)
-		}
-
-		// Handle range requests
-		var start, end int64 = 0, -1
-		for _, option := range options {
-			switch x := option.(type) {
-			case *fs.RangeOption:
-				start, end = x.Start, x.End
-			case *fs.SeekOption:
-				start = x.Offset
-			}
-		}
-
-		if start > 0 || end >= 0 {
-			rangeHeader := fmt.Sprintf("bytes=%d-", start)
-			if end >= 0 {
-				rangeHeader = fmt.Sprintf("bytes=%d-%d", start, end)
-			}
-			req.Header.Set("Range", rangeHeader)
-			fs.Debugf(o.fs, "请求范围: %s", rangeHeader)
-		}
-
-		// Set user agent
-		req.Header.Set("User-Agent", o.fs.opt.UserAgent)
-		// Note: Don't set timeout here as it will be applied to the entire download
-
-		// Make the request using rclone standard HTTP client
-		client := fshttp.NewClient(ctx)
-		resp, err = client.Do(req)
-		if err != nil {
-			return shouldRetry(ctx, resp, err)
-		}
-
-		// Check status code
-		switch resp.StatusCode {
-		case http.StatusOK, http.StatusPartialContent:
-			return false, nil // Success
-		case http.StatusFound, http.StatusMovedPermanently, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
-			// Let the HTTP client handle redirects automatically
-			// This should not happen if the client is configured correctly
-			resp.Body.Close()
-			return false, fmt.Errorf("unexpected redirect response %d - client should handle this automatically", resp.StatusCode)
-		case http.StatusRequestedRangeNotSatisfiable:
-			resp.Body.Close()
-			return false, fmt.Errorf("range not satisfiable")
-		case http.StatusNotFound:
-			resp.Body.Close()
-			return false, fs.ErrorObjectNotFound
-		default:
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			return shouldRetry(ctx, resp, fmt.Errorf("download failed with status %d: %s", resp.StatusCode, string(body)))
-		}
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	// 创建包装的ReadCloser来处理进度更新和资源清理
-	return &ProgressReadCloser{
-		ReadCloser:      resp.Body,
-		fs:              o.fs,
-		totalSize:       o.size,
-		transferredSize: 0,
-		startTime:       time.Now(),
-	}, nil
+	// 使用CDN故障转移机制（默认启用）
+	return o.openWithCDNFailover(ctx, options...)
 }
 
 // openWithConcurrency 使用统一并发下载器打开文件（用于跨云传输优化）
@@ -3879,7 +3913,7 @@ func (o *Object) openNormal(ctx context.Context, options ...fs.OpenOption) (io.R
 	err := o.fs.downloadPacer.Call(func() (bool, error) {
 		downloadURL, err := o.fs.getDownloadURL(ctx, o.id)
 		if err != nil {
-			return shouldRetry(ctx, resp, fmt.Errorf("获取下载链接失败: %w", err))
+			return shouldRetry(fmt.Errorf("获取下载链接失败: %w", err))
 		}
 
 		req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
@@ -3895,13 +3929,13 @@ func (o *Object) openNormal(ctx context.Context, options ...fs.OpenOption) (io.R
 		client := fshttp.NewClient(ctx)
 		resp, err = client.Do(req)
 		if err != nil {
-			return shouldRetry(ctx, resp, fmt.Errorf("下载请求失败: %w", err))
+			return shouldRetry(fmt.Errorf("下载请求失败: %w", err))
 		}
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			return shouldRetry(ctx, resp, fmt.Errorf("下载失败，状态码: %d, 响应: %s", resp.StatusCode, string(body)))
+			_ = resp.Body.Close()
+			return shouldRetry(fmt.Errorf("下载失败，状态码: %d, 响应: %s", resp.StatusCode, string(body)))
 		}
 
 		return false, nil
@@ -3915,6 +3949,7 @@ func (o *Object) openNormal(ctx context.Context, options ...fs.OpenOption) (io.R
 	return &ProgressReadCloser{
 		ReadCloser:      resp.Body,
 		fs:              o.fs,
+		object:          o,
 		totalSize:       o.size,
 		transferredSize: 0,
 		startTime:       time.Now(),
@@ -3933,7 +3968,7 @@ func (o *Object) openWithCustomConcurrency(ctx context.Context, options ...fs.Op
 	}
 
 	// 使用简化的并发下载逻辑
-	err = o.downloadWithCustomConcurrency(ctx, tempFile, options...)
+	err = o.downloadWithCustomConcurrency(ctx, tempFile)
 	if err != nil {
 		tempFile.Close()
 		os.Remove(tempFile.Name())
@@ -3949,8 +3984,6 @@ func (o *Object) openWithCustomConcurrency(ctx context.Context, options ...fs.Op
 		return nil, fmt.Errorf("重置临时文件指针失败: %w", err)
 	}
 
-	fs.Debugf(o, "Custom concurrent download completed: %s", fs.SizeSuffix(o.size))
-
 	// 返回一个包装的ReadCloser，在关闭时删除临时文件
 	return &ConcurrentDownloadReader{
 		file:     tempFile,
@@ -3959,10 +3992,11 @@ func (o *Object) openWithCustomConcurrency(ctx context.Context, options ...fs.Op
 }
 
 // downloadWithCustomConcurrency 自定义并发下载实现
-func (o *Object) downloadWithCustomConcurrency(ctx context.Context, tempFile *os.File, _ ...fs.OpenOption) error {
+func (o *Object) downloadWithCustomConcurrency(ctx context.Context, tempFile *os.File) error {
+	downloadStartTime := time.Now()
 	// 简化的并发下载配置
-	chunkSize := int64(50 * 1024 * 1024) // 50MB分片
-	maxConcurrency := 6                  // 6线程并发
+	chunkSize := int64(defaultDownloadChunkSize) // 使用常量定义的分片大小
+	maxConcurrency := defaultDownloadConcurrency // 使用常量定义的并发数
 
 	fileSize := o.size
 	numChunks := (fileSize + chunkSize - 1) / chunkSize
@@ -4016,11 +4050,18 @@ func (o *Object) downloadWithCustomConcurrency(ctx context.Context, tempFile *os
 		return err
 	}
 
+	// 计算总体下载统计
+	totalDuration := time.Since(downloadStartTime)
+	avgSpeed := float64(o.size) / totalDuration.Seconds()
+	fs.Infof(o, "✅ 123网盘下载完成: %s | ⏱️ %v | 🚀 平均 %s/s",
+		fs.SizeSuffix(o.size), totalDuration.Truncate(time.Second), fs.SizeSuffix(int64(avgSpeed)))
+
 	return nil
 }
 
 // downloadChunk 下载单个分片
 func (o *Object) downloadChunk(ctx context.Context, url string, tempFile *os.File, start, end, chunkIndex int64) error {
+	startTime := time.Now()
 	// 创建HTTP请求
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -4037,7 +4078,7 @@ func (o *Object) downloadChunk(ctx context.Context, url string, tempFile *os.Fil
 	if err != nil {
 		return fmt.Errorf("执行下载请求失败: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// 检查响应状态
 	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
@@ -4078,8 +4119,11 @@ func (o *Object) downloadChunk(ctx context.Context, url string, tempFile *os.Fil
 		return fmt.Errorf("分片写入不完整: 期望写入%d，实际写入%d", totalRead, writtenBytes)
 	}
 
-	fs.Debugf(o, " 123网盘分片%d下载完成: %s (bytes=%d-%d)",
-		chunkIndex, fs.SizeSuffix(totalRead), start, end)
+	// 计算下载速度
+	duration := time.Since(startTime)
+	speed := float64(totalRead) / duration.Seconds()
+	fs.Infof(o, "📥 分片%d下载完成 %s [%d-%d] 🚀 %s/s",
+		chunkIndex, fs.SizeSuffix(totalRead), start, end, fs.SizeSuffix(int64(speed)))
 
 	return nil
 }
@@ -4098,13 +4142,13 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 
 	// Convert parentID to int64
-	parentFileID, err := parseParentID(parentID)
+	parentFileID, err := parseFileID(parentID)
 	if err != nil {
 		return fmt.Errorf("解析父目录ID失败: %w", err)
 	}
 
 	// 验证并清理文件名
-	cleanedFileName, warning := validateAndCleanFileName(leaf)
+	cleanedFileName, warning := o.fs.validateAndCleanFileNameUnified(leaf)
 	if warning != nil {
 		fs.Logf(o.fs, "⚠️ 文件名验证警告: %v", warning)
 		leaf = cleanedFileName
@@ -4187,7 +4231,7 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (foundID string,
 	}
 
 	// Convert pathID to int64
-	parentFileID, err := parseParentID(pathID)
+	parentFileID, err := parseFileID(pathID)
 	if err != nil {
 		return "", false, fmt.Errorf("解析父目录ID失败: %w", err)
 	}
@@ -4213,7 +4257,7 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (foundID string,
 		err = f.listPacer.Call(func() (bool, error) {
 			response, err = f.ListFile(ctx, int(parentFileID), 100, "", "", lastFileIDInt)
 			if err != nil {
-				return shouldRetry(ctx, nil, err)
+				return shouldRetry(err)
 			}
 			return false, nil
 		})
@@ -4283,7 +4327,7 @@ func (f *Fs) findLeafWithForceRefresh(ctx context.Context, pathID, leaf string) 
 	fs.Debugf(f, "🔄 强制刷新查找叶节点: pathID=%s, leaf=%s", pathID, leaf)
 
 	// Convert pathID to int64
-	parentFileID, err := parseParentID(pathID)
+	parentFileID, err := parseFileID(pathID)
 	if err != nil {
 		return "", false, fmt.Errorf("解析父目录ID失败: %w", err)
 	}
@@ -4309,7 +4353,7 @@ func (f *Fs) findLeafWithForceRefresh(ctx context.Context, pathID, leaf string) 
 		err = f.listPacer.Call(func() (bool, error) {
 			response, err = f.listFileDirectAPI(ctx, int(parentFileID), 100, "", "", lastFileIDInt)
 			if err != nil {
-				return shouldRetry(ctx, nil, err)
+				return shouldRetry(err)
 			}
 			return false, nil
 		})
@@ -4382,7 +4426,7 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 	}
 
 	// 验证并清理目录名
-	cleanedDirName, warning := validateAndCleanFileName(leaf)
+	cleanedDirName, warning := f.validateAndCleanFileNameUnified(leaf)
 	if warning != nil {
 		fs.Logf(f, "⚠️ 目录名验证警告: %v", warning)
 		leaf = cleanedDirName
@@ -4413,7 +4457,7 @@ var (
 )
 
 // loadTokenFromConfig attempts to load and parse tokens from the config file
-func loadTokenFromConfig(f *Fs, _ configmap.Mapper) bool {
+func loadTokenFromConfig(f *Fs) bool {
 	if f.opt.Token == "" {
 		fs.Debugf(f, "配置中未找到令牌（来自选项）")
 		return false
@@ -4443,7 +4487,7 @@ func loadTokenFromConfig(f *Fs, _ configmap.Mapper) bool {
 }
 
 // saveToken saves the current token to the config
-func (f *Fs) saveToken(_ context.Context, m configmap.Mapper) {
+func (f *Fs) saveToken(m configmap.Mapper) {
 	if m == nil {
 		fs.Debugf(f, "不保存令牌 - 提供的映射器为空")
 		return
@@ -4474,7 +4518,7 @@ func (f *Fs) saveToken(_ context.Context, m configmap.Mapper) {
 // Removed unused function: setupTokenRenewer
 
 // refreshTokenIfNecessary refreshes the token if necessary
-func (f *Fs) refreshTokenIfNecessary(ctx context.Context, refreshTokenExpired bool, forceRefresh bool) error {
+func (f *Fs) refreshTokenIfNecessary(refreshTokenExpired bool, forceRefresh bool) error {
 	f.tokenMu.Lock()
 
 	// Check if another thread has successfully refreshed while we were waiting
@@ -4495,7 +4539,7 @@ func (f *Fs) refreshTokenIfNecessary(ctx context.Context, refreshTokenExpired bo
 	f.tokenExpiry = expiredAt
 
 	// Save the refreshed token to config
-	f.saveToken(ctx, f.m)
+	f.saveToken(f.m)
 
 	return nil
 }
@@ -4553,7 +4597,7 @@ func GetAccessToken(clientID, clientSecret string) (string, time.Time, error) {
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("failed to send request: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return "", time.Time{}, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
@@ -4634,7 +4678,7 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 	}
 
 	// Convert dirID to int64
-	parentFileID, err := parseDirID(dirID)
+	parentFileID, err := parseFileID(dirID)
 	if err != nil {
 		return fmt.Errorf("解析目录ID失败: %w", err)
 	}
@@ -4731,7 +4775,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	fs.Debugf(f, "找到目录ID: %s，目录: %s", dirID, dir)
 
 	// Convert dirID to int64
-	parentFileID, err := parseDirID(dirID)
+	parentFileID, err := parseFileID(dirID)
 	if err != nil {
 		return nil, fmt.Errorf("解析目录ID失败: %w", err)
 	}
@@ -4884,7 +4928,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 
 	// 验证并清理目标文件名
-	cleanedDstName, warning := validateAndCleanFileName(dstName)
+	cleanedDstName, warning := f.validateAndCleanFileNameUnified(dstName)
 	if warning != nil {
 		fs.Logf(f, "⚠️ 移动操作文件名验证警告: %v", warning)
 		dstName = cleanedDstName
@@ -5136,7 +5180,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 
 	// 验证并清理目标文件名
-	_, warning := validateAndCleanFileName(dstName)
+	_, warning := f.validateAndCleanFileNameUnified(dstName)
 	if warning != nil {
 		fs.Logf(f, "⚠️ 复制操作文件名验证警告: %v", warning)
 		// Note: cleaned name is not used in current implementation
@@ -5290,7 +5334,7 @@ func (f *Fs) streamHashTransfer(ctx context.Context, src fs.ObjectInfo, parentFi
 
 	if createResp.Data.Reuse {
 		fs.Infof(f, "🚀 流式哈希计算后秒传成功！")
-		return f.createObject(fileName, createResp.Data.FileID, src.Size(), md5Hash, time.Now(), false), nil
+		return f.createObject(fileName, createResp.Data.FileID, src.Size(), md5Hash, time.Now()), nil
 	}
 
 	// 秒传失败，第二遍：重新下载并流式上传
@@ -5335,7 +5379,7 @@ func (f *Fs) streamUploadWithSession(ctx context.Context, srcObj fs.Object, crea
 			return nil, fmt.Errorf("failed to complete single upload: %w", err)
 		}
 
-		return f.createObject(fileName, result.FileID, fileSize, md5Hash, time.Now(), false), nil
+		return f.createObject(fileName, result.FileID, fileSize, md5Hash, time.Now()), nil
 	} else {
 		// 大文件：真正的边下边传实现
 		fs.Infof(f, "📤 真正的边下边传：文件大小=%s，服务器分片大小=%s",
@@ -5392,7 +5436,7 @@ func (f *Fs) streamUploadWithSession(ctx context.Context, srcObj fs.Object, crea
 		}
 
 		fs.Infof(f, "🎉 边下边传成功完成！文件ID: %d", result.FileID)
-		return f.createObject(fileName, result.FileID, fileSize, md5Hash, time.Now(), false), nil
+		return f.createObject(fileName, result.FileID, fileSize, md5Hash, time.Now()), nil
 	}
 }
 

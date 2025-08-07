@@ -279,7 +279,7 @@ func (f *Fs) processDirectoryForMediaSync(ctx context.Context, sourcePath, targe
 
 	// 4. 如果启用了同步删除，检查并删除本地不存在于网盘的.strm文件
 	if stats.SyncDelete {
-		err := f.cleanupOrphanedStrmFiles115(ctx, targetPath, entries, includeExts, excludeExts, stats)
+		err := f.cleanupOrphanedStrmFiles115(targetPath, entries, includeExts, excludeExts, stats)
 		if err != nil {
 			fs.Logf(f, "⚠️ 清理孤立.strm文件失败: %v", err)
 			// 不中断整个过程，继续执行
@@ -391,7 +391,7 @@ func (f *Fs) createStrmFileFor115(ctx context.Context, obj fs.Object, targetDir,
 }
 
 // cleanupOrphanedStrmFiles115 清理本地不存在于网盘的.strm文件
-func (f *Fs) cleanupOrphanedStrmFiles115(ctx context.Context, targetPath string, cloudEntries []fs.DirEntry,
+func (f *Fs) cleanupOrphanedStrmFiles115(targetPath string, cloudEntries []fs.DirEntry,
 	includeExts, excludeExts map[string]bool, stats *MediaSyncStats) error {
 
 	fs.Debugf(f, "🧹 开始清理孤立的.strm文件: %s", targetPath)
@@ -464,7 +464,7 @@ func (f *Fs) cleanupOrphanedStrmFiles115(ctx context.Context, targetPath string,
 		fs.Debugf(f, "✅ 清理完成，删除了 %d 个孤立的.strm文件", stats.DeletedStrm)
 
 		// 清理空目录
-		err := f.cleanupEmptyDirectories115(ctx, targetPath, stats)
+		err := f.cleanupEmptyDirectories115(targetPath, stats)
 		if err != nil {
 			fs.Logf(f, "⚠️ 清理空目录失败: %v", err)
 		}
@@ -474,15 +474,15 @@ func (f *Fs) cleanupOrphanedStrmFiles115(ctx context.Context, targetPath string,
 }
 
 // cleanupEmptyDirectories115 清理空目录
-func (f *Fs) cleanupEmptyDirectories115(ctx context.Context, startPath string, stats *MediaSyncStats) error {
+func (f *Fs) cleanupEmptyDirectories115(startPath string, stats *MediaSyncStats) error {
 	fs.Debugf(f, "🗂️ 开始清理空目录: %s", startPath)
 
 	// 递归清理空目录，从最深层开始
-	return f.cleanupEmptyDirectoriesRecursive115(ctx, startPath, stats, 0)
+	return f.cleanupEmptyDirectoriesRecursive115(startPath, stats, 0)
 }
 
 // cleanupEmptyDirectoriesRecursive115 递归清理空目录
-func (f *Fs) cleanupEmptyDirectoriesRecursive115(ctx context.Context, dirPath string, stats *MediaSyncStats, depth int) error {
+func (f *Fs) cleanupEmptyDirectoriesRecursive115(dirPath string, stats *MediaSyncStats, depth int) error {
 	// 防止无限递归，最多向上清理5层
 	if depth > 5 {
 		return nil
@@ -530,7 +530,7 @@ func (f *Fs) cleanupEmptyDirectoriesRecursive115(ctx context.Context, dirPath st
 	// 递归检查父目录
 	parentDir := filepath.Dir(dirPath)
 	if parentDir != dirPath && parentDir != "." && parentDir != "/" {
-		return f.cleanupEmptyDirectoriesRecursive115(ctx, parentDir, stats, depth+1)
+		return f.cleanupEmptyDirectoriesRecursive115(parentDir, stats, depth+1)
 	}
 
 	return nil
