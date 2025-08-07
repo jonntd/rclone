@@ -1405,13 +1405,13 @@ func init() {
 			Advanced: true,
 		}, {
 			Name:     "download_concurrency",
-			Help:     `并发下载线程数。设置为0禁用并发下载。`,
-			Default:  4,
+			Help:     `并发下载线程数。115网盘限制每个文件最多2个并发连接，建议设置为2。设置为0禁用并发下载。`,
+			Default:  2, // 115网盘限制：每个文件最多2个并发连接
 			Advanced: true,
 		}, {
 			Name:     "download_chunk_size",
-			Help:     `下载分片大小。仅在启用并发下载时有效。`,
-			Default:  fs.SizeSuffix(32 * 1024 * 1024), // 32MB
+			Help:     `下载分片大小。仅在启用并发下载时有效。建议32-64MB。`,
+			Default:  fs.SizeSuffix(64 * 1024 * 1024), // 64MB，适合2并发
 			Advanced: true,
 		}, {
 			Name:     config.ConfigEncoding,
@@ -4449,6 +4449,14 @@ func (o *Object) openWithConcurrency(ctx context.Context, options ...fs.OpenOpti
 	if err != nil {
 		tempFile.Close()
 		os.Remove(tempFile.Name())
+
+		// 检查是否是403错误（115网盘不支持并发Range请求）
+		if strings.Contains(err.Error(), "403") {
+			fs.Infof(o, "⚠️ 115网盘不支持并发Range请求，自动禁用并发下载功能")
+			// 临时禁用当前对象的并发下载
+			return o.openNormal(ctx, options...)
+		}
+
 		fs.Debugf(o, "⚠️ 并发下载失败，回退到普通下载: %v", err)
 		return o.openNormal(ctx, options...)
 	}
@@ -5063,13 +5071,31 @@ func (o *Object) downloadWithConcurrency(ctx context.Context, tempFile *os.File)
 	chunkSize := int64(o.fs.opt.DownloadChunkSize)
 	maxConcurrency := o.fs.opt.DownloadConcurrency
 
+	// 115网盘限制：每个文件最多2个并发连接
+	if maxConcurrency > 2 {
+		fs.Debugf(o, "⚠️ 115网盘限制每个文件最多2个并发连接，将并发数从%d调整为2", maxConcurrency)
+		maxConcurrency = 2
+	}
+
 	fileSize := o.size
 	numChunks := (fileSize + chunkSize - 1) / chunkSize
 	if numChunks < int64(maxConcurrency) {
 		maxConcurrency = int(numChunks)
 	}
 
-	fs.Infof(o, "📊 115网盘并发下载参数: 分片大小=%s, 分片数=%d, 并发数=%d",
+	// 针对2并发优化：如果分片数太少，增加分片大小利用率
+	if maxConcurrency == 2 && numChunks < 4 && fileSize > 200*1024*1024 { // 200MB以上且分片少于4个
+		// 重新计算分片大小，确保至少有4个分片供2个并发处理
+		optimalChunkSize := fileSize / 4
+		if optimalChunkSize > chunkSize/2 && optimalChunkSize < chunkSize*2 {
+			chunkSize = optimalChunkSize
+			numChunks = (fileSize + chunkSize - 1) / chunkSize
+			fs.Debugf(o, "🔧 115网盘2并发优化: 调整分片大小为%s, 分片数=%d",
+				fs.SizeSuffix(chunkSize), numChunks)
+		}
+	}
+
+	fs.Infof(o, "📊 115网盘并发下载参数: 分片大小=%s, 分片数=%d, 并发数=%d (115限制:最多2并发)",
 		fs.SizeSuffix(chunkSize), numChunks, maxConcurrency)
 
 	// 获取下载URL
@@ -5101,21 +5127,45 @@ func (o *Object) downloadWithConcurrency(ctx context.Context, tempFile *os.File)
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			// 下载分片
-			err := o.downloadChunk(ctx, downloadURL, tempFile, start, end, chunkIndex)
+			// 下载分片，增加重试机制
+			var err error
+			for retry := 0; retry < 3; retry++ {
+				err = o.downloadChunk(ctx, downloadURL, tempFile, start, end, chunkIndex)
+				if err == nil {
+					break
+				}
+				if retry < 2 {
+					fs.Debugf(o, "⚠️ 分片%d下载失败，重试%d/3: %v", chunkIndex+1, retry+1, err)
+					time.Sleep(time.Duration(retry+1) * time.Second)
+				}
+			}
 			if err != nil {
-				errChan <- fmt.Errorf("分片%d下载失败: %w", chunkIndex, err)
+				errChan <- fmt.Errorf("分片%d下载失败(重试3次后): %w", chunkIndex+1, err)
 			}
 		}(i, start, end)
 	}
 
-	// 等待所有分片完成
-	wg.Wait()
-	close(errChan)
+	// 等待所有分片完成，使用超时机制防止死锁
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
 
-	// 检查是否有错误
-	for err := range errChan {
-		return err
+	// 等待完成或超时
+	select {
+	case <-done:
+		// 正常完成
+		close(errChan)
+
+		// 检查是否有错误
+		for err := range errChan {
+			return err
+		}
+	case <-time.After(10 * time.Minute):
+		// 超时处理
+		close(errChan)
+		return fmt.Errorf("并发下载超时，可能存在网络问题")
 	}
 
 	downloadDuration := time.Since(downloadStartTime)
@@ -5128,6 +5178,8 @@ func (o *Object) downloadWithConcurrency(ctx context.Context, tempFile *os.File)
 
 // downloadChunk 下载单个分片
 func (o *Object) downloadChunk(ctx context.Context, downloadURL string, tempFile *os.File, start, end, chunkIndex int64) error {
+	chunkStartTime := time.Now()
+
 	// 创建Range请求
 	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
 	if err != nil {
@@ -5137,6 +5189,8 @@ func (o *Object) downloadChunk(ctx context.Context, downloadURL string, tempFile
 	rangeHeader := fmt.Sprintf("bytes=%d-%d", start, end)
 	req.Header.Set("Range", rangeHeader)
 
+	fs.Debugf(o, "🔄 开始下载分片%d: 范围=%d-%d", chunkIndex+1, start, end)
+
 	// 执行请求
 	resp, err := o.fs.openAPIClient.Do(req)
 	if err != nil {
@@ -5145,8 +5199,21 @@ func (o *Object) downloadChunk(ctx context.Context, downloadURL string, tempFile
 	defer resp.Body.Close()
 
 	// 检查响应状态
+	if resp.StatusCode == 403 {
+		return fmt.Errorf("115网盘并发限制: 每个文件最多支持2个并发连接，当前可能超出限制")
+	}
 	if resp.StatusCode != 206 {
-		return fmt.Errorf("Range请求失败，状态码: %d", resp.StatusCode)
+		return fmt.Errorf("range请求失败，状态码: %d", resp.StatusCode)
+	}
+
+	// 验证Content-Length
+	expectedSize := end - start + 1
+	if contentLength := resp.Header.Get("Content-Length"); contentLength != "" {
+		if actualSize, err := strconv.ParseInt(contentLength, 10, 64); err == nil {
+			if actualSize != expectedSize {
+				return fmt.Errorf("分片大小不匹配: 期望%d, 实际%d", expectedSize, actualSize)
+			}
+		}
 	}
 
 	// 读取数据并写入临时文件
@@ -5155,15 +5222,26 @@ func (o *Object) downloadChunk(ctx context.Context, downloadURL string, tempFile
 		return fmt.Errorf("读取响应数据失败: %w", err)
 	}
 
+	// 验证数据大小
+	if int64(len(data)) != expectedSize {
+		return fmt.Errorf("数据大小不匹配: 期望%d, 实际%d", expectedSize, len(data))
+	}
+
 	// 写入到临时文件的正确位置
-	_, err = tempFile.WriteAt(data, start)
+	n, err := tempFile.WriteAt(data, start)
 	if err != nil {
 		return fmt.Errorf("写入临时文件失败: %w", err)
 	}
+	if int64(n) != expectedSize {
+		return fmt.Errorf("写入大小不匹配: 期望%d, 实际%d", expectedSize, n)
+	}
 
-	fs.Debugf(o, "📥 115下载分片完成: %d/%d, 范围=%d-%d, 大小=%d",
+	chunkDuration := time.Since(chunkStartTime)
+	chunkSpeed := float64(len(data)) / chunkDuration.Seconds()
+
+	fs.Debugf(o, "✅ 115下载分片完成: %d/%d, 范围=%d-%d, 大小=%d, 耗时=%v, 速度=%s/s",
 		chunkIndex+1, (o.size+int64(o.fs.opt.DownloadChunkSize)-1)/int64(o.fs.opt.DownloadChunkSize),
-		start, end, len(data))
+		start, end, len(data), chunkDuration, fs.SizeSuffix(int64(chunkSpeed)))
 
 	return nil
 }

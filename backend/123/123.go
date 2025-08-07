@@ -5289,7 +5289,7 @@ func (f *Fs) memoryHashTransfer(ctx context.Context, src fs.ObjectInfo, parentFi
 
 // Removed unused functions: getHTTPClient, getAdaptiveTimeout, detectNetworkSpeed, getOptimalConcurrency, getOptimalChunkSize
 
-// streamHashTransfer 大文件流式哈希传输
+// streamHashTransfer 大文件流式哈希传输 - 修复版：一次传输同时计算哈希
 func (f *Fs) streamHashTransfer(ctx context.Context, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
 	// 转换为fs.Object以便调用Open方法
 	srcObj, ok := src.(fs.Object)
@@ -5297,49 +5297,113 @@ func (f *Fs) streamHashTransfer(ctx context.Context, src fs.ObjectInfo, parentFi
 		return nil, fmt.Errorf("source is not a valid fs.Object")
 	}
 
-	// 第一遍：流式计算MD5哈希
-	fs.Infof(f, "🔄 第一遍：流式计算文件哈希...")
+	fileSize := src.Size()
+	fs.Infof(f, "🔄 优化流式传输：边下载边计算哈希边上传 (文件大小: %s)", fs.SizeSuffix(fileSize))
 
-	srcReader, err := srcObj.Open(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open source file for hash calculation: %w", err)
-	}
-	defer srcReader.Close()
-
-	// 流式计算MD5，不保存数据
-	hasher := md5.New()
-	buffer := make([]byte, 64*1024) // 64KB缓冲区
-
-	for {
-		n, err := srcReader.Read(buffer)
-		if n > 0 {
-			hasher.Write(buffer[:n])
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("failed to read data for hash calculation: %w", err)
-		}
-	}
-
-	md5Hash := fmt.Sprintf("%x", hasher.Sum(nil))
-	fs.Infof(f, "📊 流式哈希计算完成: MD5: %s", md5Hash)
-
-	// 尝试秒传
-	createResp, err := f.createUpload(ctx, parentFileID, fileName, md5Hash, src.Size())
+	// 先尝试预创建上传会话（不提供MD5，让123网盘准备接收）
+	createResp, err := f.createUpload(ctx, parentFileID, fileName, "", fileSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create upload session: %w", err)
 	}
 
+	// 如果123网盘支持无MD5预创建且文件已存在，直接返回
 	if createResp.Data.Reuse {
-		fs.Infof(f, "🚀 流式哈希计算后秒传成功！")
-		return f.createObject(fileName, createResp.Data.FileID, src.Size(), md5Hash, time.Now()), nil
+		fs.Infof(f, "🚀 文件已存在，无需传输！")
+		return f.createObject(fileName, createResp.Data.FileID, fileSize, "", time.Now()), nil
 	}
 
-	// 秒传失败，第二遍：重新下载并流式上传
-	fs.Infof(f, "⬆️ 秒传失败，第二遍：重新下载并流式上传")
-	return f.streamUploadWithSession(ctx, srcObj, createResp, fileName, md5Hash)
+	// 打开源文件进行一次性传输
+	srcReader, err := srcObj.Open(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open source file: %w", err)
+	}
+	defer srcReader.Close()
+
+	// 创建MD5计算器
+	hasher := md5.New()
+
+	// 使用TeeReader同时计算哈希和传输数据
+	hashingReader := io.TeeReader(srcReader, hasher)
+
+	// 执行边下载边上传边计算哈希
+	err = f.streamUploadWithHashingReader(ctx, hashingReader, createResp, fileSize)
+	if err != nil {
+		return nil, fmt.Errorf("failed to stream upload: %w", err)
+	}
+
+	// 计算最终MD5哈希
+	md5Hash := fmt.Sprintf("%x", hasher.Sum(nil))
+	fs.Infof(f, "📊 一次传输完成，MD5: %s", md5Hash)
+
+	// 完成上传并获取真实文件ID
+	result, err := f.completeUploadWithResultAndSize(ctx, createResp.Data.PreuploadID, fileSize)
+	if err != nil {
+		return nil, fmt.Errorf("failed to complete upload: %w", err)
+	}
+
+	return f.createObject(fileName, result.FileID, fileSize, md5Hash, time.Now()), nil
+}
+
+// streamUploadWithHashingReader 使用哈希计算Reader进行流式上传
+func (f *Fs) streamUploadWithHashingReader(ctx context.Context, reader io.Reader, createResp *UploadCreateResp, fileSize int64) error {
+	serverChunkSize := createResp.Data.SliceSize // 使用服务器指定的分片大小
+
+	// 检查是否需要分片上传
+	if fileSize <= 100*1024*1024 { // 100MB阈值
+		// 小文件：读取全部数据并上传
+		fs.Infof(f, "📤 小文件流式上传: %s", fs.SizeSuffix(fileSize))
+
+		data, err := io.ReadAll(reader)
+		if err != nil {
+			return fmt.Errorf("failed to read file data: %w", err)
+		}
+
+		return f.uploadSinglePart(ctx, createResp.Data.PreuploadID, data)
+	} else {
+		// 大文件：分片流式上传
+		fs.Infof(f, "📤 大文件分片流式上传: 文件大小=%s，分片大小=%s",
+			fs.SizeSuffix(fileSize), fs.SizeSuffix(serverChunkSize))
+
+		totalChunks := (fileSize + serverChunkSize - 1) / serverChunkSize
+		fs.Infof(f, "🔢 总分片数: %d", totalChunks)
+
+		// 分片上传
+		for chunkIndex := int64(0); chunkIndex < totalChunks; chunkIndex++ {
+			// 计算当前分片大小
+			actualChunkSize := serverChunkSize
+			if chunkIndex == totalChunks-1 {
+				// 最后一个分片可能较小
+				actualChunkSize = fileSize - chunkIndex*serverChunkSize
+			}
+
+			// 读取分片数据
+			chunkData := make([]byte, actualChunkSize)
+			n, err := io.ReadFull(reader, chunkData)
+			if err != nil && err != io.ErrUnexpectedEOF {
+				return fmt.Errorf("failed to read chunk %d: %w", chunkIndex+1, err)
+			}
+			if int64(n) != actualChunkSize {
+				return fmt.Errorf("chunk %d size mismatch: expected %d, got %d", chunkIndex+1, actualChunkSize, n)
+			}
+
+			// 计算分片MD5并上传
+			chunkHash := fmt.Sprintf("%x", md5.Sum(chunkData))
+			err = f.uploadPartWithMultipart(ctx, createResp.Data.PreuploadID, chunkIndex+1, chunkHash, chunkData)
+			if err != nil {
+				return fmt.Errorf("failed to upload chunk %d: %w", chunkIndex+1, err)
+			}
+
+			fs.Debugf(f, "✅ 分片 %d/%d 上传完成", chunkIndex+1, totalChunks)
+		}
+
+		// 完成分片上传
+		_, err := f.completeUploadWithResultAndSize(ctx, createResp.Data.PreuploadID, fileSize)
+		if err != nil {
+			return fmt.Errorf("failed to complete multipart upload: %w", err)
+		}
+
+		return nil
+	}
 }
 
 // uploadFromMemory 函数已删除，小文件现在直接使用 singleStepUpload API
