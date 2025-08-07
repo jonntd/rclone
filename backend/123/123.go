@@ -5289,7 +5289,7 @@ func (f *Fs) memoryHashTransfer(ctx context.Context, src fs.ObjectInfo, parentFi
 
 // Removed unused functions: getHTTPClient, getAdaptiveTimeout, detectNetworkSpeed, getOptimalConcurrency, getOptimalChunkSize
 
-// streamHashTransfer 大文件流式哈希传输 - 修复版：一次传输同时计算哈希
+// streamHashTransfer 大文件流式哈希传输 - 修复版：边计算哈希边缓存，避免重复下载
 func (f *Fs) streamHashTransfer(ctx context.Context, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
 	// 转换为fs.Object以便调用Open方法
 	srcObj, ok := src.(fs.Object)
@@ -5298,50 +5298,71 @@ func (f *Fs) streamHashTransfer(ctx context.Context, src fs.ObjectInfo, parentFi
 	}
 
 	fileSize := src.Size()
-	fs.Infof(f, "🔄 优化流式传输：边下载边计算哈希边上传 (文件大小: %s)", fs.SizeSuffix(fileSize))
+	fs.Infof(f, "🔄 优化流式哈希：边下载边计算哈希边缓存 (文件大小: %s)", fs.SizeSuffix(fileSize))
 
-	// 先尝试预创建上传会话（不提供MD5，让123网盘准备接收）
-	createResp, err := f.createUpload(ctx, parentFileID, fileName, "", fileSize)
+	// 创建临时文件用于缓存
+	tempFile, err := os.CreateTemp("", "rclone-123pan-stream-*.tmp")
 	if err != nil {
-		return nil, fmt.Errorf("failed to create upload session: %w", err)
+		return nil, fmt.Errorf("failed to create temp file: %w", err)
 	}
+	defer func() {
+		tempFile.Close()
+		os.Remove(tempFile.Name())
+	}()
 
-	// 如果123网盘支持无MD5预创建且文件已存在，直接返回
-	if createResp.Data.Reuse {
-		fs.Infof(f, "🚀 文件已存在，无需传输！")
-		return f.createObject(fileName, createResp.Data.FileID, fileSize, "", time.Now()), nil
-	}
+	// 第一遍：边下载边计算哈希边写入临时文件
+	fs.Infof(f, "🔄 第一遍：边下载边计算哈希边缓存...")
 
-	// 打开源文件进行一次性传输
 	srcReader, err := srcObj.Open(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open source file: %w", err)
+		return nil, fmt.Errorf("failed to open source file for hash calculation: %w", err)
 	}
 	defer srcReader.Close()
 
 	// 创建MD5计算器
 	hasher := md5.New()
 
-	// 使用TeeReader同时计算哈希和传输数据
-	hashingReader := io.TeeReader(srcReader, hasher)
+	// 使用MultiWriter同时写入临时文件和MD5计算器
+	multiWriter := io.MultiWriter(tempFile, hasher)
 
-	// 执行边下载边上传边计算哈希
-	err = f.streamUploadWithHashingReader(ctx, hashingReader, createResp, fileSize)
+	// 流式传输：同时计算哈希和缓存数据
+	_, err = io.Copy(multiWriter, srcReader)
 	if err != nil {
-		return nil, fmt.Errorf("failed to stream upload: %w", err)
+		return nil, fmt.Errorf("failed to stream data for hash calculation and caching: %w", err)
 	}
 
-	// 计算最终MD5哈希
+	// 计算MD5哈希
 	md5Hash := fmt.Sprintf("%x", hasher.Sum(nil))
-	fs.Infof(f, "📊 一次传输完成，MD5: %s", md5Hash)
+	fs.Infof(f, "📊 流式哈希计算完成: MD5: %s", md5Hash)
 
-	// 完成上传并获取真实文件ID
-	result, err := f.completeUploadWithResultAndSize(ctx, createResp.Data.PreuploadID, fileSize)
+	// 尝试秒传
+	createResp, err := f.createUpload(ctx, parentFileID, fileName, md5Hash, fileSize)
 	if err != nil {
-		return nil, fmt.Errorf("failed to complete upload: %w", err)
+		return nil, fmt.Errorf("failed to create upload session: %w", err)
 	}
 
-	return f.createObject(fileName, result.FileID, fileSize, md5Hash, time.Now()), nil
+	if createResp.Data.Reuse {
+		fs.Infof(f, "🚀 流式哈希计算后秒传成功！")
+		return f.createObject(fileName, createResp.Data.FileID, fileSize, md5Hash, time.Now()), nil
+	}
+
+	// 秒传失败，使用缓存的临时文件上传（避免重复下载）
+	fs.Infof(f, "⬆️ 秒传失败，使用缓存文件上传（避免重复下载）")
+
+	// 重置临时文件指针到开头
+	_, err = tempFile.Seek(0, io.SeekStart)
+	if err != nil {
+		return nil, fmt.Errorf("failed to seek temp file: %w", err)
+	}
+
+	// 使用缓存文件进行上传
+	err = f.uploadFile(ctx, tempFile, createResp, fileSize)
+	if err != nil {
+		return nil, fmt.Errorf("failed to upload from cache: %w", err)
+	}
+
+	fs.Infof(f, "✅ 优化流式哈希传输完成！避免了重复下载")
+	return f.createObject(fileName, createResp.Data.FileID, fileSize, md5Hash, time.Now()), nil
 }
 
 // streamUploadWithHashingReader 使用哈希计算Reader进行流式上传
