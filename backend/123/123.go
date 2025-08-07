@@ -5289,7 +5289,7 @@ func (f *Fs) memoryHashTransfer(ctx context.Context, src fs.ObjectInfo, parentFi
 
 // Removed unused functions: getHTTPClient, getAdaptiveTimeout, detectNetworkSpeed, getOptimalConcurrency, getOptimalChunkSize
 
-// streamHashTransfer 大文件流式哈希传输 - 修复版：边计算哈希边缓存，避免重复下载
+// streamHashTransfer 大文件流式哈希传输
 func (f *Fs) streamHashTransfer(ctx context.Context, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
 	// 转换为fs.Object以便调用Open方法
 	srcObj, ok := src.(fs.Object)
@@ -5297,21 +5297,8 @@ func (f *Fs) streamHashTransfer(ctx context.Context, src fs.ObjectInfo, parentFi
 		return nil, fmt.Errorf("source is not a valid fs.Object")
 	}
 
-	fileSize := src.Size()
-	fs.Infof(f, "🔄 优化流式哈希：边下载边计算哈希边缓存 (文件大小: %s)", fs.SizeSuffix(fileSize))
-
-	// 创建临时文件用于缓存
-	tempFile, err := os.CreateTemp("", "rclone-123pan-stream-*.tmp")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temp file: %w", err)
-	}
-	defer func() {
-		tempFile.Close()
-		os.Remove(tempFile.Name())
-	}()
-
-	// 第一遍：边下载边计算哈希边写入临时文件
-	fs.Infof(f, "🔄 第一遍：边下载边计算哈希边缓存...")
+	// 第一遍：流式计算MD5哈希
+	fs.Infof(f, "🔄 第一遍：流式计算文件哈希...")
 
 	srcReader, err := srcObj.Open(ctx)
 	if err != nil {
@@ -5319,50 +5306,40 @@ func (f *Fs) streamHashTransfer(ctx context.Context, src fs.ObjectInfo, parentFi
 	}
 	defer srcReader.Close()
 
-	// 创建MD5计算器
+	// 流式计算MD5，不保存数据
 	hasher := md5.New()
+	buffer := make([]byte, 64*1024) // 64KB缓冲区
 
-	// 使用MultiWriter同时写入临时文件和MD5计算器
-	multiWriter := io.MultiWriter(tempFile, hasher)
-
-	// 流式传输：同时计算哈希和缓存数据
-	_, err = io.Copy(multiWriter, srcReader)
-	if err != nil {
-		return nil, fmt.Errorf("failed to stream data for hash calculation and caching: %w", err)
+	for {
+		n, err := srcReader.Read(buffer)
+		if n > 0 {
+			hasher.Write(buffer[:n])
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to read data for hash calculation: %w", err)
+		}
 	}
 
-	// 计算MD5哈希
 	md5Hash := fmt.Sprintf("%x", hasher.Sum(nil))
 	fs.Infof(f, "📊 流式哈希计算完成: MD5: %s", md5Hash)
 
 	// 尝试秒传
-	createResp, err := f.createUpload(ctx, parentFileID, fileName, md5Hash, fileSize)
+	createResp, err := f.createUpload(ctx, parentFileID, fileName, md5Hash, src.Size())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create upload session: %w", err)
 	}
 
 	if createResp.Data.Reuse {
 		fs.Infof(f, "🚀 流式哈希计算后秒传成功！")
-		return f.createObject(fileName, createResp.Data.FileID, fileSize, md5Hash, time.Now()), nil
+		return f.createObject(fileName, createResp.Data.FileID, src.Size(), md5Hash, time.Now()), nil
 	}
 
-	// 秒传失败，使用缓存的临时文件上传（避免重复下载）
-	fs.Infof(f, "⬆️ 秒传失败，使用缓存文件上传（避免重复下载）")
-
-	// 重置临时文件指针到开头
-	_, err = tempFile.Seek(0, io.SeekStart)
-	if err != nil {
-		return nil, fmt.Errorf("failed to seek temp file: %w", err)
-	}
-
-	// 使用缓存文件进行上传
-	err = f.uploadFile(ctx, tempFile, createResp, fileSize)
-	if err != nil {
-		return nil, fmt.Errorf("failed to upload from cache: %w", err)
-	}
-
-	fs.Infof(f, "✅ 优化流式哈希传输完成！避免了重复下载")
-	return f.createObject(fileName, createResp.Data.FileID, fileSize, md5Hash, time.Now()), nil
+	// 秒传失败，第二遍：重新下载并流式上传
+	fs.Infof(f, "⬆️ 秒传失败，第二遍：重新下载并流式上传")
+	return f.streamUploadWithSession(ctx, srcObj, createResp, fileName, md5Hash)
 }
 
 // streamUploadWithHashingReader 使用哈希计算Reader进行流式上传
