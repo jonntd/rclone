@@ -3016,23 +3016,10 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if err != nil {
 		// Assume it is a file (标准rclone模式)
 		newRoot, remote := dircache.SplitPath(f.root)
-		// 修复：避免锁复制，创建新的Fs实例而不是复制
-		tempF := &Fs{
-			name:          f.name,
-			originalName:  f.originalName,
-			root:          newRoot,
-			opt:           f.opt,
-			features:      f.features,
-			tradClient:    f.tradClient,
-			openAPIClient: f.openAPIClient,
-			pacer:         f.pacer,
-			rootFolder:    f.rootFolder,
-			rootFolderID:  f.rootFolderID,
-			appVer:        f.appVer,
-			userID:        f.userID,
-			userkey:       f.userkey,
-		}
-		tempF.dirCache = dircache.New(newRoot, f.rootFolderID, tempF)
+		// Fix: 使用标准的结构体复制模式，避免遗漏字段（如token）
+		tempF := *f // 直接复制整个结构体，包括所有token字段
+		tempF.root = newRoot
+		tempF.dirCache = dircache.New(newRoot, f.rootFolderID, &tempF)
 		// Make new Fs which is the parent
 		err = tempF.dirCache.FindRoot(ctx, false)
 		if err != nil {
@@ -3064,23 +3051,10 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		}
 		fs.Debugf(f, "🔧 文件路径检测: newRoot=%s, remote=%s, originalRootID=%s", newRoot, remote, originalRootID)
 
-		// 修复：避免锁复制，创建新的Fs实例而不是复制
-		tempF := &Fs{
-			name:          f.name,
-			originalName:  f.originalName,
-			root:          newRoot,
-			opt:           f.opt,
-			features:      f.features,
-			tradClient:    f.tradClient,
-			openAPIClient: f.openAPIClient,
-			pacer:         f.pacer,
-			rootFolder:    f.rootFolder,
-			rootFolderID:  f.rootFolderID,
-			appVer:        f.appVer,
-			userID:        f.userID,
-			userkey:       f.userkey,
-		}
-		tempF.dirCache = dircache.New(newRoot, originalRootID, tempF)
+		// Fix: 使用标准的结构体复制模式，避免遗漏字段（如token）
+		tempF := *f // 直接复制整个结构体，包括所有token字段
+		tempF.root = newRoot
+		tempF.dirCache = dircache.New(newRoot, originalRootID, &tempF)
 		// Make new Fs which is the parent
 		err = tempF.dirCache.FindRoot(ctx, false)
 		if err != nil {
