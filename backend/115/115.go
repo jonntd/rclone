@@ -2090,6 +2090,28 @@ func (f *Fs) refreshTokenIfNecessary(ctx context.Context, refreshTokenExpired bo
 	// Perform the actual token refresh
 	result, err := f.performTokenRefresh(ctx, refreshToken)
 	if err != nil {
+		// Check if this is a refresh token expired error that requires re-login
+		var tokenErr *TokenError
+		if errors.As(err, &tokenErr) && tokenErr.IsRefreshTokenExpired {
+			fs.Debugf(f, "🔄 刷新令牌已过期，尝试完整重新登录")
+
+			// Clear token information before re-login
+			f.tokenMu.Lock()
+			f.clearTokenInfo()
+			f.tokenMu.Unlock()
+
+			// Attempt re-login
+			loginErr := f.login(ctx)
+			if loginErr != nil {
+				return fmt.Errorf("re-login failed after refresh token expired: %w", loginErr)
+			}
+
+			// Save the new token after successful login
+			f.saveToken(f.m)
+			fs.Debugf(f, "✅ 刷新令牌过期后重新登录成功")
+			return nil
+		}
+
 		return err // Error already formatted with context
 	}
 
@@ -2124,6 +2146,14 @@ func isTokenStillValid(f *Fs) bool {
 	return time.Now().Before(f.tokenExpiry.Add(-tokenRefreshWindow))
 }
 
+// clearTokenInfo clears all token information (must be called with tokenMu locked)
+func (f *Fs) clearTokenInfo() {
+	f.accessToken = ""
+	f.refreshToken = ""
+	f.tokenExpiry = time.Time{}
+	fs.Debugf(f, "🧹 已清空所有令牌信息")
+}
+
 // performTokenRefresh handles the actual API call to refresh the token
 func (f *Fs) performTokenRefresh(ctx context.Context, refreshToken string) (*RefreshTokenResp, error) {
 	// 使用统一客户端，无需单独初始化
@@ -2142,11 +2172,24 @@ func (f *Fs) performTokenRefresh(ctx context.Context, refreshToken string) (*Ref
 		fs.Errorf(f, "❌ 响应状态: %v, 代码: %d, 消息: %q",
 			refreshResp.State, refreshResp.Code, refreshResp.Message)
 
+		// Check if this is a refresh_token invalid error (40140116)
+		if refreshResp.Code == 40140116 {
+			fs.Errorf(f, "❌ 刷新令牌已失效(40140116)，清空令牌信息并触发重新登录")
+
+			// Clear all token information to force re-login
+			f.tokenMu.Lock()
+			f.clearTokenInfo()
+			f.tokenMu.Unlock()
+
+			// Return a specific error to trigger re-login
+			return nil, NewTokenError("refresh token expired, need re-login", true)
+		}
+
 		fs.Errorf(f, "❌ 刷新令牌响应为空，尝试重新登录")
 
 		// Re-lock before checking token again to avoid race condition
 		f.tokenMu.Lock()
-		// Check if another thread has already refreshed the token
+		// Only check if another thread refreshed if this wasn't a refresh_token invalid error
 		if f.accessToken != "" && time.Now().Before(f.tokenExpiry) {
 			fs.Debugf(f, "✅ 等待期间令牌已被其他线程刷新")
 			f.tokenMu.Unlock()
@@ -2255,12 +2298,23 @@ func (f *Fs) callRefreshTokenAPI(ctx context.Context, refreshToken string) (*Ref
 
 	resp, err := tempClient.CallJSON(ctx, &opts, nil, &refreshResp)
 	if err != nil {
+		// Check if this is a 40140116 error (refresh_token invalid)
+		if strings.Contains(err.Error(), "40140116") || strings.Contains(err.Error(), "no auth") {
+			fs.Debugf(f, "🔐 检测到刷新令牌无效错误: %v", err)
+			return nil, NewTokenError("refresh token invalid (40140116)", true)
+		}
 		return nil, err
 	}
 
 	// 检查HTTP状态码
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("refresh token API returned status %d", resp.StatusCode)
+	}
+
+	// 检查响应中的错误码
+	if !refreshResp.State && refreshResp.Code == 40140116 {
+		fs.Debugf(f, "🔐 响应中检测到刷新令牌无效错误(40140116)")
+		return nil, NewTokenError("refresh token invalid (40140116)", true)
 	}
 
 	// 响应已经通过CallJSON解析到refreshResp中
@@ -2290,11 +2344,20 @@ func (f *Fs) ensureOpenAPIClient(ctx context.Context) error {
 func handleRefreshError(f *Fs, ctx context.Context, err error) (*RefreshTokenResp, error) {
 	fs.Errorf(f, "❌ 刷新令牌失败: %v", err)
 
-	// Check if the error indicates the refresh token itself is expired
+	// Check if the error indicates the refresh token itself is expired or invalid
 	var tokenErr *TokenError
 	if errors.As(err, &tokenErr) && tokenErr.IsRefreshTokenExpired ||
-		strings.Contains(err.Error(), "refresh token expired") {
-		fs.Debugf(f, "🔄 刷新令牌似乎已过期，尝试完整重新登录")
+		strings.Contains(err.Error(), "refresh token expired") ||
+		strings.Contains(err.Error(), "40140116") ||
+		strings.Contains(err.Error(), "no auth") {
+
+		fs.Debugf(f, "🔄 刷新令牌已失效，清空令牌信息并尝试完整重新登录")
+
+		// Clear all token information to ensure clean state
+		f.tokenMu.Lock()
+		f.clearTokenInfo()
+		f.tokenMu.Unlock()
+
 		loginErr := f.login(ctx) // login handles its own locking
 		if loginErr != nil {
 			return nil, fmt.Errorf("re-login failed after refresh token expired: %w", loginErr)
@@ -2627,6 +2690,13 @@ func (f *Fs) handleTokenError(ctx context.Context, opts *rest.Opts, apiErr error
 	var tokenErr *TokenError
 	if errors.As(apiErr, &tokenErr) {
 		fs.Debugf(f, "🔐 检测到令牌错误: %v (需要重新登录: %v)", tokenErr, tokenErr.IsRefreshTokenExpired)
+
+		// Check if we're already in a refresh cycle to prevent infinite loops
+		if f.isRefreshing.Load() {
+			fs.Debugf(f, "⚠️ 令牌刷新已在进行中，避免递归调用")
+			return false, fmt.Errorf("token refresh already in progress, avoiding recursion")
+		}
+
 		// Handle token refresh/re-login using refreshTokenIfNecessary
 		refreshErr := f.refreshTokenIfNecessary(ctx, tokenErr.IsRefreshTokenExpired, !tokenErr.IsRefreshTokenExpired)
 		if refreshErr != nil {
@@ -2644,10 +2714,17 @@ func (f *Fs) handleTokenError(ctx context.Context, opts *rest.Opts, apiErr error
 			token := f.accessToken
 			f.tokenMu.Unlock()
 
+			// Validate we have a valid token
+			if token == "" {
+				fs.Errorf(f, "❌ 刷新后仍然没有有效的访问令牌")
+				return false, fmt.Errorf("no valid access token after refresh")
+			}
+
 			if opts.ExtraHeaders == nil {
 				opts.ExtraHeaders = make(map[string]string)
 			}
 			opts.ExtraHeaders["Authorization"] = "Bearer " + token
+			fs.Debugf(f, "🔑 已更新Authorization头部，令牌长度: %d", len(token))
 		}
 		return true, nil // Signal retry with the refreshed token
 	}
