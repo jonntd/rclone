@@ -3375,7 +3375,8 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 		// 检查是否启用流式哈希模式
 		if f.opt.StreamHashMode {
 			fs.Infof(f, "🌊 启用流式哈希模式: %s (%s)", remote, fs.SizeSuffix(src.Size()))
-			return f.smartStreamHashTransfer115(ctx, src, remote, options...)
+			// 使用已经打开的Reader进行流式哈希传输，避免重复下载
+			return f.smartStreamHashTransferWithReader115(ctx, in, src, remote, options...)
 		} else {
 			return f.crossCloudUploadWithLocalCache(ctx, in, src, remote, options...)
 		}
@@ -10107,6 +10108,143 @@ func (f *Fs) streamHashTransfer115(ctx context.Context, src fs.ObjectInfo, remot
 func (f *Fs) uploadFromMemory115(ctx context.Context, data []byte, o *Object, options ...fs.OpenOption) (fs.Object, error) {
 	// 使用现有的上传逻辑，传入内存数据
 	return f.upload(ctx, bytes.NewReader(data), o, o.remote, options...)
+}
+
+// smartStreamHashTransferWithReader115 115网盘智能流式哈希传输（使用现有Reader）
+// 根据文件大小选择最优策略，避免重复下载
+func (f *Fs) smartStreamHashTransferWithReader115(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote string, options ...fs.OpenOption) (fs.Object, error) {
+	fileSize := src.Size()
+
+	// 智能策略选择
+	if fileSize <= 100*1024*1024 { // 100MB以下使用内存缓存
+		fs.Infof(f, "📝 小文件使用内存缓存模式: %s", fs.SizeSuffix(fileSize))
+		return f.memoryHashTransferWithReader115(ctx, in, src, remote, options...)
+	} else {
+		fs.Infof(f, "🌊 大文件使用流式哈希模式: %s", fs.SizeSuffix(fileSize))
+		return f.streamHashTransferWithReader115(ctx, in, src, remote, options...)
+	}
+}
+
+// memoryHashTransferWithReader115 115网盘小文件内存缓存哈希传输（使用现有Reader）
+func (f *Fs) memoryHashTransferWithReader115(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote string, options ...fs.OpenOption) (fs.Object, error) {
+	fs.Infof(f, "🔄 优化内存哈希：使用现有数据流，避免重复下载 (文件大小: %s)", fs.SizeSuffix(src.Size()))
+
+	// 读取整个文件到内存并计算SHA1
+	data, err := io.ReadAll(in)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file data: %w", err)
+	}
+
+	// 计算SHA1哈希（115网盘需要SHA1）
+	hasher := sha1.New()
+	hasher.Write(data)
+	sha1Hash := fmt.Sprintf("%X", hasher.Sum(nil)) // 115网盘需要大写SHA1
+
+	fs.Infof(f, "📊 内存哈希计算完成: %s, SHA1: %s", fs.SizeSuffix(int64(len(data))), sha1Hash)
+
+	// 尝试秒传
+	leaf, dirID, err := f.dirCache.FindPath(ctx, remote, true)
+	if err != nil {
+		return nil, err
+	}
+
+	// 创建对象用于上传
+	o := &Object{
+		fs:      f,
+		remote:  remote,
+		size:    int64(len(data)),
+		sha1sum: sha1Hash,
+	}
+
+	// 尝试哈希上传（秒传）
+	gotIt, _, _, cleanup, err := f.tryHashUpload(ctx, bytes.NewReader(data), src, o, leaf, dirID, int64(len(data)), options...)
+	if cleanup != nil {
+		defer cleanup()
+	}
+
+	if err == nil && gotIt {
+		fs.Infof(f, "🚀 内存哈希计算后秒传成功！")
+		return o, nil
+	}
+
+	// 秒传失败，使用内存数据直接上传
+	fs.Infof(f, "⬆️ 秒传失败，使用内存数据上传")
+	return f.uploadFromMemory115(ctx, data, o, options...)
+}
+
+// streamHashTransferWithReader115 115网盘大文件流式哈希传输（使用现有Reader）
+func (f *Fs) streamHashTransferWithReader115(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote string, options ...fs.OpenOption) (fs.Object, error) {
+	fileSize := src.Size()
+	fs.Infof(f, "🔄 优化流式哈希：使用现有数据流，避免重复下载 (文件大小: %s)", fs.SizeSuffix(fileSize))
+
+	// 创建临时文件用于缓存数据和计算哈希
+	tempFile, err := os.CreateTemp("", "rclone-115-stream-*.tmp")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer func() {
+		tempFile.Close()
+		os.Remove(tempFile.Name())
+	}()
+
+	// 创建SHA1计算器
+	hasher := sha1.New()
+
+	// 使用MultiWriter同时写入临时文件和SHA1计算器
+	multiWriter := io.MultiWriter(tempFile, hasher)
+
+	// 从现有的Reader读取数据，同时计算哈希和缓存
+	_, err = io.Copy(multiWriter, in)
+	if err != nil {
+		return nil, fmt.Errorf("failed to stream data for hash calculation and caching: %w", err)
+	}
+
+	// 计算SHA1哈希
+	sha1Hash := fmt.Sprintf("%X", hasher.Sum(nil)) // 115网盘需要大写SHA1
+	fs.Infof(f, "📊 流式哈希计算完成: SHA1: %s", sha1Hash)
+
+	// 尝试秒传
+	leaf, dirID, err := f.dirCache.FindPath(ctx, remote, true)
+	if err != nil {
+		return nil, err
+	}
+
+	// 创建对象用于上传
+	o := &Object{
+		fs:      f,
+		remote:  remote,
+		size:    fileSize,
+		sha1sum: sha1Hash,
+	}
+
+	// 尝试秒传：直接使用已计算的SHA1哈希调用initUploadOpenAPI
+	fs.Infof(f, "🔍 尝试使用已计算SHA1进行秒传...")
+	ui, err := f.initUploadOpenAPI(ctx, fileSize, leaf, dirID, sha1Hash, "", "", "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to init upload for instant upload: %w", err)
+	}
+
+	// 检查秒传状态
+	if ui.GetStatus() == 2 {
+		fs.Infof(f, "🚀 流式哈希计算后秒传成功！")
+		// 设置对象的元数据
+		o.id = ui.GetFileID()
+		o.pickCode = ui.GetPickCode()
+		o.hasMetaData = true
+		return o, nil
+	}
+
+	// 秒传失败，使用缓存的临时文件上传（避免重复下载）
+	fs.Infof(f, "⬆️ 秒传失败，使用缓存文件上传（避免重复下载）")
+
+	// 重置临时文件指针到开头
+	_, err = tempFile.Seek(0, io.SeekStart)
+	if err != nil {
+		return nil, fmt.Errorf("failed to seek temp file: %w", err)
+	}
+
+	// 使用缓存文件进行上传
+	return f.upload(ctx, tempFile, o, o.remote, options...)
 }
 
 // streamUploadWithHash115 115网盘使用已计算哈希进行流式上传
