@@ -1258,7 +1258,7 @@ const (
 	defaultUserAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
 
 	// 🚦 115网盘统一QPS控制：全局账户级别限制，避免770004错误
-	unifiedMinSleep = fs.Duration(200 * time.Millisecond) // ~6.7 QPS - 优化下载性能
+	unifiedMinSleep = fs.Duration(300 * time.Millisecond) // ~3 QPS - 优化性能与稳定性平衡
 
 	maxSleep      = 2 * time.Second
 	decayConstant = 2 // bigger for slower decay, exponential
@@ -1404,16 +1404,6 @@ func init() {
 			Default:  false,
 			Advanced: true,
 		}, {
-			Name:     "download_concurrency",
-			Help:     `并发下载线程数。115网盘限制每个文件最多2个并发连接，建议设置为2。设置为0禁用并发下载。`,
-			Default:  2, // 115网盘限制：每个文件最多2个并发连接
-			Advanced: true,
-		}, {
-			Name:     "download_chunk_size",
-			Help:     `下载分片大小。仅在启用并发下载时有效。建议32-64MB。`,
-			Default:  fs.SizeSuffix(64 * 1024 * 1024), // 64MB，适合2并发
-			Advanced: true,
-		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -1452,10 +1442,6 @@ type Options struct {
 
 	// API限流控制选项
 	QPSLimit fs.Duration `config:"qps_limit"` // API调用间隔时间 (例如: 250ms = 4 QPS)
-
-	// 下载性能优化选项
-	DownloadConcurrency int           `config:"download_concurrency"` // 并发下载线程数
-	DownloadChunkSize   fs.SizeSuffix `config:"download_chunk_size"`  // 下载分片大小
 }
 
 // TransferSpeedMonitor 传输速度监控器
@@ -3016,10 +3002,23 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if err != nil {
 		// Assume it is a file (标准rclone模式)
 		newRoot, remote := dircache.SplitPath(f.root)
-		// Fix: 使用标准的结构体复制模式，避免遗漏字段（如token）
-		tempF := *f // 直接复制整个结构体，包括所有token字段
-		tempF.root = newRoot
-		tempF.dirCache = dircache.New(newRoot, f.rootFolderID, &tempF)
+		// 修复：避免锁复制，创建新的Fs实例而不是复制
+		tempF := &Fs{
+			name:          f.name,
+			originalName:  f.originalName,
+			root:          newRoot,
+			opt:           f.opt,
+			features:      f.features,
+			tradClient:    f.tradClient,
+			openAPIClient: f.openAPIClient,
+			pacer:         f.pacer,
+			rootFolder:    f.rootFolder,
+			rootFolderID:  f.rootFolderID,
+			appVer:        f.appVer,
+			userID:        f.userID,
+			userkey:       f.userkey,
+		}
+		tempF.dirCache = dircache.New(newRoot, f.rootFolderID, tempF)
 		// Make new Fs which is the parent
 		err = tempF.dirCache.FindRoot(ctx, false)
 		if err != nil {
@@ -3051,10 +3050,23 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		}
 		fs.Debugf(f, "🔧 文件路径检测: newRoot=%s, remote=%s, originalRootID=%s", newRoot, remote, originalRootID)
 
-		// Fix: 使用标准的结构体复制模式，避免遗漏字段（如token）
-		tempF := *f // 直接复制整个结构体，包括所有token字段
-		tempF.root = newRoot
-		tempF.dirCache = dircache.New(newRoot, originalRootID, &tempF)
+		// 修复：避免锁复制，创建新的Fs实例而不是复制
+		tempF := &Fs{
+			name:          f.name,
+			originalName:  f.originalName,
+			root:          newRoot,
+			opt:           f.opt,
+			features:      f.features,
+			tradClient:    f.tradClient,
+			openAPIClient: f.openAPIClient,
+			pacer:         f.pacer,
+			rootFolder:    f.rootFolder,
+			rootFolderID:  f.rootFolderID,
+			appVer:        f.appVer,
+			userID:        f.userID,
+			userkey:       f.userkey,
+		}
+		tempF.dirCache = dircache.New(newRoot, originalRootID, tempF)
 		// Make new Fs which is the parent
 		err = tempF.dirCache.FindRoot(ctx, false)
 		if err != nil {
@@ -3349,8 +3361,7 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 		// 检查是否启用流式哈希模式
 		if f.opt.StreamHashMode {
 			fs.Infof(f, "🌊 启用流式哈希模式: %s (%s)", remote, fs.SizeSuffix(src.Size()))
-			// 使用已经打开的Reader进行流式哈希传输，避免重复下载
-			return f.smartStreamHashTransferWithReader115(ctx, in, src, remote, options...)
+			return f.smartStreamHashTransfer115(ctx, src, remote, options...)
 		} else {
 			return f.crossCloudUploadWithLocalCache(ctx, in, src, remote, options...)
 		}
@@ -4292,13 +4303,8 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
 
-	// 115网盘下载策略：根据文件大小和用户配置决定是否使用并发下载
-	if o.fs.opt.DownloadConcurrency > 0 && o.size >= 100*1024*1024 { // 100MB以上且启用并发
-		fs.Debugf(o, "📥 115下载策略: 启用并发下载 (文件大小: %s, 并发数: %d)",
-			fs.SizeSuffix(o.size), o.fs.opt.DownloadConcurrency)
-		return o.openWithConcurrency(ctx, options...)
-	}
-	fs.Debugf(o, "📥 115下载策略: 使用普通下载 (文件大小: %s)", fs.SizeSuffix(o.size))
+	// 115网盘下载策略说明：完全禁用并发策略
+	fs.Debugf(o, "📥 115下载策略: 禁用并发下载 (1TB阈值 + 1GB分片，强制普通下载)")
 
 	// Get/refresh download URL
 	err = o.setDownloadURL(ctx)
@@ -4377,181 +4383,6 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		fs.Debugf(o, "📥 115 Range响应: Status=%d, Content-Length=%s, Content-Range=%s",
 			resp.StatusCode, contentLength, contentRange)
 
-		// Check if Range request was handled correctly
-		if resp.StatusCode != 206 {
-			fs.Debugf(o, "⚠️ 115 Range请求未返回206状态码: %d", resp.StatusCode)
-		}
-	}
-
-	// 创建包装的ReadCloser来提供下载进度跟踪
-	return &ProgressReadCloser115{
-		ReadCloser: resp.Body,
-		fs:         o.fs,
-		object:     o,
-		totalSize:  o.size,
-		startTime:  time.Now(),
-	}, nil
-}
-
-// openWithConcurrency 使用并发下载打开文件
-func (o *Object) openWithConcurrency(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
-	fs.Debugf(o, "🚀 启动115网盘并发下载: 文件大小=%s, 并发数=%d, 分片大小=%s",
-		fs.SizeSuffix(o.size), o.fs.opt.DownloadConcurrency, fs.SizeSuffix(int64(o.fs.opt.DownloadChunkSize)))
-
-	// 检查是否有Range选项，如果有则回退到普通下载
-	for _, option := range options {
-		if _, ok := option.(*fs.RangeOption); ok {
-			fs.Debugf(o, "⚠️ 检测到Range请求，回退到普通下载")
-			return o.openNormal(ctx, options...)
-		}
-	}
-
-	// 获取下载URL
-	err := o.setDownloadURL(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get download URL: %w", err)
-	}
-
-	// 创建临时文件用于并发下载
-	tempFile, err := os.CreateTemp("", "115_concurrent_download_*.tmp")
-	if err != nil {
-		fs.Debugf(o, "⚠️ 创建临时文件失败，回退到普通下载: %v", err)
-		return o.openNormal(ctx, options...)
-	}
-
-	// 执行并发下载
-	err = o.downloadWithConcurrency(ctx, tempFile)
-	if err != nil {
-		tempFile.Close()
-		os.Remove(tempFile.Name())
-
-		// 检查是否是403错误（115网盘不支持并发Range请求）
-		if strings.Contains(err.Error(), "403") {
-			fs.Infof(o, "⚠️ 115网盘不支持并发Range请求，自动禁用并发下载功能")
-			// 临时禁用当前对象的并发下载
-			return o.openNormal(ctx, options...)
-		}
-
-		fs.Debugf(o, "⚠️ 并发下载失败，回退到普通下载: %v", err)
-		return o.openNormal(ctx, options...)
-	}
-
-	// 重置文件指针到开头
-	_, err = tempFile.Seek(0, io.SeekStart)
-	if err != nil {
-		tempFile.Close()
-		os.Remove(tempFile.Name())
-		return nil, fmt.Errorf("failed to seek temp file: %w", err)
-	}
-
-	// 返回一个自动清理的ReadCloser
-	return &tempFileReadCloser{
-		file:     tempFile,
-		tempPath: tempFile.Name(),
-	}, nil
-}
-
-// openNormal 使用普通方式打开文件（原有逻辑的重命名）
-func (o *Object) openNormal(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
-	// 这里是原有的Open函数逻辑，但跳过并发检查部分
-	// Ensure metadata (specifically pickCode or ID) is available
-	err := o.readMetaData(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read metadata before open: %w", err)
-	}
-
-	if o.size == 0 {
-		// No need for download URL for 0-byte files
-		return io.NopCloser(bytes.NewReader(nil)), nil
-	}
-
-	// Get/refresh download URL
-	err = o.setDownloadURL(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get download URL: %w", err)
-	}
-	if !o.durl.Valid() {
-		// Attempt refresh again if invalid right after getting it
-		fs.Debugf(o, "⚠️ 下载URL获取后立即无效，重试中...")
-		// 使用rclone标准pacer而不是直接sleep
-		_ = o.fs.pacer.Call(func() (bool, error) {
-			return false, nil // 只是为了利用pacer的延迟机制
-		})
-		err = o.setDownloadURLWithForce(ctx, true) // Force refresh
-		if err != nil {
-			return nil, fmt.Errorf("failed to get download URL on retry: %w", err)
-		}
-		if !o.durl.Valid() {
-			return nil, errors.New("failed to obtain a valid download URL")
-		}
-	}
-
-	// 并发安全修复：使用互斥锁保护对durl的访问
-	o.durlMu.Lock()
-
-	// 检查URL有效性（在锁保护下）
-	if o.durl == nil || !o.durl.Valid() {
-		o.durlMu.Unlock()
-
-		// 使用rclone标准方法重新获取下载URL
-		err := o.setDownloadURLWithForce(ctx, true)
-		if err != nil {
-			return nil, fmt.Errorf("failed to re-obtain download URL: %w", err)
-		}
-
-		// 重新获取锁以继续后续操作
-		o.durlMu.Lock()
-	}
-
-	// 创建URL的本地副本，避免在使用过程中被其他线程修改
-	downloadURL := o.durl.URL
-	o.durlMu.Unlock()
-
-	// 使用本地副本创建请求，避免并发访问问题
-	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	// Apply any range options
-	fs.FixRangeOption(options, o.size)
-	for _, option := range options {
-		switch x := option.(type) {
-		case *fs.RangeOption:
-			if x.Start >= 0 {
-				rangeHeader := fmt.Sprintf("bytes=%d-", x.Start)
-				if x.End >= 0 {
-					rangeHeader = fmt.Sprintf("bytes=%d-%d", x.Start, x.End)
-				}
-				req.Header.Set("Range", rangeHeader)
-				fs.Debugf(o, "🔍 115 Range请求: %s", rangeHeader)
-			}
-		case *fs.HTTPOption:
-			key, value := x.Header()
-			if key != "" && value != "" {
-				req.Header.Set(key, value)
-			}
-		default:
-			if option.Mandatory() {
-				fs.Logf(o, "Unsupported mandatory option: %v", option)
-			}
-		}
-	}
-
-	// Execute the request
-	resp, err := o.fs.openAPIClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	// Check for successful response
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		_ = resp.Body.Close()
-		return nil, fmt.Errorf("HTTP error %d: %s", resp.StatusCode, resp.Status)
-	}
-
-	// Handle range requests
-	if req.Header.Get("Range") != "" {
 		// Check if Range request was handled correctly
 		if resp.StatusCode != 206 {
 			fs.Debugf(o, "⚠️ 115 Range请求未返回206状态码: %d", resp.StatusCode)
@@ -5017,208 +4848,6 @@ type ProgressReadCloser115 struct {
 	startTime       time.Time
 	lastLogTime     time.Time
 	lastLogPercent  int
-}
-
-// tempFileReadCloser 包装临时文件的ReadCloser，在关闭时自动清理临时文件
-type tempFileReadCloser struct {
-	file     *os.File
-	tempPath string
-}
-
-func (t *tempFileReadCloser) Read(p []byte) (n int, err error) {
-	return t.file.Read(p)
-}
-
-func (t *tempFileReadCloser) Close() error {
-	err := t.file.Close()
-	// 清理临时文件
-	if removeErr := os.Remove(t.tempPath); removeErr != nil {
-		fs.Debugf(nil, "⚠️ 清理临时文件失败: %v", removeErr)
-	}
-	return err
-}
-
-// downloadWithConcurrency 执行并发下载到临时文件
-func (o *Object) downloadWithConcurrency(ctx context.Context, tempFile *os.File) error {
-	downloadStartTime := time.Now()
-
-	// 获取配置参数
-	chunkSize := int64(o.fs.opt.DownloadChunkSize)
-	maxConcurrency := o.fs.opt.DownloadConcurrency
-
-	// 115网盘限制：每个文件最多2个并发连接
-	if maxConcurrency > 2 {
-		fs.Debugf(o, "⚠️ 115网盘限制每个文件最多2个并发连接，将并发数从%d调整为2", maxConcurrency)
-		maxConcurrency = 2
-	}
-
-	fileSize := o.size
-	numChunks := (fileSize + chunkSize - 1) / chunkSize
-	if numChunks < int64(maxConcurrency) {
-		maxConcurrency = int(numChunks)
-	}
-
-	// 针对2并发优化：如果分片数太少，增加分片大小利用率
-	if maxConcurrency == 2 && numChunks < 4 && fileSize > 200*1024*1024 { // 200MB以上且分片少于4个
-		// 重新计算分片大小，确保至少有4个分片供2个并发处理
-		optimalChunkSize := fileSize / 4
-		if optimalChunkSize > chunkSize/2 && optimalChunkSize < chunkSize*2 {
-			chunkSize = optimalChunkSize
-			numChunks = (fileSize + chunkSize - 1) / chunkSize
-			fs.Debugf(o, "🔧 115网盘2并发优化: 调整分片大小为%s, 分片数=%d",
-				fs.SizeSuffix(chunkSize), numChunks)
-		}
-	}
-
-	fs.Infof(o, "📊 115网盘并发下载参数: 分片大小=%s, 分片数=%d, 并发数=%d (115限制:最多2并发)",
-		fs.SizeSuffix(chunkSize), numChunks, maxConcurrency)
-
-	// 获取下载URL
-	o.durlMu.Lock()
-	if o.durl == nil || !o.durl.Valid() {
-		o.durlMu.Unlock()
-		return fmt.Errorf("download URL not available")
-	}
-	downloadURL := o.durl.URL
-	o.durlMu.Unlock()
-
-	// 创建并发下载任务
-	var wg sync.WaitGroup
-	errChan := make(chan error, maxConcurrency)
-	semaphore := make(chan struct{}, maxConcurrency)
-
-	for i := int64(0); i < numChunks; i++ {
-		start := i * chunkSize
-		end := start + chunkSize - 1
-		if end >= fileSize {
-			end = fileSize - 1
-		}
-
-		wg.Add(1)
-		go func(chunkIndex, start, end int64) {
-			defer wg.Done()
-
-			// 获取信号量
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
-
-			// 下载分片，增加重试机制
-			var err error
-			for retry := 0; retry < 3; retry++ {
-				err = o.downloadChunk(ctx, downloadURL, tempFile, start, end, chunkIndex)
-				if err == nil {
-					break
-				}
-				if retry < 2 {
-					fs.Debugf(o, "⚠️ 分片%d下载失败，重试%d/3: %v", chunkIndex+1, retry+1, err)
-					time.Sleep(time.Duration(retry+1) * time.Second)
-				}
-			}
-			if err != nil {
-				errChan <- fmt.Errorf("分片%d下载失败(重试3次后): %w", chunkIndex+1, err)
-			}
-		}(i, start, end)
-	}
-
-	// 等待所有分片完成，使用超时机制防止死锁
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	// 等待完成或超时
-	select {
-	case <-done:
-		// 正常完成
-		close(errChan)
-
-		// 检查是否有错误
-		for err := range errChan {
-			return err
-		}
-	case <-time.After(10 * time.Minute):
-		// 超时处理
-		close(errChan)
-		return fmt.Errorf("并发下载超时，可能存在网络问题")
-	}
-
-	downloadDuration := time.Since(downloadStartTime)
-	avgSpeed := float64(fileSize) / downloadDuration.Seconds()
-	fs.Infof(o, "✅ 115网盘并发下载完成: 耗时=%v, 平均速度=%s/s",
-		downloadDuration, fs.SizeSuffix(int64(avgSpeed)))
-
-	return nil
-}
-
-// downloadChunk 下载单个分片
-func (o *Object) downloadChunk(ctx context.Context, downloadURL string, tempFile *os.File, start, end, chunkIndex int64) error {
-	chunkStartTime := time.Now()
-
-	// 创建Range请求
-	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
-	if err != nil {
-		return fmt.Errorf("创建请求失败: %w", err)
-	}
-
-	rangeHeader := fmt.Sprintf("bytes=%d-%d", start, end)
-	req.Header.Set("Range", rangeHeader)
-
-	fs.Debugf(o, "🔄 开始下载分片%d: 范围=%d-%d", chunkIndex+1, start, end)
-
-	// 执行请求
-	resp, err := o.fs.openAPIClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("HTTP请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// 检查响应状态
-	if resp.StatusCode == 403 {
-		return fmt.Errorf("115网盘并发限制: 每个文件最多支持2个并发连接，当前可能超出限制")
-	}
-	if resp.StatusCode != 206 {
-		return fmt.Errorf("range请求失败，状态码: %d", resp.StatusCode)
-	}
-
-	// 验证Content-Length
-	expectedSize := end - start + 1
-	if contentLength := resp.Header.Get("Content-Length"); contentLength != "" {
-		if actualSize, err := strconv.ParseInt(contentLength, 10, 64); err == nil {
-			if actualSize != expectedSize {
-				return fmt.Errorf("分片大小不匹配: 期望%d, 实际%d", expectedSize, actualSize)
-			}
-		}
-	}
-
-	// 读取数据并写入临时文件
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("读取响应数据失败: %w", err)
-	}
-
-	// 验证数据大小
-	if int64(len(data)) != expectedSize {
-		return fmt.Errorf("数据大小不匹配: 期望%d, 实际%d", expectedSize, len(data))
-	}
-
-	// 写入到临时文件的正确位置
-	n, err := tempFile.WriteAt(data, start)
-	if err != nil {
-		return fmt.Errorf("写入临时文件失败: %w", err)
-	}
-	if int64(n) != expectedSize {
-		return fmt.Errorf("写入大小不匹配: 期望%d, 实际%d", expectedSize, n)
-	}
-
-	chunkDuration := time.Since(chunkStartTime)
-	chunkSpeed := float64(len(data)) / chunkDuration.Seconds()
-
-	fs.Debugf(o, "✅ 115下载分片完成: %d/%d, 范围=%d-%d, 大小=%d, 耗时=%v, 速度=%s/s",
-		chunkIndex+1, (o.size+int64(o.fs.opt.DownloadChunkSize)-1)/int64(o.fs.opt.DownloadChunkSize),
-		start, end, len(data), chunkDuration, fs.SizeSuffix(int64(chunkSpeed)))
-
-	return nil
 }
 
 // Read 实现io.Reader接口，同时更新进度
@@ -8937,8 +8566,8 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 // 采用单线程顺序上传模式，确保上传稳定性和SHA1验证通过
 
 const (
-	// 💾 优化缓冲区配置：512MB缓冲区，提升下载性能
-	bufferSize           = 512 * 1024 * 1024 // 512MB缓冲区，性能优化
+	// 💾 VPS优化缓冲区配置：256MB缓冲区，适合小内存环境
+	bufferSize           = 256 * 1024 * 1024 // 256MB缓冲区，VPS友好
 	bufferCacheFlushTime = 5 * time.Second   // 缓冲区清理时间
 )
 
@@ -10082,143 +9711,6 @@ func (f *Fs) streamHashTransfer115(ctx context.Context, src fs.ObjectInfo, remot
 func (f *Fs) uploadFromMemory115(ctx context.Context, data []byte, o *Object, options ...fs.OpenOption) (fs.Object, error) {
 	// 使用现有的上传逻辑，传入内存数据
 	return f.upload(ctx, bytes.NewReader(data), o, o.remote, options...)
-}
-
-// smartStreamHashTransferWithReader115 115网盘智能流式哈希传输（使用现有Reader）
-// 根据文件大小选择最优策略，避免重复下载
-func (f *Fs) smartStreamHashTransferWithReader115(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote string, options ...fs.OpenOption) (fs.Object, error) {
-	fileSize := src.Size()
-
-	// 智能策略选择
-	if fileSize <= 100*1024*1024 { // 100MB以下使用内存缓存
-		fs.Infof(f, "📝 小文件使用内存缓存模式: %s", fs.SizeSuffix(fileSize))
-		return f.memoryHashTransferWithReader115(ctx, in, src, remote, options...)
-	} else {
-		fs.Infof(f, "🌊 大文件使用流式哈希模式: %s", fs.SizeSuffix(fileSize))
-		return f.streamHashTransferWithReader115(ctx, in, src, remote, options...)
-	}
-}
-
-// memoryHashTransferWithReader115 115网盘小文件内存缓存哈希传输（使用现有Reader）
-func (f *Fs) memoryHashTransferWithReader115(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote string, options ...fs.OpenOption) (fs.Object, error) {
-	fs.Infof(f, "🔄 优化内存哈希：使用现有数据流，避免重复下载 (文件大小: %s)", fs.SizeSuffix(src.Size()))
-
-	// 读取整个文件到内存并计算SHA1
-	data, err := io.ReadAll(in)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read file data: %w", err)
-	}
-
-	// 计算SHA1哈希（115网盘需要SHA1）
-	hasher := sha1.New()
-	hasher.Write(data)
-	sha1Hash := fmt.Sprintf("%X", hasher.Sum(nil)) // 115网盘需要大写SHA1
-
-	fs.Infof(f, "📊 内存哈希计算完成: %s, SHA1: %s", fs.SizeSuffix(int64(len(data))), sha1Hash)
-
-	// 尝试秒传
-	leaf, dirID, err := f.dirCache.FindPath(ctx, remote, true)
-	if err != nil {
-		return nil, err
-	}
-
-	// 创建对象用于上传
-	o := &Object{
-		fs:      f,
-		remote:  remote,
-		size:    int64(len(data)),
-		sha1sum: sha1Hash,
-	}
-
-	// 尝试哈希上传（秒传）
-	gotIt, _, _, cleanup, err := f.tryHashUpload(ctx, bytes.NewReader(data), src, o, leaf, dirID, int64(len(data)), options...)
-	if cleanup != nil {
-		defer cleanup()
-	}
-
-	if err == nil && gotIt {
-		fs.Infof(f, "🚀 内存哈希计算后秒传成功！")
-		return o, nil
-	}
-
-	// 秒传失败，使用内存数据直接上传
-	fs.Infof(f, "⬆️ 秒传失败，使用内存数据上传")
-	return f.uploadFromMemory115(ctx, data, o, options...)
-}
-
-// streamHashTransferWithReader115 115网盘大文件流式哈希传输（使用现有Reader）
-func (f *Fs) streamHashTransferWithReader115(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote string, options ...fs.OpenOption) (fs.Object, error) {
-	fileSize := src.Size()
-	fs.Infof(f, "🔄 优化流式哈希：使用现有数据流，避免重复下载 (文件大小: %s)", fs.SizeSuffix(fileSize))
-
-	// 创建临时文件用于缓存数据和计算哈希
-	tempFile, err := os.CreateTemp("", "rclone-115-stream-*.tmp")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temp file: %w", err)
-	}
-	defer func() {
-		tempFile.Close()
-		os.Remove(tempFile.Name())
-	}()
-
-	// 创建SHA1计算器
-	hasher := sha1.New()
-
-	// 使用MultiWriter同时写入临时文件和SHA1计算器
-	multiWriter := io.MultiWriter(tempFile, hasher)
-
-	// 从现有的Reader读取数据，同时计算哈希和缓存
-	_, err = io.Copy(multiWriter, in)
-	if err != nil {
-		return nil, fmt.Errorf("failed to stream data for hash calculation and caching: %w", err)
-	}
-
-	// 计算SHA1哈希
-	sha1Hash := fmt.Sprintf("%X", hasher.Sum(nil)) // 115网盘需要大写SHA1
-	fs.Infof(f, "📊 流式哈希计算完成: SHA1: %s", sha1Hash)
-
-	// 尝试秒传
-	leaf, dirID, err := f.dirCache.FindPath(ctx, remote, true)
-	if err != nil {
-		return nil, err
-	}
-
-	// 创建对象用于上传
-	o := &Object{
-		fs:      f,
-		remote:  remote,
-		size:    fileSize,
-		sha1sum: sha1Hash,
-	}
-
-	// 尝试秒传：直接使用已计算的SHA1哈希调用initUploadOpenAPI
-	fs.Infof(f, "🔍 尝试使用已计算SHA1进行秒传...")
-	ui, err := f.initUploadOpenAPI(ctx, fileSize, leaf, dirID, sha1Hash, "", "", "")
-	if err != nil {
-		return nil, fmt.Errorf("failed to init upload for instant upload: %w", err)
-	}
-
-	// 检查秒传状态
-	if ui.GetStatus() == 2 {
-		fs.Infof(f, "🚀 流式哈希计算后秒传成功！")
-		// 设置对象的元数据
-		o.id = ui.GetFileID()
-		o.pickCode = ui.GetPickCode()
-		o.hasMetaData = true
-		return o, nil
-	}
-
-	// 秒传失败，使用缓存的临时文件上传（避免重复下载）
-	fs.Infof(f, "⬆️ 秒传失败，使用缓存文件上传（避免重复下载）")
-
-	// 重置临时文件指针到开头
-	_, err = tempFile.Seek(0, io.SeekStart)
-	if err != nil {
-		return nil, fmt.Errorf("failed to seek temp file: %w", err)
-	}
-
-	// 使用缓存文件进行上传
-	return f.upload(ctx, tempFile, o, o.remote, options...)
 }
 
 // streamUploadWithHash115 115网盘使用已计算哈希进行流式上传
