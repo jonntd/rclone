@@ -3958,6 +3958,12 @@ func (o *Object) openNormal(ctx context.Context, options ...fs.OpenOption) (io.R
 
 // openWithCustomConcurrency 使用自定义并发下载（当统一下载器不可用时）
 func (o *Object) openWithCustomConcurrency(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	// 如果 StreamHashMode 启用，则直接回退到普通下载（避免临时文件）
+	if o.fs.opt.StreamHashMode {
+		fs.Debugf(o, "DisableTempFile is true, falling back to normal download for: %s", o.Remote())
+		return o.openNormal(ctx, options...)
+	}
+
 	fs.Debugf(o, "Starting custom concurrent download: %s", fs.SizeSuffix(o.size))
 
 	// 创建临时文件用于并发下载
