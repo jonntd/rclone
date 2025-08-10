@@ -137,6 +137,25 @@ type CachedURL struct {
 	ExpiresAt time.Time // 过期时间
 }
 
+// 💾 持久化缓存数据结构
+type PersistentParentDirCache struct {
+	Data    map[int64]time.Time `json:"data"`
+	SavedAt time.Time           `json:"saved_at"`
+	Version string              `json:"version"`
+}
+
+type PersistentListFileCache struct {
+	Data    map[string]*CachedListResponse `json:"data"`
+	SavedAt time.Time                      `json:"saved_at"`
+	Version string                         `json:"version"`
+}
+
+type CachedListResponse struct {
+	Response  *ListResponse `json:"response"`
+	CachedAt  time.Time     `json:"cached_at"`
+	ExpiresAt time.Time     `json:"expires_at"`
+}
+
 // Fs 表示远程123网盘驱动器实例
 type Fs struct {
 	name         string       // 此远程实例的名称
@@ -161,6 +180,11 @@ type Fs struct {
 	downloadURLCache sync.Map            // 下载URL缓存 (map[string]CachedURL) - 使用sync.Map提升并发性能
 	listFileCache    *cache.Cache        // ListFile结果缓存
 	cacheMu          sync.RWMutex        // 保护parentDirCache的读写锁
+
+	// 💾 持久化缓存系统
+	persistentCacheDir string // 持久化缓存目录
+	parentDirCacheFile string // 父目录缓存文件路径
+	listFileCacheFile  string // ListFile缓存文件路径
 
 	// 上传域名缓存
 	uploadDomain    string       // 缓存的上传域名
@@ -600,6 +624,8 @@ func (f *Fs) verifyParentFileID(ctx context.Context, parentFileID int64) (bool, 
 		f.cacheMu.Lock()
 		f.parentDirCache[parentFileID] = time.Now()
 		f.cacheMu.Unlock()
+		// 💾 保存到持久化缓存
+		go f.saveParentDirCache() // 异步保存，避免阻塞
 		fs.Debugf(f, "✅ 父目录ID %d 验证成功", parentFileID)
 	}
 
@@ -932,6 +958,14 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 		// 🔄 新增：刷新目录缓存
 		return f.refreshCacheCommand(ctx, arg)
 
+	case "clear-cache":
+		// 🧹 新增：清理持久化缓存
+		return f.clearCacheCommand(ctx, arg, opt)
+
+	case "cache-stats":
+		// 📊 新增：查看缓存统计
+		return f.cacheStatsCommand(ctx, arg, opt)
+
 	default:
 		return nil, fs.ErrorCommandNotFound
 	}
@@ -1029,6 +1063,8 @@ func (f *Fs) ListFile(ctx context.Context, parentFileID, limit int, searchData, 
 	if searchData == "" && searchMode == "" && lastFileID == 0 && limit == 100 {
 		cacheKey := fmt.Sprintf("listfile_%d", parentFileID)
 		f.listFileCache.Put(cacheKey, &result)
+		// 💾 同时保存到持久化缓存
+		f.saveListFileCacheEntry(cacheKey, &result)
 		fs.Debugf(f, "💾 ListFile结果已缓存: parentFileID=%d", parentFileID)
 	}
 
@@ -3753,6 +3789,12 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		fs.Debugf(f, "🔄 持久化缓存已过期，将在首次使用时重新构建")
 	}
 
+	// 💾 初始化持久化缓存系统
+	f.initPersistentCache()
+
+	// 💾 加载持久化缓存
+	f.loadPersistentCaches()
+
 	// Initialize authentication
 	tokenLoaded := loadTokenFromConfig(f)
 	fs.Debugf(f, "从配置加载令牌: %v（过期时间 %v）", tokenLoaded, f.tokenExpiry)
@@ -5373,121 +5415,9 @@ func (oi *ObjectInfo) Hash(ctx context.Context, t fshash.Type) (string, error) {
 	return "", fshash.ErrUnsupported
 }
 
-// smartStreamHashTransfer 智能流式哈希传输
-// 根据文件大小选择最优策略：小文件内存缓存，大文件流式哈希计算
-func (f *Fs) smartStreamHashTransfer(ctx context.Context, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
-	fileSize := src.Size()
-
-	// 🌊 StreamHashMode下使用更保守的内存策略
-	// 小文件（≤10MB）：内存缓存 + 单步上传API
-	// 大文件（>10MB）：流式哈希 + 分片上传API
-	memoryThreshold := int64(10 * 1024 * 1024) // 10MB，更安全的内存使用
-
-	if fileSize <= memoryThreshold {
-		fs.Infof(f, "📝 小文件使用内存缓存模式: %s", fs.SizeSuffix(fileSize))
-		return f.memoryHashTransfer(ctx, src, parentFileID, fileName)
-	} else {
-		fs.Infof(f, "🌊 大文件使用流式哈希模式: %s", fs.SizeSuffix(fileSize))
-		return f.streamHashTransfer(ctx, src, parentFileID, fileName)
-	}
-}
-
-// memoryHashTransfer 小文件内存缓存哈希传输
-func (f *Fs) memoryHashTransfer(ctx context.Context, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
-	// 转换为fs.Object以便调用Open方法
-	srcObj, ok := src.(fs.Object)
-	if !ok {
-		return nil, fmt.Errorf("source is not a valid fs.Object")
-	}
-
-	// 打开源文件
-	srcReader, err := srcObj.Open(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open source file: %w", err)
-	}
-	defer srcReader.Close()
-
-	// 读取整个文件到内存并计算MD5
-	data, err := io.ReadAll(srcReader)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read file data: %w", err)
-	}
-
-	// 计算MD5哈希
-	hasher := md5.New()
-	hasher.Write(data)
-	md5Hash := fmt.Sprintf("%x", hasher.Sum(nil))
-
-	fs.Infof(f, "📊 内存哈希计算完成: %s, MD5: %s", fs.SizeSuffix(int64(len(data))), md5Hash)
-
-	// 小文件直接使用单步上传API（包含秒传检查）
-	fs.Infof(f, "📤 小文件使用单步上传API（支持秒传）")
-	return f.singleStepUpload(ctx, data, parentFileID, fileName, md5Hash)
-}
-
-// Removed unused functions: getHTTPClient, getAdaptiveTimeout, detectNetworkSpeed, getOptimalConcurrency, getOptimalChunkSize
-
-// streamHashTransfer 大文件流式哈希传输
-func (f *Fs) streamHashTransfer(ctx context.Context, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
-	// 转换为fs.Object以便调用Open方法
-	srcObj, ok := src.(fs.Object)
-	if !ok {
-		return nil, fmt.Errorf("source is not a valid fs.Object")
-	}
-
-	// 第一遍：流式计算MD5哈希（为了秒传）
-	fs.Infof(f, "🔄 第一遍：流式计算文件哈希用于秒传...")
-
-	srcReader, err := srcObj.Open(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open source file for hash calculation: %w", err)
-	}
-	defer srcReader.Close()
-
-	// 流式计算MD5，不保存数据
-	hasher := md5.New()
-	buffer := make([]byte, 1024*1024) // 🔧 简单修复：增大缓冲区到1MB，提高rclone进度更新频率
-
-	totalRead := int64(0)
-	for {
-		n, err := srcReader.Read(buffer)
-		if n > 0 {
-			hasher.Write(buffer[:n])
-			totalRead += int64(n)
-
-			// 保留原有的详细进度日志，每1MB输出一次
-			if totalRead%(1024*1024) == 0 || err == io.EOF {
-				percentage := float64(totalRead) / float64(src.Size()) * 100
-				fs.Debugf(f, "📊 流式哈希计算进度: %s/%s (%.1f%%)",
-					fs.SizeSuffix(totalRead), fs.SizeSuffix(src.Size()), percentage)
-			}
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("failed to read data for hash calculation: %w", err)
-		}
-	}
-
-	md5Hash := fmt.Sprintf("%x", hasher.Sum(nil))
-	fs.Infof(f, "📊 流式哈希计算完成: MD5: %s", md5Hash)
-
-	// 尝试秒传
-	createResp, err := f.createUpload(ctx, parentFileID, fileName, md5Hash, src.Size())
-	if err != nil {
-		return nil, fmt.Errorf("failed to create upload session: %w", err)
-	}
-
-	if createResp.Data.Reuse {
-		fs.Infof(f, "🚀 流式哈希计算后秒传成功！")
-		return f.createObject(fileName, createResp.Data.FileID, src.Size(), md5Hash, time.Now()), nil
-	}
-
-	// 秒传失败，第二遍：重新下载并边下边传（使用服务器分块大小）
-	fs.Infof(f, "⬆️ 秒传失败，第二遍：边下边传（服务器分块大小: %s）", fs.SizeSuffix(createResp.Data.SliceSize))
-	return f.streamUploadWithSession(ctx, srcObj, createResp, fileName, md5Hash)
-}
+// Removed unused functions:
+// - getHTTPClient, getAdaptiveTimeout, detectNetworkSpeed, getOptimalConcurrency, getOptimalChunkSize
+// - smartStreamHashTransfer, memoryHashTransfer, streamHashTransfer (失效的传输函数)
 
 // streamHashTransferWithReader 大文件流式哈希传输（使用已包装的Reader）
 // 🔧 修复进度显示问题：使用rclone传递的已被Transfer包装的Reader
@@ -5706,3 +5636,292 @@ func (f *Fs) uploadSingleChunk(ctx context.Context, preuploadID string, chunkInd
 
 // measureNetworkLatency removed - use reasonable default latency
 // This function is no longer needed as we simplified network detection
+
+// 💾 持久化缓存管理方法
+
+// initPersistentCache 初始化持久化缓存系统
+func (f *Fs) initPersistentCache() {
+	// 获取缓存目录
+	cacheDir := config.GetCacheDir()
+	f.persistentCacheDir = filepath.Join(cacheDir, "123-cache", f.name)
+
+	// 创建缓存目录
+	if err := os.MkdirAll(f.persistentCacheDir, 0755); err != nil {
+		fs.Debugf(f, "⚠️ 创建持久化缓存目录失败: %v", err)
+		return
+	}
+
+	// 设置缓存文件路径
+	f.parentDirCacheFile = filepath.Join(f.persistentCacheDir, "parent_dir_cache.json")
+	f.listFileCacheFile = filepath.Join(f.persistentCacheDir, "list_file_cache.json")
+
+	fs.Debugf(f, "💾 持久化缓存目录: %s", f.persistentCacheDir)
+}
+
+// loadPersistentCaches 加载持久化缓存
+func (f *Fs) loadPersistentCaches() {
+	// 加载父目录缓存
+	f.loadParentDirCache()
+
+	// 加载ListFile缓存
+	f.loadListFileCache()
+}
+
+// loadParentDirCache 加载父目录缓存
+func (f *Fs) loadParentDirCache() {
+	if f.parentDirCacheFile == "" {
+		return
+	}
+
+	data, err := os.ReadFile(f.parentDirCacheFile)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			fs.Debugf(f, "⚠️ 读取父目录缓存失败: %v", err)
+		}
+		return
+	}
+
+	var cache PersistentParentDirCache
+	if err := json.Unmarshal(data, &cache); err != nil {
+		fs.Debugf(f, "⚠️ 解析父目录缓存失败: %v", err)
+		return
+	}
+
+	// 检查缓存是否过期（24小时）
+	if time.Since(cache.SavedAt) > 24*time.Hour {
+		fs.Debugf(f, "🔄 父目录缓存已过期，跳过加载")
+		return
+	}
+
+	// 过滤过期的条目（5分钟）
+	validCount := 0
+	f.cacheMu.Lock()
+	for dirID, verifyTime := range cache.Data {
+		if time.Since(verifyTime) <= 5*time.Minute {
+			f.parentDirCache[dirID] = verifyTime
+			validCount++
+		}
+	}
+	f.cacheMu.Unlock()
+
+	fs.Debugf(f, "📁 从持久化缓存加载 %d 个有效父目录条目", validCount)
+}
+
+// loadListFileCache 加载ListFile缓存
+func (f *Fs) loadListFileCache() {
+	if f.listFileCacheFile == "" {
+		return
+	}
+
+	data, err := os.ReadFile(f.listFileCacheFile)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			fs.Debugf(f, "⚠️ 读取ListFile缓存失败: %v", err)
+		}
+		return
+	}
+
+	var cache PersistentListFileCache
+	if err := json.Unmarshal(data, &cache); err != nil {
+		fs.Debugf(f, "⚠️ 解析ListFile缓存失败: %v", err)
+		return
+	}
+
+	// 检查缓存是否过期（24小时）
+	if time.Since(cache.SavedAt) > 24*time.Hour {
+		fs.Debugf(f, "🔄 ListFile缓存已过期，跳过加载")
+		return
+	}
+
+	// 过滤过期的条目（5分钟）
+	validCount := 0
+	for key, cachedResp := range cache.Data {
+		if time.Since(cachedResp.CachedAt) <= 5*time.Minute {
+			f.listFileCache.Put(key, cachedResp.Response)
+			validCount++
+		}
+	}
+
+	fs.Debugf(f, "📋 从持久化缓存加载 %d 个有效ListFile条目", validCount)
+}
+
+// saveParentDirCache 保存父目录缓存到磁盘
+func (f *Fs) saveParentDirCache() {
+	if f.parentDirCacheFile == "" {
+		return
+	}
+
+	f.cacheMu.RLock()
+	data := make(map[int64]time.Time)
+	for k, v := range f.parentDirCache {
+		data[k] = v
+	}
+	f.cacheMu.RUnlock()
+
+	cache := PersistentParentDirCache{
+		Data:    data,
+		SavedAt: time.Now(),
+		Version: "1.0",
+	}
+
+	jsonData, err := json.Marshal(cache)
+	if err != nil {
+		fs.Debugf(f, "⚠️ 序列化父目录缓存失败: %v", err)
+		return
+	}
+
+	if err := os.WriteFile(f.parentDirCacheFile, jsonData, 0644); err != nil {
+		fs.Debugf(f, "⚠️ 保存父目录缓存失败: %v", err)
+		return
+	}
+
+	fs.Debugf(f, "💾 父目录缓存已保存: %d 个条目", len(data))
+}
+
+// saveListFileCacheEntry 保存单个ListFile缓存条目
+func (f *Fs) saveListFileCacheEntry(key string, response *ListResponse) {
+	if f.listFileCacheFile == "" {
+		return
+	}
+
+	// 读取现有缓存
+	var cache PersistentListFileCache
+	if data, err := os.ReadFile(f.listFileCacheFile); err == nil {
+		json.Unmarshal(data, &cache)
+	}
+
+	// 初始化数据结构
+	if cache.Data == nil {
+		cache.Data = make(map[string]*CachedListResponse)
+	}
+
+	// 添加新条目
+	cache.Data[key] = &CachedListResponse{
+		Response:  response,
+		CachedAt:  time.Now(),
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+	}
+	cache.SavedAt = time.Now()
+	cache.Version = "1.0"
+
+	// 清理过期条目
+	for k, v := range cache.Data {
+		if time.Since(v.CachedAt) > 5*time.Minute {
+			delete(cache.Data, k)
+		}
+	}
+
+	// 保存到磁盘
+	if jsonData, err := json.Marshal(cache); err == nil {
+		os.WriteFile(f.listFileCacheFile, jsonData, 0644)
+		fs.Debugf(f, "💾 ListFile缓存条目已保存: %s", key)
+	}
+}
+
+// 🧹 缓存管理方法
+
+// clearPersistentCache 清理持久化缓存
+func (f *Fs) clearPersistentCache() error {
+	if f.persistentCacheDir == "" {
+		return nil
+	}
+
+	// 删除整个缓存目录
+	if err := os.RemoveAll(f.persistentCacheDir); err != nil {
+		fs.Debugf(f, "⚠️ 清理持久化缓存失败: %v", err)
+		return err
+	}
+
+	// 重新创建缓存目录
+	if err := os.MkdirAll(f.persistentCacheDir, 0755); err != nil {
+		fs.Debugf(f, "⚠️ 重新创建缓存目录失败: %v", err)
+		return err
+	}
+
+	fs.Debugf(f, "🧹 持久化缓存已清理: %s", f.persistentCacheDir)
+	return nil
+}
+
+// getCacheStats 获取缓存统计信息
+func (f *Fs) getCacheStats() map[string]interface{} {
+	stats := make(map[string]interface{})
+
+	if f.persistentCacheDir == "" {
+		return stats
+	}
+
+	// 统计缓存文件大小
+	var totalSize int64
+	fileCount := 0
+
+	filepath.Walk(f.persistentCacheDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !info.IsDir() {
+			totalSize += info.Size()
+			fileCount++
+		}
+		return nil
+	})
+
+	stats["cache_dir"] = f.persistentCacheDir
+	stats["total_size"] = totalSize
+	stats["file_count"] = fileCount
+	stats["size_mb"] = float64(totalSize) / 1024 / 1024
+
+	// 检查各个缓存文件
+	if info, err := os.Stat(f.listFileCacheFile); err == nil {
+		stats["list_file_cache_size"] = info.Size()
+		stats["list_file_cache_modified"] = info.ModTime()
+	}
+
+	if info, err := os.Stat(f.parentDirCacheFile); err == nil {
+		stats["parent_dir_cache_size"] = info.Size()
+		stats["parent_dir_cache_modified"] = info.ModTime()
+	}
+
+	return stats
+}
+
+// clearCacheCommand 清理缓存命令
+func (f *Fs) clearCacheCommand(ctx context.Context, args []string, opt map[string]string) (any, error) {
+	result := make(map[string]interface{})
+
+	// 清理内存缓存
+	f.listFileCache.Clear()
+	f.cacheMu.Lock()
+	f.parentDirCache = make(map[int64]time.Time)
+	f.cacheMu.Unlock()
+
+	result["memory_cache_cleared"] = true
+
+	// 清理持久化缓存
+	if err := f.clearPersistentCache(); err != nil {
+		result["persistent_cache_error"] = err.Error()
+		return result, err
+	}
+
+	result["persistent_cache_cleared"] = true
+	result["cache_dir"] = f.persistentCacheDir
+
+	fs.Infof(f, "🧹 所有缓存已清理完成")
+	return result, nil
+}
+
+// cacheStatsCommand 缓存统计命令
+func (f *Fs) cacheStatsCommand(ctx context.Context, args []string, opt map[string]string) (any, error) {
+	stats := f.getCacheStats()
+
+	// 添加内存缓存统计
+	f.cacheMu.RLock()
+	stats["memory_parent_dir_cache_count"] = len(f.parentDirCache)
+	f.cacheMu.RUnlock()
+
+	// 添加ListFile内存缓存统计（估算）
+	listFileCacheCount := 0
+	// 注意：cache.Cache没有直接的计数方法，这里只是占位
+	stats["memory_list_file_cache_count"] = listFileCacheCount
+
+	return stats, nil
+}

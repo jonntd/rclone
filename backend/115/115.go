@@ -1450,6 +1450,13 @@ type CachedDownloadURL struct {
 	ExpiresAt time.Time // 过期时间
 }
 
+// 💾 115网盘持久化缓存数据结构
+type PersistentDownloadURLCache struct {
+	Data    map[string]CachedDownloadURL `json:"data"`
+	SavedAt time.Time                    `json:"saved_at"`
+	Version string                       `json:"version"`
+}
+
 // Valid 检查缓存的URL是否仍然有效
 func (c CachedDownloadURL) Valid() bool {
 	return time.Now().Before(c.ExpiresAt)
@@ -1543,6 +1550,10 @@ type Fs struct {
 
 	// 🔧 性能优化：下载URL缓存系统
 	downloadURLCache sync.Map // 下载URL缓存 (map[string]CachedDownloadURL)
+
+	// 💾 持久化缓存系统
+	persistentCacheDir   string // 持久化缓存目录
+	downloadURLCacheFile string // 下载URL缓存文件路径
 }
 
 // NewTransferSpeedMonitor 创建新的传输速度监控器
@@ -3053,6 +3064,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 	f.dirCache = dircache.NewWithPersistent(f.root, f.rootFolderID, f, "115", configData)
 
+	// 💾 初始化持久化缓存系统
+	f.initPersistentCache115()
+
+	// 💾 加载持久化缓存
+	f.loadPersistentCaches115()
+
 	// 🔧 优化的rclone模式：结合标准模式和115网盘特性
 	// Find the current root
 	err = f.dirCache.FindRoot(ctx, false)
@@ -4059,6 +4076,14 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 		// 🔄 新增：刷新目录缓存
 		return f.refreshCacheCommand(ctx, arg)
 
+	case "clear-cache":
+		// 🧹 新增：清理持久化缓存
+		return f.clearCacheCommand115(ctx, arg, opt)
+
+	case "cache-stats":
+		// 📊 新增：查看缓存统计
+		return f.cacheStatsCommand115(ctx, arg, opt)
+
 	default:
 		return nil, fs.ErrorCommandNotFound
 	}
@@ -4777,6 +4802,8 @@ func (o *Object) setDownloadURL(ctx context.Context) error {
 		ExpiresAt: time.Now().Add(3 * time.Minute), // 3分钟缓存，留2分钟安全边际
 	}
 	o.fs.downloadURLCache.Store(cacheKey, cachedURL)
+	// 💾 异步保存到持久化缓存
+	go o.fs.saveDownloadURLCache()
 	fs.Debugf(o, "✅ 成功获取下载URL并缓存（3分钟有效期）")
 
 	o.durlMu.Unlock()
@@ -10197,4 +10224,219 @@ func (f *Fs) calculateRangeHashFromSource(ctx context.Context, srcObj fs.Object,
 	fs.Debugf(f, "🔐 二次验证SHA1: %s (范围: %s)", sha1Hash, rangeSpec)
 
 	return sha1Hash, nil
+}
+
+// 💾 115网盘持久化缓存管理方法
+
+// initPersistentCache115 初始化115网盘持久化缓存系统
+func (f *Fs) initPersistentCache115() {
+	// 获取缓存目录
+	cacheDir := config.GetCacheDir()
+	f.persistentCacheDir = filepath.Join(cacheDir, "115-cache", f.name)
+
+	// 创建缓存目录
+	if err := os.MkdirAll(f.persistentCacheDir, 0755); err != nil {
+		fs.Debugf(f, "⚠️ 创建115持久化缓存目录失败: %v", err)
+		return
+	}
+
+	// 设置缓存文件路径
+	f.downloadURLCacheFile = filepath.Join(f.persistentCacheDir, "download_url_cache.json")
+
+	fs.Debugf(f, "💾 115持久化缓存目录: %s", f.persistentCacheDir)
+}
+
+// loadPersistentCaches115 加载115网盘持久化缓存
+func (f *Fs) loadPersistentCaches115() {
+	// 加载下载URL缓存
+	f.loadDownloadURLCache()
+}
+
+// loadDownloadURLCache 加载下载URL缓存
+func (f *Fs) loadDownloadURLCache() {
+	if f.downloadURLCacheFile == "" {
+		return
+	}
+
+	data, err := os.ReadFile(f.downloadURLCacheFile)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			fs.Debugf(f, "⚠️ 读取下载URL缓存失败: %v", err)
+		}
+		return
+	}
+
+	var cache PersistentDownloadURLCache
+	if err := json.Unmarshal(data, &cache); err != nil {
+		fs.Debugf(f, "⚠️ 解析下载URL缓存失败: %v", err)
+		return
+	}
+
+	// 检查缓存是否过期（24小时）
+	if time.Since(cache.SavedAt) > 24*time.Hour {
+		fs.Debugf(f, "🔄 下载URL缓存已过期，跳过加载")
+		return
+	}
+
+	// 过滤过期的条目（1小时）
+	validCount := 0
+	for pickCode, cachedURL := range cache.Data {
+		if cachedURL.Valid() && !cachedURL.NearExpiry() {
+			f.downloadURLCache.Store(pickCode, cachedURL)
+			validCount++
+		}
+	}
+
+	fs.Debugf(f, "📥 从持久化缓存加载 %d 个有效下载URL条目", validCount)
+
+	// 🧹 加载后清理可能的过期缓存
+	go f.cleanExpiredURLCache()
+}
+
+// saveDownloadURLCache 保存下载URL缓存到磁盘
+func (f *Fs) saveDownloadURLCache() {
+	if f.downloadURLCacheFile == "" {
+		return
+	}
+
+	// 从sync.Map中提取数据
+	data := make(map[string]CachedDownloadURL)
+	f.downloadURLCache.Range(func(key, value interface{}) bool {
+		if keyStr, ok := key.(string); ok {
+			if cachedURL, ok := value.(CachedDownloadURL); ok {
+				// 只保存有效且未即将过期的URL
+				if cachedURL.Valid() && !cachedURL.NearExpiry() {
+					data[keyStr] = cachedURL
+				}
+			}
+		}
+		return true
+	})
+
+	cache := PersistentDownloadURLCache{
+		Data:    data,
+		SavedAt: time.Now(),
+		Version: "1.0",
+	}
+
+	jsonData, err := json.Marshal(cache)
+	if err != nil {
+		fs.Debugf(f, "⚠️ 序列化下载URL缓存失败: %v", err)
+		return
+	}
+
+	if err := os.WriteFile(f.downloadURLCacheFile, jsonData, 0644); err != nil {
+		fs.Debugf(f, "⚠️ 保存下载URL缓存失败: %v", err)
+		return
+	}
+
+	fs.Debugf(f, "💾 下载URL缓存已保存: %d 个条目", len(data))
+}
+
+// 🧹 115网盘缓存管理方法
+
+// clearPersistentCache115 清理115网盘持久化缓存
+func (f *Fs) clearPersistentCache115() error {
+	if f.persistentCacheDir == "" {
+		return nil
+	}
+
+	// 删除整个缓存目录
+	if err := os.RemoveAll(f.persistentCacheDir); err != nil {
+		fs.Debugf(f, "⚠️ 清理115持久化缓存失败: %v", err)
+		return err
+	}
+
+	// 重新创建缓存目录
+	if err := os.MkdirAll(f.persistentCacheDir, 0755); err != nil {
+		fs.Debugf(f, "⚠️ 重新创建115缓存目录失败: %v", err)
+		return err
+	}
+
+	fs.Debugf(f, "🧹 115持久化缓存已清理: %s", f.persistentCacheDir)
+	return nil
+}
+
+// getCacheStats115 获取115网盘缓存统计信息
+func (f *Fs) getCacheStats115() map[string]interface{} {
+	stats := make(map[string]interface{})
+
+	if f.persistentCacheDir == "" {
+		return stats
+	}
+
+	// 统计缓存文件大小
+	var totalSize int64
+	fileCount := 0
+
+	filepath.Walk(f.persistentCacheDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !info.IsDir() {
+			totalSize += info.Size()
+			fileCount++
+		}
+		return nil
+	})
+
+	stats["cache_dir"] = f.persistentCacheDir
+	stats["total_size"] = totalSize
+	stats["file_count"] = fileCount
+	stats["size_mb"] = float64(totalSize) / 1024 / 1024
+
+	// 检查下载URL缓存文件
+	if info, err := os.Stat(f.downloadURLCacheFile); err == nil {
+		stats["download_url_cache_size"] = info.Size()
+		stats["download_url_cache_modified"] = info.ModTime()
+	}
+
+	// 统计内存中的下载URL缓存
+	urlCacheCount := 0
+	f.downloadURLCache.Range(func(key, value interface{}) bool {
+		urlCacheCount++
+		return true
+	})
+	stats["memory_url_cache_count"] = urlCacheCount
+
+	return stats
+}
+
+// clearCacheCommand115 清理115网盘缓存命令
+func (f *Fs) clearCacheCommand115(ctx context.Context, args []string, opt map[string]string) (any, error) {
+	result := make(map[string]interface{})
+
+	// 清理内存中的下载URL缓存
+	f.downloadURLCache = sync.Map{}
+	result["memory_download_url_cache_cleared"] = true
+
+	// 清理持久化缓存
+	if err := f.clearPersistentCache115(); err != nil {
+		result["persistent_cache_error"] = err.Error()
+		return result, err
+	}
+
+	result["persistent_cache_cleared"] = true
+	result["cache_dir"] = f.persistentCacheDir
+
+	// 清理DirCache（如果需要）
+	if f.dirCache != nil {
+		f.dirCache.ResetRoot()
+		result["dir_cache_reset"] = true
+	}
+
+	fs.Infof(f, "🧹 115网盘所有缓存已清理完成")
+	return result, nil
+}
+
+// cacheStatsCommand115 115网盘缓存统计命令
+func (f *Fs) cacheStatsCommand115(ctx context.Context, args []string, opt map[string]string) (any, error) {
+	stats := f.getCacheStats115()
+
+	// 添加DirCache统计
+	if f.dirCache != nil {
+		stats["dir_cache_entries"] = "available" // DirCache没有直接的计数方法
+	}
+
+	return stats, nil
 }

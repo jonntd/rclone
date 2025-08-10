@@ -84,16 +84,27 @@ func (f *Fs) mediaSyncCommand(ctx context.Context, args []string, opt map[string
 		sourcePath, targetPath, fs.SizeSuffix(minSize), strmFormat, dryRun, syncDelete)
 
 	// 4. 开始递归处理
-	// 获取源路径的根目录名称，并添加到目标路径中
+	// 🔧 修复：检查是否需要创建根目录层级
+	var fullTargetPath string
+
+	// 如果用户明确指定了目标路径包含源目录名，则直接使用
 	rootDirName := f.root
 	if rootDirName == "" {
 		rootDirName = "root"
 	}
-	// 清理路径，去掉末尾的斜杠
 	rootDirName = strings.TrimSuffix(rootDirName, "/")
 
-	// 构建包含根目录的目标路径
-	fullTargetPath := filepath.Join(targetPath, rootDirName)
+	// 检查目标路径是否已经包含了源目录名
+	targetBaseName := filepath.Base(targetPath)
+	if targetBaseName == rootDirName {
+		// 目标路径已经包含源目录名，直接使用
+		fullTargetPath = targetPath
+		fs.Debugf(f, "🎯 目标路径已包含源目录名，直接使用: %s", fullTargetPath)
+	} else {
+		// 目标路径不包含源目录名，添加根目录层级
+		fullTargetPath = filepath.Join(targetPath, rootDirName)
+		fs.Debugf(f, "📁 添加根目录层级: %s -> %s", targetPath, fullTargetPath)
+	}
 
 	err = f.processDirectoryForMediaSync(ctx, sourcePath, fullTargetPath, minSize, strmFormat,
 		includeExts, excludeExts, stats)
