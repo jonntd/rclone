@@ -178,7 +178,8 @@ type Fs struct {
 	dirCache *dircache.DirCache
 }
 
-// ProgressReadCloser 包装ReadCloser以提供123网盘下载进度跟踪和资源管理
+// ProgressReadCloser 混合进度显示包装器
+// 🔧 既提供详细的进度日志，又兼容rclone的accounting系统
 type ProgressReadCloser struct {
 	io.ReadCloser
 	fs              *Fs
@@ -190,7 +191,7 @@ type ProgressReadCloser struct {
 	lastLogPercent  int
 }
 
-// Read 实现io.Reader接口，同时更新进度
+// Read 实现io.Reader接口，提供详细进度日志但不干扰rclone的accounting
 func (prc *ProgressReadCloser) Read(p []byte) (n int, err error) {
 	n, err = prc.ReadCloser.Read(p)
 	if n > 0 {
@@ -203,8 +204,8 @@ func (prc *ProgressReadCloser) Read(p []byte) (n int, err error) {
 		}
 
 		now := time.Now()
-		// 减少日志频率：只在进度变化超过10%或时间间隔超过5秒时输出日志
-		shouldLog := (percentage >= prc.lastLogPercent+10) ||
+		// 减少日志频率：只在进度变化超过2%或时间间隔超过5秒时输出日志
+		shouldLog := (percentage >= prc.lastLogPercent+2) ||
 			(now.Sub(prc.lastLogTime) > 5*time.Second) ||
 			(prc.transferredSize == prc.totalSize) ||
 			(percentage == 100)
@@ -246,58 +247,10 @@ func (prc *ProgressReadCloser) Close() error {
 	return prc.ReadCloser.Close()
 }
 
-// TwoStepProgressReader 用于内部两步传输的进度跟踪
-type TwoStepProgressReader struct {
-	io.Reader
-	totalSize       int64
-	transferredSize int64
-	startTime       time.Time
-	lastLogTime     time.Time
-	lastLogPercent  int
-	stepName        string
-	fileName        string
-	fs              *Fs
-}
+// TwoStepProgressReader 已移除：使用rclone原生的accounting系统来处理进度报告
+// 内部两步传输的进度由主传输进度显示，不需要额外的进度跟踪
 
-// Read 实现io.Reader接口，同时更新进度
-func (tpr *TwoStepProgressReader) Read(p []byte) (n int, err error) {
-	n, err = tpr.Reader.Read(p)
-	if n > 0 {
-		tpr.transferredSize += int64(n)
-
-		// 计算进度百分比
-		var percentage int
-		if tpr.totalSize > 0 {
-			percentage = int(float64(tpr.transferredSize) / float64(tpr.totalSize) * 100)
-		}
-
-		now := time.Now()
-		// 减少日志频率：只在进度变化超过10%或时间间隔超过5秒时输出日志
-		shouldLog := (percentage >= tpr.lastLogPercent+10) ||
-			(now.Sub(tpr.lastLogTime) > 5*time.Second) ||
-			(tpr.transferredSize == tpr.totalSize) ||
-			(percentage == 100)
-
-		if shouldLog {
-			elapsed := now.Sub(tpr.startTime)
-			var speed float64
-			if elapsed.Seconds() > 0 {
-				speed = float64(tpr.transferredSize) / elapsed.Seconds() / 1024 / 1024 // MB/s
-			}
-
-			fs.Debugf(tpr.fs, "📥 %s进度: %s/%s (%d%%) 速度: %.2f MB/s [%s]",
-				tpr.stepName,
-				fs.SizeSuffix(tpr.transferredSize),
-				fs.SizeSuffix(tpr.totalSize),
-				percentage,
-				speed,
-				tpr.fileName)
-			tpr.lastLogTime = now
-			tpr.lastLogPercent = percentage
-		}
-	}
-	return n, err
-}
+// TwoStepProgressReader 相关方法已移除：现在使用rclone原生的accounting系统
 
 // Object 描述123网盘中的文件或文件夹对象
 type Object struct {
@@ -1560,6 +1513,38 @@ func (o *Object) openWithCDNFailover(ctx context.Context, options ...fs.OpenOpti
 	return nil, fmt.Errorf("CDN failover exhausted after %d attempts: %w", maxRetries, lastErr)
 }
 
+// openWithSimpleRetry 简化的重试机制：失败时直接重新获取URL
+func (o *Object) openWithSimpleRetry(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	// 第一次尝试：使用缓存的下载URL
+	rc, err := o.openNormal(ctx, options...)
+	if err == nil {
+		return rc, nil
+	}
+
+	// 检查是否为连接超时错误
+	if isConnectionTimeout(err) {
+		fs.Debugf(o, "🔄 下载失败，重新获取URL重试: %v", err)
+
+		// 清除缓存的下载URL，强制重新获取（可能获得新的CDN节点）
+		o.fs.invalidateDownloadURL(o.id)
+
+		// 第二次尝试：使用新的下载URL
+		rc, retryErr := o.openNormal(ctx, options...)
+		if retryErr == nil {
+			fs.Debugf(o, "✅ 重新获取URL后下载成功")
+			return rc, nil
+		}
+
+		// 两次都失败，返回最后的错误
+		fs.Debugf(o, "❌ 重新获取URL后仍然失败: %v", retryErr)
+		return nil, retryErr
+	}
+
+	// 非连接超时错误，直接返回
+	fs.Debugf(o, "❌ 非连接超时错误，不重试: %v", err)
+	return nil, err
+}
+
 // makeAPICallWithRest 使用rclone标准rest客户端进行API调用，自动集成QPS限制
 // 这是推荐的API调用方法，替代直接使用HTTP客户端
 func (f *Fs) makeAPICallWithRest(ctx context.Context, endpoint string, method string, reqBody any, respBody any) error {
@@ -2707,7 +2692,8 @@ func (f *Fs) handleCrossCloudTransfer(ctx context.Context, in io.Reader, src fs.
 	// 检查是否启用流式哈希模式
 	if f.opt.StreamHashMode {
 		fs.Infof(f, "🌊 启用流式哈希模式: %s (%s)", fileName, fs.SizeSuffix(fileSize))
-		return f.smartStreamHashTransfer(ctx, src, parentFileID, fileName)
+		// 🔧 关键修复：使用传递的Reader（已被rclone Transfer包装），确保进度正确显示
+		return f.streamHashTransferWithReader(ctx, in, src, parentFileID, fileName)
 	}
 	fs.Infof(f, "🔄 开始两步传输: %s (%s)", fileName, fs.SizeSuffix(fileSize))
 	fs.Infof(f, "📥 步骤1: 下载到本地 → 📤 步骤2: 上传到123网盘")
@@ -2762,20 +2748,12 @@ func (f *Fs) internalTwoStepTransfer(ctx context.Context, in io.Reader, src fs.O
 	hasher := md5.New()
 	multiWriter := io.MultiWriter(tempFile, hasher)
 
-	// 创建进度包装器来显示Step 1下载进度
-	progressReader := &TwoStepProgressReader{
-		Reader:          srcReader,
-		totalSize:       fileSize,
-		transferredSize: 0,
-		startTime:       time.Now(),
-		lastLogTime:     time.Time{},
-		lastLogPercent:  -1,
-		stepName:        "Step 1: 下载",
-		fileName:        fileName,
-		fs:              f,
-	}
+	// 🔧 修复进度显示问题：直接使用原始Reader，避免重复进度跟踪
+	// 不使用TwoStepProgressReader，让rclone的accounting系统处理进度
+	// 内部两步传输的进度由主传输进度显示，不需要额外的进度跟踪
+	fs.Debugf(f, "📥 Step 1: 开始下载到临时文件")
 
-	written, err := io.Copy(multiWriter, progressReader)
+	written, err := io.Copy(multiWriter, srcReader)
 	if err != nil {
 		return nil, fmt.Errorf("下载到临时文件失败: %w", err)
 	}
@@ -3871,6 +3849,12 @@ func (o *Object) Storable() bool {
 // Open the file for reading.
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 
+	// 🌊 优先检查流式哈希模式：避免临时文件创建
+	if o.fs.opt.StreamHashMode {
+		fs.Debugf(o, "🌊 StreamHashMode启用，使用普通下载避免临时文件: %s", o.Remote())
+		return o.openWithCDNFailover(ctx, options...)
+	}
+
 	// 跨云传输优化：检测大文件并启用多线程下载
 	// 检查是否已经有禁用并发下载选项，避免重复并发
 	hasDisableOption := false
@@ -3891,8 +3875,8 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		return o.openWithConcurrency(ctx, options...)
 	}
 
-	// 使用CDN故障转移机制（默认启用）
-	return o.openWithCDNFailover(ctx, options...)
+	// 使用简化的重试机制（优化：直接重新获取URL而不是复杂的CDN故障转移）
+	return o.openWithSimpleRetry(ctx, options...)
 }
 
 // openWithConcurrency 使用统一并发下载器打开文件（用于跨云传输优化）
@@ -3945,7 +3929,8 @@ func (o *Object) openNormal(ctx context.Context, options ...fs.OpenOption) (io.R
 		return nil, err
 	}
 
-	// 创建包装的ReadCloser来处理进度更新和资源清理
+	// 🔧 混合进度显示方案：既修复rclone标准进度，又保留详细进度日志
+	// 创建包装的ReadCloser来提供详细的下载进度日志，同时让rclone正确处理标准进度
 	return &ProgressReadCloser{
 		ReadCloser:      resp.Body,
 		fs:              o.fs,
@@ -5248,10 +5233,12 @@ func (oi *ObjectInfo) Hash(ctx context.Context, t fshash.Type) (string, error) {
 func (f *Fs) smartStreamHashTransfer(ctx context.Context, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
 	fileSize := src.Size()
 
-	// 智能策略选择：与123网盘API限制保持一致
-	// 小文件（≤100MB）：内存缓存 + 单步上传API
-	// 大文件（>100MB）：流式哈希 + 分片上传API
-	if fileSize <= 100*1024*1024 { // 100MB以下使用内存缓存
+	// 🌊 StreamHashMode下使用更保守的内存策略
+	// 小文件（≤10MB）：内存缓存 + 单步上传API
+	// 大文件（>10MB）：流式哈希 + 分片上传API
+	memoryThreshold := int64(10 * 1024 * 1024) // 10MB，更安全的内存使用
+
+	if fileSize <= memoryThreshold {
 		fs.Infof(f, "📝 小文件使用内存缓存模式: %s", fs.SizeSuffix(fileSize))
 		return f.memoryHashTransfer(ctx, src, parentFileID, fileName)
 	} else {
@@ -5303,8 +5290,8 @@ func (f *Fs) streamHashTransfer(ctx context.Context, src fs.ObjectInfo, parentFi
 		return nil, fmt.Errorf("source is not a valid fs.Object")
 	}
 
-	// 第一遍：流式计算MD5哈希
-	fs.Infof(f, "🔄 第一遍：流式计算文件哈希...")
+	// 第一遍：流式计算MD5哈希（为了秒传）
+	fs.Infof(f, "🔄 第一遍：流式计算文件哈希用于秒传...")
 
 	srcReader, err := srcObj.Open(ctx)
 	if err != nil {
@@ -5314,12 +5301,21 @@ func (f *Fs) streamHashTransfer(ctx context.Context, src fs.ObjectInfo, parentFi
 
 	// 流式计算MD5，不保存数据
 	hasher := md5.New()
-	buffer := make([]byte, 64*1024) // 64KB缓冲区
+	buffer := make([]byte, 1024*1024) // 🔧 简单修复：增大缓冲区到1MB，提高rclone进度更新频率
 
+	totalRead := int64(0)
 	for {
 		n, err := srcReader.Read(buffer)
 		if n > 0 {
 			hasher.Write(buffer[:n])
+			totalRead += int64(n)
+
+			// 保留原有的详细进度日志，每1MB输出一次
+			if totalRead%(1024*1024) == 0 || err == io.EOF {
+				percentage := float64(totalRead) / float64(src.Size()) * 100
+				fs.Debugf(f, "📊 流式哈希计算进度: %s/%s (%.1f%%)",
+					fs.SizeSuffix(totalRead), fs.SizeSuffix(src.Size()), percentage)
+			}
 		}
 		if err == io.EOF {
 			break
@@ -5343,8 +5339,70 @@ func (f *Fs) streamHashTransfer(ctx context.Context, src fs.ObjectInfo, parentFi
 		return f.createObject(fileName, createResp.Data.FileID, src.Size(), md5Hash, time.Now()), nil
 	}
 
-	// 秒传失败，第二遍：重新下载并流式上传
-	fs.Infof(f, "⬆️ 秒传失败，第二遍：重新下载并流式上传")
+	// 秒传失败，第二遍：重新下载并边下边传（使用服务器分块大小）
+	fs.Infof(f, "⬆️ 秒传失败，第二遍：边下边传（服务器分块大小: %s）", fs.SizeSuffix(createResp.Data.SliceSize))
+	return f.streamUploadWithSession(ctx, srcObj, createResp, fileName, md5Hash)
+}
+
+// streamHashTransferWithReader 大文件流式哈希传输（使用已包装的Reader）
+// 🔧 修复进度显示问题：使用rclone传递的已被Transfer包装的Reader
+func (f *Fs) streamHashTransferWithReader(ctx context.Context, in io.Reader, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
+	// 第一遍：流式计算MD5哈希（为了秒传）
+	fs.Infof(f, "🔄 第一遍：流式计算文件哈希用于秒传...")
+
+	// 🔧 关键修复：使用传递的Reader（已被Transfer包装），进度会正确显示
+	srcReader := in
+
+	// 流式计算MD5，不保存数据
+	hasher := md5.New()
+	buffer := make([]byte, 1024*1024) // 1MB缓冲区，提高进度更新频率
+
+	totalRead := int64(0)
+	for {
+		n, err := srcReader.Read(buffer)
+		if n > 0 {
+			hasher.Write(buffer[:n])
+			totalRead += int64(n)
+
+			// 保留原有的详细进度日志，每1MB输出一次
+			if totalRead%(1024*1024) == 0 || err == io.EOF {
+				percentage := float64(totalRead) / float64(src.Size()) * 100
+				fs.Debugf(f, "📊 流式哈希计算进度: %s/%s (%.1f%%)",
+					fs.SizeSuffix(totalRead), fs.SizeSuffix(src.Size()), percentage)
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to read data for hash calculation: %w", err)
+		}
+	}
+
+	md5Hash := fmt.Sprintf("%x", hasher.Sum(nil))
+	fs.Infof(f, "📊 流式哈希计算完成: MD5: %s", md5Hash)
+
+	// 尝试秒传
+	createResp, err := f.createUpload(ctx, parentFileID, fileName, md5Hash, src.Size())
+	if err != nil {
+		return nil, fmt.Errorf("failed to create upload session: %w", err)
+	}
+
+	if createResp.Data.Reuse {
+		fs.Infof(f, "🚀 流式哈希计算后秒传成功！")
+		return f.createObject(fileName, createResp.Data.FileID, src.Size(), md5Hash, time.Now()), nil
+	}
+
+	// 秒传失败，需要重新下载并边下边传
+	// 注意：此时Reader已经被读完，需要重新打开源文件
+	fs.Infof(f, "⬆️ 秒传失败，第二遍：边下边传（服务器分块大小: %s）", fs.SizeSuffix(createResp.Data.SliceSize))
+
+	// 转换为fs.Object以便重新打开
+	srcObj, ok := src.(fs.Object)
+	if !ok {
+		return nil, fmt.Errorf("source is not a valid fs.Object")
+	}
+
 	return f.streamUploadWithSession(ctx, srcObj, createResp, fileName, md5Hash)
 }
 
@@ -5356,7 +5414,7 @@ func (f *Fs) streamUploadWithSession(ctx context.Context, srcObj fs.Object, crea
 	serverChunkSize := createResp.Data.SliceSize // 使用服务器指定的分片大小
 
 	// 检查是否需要分片上传（与流式哈希模式的阈值保持一致）
-	if fileSize <= 100*1024*1024 { // 100MB阈值，与smartStreamHashTransfer保持一致
+	if fileSize <= 10*1024*1024 { // 10MB阈值，与smartStreamHashTransfer保持一致
 		// 小文件：不应该走到这里，因为小文件应该直接使用 singleStepUpload
 		// 但如果走到这里，说明是从分片上传流程过来的，需要继续使用分片上传完成
 		fs.Infof(f, "📤 边下边传：小文件继续使用分片上传流程（已创建分片上传会话）")
@@ -5382,7 +5440,7 @@ func (f *Fs) streamUploadWithSession(ctx context.Context, srcObj fs.Object, crea
 		// 完成上传并获取真实文件ID
 		result, err := f.completeUploadWithResultAndSize(ctx, createResp.Data.PreuploadID, fileSize)
 		if err != nil {
-			return nil, fmt.Errorf("failed to complete single upload: %w", err)
+			return nil, fmt.Errorf("failed to complete upload: %w", err)
 		}
 
 		return f.createObject(fileName, result.FileID, fileSize, md5Hash, time.Now()), nil
