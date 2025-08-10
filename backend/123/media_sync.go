@@ -378,8 +378,17 @@ func (f *Fs) globalSyncDelete(ctx context.Context, sourcePath, targetPath string
 	}
 	rootDirName = strings.TrimSuffix(rootDirName, "/")
 
-	// 限制清理范围到当前同步任务的目录
-	syncedTargetPath := filepath.Join(targetPath, rootDirName)
+	// 🔧 修复路径重复问题：检查targetPath是否已经以rootDirName结尾
+	var syncedTargetPath string
+	if strings.HasSuffix(targetPath, rootDirName) {
+		// targetPath已经包含rootDirName，直接使用
+		syncedTargetPath = targetPath
+		fs.Debugf(f, "🎯 目标路径已包含根目录名，直接使用: %s", syncedTargetPath)
+	} else {
+		// targetPath不包含rootDirName，需要添加
+		syncedTargetPath = filepath.Join(targetPath, rootDirName)
+		fs.Debugf(f, "📁 添加根目录到目标路径: %s + %s = %s", targetPath, rootDirName, syncedTargetPath)
+	}
 
 	fs.Debugf(f, "🧹 开始限定范围的同步删除: %s (仅限: %s)", targetPath, syncedTargetPath)
 	fs.Logf(f, "🔒 安全边界：只清理当前同步目录 %s，不影响其他目录", syncedTargetPath)
