@@ -1722,11 +1722,20 @@ type Object struct {
 	pickCodeMu     sync.Mutex // 新增：保护pickCode获取的并发访问
 }
 
+// DownloadFileInfo represents the details of a single file in download URL response
+type DownloadFileInfo struct {
+	FileName string      `json:"file_name"` // Name of the file
+	FileSize int64       `json:"file_size"` // Size of the file in bytes
+	PickCode string      `json:"pick_code"` // File pick code (extraction code)
+	SHA1     string      `json:"sha1"`      // SHA1 hash of the file content
+	URL      DownloadURL `json:"url"`       // Object containing the download URL
+}
+
 type ApiResponse struct {
-	State   bool                `json:"state"`   // Indicates success or failure
-	Message string              `json:"message"` // Optional message
-	Code    int                 `json:"code"`    // Status code
-	Data    map[string]FileInfo `json:"data"`    // Map where keys are file IDs (strings) and values are FileInfo objects
+	State   bool                        `json:"state"`   // Indicates success or failure
+	Message string                      `json:"message"` // Optional message
+	Code    int                         `json:"code"`    // Status code
+	Data    map[string]DownloadFileInfo `json:"data"`    // Map where keys are file IDs (strings) and values are DownloadFileInfo objects
 }
 
 // retryErrorCodes is a slice of HTTP status codes that we will retry
@@ -9649,97 +9658,42 @@ func (f *Fs) getDownloadURLByPickCodeHTTP(ctx context.Context, pickCode string, 
 
 	fs.Debugf(f, "Using native HTTP method to get download URL: pick_code=%s, UA=%s", pickCode, userAgent)
 
-	// 解析响应结构
-	var response struct {
-		State   bool   `json:"state"`
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-		Data    map[string]struct {
-			URL struct {
-				URL string `json:"url"`
-			} `json:"url"`
-		} `json:"data"`
-	}
-
-	// 使用pacer包装请求，自动处理QPS限制和重试
-	var resp *http.Response
-	err := f.pacer.Call(func() (bool, error) {
-		var err error
-
-		// 获取当前token
-		f.tokenMu.Lock()
-		currentToken := f.accessToken
-		f.tokenMu.Unlock()
-
-		if currentToken == "" {
-			return false, fmt.Errorf("no valid access token available")
-		}
-
-		// 创建原生HTTP请求
-		requestBody := strings.NewReader("pick_code=" + pickCode)
-		req, reqErr := http.NewRequestWithContext(ctx, "POST", openAPIRootURL+"/open/ufile/downurl", requestBody)
-		if reqErr != nil {
-			return false, fmt.Errorf("创建HTTP请求失败: %w", reqErr)
-		}
-
-		// 设置请求头
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		req.Header.Set("User-Agent", userAgent)
-		req.Header.Set("Authorization", "Bearer "+currentToken)
-
-		// 使用原生HTTP客户端发送请求
-		httpClient := fshttp.NewClient(ctx)
-		resp, err = httpClient.Do(req)
-		if err != nil {
-			fs.Debugf(f, "HTTP请求失败: %v", err)
-			return fserrors.ShouldRetry(err), err
-		}
-
-		// 检查HTTP状态码
-		if resp.StatusCode == http.StatusUnauthorized {
-			fs.Debugf(f, "🔐 收到401错误，尝试刷新token")
-			resp.Body.Close()
-			// 尝试刷新token
-			if refreshErr := f.refreshTokenIfNecessary(ctx, false, true); refreshErr != nil {
-				fs.Errorf(f, "刷新token失败: %v", refreshErr)
-				return false, fmt.Errorf("身份验证失败: %w", refreshErr)
-			}
-			fs.Debugf(f, "✅ token已刷新，将重试API调用")
-			return true, nil // 重试
-		}
-
-		// 检查是否触发限流
-		if resp.StatusCode == http.StatusTooManyRequests {
-			fs.Debugf(f, "⏳ 触发API限流，等待重试")
-			resp.Body.Close()
-			return true, nil // 重试，pacer会自动增加延迟
-		}
-
-		// 其他HTTP错误
-		if resp.StatusCode >= 400 {
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			return false, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
-		}
-
-		return false, nil // 成功，不重试
-	})
-
+	// 创建原生HTTP客户端
+	client := &http.Client{}
+	req, err := http.NewRequest("POST", openAPIRootURL+"/open/ufile/downurl", strings.NewReader("pick_code="+pickCode))
 	if err != nil {
-		return "", fmt.Errorf("API调用失败: %w", err)
+		fs.Errorf(nil, "创建请求失败: %v", err)
+		return "", err
 	}
-	defer resp.Body.Close()
+
+	// 准备认证信息
+	opts := rest.Opts{}
+	f.prepareTokenForRequest(ctx, &opts)
+
+	// 设置请求头
+	req.Header.Set("Authorization", opts.ExtraHeaders["Authorization"])
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	fs.Infof(nil, "Authorization: %s, User-Agent: %s", opts.ExtraHeaders["Authorization"], userAgent)
+
+	// 发送请求并处理响应
+	res, err := client.Do(req)
+	if err != nil {
+		fs.Logf(nil, "请求失败: %v", err)
+		return "", err
+	}
+	defer res.Body.Close()
 
 	// 解析响应
-	if decodeErr := json.NewDecoder(resp.Body).Decode(&response); decodeErr != nil {
-		fs.Errorf(f, "解析响应失败: %v", decodeErr)
+	var response ApiResponse
+	if decodeErr := json.NewDecoder(res.Body).Decode(&response); decodeErr != nil {
+		fs.Logf(nil, "解析响应失败: %v", decodeErr)
 		return "", decodeErr
 	}
 
-	// 提取下载URL
 	for _, downInfo := range response.Data {
 		if downInfo.URL.URL != "" {
-			fs.Debugf(f, "✅ 成功获取下载URL: %s", downInfo.URL.URL)
+			fs.Infof(nil, "获取到下载URL: %s", downInfo.URL.URL)
 			return downInfo.URL.URL, nil
 		}
 	}
