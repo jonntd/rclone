@@ -30,6 +30,7 @@ import (
 	"github.com/rclone/rclone/lib/rest"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
@@ -247,10 +248,131 @@ func (prc *ProgressReadCloser) Close() error {
 	return prc.ReadCloser.Close()
 }
 
-// TwoStepProgressReader 已移除：使用rclone原生的accounting系统来处理进度报告
-// 内部两步传输的进度由主传输进度显示，不需要额外的进度跟踪
+// TwoStepProgressReader 跨云传输统一进度显示
+// 🔧 重新实现：解决跨云传输进度跳跃和不连续的问题
+type TwoStepProgressReader struct {
+	io.ReadCloser
+	fs             *Fs
+	remote         string
+	totalSize      int64
+	downloadBytes  int64
+	uploadBytes    int64
+	phase          string // "download" or "upload"
+	startTime      time.Time
+	lastLogTime    time.Time
+	lastLogPercent int
+	account        *accounting.Account
+}
 
-// TwoStepProgressReader 相关方法已移除：现在使用rclone原生的accounting系统
+// NewTwoStepProgressReader 创建跨云传输进度跟踪器
+func NewTwoStepProgressReader(rc io.ReadCloser, fs *Fs, remote string, size int64, account *accounting.Account) *TwoStepProgressReader {
+	return &TwoStepProgressReader{
+		ReadCloser: rc,
+		fs:         fs,
+		remote:     remote,
+		totalSize:  size,
+		phase:      "download",
+		startTime:  time.Now(),
+		account:    account,
+	}
+}
+
+// Read 实现io.Reader接口，统一处理跨云传输进度
+func (tpr *TwoStepProgressReader) Read(p []byte) (n int, err error) {
+	n, err = tpr.ReadCloser.Read(p)
+	if n > 0 {
+		if tpr.phase == "download" {
+			tpr.downloadBytes += int64(n)
+			tpr.updateProgress()
+		}
+	}
+	return n, err
+}
+
+// SwitchToUpload 切换到上传阶段
+func (tpr *TwoStepProgressReader) SwitchToUpload() {
+	tpr.phase = "upload"
+	tpr.uploadBytes = 0
+	fs.Infof(tpr.fs, "🔄 跨云传输切换到上传阶段: %s", tpr.remote)
+}
+
+// UpdateUploadProgress 更新上传进度
+func (tpr *TwoStepProgressReader) UpdateUploadProgress(uploaded int64) {
+	if tpr.phase == "upload" {
+		tpr.uploadBytes = uploaded
+		tpr.updateProgress()
+	}
+}
+
+// updateProgress 统一更新进度显示
+func (tpr *TwoStepProgressReader) updateProgress() {
+	var currentBytes, totalBytes int64
+	var phasePercent, totalPercent int
+	var emoji string
+
+	if tpr.phase == "download" {
+		currentBytes = tpr.downloadBytes
+		totalBytes = tpr.totalSize
+		phasePercent = int(float64(tpr.downloadBytes) / float64(tpr.totalSize) * 100)
+		totalPercent = phasePercent / 2 // 下载占总进度的50%
+		emoji = "📥"
+	} else {
+		currentBytes = tpr.uploadBytes
+		totalBytes = tpr.totalSize
+		phasePercent = int(float64(tpr.uploadBytes) / float64(tpr.totalSize) * 100)
+		totalPercent = 50 + phasePercent/2 // 上传占总进度的50%
+		emoji = "📤"
+	}
+
+	now := time.Now()
+	// 减少日志频率：只在进度变化超过5%或时间间隔超过3秒时输出日志
+	shouldLog := (totalPercent >= tpr.lastLogPercent+5) ||
+		(now.Sub(tpr.lastLogTime) > 3*time.Second) ||
+		(phasePercent == 100) ||
+		(totalPercent == 100)
+
+	if shouldLog {
+		elapsed := now.Sub(tpr.startTime)
+		var avgSpeed float64
+		if elapsed.Seconds() > 0 {
+			if tpr.phase == "download" {
+				avgSpeed = float64(tpr.downloadBytes) / elapsed.Seconds() / 1024 / 1024
+			} else {
+				totalTransferred := tpr.totalSize + tpr.uploadBytes
+				avgSpeed = float64(totalTransferred) / elapsed.Seconds() / 1024 / 1024
+			}
+		}
+
+		fs.Infof(tpr.fs, "%s 跨云传输 %s: %d%% | 总进度: %d%% | %s/%s | 速度: %.2f MB/s",
+			emoji, tpr.phase, phasePercent, totalPercent,
+			fs.SizeSuffix(currentBytes), fs.SizeSuffix(totalBytes), avgSpeed)
+
+		tpr.lastLogTime = now
+		tpr.lastLogPercent = totalPercent
+	}
+
+	// 更新rclone的accounting系统（虚拟进度）
+	if tpr.account != nil {
+		_ = tpr.downloadBytes + tpr.uploadBytes
+		// 不直接调用account.SetBytes，让rclone自然处理
+		// 这里只是记录，实际进度由上面的日志显示
+	}
+}
+
+// Close 关闭并输出最终统计
+func (tpr *TwoStepProgressReader) Close() error {
+	elapsed := time.Since(tpr.startTime)
+	totalTransferred := tpr.downloadBytes + tpr.uploadBytes
+	var avgSpeed float64
+	if elapsed.Seconds() > 0 {
+		avgSpeed = float64(totalTransferred) / elapsed.Seconds() / 1024 / 1024
+	}
+
+	fs.Infof(tpr.fs, "✅ 跨云传输完成: %s | 总耗时: %v | 平均速度: %.2f MB/s",
+		tpr.remote, elapsed.Truncate(time.Second), avgSpeed)
+
+	return tpr.ReadCloser.Close()
+}
 
 // Object 描述123网盘中的文件或文件夹对象
 type Object struct {
@@ -2553,23 +2675,29 @@ func (f *Fs) uploadLargeFileWithTempFile(ctx context.Context, in io.Reader, src 
 	fs.Debugf(f, "📁 大文件 (%s)，使用临时文件策略", fs.SizeSuffix(src.Size()))
 
 	// Create temp file with safe resource management
-	tempFile, err := os.CreateTemp("", "rclone-123pan-*")
+	tempFile, err := os.CreateTemp("", "rclone-123-upload-*.tmp")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp file: %w", err)
 	}
+	fs.Debugf(f, "💾 创建临时文件: %s | 原因: 大文件临时缓存 | 预计大小: %s", tempFile.Name(), fs.SizeSuffix(src.Size()))
 	defer func() {
 		// Safe resource cleanup
 		if tempFile != nil {
 			if closeErr := tempFile.Close(); closeErr != nil {
 				fs.Debugf(f, "⚠️ 关闭临时文件失败: %v", closeErr)
+			} else {
+				fs.Debugf(f, "📁 关闭临时文件成功: %s", tempFile.Name())
 			}
 			if removeErr := os.Remove(tempFile.Name()); removeErr != nil {
 				fs.Debugf(f, "⚠️ 删除临时文件失败: %v", removeErr)
+			} else {
+				fs.Debugf(f, "🧹 删除临时文件成功: %s", tempFile.Name())
 			}
 		}
 	}()
 
 	// Write to temp file while calculating MD5
+	fs.Debugf(f, "✍️ 开始写入临时文件: %s", tempFile.Name())
 	hasher := md5.New()
 	multiWriter := io.MultiWriter(tempFile, hasher)
 
@@ -2596,7 +2724,7 @@ func (f *Fs) uploadLargeFileWithTempFileForSingleStep(ctx context.Context, in io
 	fs.Debugf(f, "Large single-step file (%s), using temp file for single-step upload", fs.SizeSuffix(src.Size()))
 
 	// Create temp file with safe resource management
-	tempFile, err := os.CreateTemp("", "rclone-123pan-singlestep-*")
+	tempFile, err := os.CreateTemp("", "rclone-123-singlestep-*.tmp")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp file: %w", err)
 	}
@@ -2711,20 +2839,26 @@ func (f *Fs) internalTwoStepTransfer(ctx context.Context, in io.Reader, src fs.O
 	fs.Infof(f, "📥 步骤1: 正在下载...")
 
 	// 创建临时文件
-	tempFile, err := os.CreateTemp("", "rclone-123-transfer-*.tmp")
+	tempFile, err := os.CreateTemp("", "rclone-123-twostep-*.tmp")
 	if err != nil {
 		return nil, fmt.Errorf("创建临时文件失败: %w", err)
 	}
+	fs.Debugf(f, "💾 创建临时文件: %s | 原因: 两步传输Step1下载缓存 | 目标大小: %s", tempFile.Name(), fs.SizeSuffix(fileSize))
 	defer func() {
 		if tempFile != nil {
 			if closeErr := tempFile.Close(); closeErr != nil {
 				fs.Debugf(f, "⚠️ 关闭临时文件失败: %v", closeErr)
+			} else {
+				fs.Debugf(f, "📁 关闭临时文件成功: %s", tempFile.Name())
 			}
 			if removeErr := os.Remove(tempFile.Name()); removeErr != nil {
 				fs.Debugf(f, "⚠️ 删除临时文件失败: %v", removeErr)
+			} else {
+				fs.Debugf(f, "🧹 删除临时文件成功: %s", tempFile.Name())
 			}
 		}
 	}()
+	fs.Debugf(f, "✍️ 开始写入临时文件: %s", tempFile.Name())
 
 	// 获取源文件的Reader
 	var srcReader io.ReadCloser
@@ -3024,13 +3158,22 @@ func (f *Fs) uploadSingleChunkWithStream(ctx context.Context, srcObj fs.Object, 
 	defer func() { _ = chunkReader.Close() }()
 
 	// 创建临时文件用于此分片（只需要分片大小的存储）
-	tempFile, err := os.CreateTemp("", fmt.Sprintf("rclone-123pan-chunk-%d-*", partNumber))
+	tempFile, err := os.CreateTemp("", fmt.Sprintf("rclone-123-chunk-%d-*.tmp", partNumber))
 	if err != nil {
 		return fmt.Errorf("创建分片 %d 临时文件失败: %w", partNumber, err)
 	}
+	fs.Debugf(f, "💾 创建分片临时文件: %s | 分片: %d/%d | 大小: %s", tempFile.Name(), partNumber, totalChunks, fs.SizeSuffix(actualChunkSize))
 	defer func() {
-		_ = tempFile.Close()
-		_ = os.Remove(tempFile.Name())
+		if closeErr := tempFile.Close(); closeErr != nil {
+			fs.Debugf(f, "⚠️ 关闭分片临时文件失败: %v", closeErr)
+		} else {
+			fs.Debugf(f, "📁 关闭分片临时文件成功: %s", tempFile.Name())
+		}
+		if removeErr := os.Remove(tempFile.Name()); removeErr != nil {
+			fs.Debugf(f, "⚠️ 删除分片临时文件失败: %v", removeErr)
+		} else {
+			fs.Debugf(f, "🧹 删除分片临时文件成功: %s", tempFile.Name())
+		}
 	}()
 
 	// 创建分片MD5计算器
@@ -3040,10 +3183,12 @@ func (f *Fs) uploadSingleChunkWithStream(ctx context.Context, srcObj fs.Object, 
 	multiWriter := io.MultiWriter(tempFile, chunkHasher, overallHasher)
 
 	// 流式传输分片数据
+	fs.Debugf(f, "📤 开始流式传输分片 %d 到临时文件: %s", partNumber, tempFile.Name())
 	written, err := io.Copy(multiWriter, chunkReader)
 	if err != nil {
 		return fmt.Errorf("流式传输分片 %d 失败: %w", partNumber, err)
 	}
+	fs.Debugf(f, "✅ 分片 %d 写入临时文件完成: %s | 写入字节: %s", partNumber, tempFile.Name(), fs.SizeSuffix(written))
 
 	if written != actualChunkSize {
 		return fmt.Errorf("分片 %d 大小不匹配: 期望 %d, 实际 %d", partNumber, actualChunkSize, written)
@@ -3952,7 +4097,7 @@ func (o *Object) openWithCustomConcurrency(ctx context.Context, options ...fs.Op
 	fs.Debugf(o, "Starting custom concurrent download: %s", fs.SizeSuffix(o.size))
 
 	// 创建临时文件用于并发下载
-	tempFile, err := os.CreateTemp("", "123_custom_download_*.tmp")
+	tempFile, err := os.CreateTemp("", "rclone-123-download-*.tmp")
 	if err != nil {
 		fs.Debugf(o, "创建临时文件失败，回退到普通下载: %v", err)
 		return o.openNormal(ctx, options...)
@@ -5352,6 +5497,21 @@ func (f *Fs) streamHashTransferWithReader(ctx context.Context, in io.Reader, src
 
 	// 🔧 关键修复：使用传递的Reader（已被Transfer包装），进度会正确显示
 	srcReader := in
+
+	// 🔧 创建跨云传输统一进度跟踪器
+	var twoStepProgress *TwoStepProgressReader
+
+	// 检查是否为跨云传输（输入是ReadCloser）
+	if rc, ok := in.(io.ReadCloser); ok {
+		// 获取Account对象用于进度跟踪
+		_, account := accounting.UnWrapAccounting(in)
+		twoStepProgress = NewTwoStepProgressReader(rc, f, fileName, src.Size(), account)
+		srcReader = twoStepProgress
+		fs.Infof(f, "🌐 启用跨云传输统一进度显示: %s", fileName)
+		fs.Debugf(f, "🚀 流式哈希模式: 跳过临时文件创建，直接使用内存流式处理 | 文件: %s | 大小: %s", fileName, fs.SizeSuffix(src.Size()))
+	} else {
+		fs.Debugf(f, "🚀 流式哈希模式: 本地文件上传，跳过临时文件创建 | 文件: %s | 大小: %s", fileName, fs.SizeSuffix(src.Size()))
+	}
 
 	// 流式计算MD5，不保存数据
 	hasher := md5.New()
