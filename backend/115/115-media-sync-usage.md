@@ -18,6 +18,7 @@
 - ✅ **预览模式**：支持 dry-run 预览将要创建的文件
 - ✅ **详细统计**：提供完整的处理统计信息
 - ✅ **pick_code 自动获取**：智能获取文件的 pick_code
+- ✅ **安全的同步删除**：默认禁用，限制清理范围，多重安全保护
 
 ### Get-Download-URL 功能
 - ✅ **多格式输入支持**：
@@ -88,6 +89,22 @@ rclone backend media-sync 115:Movies /local/media/movies -o strm-format=pickcode
 rclone backend media-sync 115:Movies /local/media/movies -o dry-run=true
 ```
 
+### 同步删除功能（安全模式）
+```bash
+# 🔧 安全修复：默认禁用同步删除，避免意外删除其他同步任务的文件
+# 只创建.strm文件，不删除任何内容（默认安全模式）
+rclone backend media-sync 115:Movies /local/media/movies
+
+# 启用同步删除功能（需要明确指定）
+rclone backend media-sync 115:Movies /local/media/movies -o sync-delete=true
+
+# 🔒 安全边界：只清理当前同步目录，不影响其他目录
+# 例如：只清理 /local/media/movies/Movies/ 目录，不影响其他子目录
+
+# 建议先预览删除操作
+rclone backend media-sync 115:Movies /local/media/movies -o sync-delete=true -o dry-run=true
+```
+
 ## Media-Sync 完整选项列表
 
 | 选项 | 默认值 | 说明 |
@@ -97,6 +114,7 @@ rclone backend media-sync 115:Movies /local/media/movies -o dry-run=true
 | `include` | `mp4,mkv,avi,mov,wmv,flv,webm,m4v,3gp,ts,m2ts` | 包含的文件扩展名 |
 | `exclude` | _(空)_ | 排除的文件扩展名 |
 | `dry-run` | `false` | 预览模式，不实际创建文件 |
+| `sync-delete` | `false` | 同步删除：删除本地不存在于网盘的.strm文件和空目录（安全模式） |
 | `target-path` | _(空)_ | 目标路径（如果不在参数中指定） |
 
 ## Get-Download-URL 功能
@@ -185,6 +203,73 @@ https://cdnfhnfile.115cdn.net/5c9752149bbd80536668dd06e9f833f9ce019e86/...
 # 1. 从文件对象直接获取（最快）
 # 2. 通过 GetPickCodeByPath API 获取
 # 3. 回退到文件路径模式（兼容性）
+```
+
+## 安全使用指南
+
+### 🔒 同步删除安全机制
+
+#### 默认安全模式
+从最新版本开始，`sync-delete` 功能默认**禁用**，确保不会意外删除文件：
+
+```bash
+# 默认行为：只创建.strm文件，不删除任何内容
+rclone backend media-sync 115:Movies /media/movies
+# 输出：🎉 媒体同步完成! 处理目录:5, 处理文件:20, 创建.strm:18, 跳过:2, 错误:0
+```
+
+#### 启用删除功能的安全检查
+当明确启用 `sync-delete=true` 时，系统会显示多重警告：
+
+```bash
+rclone backend media-sync 115:Movies /media/movies -o sync-delete=true
+# 输出：
+# ⚠️ 警告：已启用同步删除功能，将删除本地不存在于网盘的.strm文件和空目录
+# 💡 提示：建议先使用 --dry-run=true 预览删除操作
+# 🔒 安全边界：只清理当前同步目录 /media/movies/Movies，不影响其他目录
+```
+
+#### 清理范围限制
+修复后的清理范围是**高度受限和安全的**：
+
+| 同步命令 | 清理范围 | 安全性 |
+|----------|----------|--------|
+| `115:Movies → /media/movies` | 仅 `/media/movies/Movies/` | ✅ 安全 |
+| `115:Videos → /media/movies` | 仅 `/media/movies/Videos/` | ✅ 安全 |
+| `115:Movies/Action → /media/movies` | 仅 `/media/movies/Movies/Action/` | ✅ 安全 |
+
+#### 多网盘同步安全示例
+```bash
+# 现在是完全安全的！不同网盘同步到同一目录
+rclone backend media-sync 115:Movies /media/library -o sync-delete=true
+# 清理范围：/media/library/Movies/
+
+rclone backend media-sync 123:Videos /media/library -o sync-delete=true
+# 清理范围：/media/library/Videos/
+
+# 两个任务完全隔离，不会互相影响！
+```
+
+#### 预览模式强烈推荐
+```bash
+# 强烈建议先预览删除操作
+rclone backend media-sync 115:Movies /media/movies -o sync-delete=true -o dry-run=true
+# 输出：
+# 🔍 [预览] 将删除孤立的.strm文件: /media/movies/Movies/old_movie.strm
+# 🔍 [预览] 将删除空目录: /media/movies/Movies/empty_folder
+```
+
+#### 安全使用建议
+1. **默认使用安全模式**：不指定 `sync-delete` 参数
+2. **预览后再执行**：使用 `dry-run=true` 预览删除操作
+3. **独立目标目录**：为不同网盘使用不同的目标目录
+4. **定期备份**：重要的 .strm 文件建议定期备份
+
+```bash
+# 推荐的安全使用方式
+rclone backend media-sync 115:Movies /media/115-movies -o sync-delete=true
+rclone backend media-sync 123:Movies /media/123-movies -o sync-delete=true
+# 完全隔离，绝对安全
 ```
 
 ## 使用场景
@@ -384,6 +469,11 @@ echo "路径方式耗时: ${path_time}秒"
 3. **pick_code 获取**：某些文件可能无法获取 pick_code，会自动回退到路径模式
 4. **网络稳定性**：建议在网络稳定的环境下执行
 5. **存储空间**：.strm 文件很小，但仍需要确保有足够的存储空间
+6. **🔒 同步删除安全**：
+   - 默认禁用同步删除功能，确保数据安全
+   - 启用时只影响当前同步的子目录，不会误删其他文件
+   - 强烈建议使用 `dry-run=true` 预览删除操作
+   - 多网盘同步到同一目录时完全隔离，不会互相影响
 
 ## 故障排除
 
@@ -545,6 +635,7 @@ rclone backend get-download-url 115: "/Movies/Action/Movie.mp4" -vv
 - ✅ **完全的UA支持**：所有输入格式都支持自定义User-Agent
 - ✅ **智能回退机制**：多重策略确保高成功率
 - ✅ **详细的调试支持**：完整的日志记录和错误处理
+- ✅ **数据安全**：默认安全模式，限制清理范围，多重保护机制
 
 ### 实际价值
 

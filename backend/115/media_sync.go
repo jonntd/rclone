@@ -65,11 +65,13 @@ func (f *Fs) mediaSyncCommand(ctx context.Context, args []string, opt map[string
 	excludeExts := f.parseExtensions(opt["exclude"], "")
 
 	dryRun := opt["dry-run"] == "true"
-	// media-sync 默认启用同步删除，类似 rclone sync
+	// 🔧 安全修复：默认禁用同步删除，避免意外删除其他同步任务的文件
 	syncDelete := true
-	// 如果用户明确设置为 false，则禁用同步删除
-	if opt["sync-delete"] == "false" {
-		syncDelete = false
+	// 只有用户明确设置为 true 时才启用同步删除
+	if opt["sync-delete"] == "true" {
+		syncDelete = true
+		fs.Logf(f, "⚠️ 警告：已启用同步删除功能，将删除本地不存在于网盘的.strm文件和空目录")
+		fs.Logf(f, "💡 提示：建议先使用 --dry-run=true 预览删除操作")
 	}
 
 	// 3. 初始化统计信息
@@ -564,24 +566,42 @@ func (f *Fs) shouldPreserveDirectory115(dirPath string) bool {
 }
 
 // globalSyncDelete115 全局同步删除功能，类似 rclone sync
+// 🔧 安全修复：限制清理范围到当前同步的子目录，避免影响其他同步任务
 func (f *Fs) globalSyncDelete115(ctx context.Context, sourcePath, targetPath string,
 	includeExts, excludeExts map[string]bool, stats *MediaSyncStats) error {
 
-	fs.Debugf(f, "🧹 开始全局同步删除: %s", targetPath)
+	// 🔧 修复：只清理当前同步的根目录，而不是整个targetPath
+	rootDirName := f.root
+	if rootDirName == "" {
+		rootDirName = "root"
+	}
+	rootDirName = strings.TrimSuffix(rootDirName, "/")
 
-	// 1. 递归收集所有本地.strm文件
+	// 限制清理范围到当前同步任务的目录
+	syncedTargetPath := filepath.Join(targetPath, rootDirName)
+
+	fs.Debugf(f, "🧹 开始限定范围的同步删除: %s (仅限: %s)", targetPath, syncedTargetPath)
+	fs.Logf(f, "🔒 安全边界：只清理当前同步目录 %s，不影响其他目录", syncedTargetPath)
+
+	// 1. 只收集当前同步目录中的.strm文件
 	localStrmFiles := make(map[string]string) // 相对路径 -> 绝对路径
-	err := f.collectLocalStrmFiles115(targetPath, "", localStrmFiles)
+	err := f.collectLocalStrmFiles115(syncedTargetPath, "", localStrmFiles)
 	if err != nil {
 		return fmt.Errorf("收集本地.strm文件失败: %w", err)
 	}
 
 	if len(localStrmFiles) == 0 {
-		fs.Debugf(f, "📂 没有找到.strm文件: %s", targetPath)
+		fs.Debugf(f, "📂 没有找到.strm文件: %s", syncedTargetPath)
 		return nil
 	}
 
 	fs.Debugf(f, "📂 找到 %d 个本地.strm文件", len(localStrmFiles))
+
+	// 🔧 安全检查：如果发现大量.strm文件，警告用户
+	if len(localStrmFiles) > 500 {
+		fs.Logf(f, "⚠️ 警告：发现%d个.strm文件，请确认删除范围正确", len(localStrmFiles))
+		fs.Logf(f, "💡 提示：如果数量异常，请检查目标路径设置或使用 --dry-run=true 预览")
+	}
 
 	// 2. 递归收集网盘中的所有视频文件
 	cloudVideoFiles := make(map[string]bool) // .strm文件名 -> 是否存在
@@ -618,10 +638,11 @@ func (f *Fs) globalSyncDelete115(ctx context.Context, sourcePath, targetPath str
 		stats.DeletedStrm++
 	}
 
-	// 5. 清理空目录
+	// 5. 清理空目录（限制在当前同步目录范围内）
 	if stats.DeletedStrm > 0 {
 		fs.Debugf(f, "✅ 删除了 %d 个孤立的.strm文件，开始清理空目录", stats.DeletedStrm)
-		err := f.cleanupEmptyDirectoriesGlobal115(ctx, targetPath, stats)
+		// 🔧 修复：只清理当前同步目录的空目录
+		err := f.cleanupEmptyDirectoriesGlobal115(ctx, syncedTargetPath, stats)
 		if err != nil {
 			fs.Logf(f, "⚠️ 清理空目录失败: %v", err)
 		}

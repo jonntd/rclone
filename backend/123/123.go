@@ -890,7 +890,7 @@ rclone backend media-sync 123:Videos /local/media/videos -o min-size=200M -o str
 		"include":     "包含的文件扩展名，逗号分隔 (默认: mp4,mkv,avi,mov,wmv,flv,webm,m4v,3gp,ts,m2ts)",
 		"exclude":     "排除的文件扩展名，逗号分隔",
 		"update-mode": "更新模式: full/incremental (默认: full)",
-		"sync-delete": "同步删除: false(仅创建.strm文件)/true(删除孤立文件和空目录) (默认: true，类似rclone sync)",
+		"sync-delete": "同步删除: false(仅创建.strm文件)/true(删除孤立文件和空目录) (默认: false，安全模式)",
 		"dry-run":     "预览模式，显示将要创建的文件但不实际创建 (true/false)",
 		"target-path": "目标路径，如果不在参数中指定则必须通过此选项提供",
 	},
