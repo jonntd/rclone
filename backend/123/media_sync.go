@@ -65,13 +65,15 @@ func (f *Fs) mediaSyncCommand(ctx context.Context, args []string, opt map[string
 	excludeExts := f.parseExtensions(opt["exclude"], "")
 
 	dryRun := opt["dry-run"] == "true"
-	// 🔧 安全修复：默认禁用同步删除，避免意外删除其他同步任务的文件
+	// 默认启用同步删除，类似 rclone sync 的行为
 	syncDelete := true
-	// 只有用户明确设置为 true 时才启用同步删除
-	if opt["sync-delete"] == "true" {
-		syncDelete = true
-		fs.Logf(f, "⚠️ 警告：已启用同步删除功能，将删除本地不存在于网盘的.strm文件和空目录")
-		fs.Logf(f, "💡 提示：建议先使用 --dry-run=true 预览删除操作")
+	// 用户可以通过 sync-delete=false 来禁用同步删除
+	if opt["sync-delete"] == "false" {
+		syncDelete = false
+		fs.Logf(f, "🔒 安全模式：同步删除已禁用，只会创建.strm文件，不会删除任何文件")
+	} else {
+		fs.Logf(f, "🧹 同步删除已启用，将删除本地不存在于网盘的.strm文件和空目录")
+		fs.Logf(f, "💡 提示：如需禁用删除功能，请添加 -o sync-delete=false 选项")
 	}
 
 	// 3. 初始化统计信息
@@ -84,27 +86,10 @@ func (f *Fs) mediaSyncCommand(ctx context.Context, args []string, opt map[string
 		sourcePath, targetPath, fs.SizeSuffix(minSize), strmFormat, dryRun, syncDelete)
 
 	// 4. 开始递归处理
-	// 🔧 修复：检查是否需要创建根目录层级
-	var fullTargetPath string
-
-	// 如果用户明确指定了目标路径包含源目录名，则直接使用
-	rootDirName := f.root
-	if rootDirName == "" {
-		rootDirName = "root"
-	}
-	rootDirName = strings.TrimSuffix(rootDirName, "/")
-
-	// 检查目标路径是否已经包含了源目录名
-	targetBaseName := filepath.Base(targetPath)
-	if targetBaseName == rootDirName {
-		// 目标路径已经包含源目录名，直接使用
-		fullTargetPath = targetPath
-		fs.Debugf(f, "🎯 目标路径已包含源目录名，直接使用: %s", fullTargetPath)
-	} else {
-		// 目标路径不包含源目录名，添加根目录层级
-		fullTargetPath = filepath.Join(targetPath, rootDirName)
-		fs.Debugf(f, "📁 添加根目录层级: %s -> %s", targetPath, fullTargetPath)
-	}
+	// 🔧 修复路径重复问题：直接使用用户指定的目标路径
+	// 用户已经在命令中明确指定了完整的目标路径，不需要再添加额外的目录层级
+	fullTargetPath := targetPath
+	fs.Debugf(f, "🎯 使用用户指定的目标路径: %s", fullTargetPath)
 
 	err = f.processDirectoryForMediaSync(ctx, sourcePath, fullTargetPath, minSize, strmFormat,
 		includeExts, excludeExts, stats)
@@ -448,7 +433,13 @@ func (f *Fs) globalSyncDelete(ctx context.Context, sourcePath, targetPath string
 		stats.DeletedStrm++
 	}
 
-	// 5. 清理空目录（限制在当前同步目录范围内）
+	// 5. 删除其他多余文件（非.strm文件）
+	err = f.cleanupExtraFiles(ctx, syncedTargetPath, cloudVideoFiles, stats)
+	if err != nil {
+		fs.Logf(f, "⚠️ 清理多余文件失败: %v", err)
+	}
+
+	// 6. 清理空目录（限制在当前同步目录范围内）
 	if stats.DeletedStrm > 0 {
 		fs.Debugf(f, "✅ 删除了 %d 个孤立的.strm文件，开始清理空目录", stats.DeletedStrm)
 		// 🔧 修复：只清理当前同步目录的空目录
@@ -635,4 +626,228 @@ func (f *Fs) collectAllDirectories(basePath string, dirs *[]string) error {
 	}
 
 	return nil
+}
+
+// cleanupExtraFiles 删除目标目录中不属于当前同步范围的所有文件
+func (f *Fs) cleanupExtraFiles(ctx context.Context, targetPath string, expectedStrmFiles map[string]bool, stats *MediaSyncStats) error {
+	fs.Debugf(f, "🧹 开始清理多余文件: %s", targetPath)
+
+	return f.cleanupExtraFilesRecursive(targetPath, "", expectedStrmFiles, stats)
+}
+
+// cleanupExtraFilesRecursive 递归清理多余文件
+func (f *Fs) cleanupExtraFilesRecursive(basePath, relativePath string, expectedStrmFiles map[string]bool, stats *MediaSyncStats) error {
+	currentPath := filepath.Join(basePath, relativePath)
+
+	entries, err := os.ReadDir(currentPath)
+	if err != nil {
+		return fmt.Errorf("读取目录失败 %s: %w", currentPath, err)
+	}
+
+	// 先收集当前目录中的所有.strm文件（有效的）
+	validStrmBasenames := make(map[string]bool)
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".strm") {
+			strmName := entry.Name()
+			if expectedStrmFiles[strmName] {
+				// 这是一个有效的.strm文件，提取基础名称
+				baseName := strings.TrimSuffix(strmName, ".strm")
+				validStrmBasenames[baseName] = true
+			}
+		}
+	}
+
+	for _, entry := range entries {
+		entryPath := filepath.Join(relativePath, entry.Name())
+		fullPath := filepath.Join(basePath, entryPath)
+
+		if entry.IsDir() {
+			// 递归处理子目录
+			err := f.cleanupExtraFilesRecursive(basePath, entryPath, expectedStrmFiles, stats)
+			if err != nil {
+				fs.Debugf(f, "⚠️ 处理子目录失败: %v", err)
+				// 继续处理其他目录
+			}
+		} else {
+			// 处理文件
+			fileName := entry.Name()
+
+			// 如果是.strm文件，跳过（已经在前面处理过了）
+			if strings.HasSuffix(fileName, ".strm") {
+				continue
+			}
+
+			// 非.strm文件，检查是否应该保留
+			if f.shouldKeepExtraFile(fileName, validStrmBasenames) {
+				fs.Debugf(f, "🔒 保留相关文件: %s", fullPath)
+				continue
+			}
+
+			// 删除多余文件
+			if stats.DryRun {
+				fs.Infof(f, "🔍 [预览] 将删除多余文件: %s", fullPath)
+			} else {
+				fs.Infof(f, "🗑️ 删除多余文件: %s", fullPath)
+				if err := os.Remove(fullPath); err != nil {
+					errMsg := fmt.Sprintf("删除多余文件失败 %s: %v", fullPath, err)
+					stats.ErrorMessages = append(stats.ErrorMessages, errMsg)
+					stats.Errors++
+					fs.Logf(f, "❌ %s", errMsg)
+					continue
+				}
+			}
+			stats.DeletedStrm++ // 复用这个计数器
+		}
+	}
+
+	return nil
+}
+
+// shouldKeepExtraFile 判断是否应该保留额外的文件
+func (f *Fs) shouldKeepExtraFile(fileName string, validStrmBasenames map[string]bool) bool {
+	ext := strings.ToLower(filepath.Ext(fileName))
+	lowerName := strings.ToLower(fileName)
+
+	// 1. 智能检查是否与当前目录中的有效视频文件相关
+	if f.isRelatedToValidVideo(fileName, validStrmBasenames) {
+		return true
+	}
+
+	// 2. 检查是否是目录级别的通用文件（不与特定视频相关）
+	generalFiles := []string{
+		"readme", "license", "changelog", "version",
+		"index", "description", "info",
+	}
+
+	for _, generalFile := range generalFiles {
+		if strings.Contains(lowerName, generalFile) {
+			return true
+		}
+	}
+
+	// 3. 检查是否是目录级别的媒体文件（如目录海报）
+	if strings.Contains(lowerName, "poster") ||
+		strings.Contains(lowerName, "fanart") ||
+		strings.Contains(lowerName, "banner") ||
+		strings.Contains(lowerName, "folder") {
+		mediaExtensions := map[string]bool{
+			".jpg": true, ".jpeg": true, ".png": true, ".webp": true,
+		}
+		if mediaExtensions[ext] {
+			return true
+		}
+	}
+
+	// 其他文件不保留
+	return false
+}
+
+// isRelatedToValidVideo 智能检查文件是否与有效视频相关
+func (f *Fs) isRelatedToValidVideo(fileName string, validStrmBasenames map[string]bool) bool {
+	baseName := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+	ext := strings.ToLower(filepath.Ext(fileName))
+
+	// 定义相关文件的扩展名
+	relatedExtensions := map[string]bool{
+		".nfo":  true, // 媒体信息文件
+		".jpg":  true, // 海报图片
+		".jpeg": true,
+		".png":  true,
+		".webp": true,
+		".srt":  true, // 字幕文件
+		".ass":  true,
+		".ssa":  true,
+		".vtt":  true,
+		".sub":  true,
+		".idx":  true,
+	}
+
+	// 如果不是相关扩展名，直接返回false
+	if !relatedExtensions[ext] {
+		return false
+	}
+
+	// 策略1：完全匹配（传统方式）
+	// 例如：电影.nfo 对应 电影.strm
+	if validStrmBasenames[baseName] {
+		return true
+	}
+
+	// 策略2：后缀匹配（处理 基础名-类型.扩展名 的情况）
+	// 例如：电影-poster.jpg 对应 电影.strm
+	mediaSuffixes := []string{
+		"-poster", "-fanart", "-banner", "-thumb", "-clearlogo",
+		"-landscape", "-disc", "-logo", "-clearart", "-backdrop",
+	}
+
+	for suffix := range mediaSuffixes {
+		if strings.HasSuffix(baseName, mediaSuffixes[suffix]) {
+			// 去掉后缀，检查是否有对应的视频
+			videoBaseName := strings.TrimSuffix(baseName, mediaSuffixes[suffix])
+			if validStrmBasenames[videoBaseName] {
+				return true
+			}
+		}
+	}
+
+	// 策略3：前缀匹配（处理长文件名的情况）
+	// 例如：很长的电影名.2002.1080p.BluRay-poster.jpg 对应 很长的电影名.2002.1080p.BluRay.strm
+	for validBaseName := range validStrmBasenames {
+		// 检查当前文件是否以某个有效视频的基础名开头
+		if strings.HasPrefix(baseName, validBaseName) {
+			// 检查剩余部分是否是媒体后缀
+			remaining := strings.TrimPrefix(baseName, validBaseName)
+			for _, suffix := range mediaSuffixes {
+				if remaining == suffix {
+					return true
+				}
+			}
+		}
+	}
+
+	// 策略4：模糊匹配（处理文件名中有细微差异的情况）
+	// 例如：无间道.Infernal Affairs.2002 vs 无间道Infernal Affairs.2002
+	for validBaseName := range validStrmBasenames {
+		if f.isSimilarBaseName(baseName, validBaseName, mediaSuffixes) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isSimilarBaseName 检查两个基础名是否相似（处理细微差异）
+func (f *Fs) isSimilarBaseName(fileName, validBaseName string, mediaSuffixes []string) bool {
+	// 先检查是否有媒体后缀
+	actualBaseName := fileName
+	for _, suffix := range mediaSuffixes {
+		if strings.HasSuffix(fileName, suffix) {
+			actualBaseName = strings.TrimSuffix(fileName, suffix)
+			break
+		}
+	}
+
+	// 标准化比较（去掉空格、点号等差异）
+	normalize := func(s string) string {
+		s = strings.ReplaceAll(s, " ", "")
+		s = strings.ReplaceAll(s, ".", "")
+		s = strings.ReplaceAll(s, "-", "")
+		s = strings.ReplaceAll(s, "_", "")
+		return strings.ToLower(s)
+	}
+
+	normalizedActual := normalize(actualBaseName)
+	normalizedValid := normalize(validBaseName)
+
+	// 检查标准化后是否相同
+	if normalizedActual == normalizedValid {
+		return true
+	}
+
+	// 检查是否一个是另一个的前缀（处理版本差异）
+	if len(normalizedActual) > len(normalizedValid) {
+		return strings.HasPrefix(normalizedActual, normalizedValid)
+	} else {
+		return strings.HasPrefix(normalizedValid, normalizedActual)
+	}
 }
