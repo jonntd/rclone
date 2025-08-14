@@ -257,8 +257,13 @@ func (b *OpenAPIBase) Err() error {
 	if code == 0 && (string(b.Message) == "770004" ||
 		strings.Contains(b.ErrMsg(), "770004") ||
 		strings.Contains(b.ErrMsg(), "已达到当前访问上限")) {
-		// This is a rate limit error
-		return fmt.Errorf("%s: rate limit exceeded", out)
+		// This is a rate limit error - return as retryable error
+		return fserrors.NewErrorRetryAfter(5 * time.Second)
+	}
+
+	// Also check for direct error code 770004
+	if code == 770004 {
+		return fserrors.NewErrorRetryAfter(5 * time.Second)
 	}
 
 	switch code {
@@ -1258,7 +1263,7 @@ const (
 	defaultUserAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
 
 	// 🚦 115网盘统一QPS控制：全局账户级别限制，避免770004错误
-	unifiedMinSleep = fs.Duration(100 * time.Millisecond) // 🔧 性能优化：~10 QPS - 提升上传速度
+	unifiedMinSleep = fs.Duration(200 * time.Millisecond) // 🔧 平衡优化：~5 QPS - 平衡性能与稳定性
 
 	maxSleep      = 2 * time.Second
 	decayConstant = 2 // bigger for slower decay, exponential
@@ -2933,7 +2938,7 @@ func initializeOptions115(name, root string, m configmap.Mapper) (*Options, stri
 
 	// 设置API限流控制的默认值
 	if opt.QPSLimit == 0 {
-		opt.QPSLimit = unifiedMinSleep // 默认使用300ms间隔 (约3.3 QPS)
+		opt.QPSLimit = unifiedMinSleep // 默认使用200ms间隔 (约5 QPS)
 	}
 
 	// 其他增强功能已设置为合理的默认值，无需用户配置

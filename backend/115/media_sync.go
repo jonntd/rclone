@@ -8,8 +8,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/fserrors"
 )
 
 // MediaSyncStats 媒体同步统计信息
@@ -201,13 +203,61 @@ func (f *Fs) processDirectoryForMediaSync(ctx context.Context, sourcePath, targe
 		fs.Infof(f, "🔍 [预览] 将创建目录: %s", targetPath)
 	}
 
-	// 2. 列出源目录内容
-	entries, err := f.List(ctx, sourcePath)
-	if err != nil {
-		errMsg := fmt.Sprintf("列出目录失败 %s: %v", sourcePath, err)
-		stats.ErrorMessages = append(stats.ErrorMessages, errMsg)
-		stats.Errors++
-		return errors.New(errMsg)
+	// 2. 列出源目录内容，支持重试机制
+	var entries []fs.DirEntry
+	var err error
+
+	// 对于 API 限流错误，进行重试
+	maxRetries := 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		entries, err = f.List(ctx, sourcePath)
+		if err == nil {
+			break // 成功，跳出重试循环
+		}
+
+		// 检查是否为可重试错误
+		if fserrors.IsRetryError(err) {
+			if attempt < maxRetries-1 { // 还有重试机会
+				fs.Logf(f, "⚠️ API限流错误，等待重试 (%d/%d): %s: %v", attempt+1, maxRetries, sourcePath, err)
+
+				// 从错误中提取重试延迟时间
+				if retryAfterErr, ok := err.(*fserrors.ErrorRetryAfter); ok {
+					retryAfterTime := retryAfterErr.RetryAfter()
+					waitDuration := time.Until(retryAfterTime)
+					if waitDuration > 0 {
+						fs.Debugf(f, "🔄 等待 %v 后重试", waitDuration)
+						select {
+						case <-time.After(waitDuration):
+							// 继续重试
+						case <-ctx.Done():
+							return ctx.Err()
+						}
+					}
+				} else {
+					// 默认等待 5 秒
+					fs.Debugf(f, "🔄 等待 5s 后重试")
+					select {
+					case <-time.After(5 * time.Second):
+						// 继续重试
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				}
+			} else {
+				// 重试次数用完，记录错误但继续处理其他目录
+				errMsg := fmt.Sprintf("列出目录失败 %s: %v", sourcePath, err)
+				stats.ErrorMessages = append(stats.ErrorMessages, errMsg)
+				stats.Errors++
+				fs.Logf(f, "⚠️ %s (重试%d次后仍失败，跳过此目录继续同步)", errMsg, maxRetries)
+				return nil
+			}
+		} else {
+			// 非重试错误，直接返回
+			errMsg := fmt.Sprintf("列出目录失败 %s: %v", sourcePath, err)
+			stats.ErrorMessages = append(stats.ErrorMessages, errMsg)
+			stats.Errors++
+			return errors.New(errMsg)
+		}
 	}
 
 	// 3. 处理每个条目
@@ -573,17 +623,10 @@ func (f *Fs) globalSyncDelete115(ctx context.Context, sourcePath, targetPath str
 	}
 	rootDirName = strings.TrimSuffix(rootDirName, "/")
 
-	// 🔧 修复路径重复问题：检查targetPath是否已经以rootDirName结尾
-	var syncedTargetPath string
-	if strings.HasSuffix(targetPath, rootDirName) {
-		// targetPath已经包含rootDirName，直接使用
-		syncedTargetPath = targetPath
-		fs.Debugf(f, "🎯 目标路径已包含根目录名，直接使用: %s", syncedTargetPath)
-	} else {
-		// targetPath不包含rootDirName，需要添加
-		syncedTargetPath = filepath.Join(targetPath, rootDirName)
-		fs.Debugf(f, "📁 添加根目录到目标路径: %s + %s = %s", targetPath, rootDirName, syncedTargetPath)
-	}
+	// 🔧 修复路径重复问题：直接使用用户指定的目标路径，不再自动添加根目录名
+	// 用户在命令中已经明确指定了完整的目标路径，应该尊重用户的选择
+	syncedTargetPath := targetPath
+	fs.Debugf(f, "🎯 使用用户指定的目标路径进行同步删除: %s", syncedTargetPath)
 
 	fs.Debugf(f, "🧹 开始限定范围的同步删除: %s (仅限: %s)", targetPath, syncedTargetPath)
 	fs.Logf(f, "🔒 安全边界：只清理当前同步目录 %s，不影响其他目录", syncedTargetPath)
