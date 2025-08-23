@@ -23,7 +23,7 @@ import (
 // DefaultConfig returns the default configuration
 func DefaultConfig() *Config {
 	return &Config{
-		VideoExtensions: []string{".iso", "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "3gp", "ts", "m2ts"},
+		VideoExtensions: []string{"iso", "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "3gp", "ts", "m2ts"},
 		MinFileSize:     200 * 1024 * 1024, // 100MB
 		URLFormat:       "auto",
 		CacheTimeout:    fs.Duration(30 * time.Minute),
