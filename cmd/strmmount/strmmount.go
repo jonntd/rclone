@@ -23,11 +23,20 @@ import (
 // DefaultConfig returns the default configuration
 func DefaultConfig() *Config {
 	return &Config{
-		VideoExtensions: []string{"mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "3gp", "ts", "m2ts"},
+		VideoExtensions: []string{".iso", "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "3gp", "ts", "m2ts"},
 		MinFileSize:     100 * 1024 * 1024, // 100MB
 		URLFormat:       "auto",
 		CacheTimeout:    fs.Duration(30 * time.Minute),
 		MaxCacheSize:    10000,
+
+		// 持久化缓存默认配置
+		PersistentCache:   true,                         // 默认启用
+		CacheDir:          "",                           // 使用默认缓存目录
+		CacheTTL:          fs.Duration(5 * time.Minute), // 5分钟过期
+		MaxPersistentSize: 100 * 1024 * 1024,            // 100MB
+		SyncInterval:      fs.Duration(1 * time.Minute), // 1分钟同步间隔
+		EnableCompression: true,                         // 启用压缩
+		BackgroundSync:    true,                         // 启用后台同步
 	}
 }
 
@@ -79,6 +88,22 @@ func addSTRMFlags(flagSet *pflag.FlagSet) {
 		"Cache timeout for file metadata", "")
 	flags.IntVarP(flagSet, &strmConfig.MaxCacheSize, "max-cache-size", "", strmConfig.MaxCacheSize,
 		"Maximum cache entries", "")
+
+	// 持久化缓存参数
+	flags.BoolVarP(flagSet, &strmConfig.PersistentCache, "persistent-cache", "", strmConfig.PersistentCache,
+		"Enable persistent cache for faster startup", "")
+	flags.StringVarP(flagSet, &strmConfig.CacheDir, "cache-dir", "", strmConfig.CacheDir,
+		"Custom cache directory path", "")
+	flags.FVarP(flagSet, &strmConfig.CacheTTL, "cache-ttl", "",
+		"Cache time-to-live (e.g. 5m, 1h)", "")
+	flags.FVarP(flagSet, &strmConfig.MaxPersistentSize, "max-persistent-size", "",
+		"Maximum persistent cache size", "")
+	flags.FVarP(flagSet, &strmConfig.SyncInterval, "sync-interval", "",
+		"Background sync interval", "")
+	flags.BoolVarP(flagSet, &strmConfig.EnableCompression, "enable-compression", "", strmConfig.EnableCompression,
+		"Enable cache compression", "")
+	flags.BoolVarP(flagSet, &strmConfig.BackgroundSync, "background-sync", "", strmConfig.BackgroundSync,
+		"Enable background sync", "")
 }
 
 // mount implements the strm-mount functionality

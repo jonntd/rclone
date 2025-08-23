@@ -29,6 +29,15 @@ type Config struct {
 	URLFormat       string
 	CacheTimeout    fs.Duration
 	MaxCacheSize    int
+
+	// 持久化缓存配置
+	PersistentCache   bool          // 是否启用持久化缓存
+	CacheDir          string        // 缓存目录
+	CacheTTL          fs.Duration   // 缓存过期时间
+	MaxPersistentSize fs.SizeSuffix // 最大持久化缓存大小
+	SyncInterval      fs.Duration   // 同步间隔
+	EnableCompression bool          // 是否启用压缩
+	BackgroundSync    bool          // 是否启用后台同步
 }
 
 const fhUnset = ^uint64(0)
@@ -48,11 +57,16 @@ type STRMFS struct {
 	strmCache      map[string]string // path -> strm content
 	strmCacheMu    sync.RWMutex
 	lastCacheClean time.Time
+
+	// 持久化缓存
+	persistentCache *STRMPersistentCache
+	cacheData       *CacheData
+	cacheMu         sync.RWMutex
 }
 
 // NewSTRMFS creates a new STRM filesystem
 func NewSTRMFS(VFS *vfs.VFS, opt *mountlib.Options, config *Config) *STRMFS {
-	return &STRMFS{
+	fsys := &STRMFS{
 		VFS:       VFS,
 		f:         VFS.Fs(),
 		opt:       opt,
@@ -60,6 +74,129 @@ func NewSTRMFS(VFS *vfs.VFS, opt *mountlib.Options, config *Config) *STRMFS {
 		ready:     make(chan struct{}),
 		strmCache: make(map[string]string),
 	}
+
+	// 初始化持久化缓存
+	fsys.initPersistentCache()
+
+	return fsys
+}
+
+// initPersistentCache 初始化持久化缓存
+func (fsys *STRMFS) initPersistentCache() {
+	// 获取后端类型
+	backend := fsys.getBackendType()
+	if backend == "" {
+		fs.Debugf(nil, "⚠️ [CACHE] 未知后端类型，禁用持久化缓存")
+		return
+	}
+
+	// 获取远程路径
+	remotePath := fsys.f.Root()
+
+	// 创建持久化缓存实例
+	persistentCache, err := NewSTRMPersistentCache(
+		backend,
+		remotePath,
+		int64(fsys.config.MinFileSize),
+		fsys.config.VideoExtensions,
+		fsys.config.URLFormat,
+	)
+	if err != nil {
+		fs.Logf(nil, "⚠️ [CACHE] 持久化缓存初始化失败: %v", err)
+		return
+	}
+
+	fsys.persistentCache = persistentCache
+
+	// 异步加载缓存数据
+	go fsys.loadCacheData()
+}
+
+// getBackendType 获取后端类型
+func (fsys *STRMFS) getBackendType() string {
+	fsType := fsys.f.Name()
+	switch fsType {
+	case "123":
+		return "123"
+	case "115":
+		return "115"
+	default:
+		return ""
+	}
+}
+
+// loadCacheData 加载缓存数据
+func (fsys *STRMFS) loadCacheData() {
+	if fsys.persistentCache == nil {
+		return
+	}
+
+	ctx := context.Background()
+	cacheData, err := fsys.persistentCache.LoadOrCreate(ctx, fsys.f)
+	if err != nil {
+		fs.Logf(nil, "⚠️ [CACHE] 加载缓存数据失败: %v", err)
+		return
+	}
+
+	fsys.cacheMu.Lock()
+	fsys.cacheData = cacheData
+	fsys.cacheMu.Unlock()
+
+	fs.Infof(nil, "✅ [CACHE] 持久化缓存已加载: %d 个文件", cacheData.FileCount)
+}
+
+// getCachedFileInfo 从持久化缓存中获取文件信息
+func (fsys *STRMFS) getCachedFileInfo(filePath string) *CachedFile {
+	fsys.cacheMu.RLock()
+	defer fsys.cacheMu.RUnlock()
+
+	if fsys.cacheData == nil {
+		return nil
+	}
+
+	// 分离目录和文件名
+	dirPath := filepath.Dir(filePath)
+	fileName := filepath.Base(filePath)
+
+	if dirPath == "." {
+		dirPath = ""
+	}
+
+	// 在缓存中查找
+	for _, dir := range fsys.cacheData.Directories {
+		if dir.Path == dirPath {
+			for _, file := range dir.Files {
+				if file.Name == fileName {
+					return &file
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// generateSTRMContentFromCache 从缓存生成 STRM 内容
+func (fsys *STRMFS) generateSTRMContentFromCache(filePath string) string {
+	cachedFile := fsys.getCachedFileInfo(filePath)
+	if cachedFile == nil {
+		return ""
+	}
+
+	// 根据后端类型生成内容
+	backend := fsys.getBackendType()
+	switch backend {
+	case "123":
+		if cachedFile.FileID != "" {
+			return fmt.Sprintf("123://%s", cachedFile.FileID)
+		}
+	case "115":
+		if cachedFile.PickCode != "" {
+			return fmt.Sprintf("115://%s", cachedFile.PickCode)
+		}
+	}
+
+	return ""
 }
 
 // Init initializes the filesystem
@@ -333,6 +470,13 @@ func (fsys *STRMFS) Open(filePath string, flags int) (int, uint64) {
 		return fsys.openSTRMFile(filePath, flags)
 	}
 
+	// 🔒 SECURITY: Block direct access to original video files
+	// Users should only access video content through .strm files
+	if fsys.shouldBlockDirectAccess(filePath) {
+		fs.Debugf(nil, "🚫 [SECURITY] Blocked direct access to video file: %s", filePath)
+		return -fuse.ENOENT, fhUnset
+	}
+
 	// Handle regular files through VFS
 	handle, err := fsys.VFS.OpenFile(filePath, flags, 0777)
 	if err != nil {
@@ -513,6 +657,13 @@ func (fsys *STRMFS) Read(path string, buf []byte, ofst int64, fh uint64) int {
 		}
 
 		return n
+	}
+
+	// 🔒 SECURITY: Block direct read access to original video files
+	// This prevents accidental large downloads when users try to access video files directly
+	if fsys.shouldBlockDirectAccess(path) {
+		fs.Debugf(nil, "🚫 [SECURITY] Blocked direct read access to video file: %s", path)
+		return -fuse.ENOENT
 	}
 
 	// Handle regular files through VFS
@@ -765,14 +916,25 @@ func (fsys *STRMFS) strmToOriginalPath(strmPath string) string {
 func (fsys *STRMFS) getSTRMContent(originalPath string, node os.FileInfo) string {
 	startTime := time.Now()
 
-	// Check cache first
+	// 1. 检查内存缓存
 	fsys.strmCacheMu.RLock()
 	if content, found := fsys.strmCache[originalPath]; found {
 		fsys.strmCacheMu.RUnlock()
-		fs.Debugf(nil, "💾 [CACHE] Hit for %s (%dB, %v)", originalPath, len(content), time.Since(startTime))
+		fs.Debugf(nil, "💾 [MEMORY-CACHE] Hit for %s (%dB, %v)", originalPath, len(content), time.Since(startTime))
 		return content
 	}
 	fsys.strmCacheMu.RUnlock()
+
+	// 2. 尝试从持久化缓存获取
+	if content := fsys.generateSTRMContentFromCache(originalPath); content != "" {
+		// 存储到内存缓存
+		fsys.strmCacheMu.Lock()
+		fsys.strmCache[originalPath] = content
+		fsys.strmCacheMu.Unlock()
+
+		fs.Debugf(nil, "💾 [PERSISTENT-CACHE] Hit for %s (%dB, %v)", originalPath, len(content), time.Since(startTime))
+		return content
+	}
 
 	fs.Debugf(nil, "💾 [CACHE] Miss for %s, generating content...", originalPath)
 
@@ -959,6 +1121,32 @@ func isVideoFile(name string, size int64, config *Config) bool {
 	return false
 }
 
+// shouldBlockDirectAccess checks if direct access to a file should be blocked
+// This prevents users from directly accessing original video files, forcing them
+// to use .strm files instead, which prevents accidental large downloads
+func (fsys *STRMFS) shouldBlockDirectAccess(filePath string) bool {
+	// Check if file exists
+	node, err := fsys.VFS.Stat(filePath)
+	if err != nil {
+		return false // If file doesn't exist, let VFS handle the error
+	}
+
+	// If it's a directory, allow access
+	if node.IsDir() {
+		return false
+	}
+
+	// If it's a video file that should be virtualized, block direct access
+	if isVideoFile(node.Name(), node.Size(), fsys.config) {
+		fs.Debugf(nil, "🔒 [BLOCK] Video file should be accessed via .strm: %s (size: %s)",
+			filePath, fs.SizeSuffix(node.Size()))
+		return true
+	}
+
+	// Allow access to non-video files
+	return false
+}
+
 // shouldShowNonVideoFile determines if a non-video file should be shown in STRM mount
 func (fsys *STRMFS) shouldShowNonVideoFile(name string) bool {
 	ext := strings.ToLower(filepath.Ext(name))
@@ -970,7 +1158,7 @@ func (fsys *STRMFS) shouldShowNonVideoFile(name string) bool {
 		".txt", ".nfo", ".md", ".log", // 文本文件
 		".jpg", ".jpeg", ".png", ".gif", ".bmp", // 图片文件
 		".exe", ".msi", ".dmg", ".pkg", // 可执行文件
-		".iso", ".img", ".bin", // 镜像文件
+		".img", ".bin", // 镜像文件
 		".pdf", ".doc", ".docx", ".xls", // 文档文件
 		".tmp", ".temp", ".cache", // 临时文件
 		".ds_store", ".thumbs.db", // 系统文件
