@@ -510,8 +510,12 @@ func (fsys *STRMFS) Readdir(dirPath string,
 					fs.Debugf(nil, "🎬 [STRM] %s → %s (cached)", node.Name(), strmName)
 				}
 			} else {
-				// Regular file - check if we should show it
-				if fsys.shouldShowNonVideoFile(node.Name()) {
+				// Regular file - check if we should hide it completely
+				if shouldHideFile(node.Name(), node.Size(), fsys.config) {
+					// 文件太小，完全隐藏
+					fs.Debugf(nil, "🙈 [HIDE] 文件太小，完全隐藏: %s (%s)", node.Name(), fs.SizeSuffix(node.Size()))
+				} else if fsys.shouldShowNonVideoFile(node.Name()) {
+					// 文件足够大但不是视频，显示原文件
 					fillStat(node, &stat)
 					fill(node.Name(), &stat, 0)
 					fs.Debugf(nil, "📄 [FILE] %s (%s)", node.Name(), fs.SizeSuffix(node.Size()))
@@ -1169,8 +1173,10 @@ func translateError(err error) int {
 
 // isVideoFile checks if a file is a video file based on extension and size
 func isVideoFile(name string, size int64, config *Config) bool {
-	// Check size first
+	// 统一大小检查：小于配置大小的文件不创建STRM
 	if size < int64(config.MinFileSize) {
+		fs.Debugf(nil, "🚫 [SIZE-LIMIT] 文件小于配置限制: %s (大小: %s < %s)",
+			name, fs.SizeSuffix(size), fs.SizeSuffix(int64(config.MinFileSize)))
 		return false
 	}
 
@@ -1178,10 +1184,24 @@ func isVideoFile(name string, size int64, config *Config) bool {
 	ext := strings.ToLower(filepath.Ext(name))
 	for _, videoExt := range config.VideoExtensions {
 		if ext == "."+strings.ToLower(videoExt) {
+			fs.Debugf(nil, "✅ [VIDEO-FILE] 符合STRM条件: %s (大小: %s, 格式: %s)",
+				name, fs.SizeSuffix(size), ext)
 			return true
 		}
 	}
 
+	fs.Debugf(nil, "🚫 [EXT-LIMIT] 不支持的文件格式: %s (格式: %s)", name, ext)
+	return false
+}
+
+// shouldHideFile checks if a file should be completely hidden (not shown at all)
+func shouldHideFile(name string, size int64, config *Config) bool {
+	// 小于配置大小的文件完全隐藏
+	if size < int64(config.MinFileSize) {
+		fs.Debugf(nil, "🙈 [HIDE-FILE] 文件太小，完全隐藏: %s (大小: %s < %s)",
+			name, fs.SizeSuffix(size), fs.SizeSuffix(int64(config.MinFileSize)))
+		return true
+	}
 	return false
 }
 
