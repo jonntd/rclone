@@ -1,0 +1,217 @@
+// Package strmmount implements a FUSE mounting system for rclone remotes
+// that virtualizes video files as .strm files for media servers.
+
+//go:build cmount
+
+// Package strmmount implements a FUSE mounting system for rclone remotes
+// that virtualizes video files as .strm files for media servers.
+package strmmount
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/rclone/rclone/cmd/mountlib"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config/flags"
+	"github.com/rclone/rclone/lib/buildinfo"
+	"github.com/rclone/rclone/vfs"
+	"github.com/spf13/pflag"
+	"github.com/winfsp/cgofuse/fuse"
+)
+
+// DefaultConfig returns the default configuration
+func DefaultConfig() *Config {
+	return &Config{
+		VideoExtensions: []string{"mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "3gp", "ts", "m2ts"},
+		MinFileSize:     100 * 1024 * 1024, // 100MB
+		URLFormat:       "auto",
+		CacheTimeout:    fs.Duration(30 * time.Minute),
+		MaxCacheSize:    10000,
+	}
+}
+
+// Global configuration
+var strmConfig = DefaultConfig()
+
+func init() {
+	// Register the command
+	cmd := mountlib.NewMountCommand("strm-mount", false, mount)
+	cmd.Short = "Mount cloud storage with video files as .strm files"
+	cmd.Long = `
+Mount cloud storage with video files virtualized as .strm files.
+
+This command mounts a cloud storage remote and presents video files as
+.strm files containing cloud protocol URLs (123://fileId or 115://pickCode).
+This is useful for media servers like Jellyfin, Emby, or Plex.
+
+Video files larger than --min-size will be virtualized as .strm files,
+while other files remain accessible normally.
+
+Supported cloud storage backends:
+- 123 网盘: Creates 123://fileId URLs
+- 115 网盘: Creates 115://pickCode URLs  
+- Other backends: Uses file paths
+
+Example:
+    rclone strm-mount 123:Movies /mnt/strm-movies
+    rclone strm-mount 115:Series /mnt/strm-series --min-size 50M
+`
+
+	// Add strm-mount specific flags
+	cmdFlags := cmd.Flags()
+	addSTRMFlags(cmdFlags)
+
+	// Register for remote control
+	mountlib.AddRc("strm-mount", mount)
+	buildinfo.Tags = append(buildinfo.Tags, "strm-mount")
+}
+
+// addSTRMFlags adds strm-mount specific flags
+func addSTRMFlags(flagSet *pflag.FlagSet) {
+	flags.StringArrayVarP(flagSet, &strmConfig.VideoExtensions, "video-ext", "", strmConfig.VideoExtensions,
+		"Video file extensions to virtualize", "")
+	flags.FVarP(flagSet, &strmConfig.MinFileSize, "min-size", "",
+		"Minimum file size to virtualize", "")
+	flags.StringVarP(flagSet, &strmConfig.URLFormat, "url-format", "", strmConfig.URLFormat,
+		"URL format: auto, 123, 115, path", "")
+	flags.FVarP(flagSet, &strmConfig.CacheTimeout, "cache-timeout", "",
+		"Cache timeout for file metadata", "")
+	flags.IntVarP(flagSet, &strmConfig.MaxCacheSize, "max-cache-size", "", strmConfig.MaxCacheSize,
+		"Maximum cache entries", "")
+}
+
+// mount implements the strm-mount functionality
+func mount(VFS *vfs.VFS, mountpoint string, opt *mountlib.Options) (<-chan error, func() error, error) {
+	startTime := time.Now()
+	f := VFS.Fs()
+
+	// Check if the backend supports strm virtualization
+	backendName := f.Name()
+	fs.Infof(nil, "🎬 [PERF] Starting STRM mount for %s backend at %s", backendName, mountpoint)
+	fs.Infof(nil, "📊 [PERF] Mount start time: %s", startTime.Format("15:04:05.000"))
+
+	// Log configuration details
+	fs.Infof(nil, "⚙️ [CONFIG] Video extensions: %v", strmConfig.VideoExtensions)
+	fs.Infof(nil, "⚙️ [CONFIG] Min file size: %s", strmConfig.MinFileSize)
+	fs.Infof(nil, "⚙️ [CONFIG] URL format: %s", strmConfig.URLFormat)
+	fs.Infof(nil, "⚙️ [CONFIG] Cache timeout: %s", strmConfig.CacheTimeout)
+	fs.Infof(nil, "⚙️ [CONFIG] Max cache size: %d", strmConfig.MaxCacheSize)
+
+	// Optimize config based on backend
+	configStartTime := time.Now()
+	optimizeConfigForBackend(backendName, strmConfig)
+	fs.Infof(nil, "📊 [PERF] Config optimization took: %v", time.Since(configStartTime))
+
+	// Create STRM filesystem
+	fsCreateStartTime := time.Now()
+	strmFS := NewSTRMFS(VFS, opt, strmConfig)
+	fs.Infof(nil, "📊 [PERF] STRM filesystem creation took: %v", time.Since(fsCreateStartTime))
+
+	// Create FUSE host
+	fuseHostStartTime := time.Now()
+	host := fuse.NewFileSystemHost(strmFS)
+	host.SetCapReaddirPlus(true)
+
+	// Set case sensitivity based on backend
+	if opt.CaseInsensitive.Valid {
+		host.SetCapCaseInsensitive(opt.CaseInsensitive.Value)
+		fs.Infof(nil, "🔧 [CONFIG] Case insensitive: %v (explicit)", opt.CaseInsensitive.Value)
+	} else {
+		caseInsensitive := f.Features().CaseInsensitive
+		host.SetCapCaseInsensitive(caseInsensitive)
+		fs.Infof(nil, "🔧 [CONFIG] Case insensitive: %v (auto-detected)", caseInsensitive)
+	}
+
+	// Create mount options
+	optionsStartTime := time.Now()
+	options := createMountOptions(VFS, opt.DeviceName, mountpoint, opt)
+	fs.Infof(nil, "📊 [PERF] FUSE host creation took: %v", time.Since(fuseHostStartTime))
+	fs.Infof(nil, "📊 [PERF] Mount options creation took: %v", time.Since(optionsStartTime))
+	fs.Infof(nil, "🔧 [CONFIG] FUSE mount options: %q", options)
+
+	// Start mounting in background
+	errChan := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fs.Errorf(nil, "💥 [ERROR] STRM mount panic: %v", r)
+				errChan <- fmt.Errorf("strm-mount failed: %v", r)
+			}
+		}()
+
+		mountStartTime := time.Now()
+		fs.Infof(nil, "🚀 [PERF] Starting FUSE mount operation...")
+
+		var err error
+		ok := host.Mount(mountpoint, options)
+		mountDuration := time.Since(mountStartTime)
+
+		if !ok {
+			err = fmt.Errorf("strm-mount failed")
+			fs.Errorf(f, "❌ [ERROR] STRM mount failed after %v", mountDuration)
+		} else {
+			fs.Infof(nil, "✅ [PERF] STRM mount successful! Total mount time: %v", mountDuration)
+			fs.Infof(nil, "📊 [PERF] Total initialization time: %v", time.Since(startTime))
+		}
+		errChan <- err
+	}()
+
+	// Unmount function
+	unmount := func() error {
+		strmFS.VFS.Shutdown()
+		fs.Debugf(nil, "Calling STRM host.Unmount")
+		if host.Unmount() {
+			fs.Debugf(nil, "STRM unmounted successfully")
+			return nil
+		}
+		return fmt.Errorf("strm host unmount failed")
+	}
+
+	return errChan, unmount, nil
+}
+
+// optimizeConfigForBackend optimizes configuration based on backend type
+func optimizeConfigForBackend(backendName string, config *Config) {
+	switch backendName {
+	case "123":
+		config.URLFormat = "123"
+		fs.Debugf(nil, "🔧 Optimized for 123 backend: URL format = 123")
+	case "115":
+		config.URLFormat = "115"
+		fs.Debugf(nil, "🔧 Optimized for 115 backend: URL format = 115")
+	default:
+		config.URLFormat = "path"
+		fs.Debugf(nil, "🔧 Using path format for %s backend", backendName)
+	}
+}
+
+// createMountOptions creates mount options for cgofuse
+func createMountOptions(VFS *vfs.VFS, deviceName, mountpoint string, opt *mountlib.Options) []string {
+	options := []string{
+		"-o", fmt.Sprintf("fsname=%s", deviceName),
+		"-o", "subtype=rclone-strm",
+		"-o", fmt.Sprintf("attr_timeout=%g", time.Duration(opt.AttrTimeout).Seconds()),
+	}
+
+	if opt.DebugFUSE {
+		options = append(options, "-o", "debug")
+	}
+
+	if opt.AllowOther {
+		options = append(options, "-o", "allow_other")
+	}
+
+	if opt.AllowRoot {
+		options = append(options, "-o", "allow_root")
+	}
+
+	if opt.DefaultPermissions {
+		options = append(options, "-o", "default_permissions")
+	}
+
+	// Read-only mount for safety
+	options = append(options, "-o", "ro")
+
+	return options
+}

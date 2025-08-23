@@ -4289,6 +4289,11 @@ func (o *Object) String() string {
 	return o.remote
 }
 
+// GetPickCode returns the pick code for STRM file generation
+func (o *Object) GetPickCode() string {
+	return o.pickCode
+}
+
 // Remote returns the remote path
 func (o *Object) Remote() string {
 	return o.remote
