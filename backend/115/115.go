@@ -38,6 +38,7 @@ import (
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/cache"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/oauthutil"
@@ -1556,6 +1557,9 @@ type Fs struct {
 	// 🔧 性能优化：下载URL缓存系统
 	downloadURLCache sync.Map // 下载URL缓存 (map[string]CachedDownloadURL)
 
+	// 🚀 性能优化：listAll结果缓存系统（类似123网盘的listFileCache）
+	listAllCache *cache.Cache // listAll结果缓存，避免重复API调用
+
 	// 💾 持久化缓存系统
 	persistentCacheDir   string // 持久化缓存目录
 	downloadURLCacheFile string // 下载URL缓存文件路径
@@ -2963,6 +2967,7 @@ func createBasicFs115(name, originalName, root string, opt *Options, m configmap
 		opt:             *opt,
 		m:               m,
 		activeTransfers: make(map[string]*TransferSpeedMonitor),
+		listAllCache:    cache.New(), // 🚀 初始化listAll结果缓存，避免重复API调用
 	}
 }
 
@@ -5474,6 +5479,24 @@ type listAllFn func(*File) bool
 func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly bool, fn listAllFn) (found bool, err error) {
 	fs.Debugf(f, "📋 listAll开始: dirID=%q, limit=%d, filesOnly=%v", dirID, limit, filesOnly)
 
+	// 🚀 性能优化：智能listAll缓存（类似123网盘的listFileCache）
+	// 只缓存简单的列表查询（无特殊限制）
+	if limit == defaultListChunkSize && !filesOnly {
+		cacheKey := fmt.Sprintf("listall_%s_%d_%v", dirID, limit, filesOnly)
+		if cached, found := f.listAllCache.GetMaybe(cacheKey); found {
+			if cachedFiles, ok := cached.([]*File); ok {
+				fs.Debugf(f, "🎯 listAll缓存命中: dirID=%s (%d个文件)", dirID, len(cachedFiles))
+				// 使用缓存的结果调用回调函数
+				for _, file := range cachedFiles {
+					if fn(file) {
+						return true, nil // 找到目标，停止处理
+					}
+				}
+				return false, nil // 处理完所有缓存文件，未找到目标
+			}
+		}
+	}
+
 	// 验证目录ID
 	if dirID == "" {
 		fs.Errorf(f, "❌ listAll: 目录ID为空，这可能导致查询根目录")
@@ -5498,6 +5521,7 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly boo
 	params.Set("asc", "0")        // Default sort: descending
 
 	offset := 0
+	var allFiles []*File // 🚀 收集所有文件用于缓存
 
 	fs.Debugf(f, "🔄 listAll: 开始分页循环")
 	for {
@@ -5536,8 +5560,19 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly boo
 			// Decode name
 			item.FileName = f.opt.Enc.ToStandardName(item.FileNameBest()) // Use best name getter
 
+			// 🚀 收集文件用于缓存（只在可缓存的查询中收集）
+			if limit == defaultListChunkSize && !filesOnly {
+				allFiles = append(allFiles, item)
+			}
+
 			if fn(item) {
 				found = true
+				// 🚀 即使找到目标，也要缓存已收集的文件
+				if limit == defaultListChunkSize && !filesOnly && len(allFiles) > 0 {
+					cacheKey := fmt.Sprintf("listall_%s_%d_%v", dirID, limit, filesOnly)
+					f.listAllCache.Put(cacheKey, allFiles)
+					fs.Debugf(f, "💾 listAll结果已缓存(早期退出): dirID=%s (%d个文件)", dirID, len(allFiles))
+				}
 				return found, nil // Early exit
 			}
 		}
@@ -5552,7 +5587,22 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly boo
 		}
 	}
 
+	// 🚀 性能优化：智能缓存存储（类似123网盘的实现）
+	if limit == defaultListChunkSize && !filesOnly && len(allFiles) > 0 {
+		cacheKey := fmt.Sprintf("listall_%s_%d_%v", dirID, limit, filesOnly)
+		f.listAllCache.Put(cacheKey, allFiles)
+		fs.Debugf(f, "💾 listAll结果已缓存: dirID=%s (%d个文件)", dirID, len(allFiles))
+	}
+
 	return found, nil
+}
+
+// clearListAllCache 清除指定目录的listAll缓存
+func (f *Fs) clearListAllCache(dirID string, reason string) {
+	cacheKey := fmt.Sprintf("listall_%s_%d_%v", dirID, defaultListChunkSize, false)
+	if f.listAllCache.Delete(cacheKey) {
+		fs.Debugf(f, "🗑️ 清除listAll缓存: dirID=%s (%s)", dirID, reason)
+	}
 }
 
 // updateAPILimitStats 更新API限流统计信息
