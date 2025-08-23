@@ -66,6 +66,7 @@ type STRMFS struct {
 	// QPS 保护
 	rateLimiter        *APIRateLimiter
 	concurrencyLimiter *ConcurrencyLimiter
+	refreshLimiter     *RefreshLimiter
 }
 
 // NewSTRMFS creates a new STRM filesystem
@@ -171,7 +172,20 @@ func (fsys *STRMFS) initQPSProtection() {
 	}
 	fsys.concurrencyLimiter = NewConcurrencyLimiter(maxConcurrent)
 
-	fs.Infof(nil, "🛡️ [QPS] QPS 保护已启用: %s 网盘, 最大并发: %d", backend, maxConcurrent)
+	// 初始化刷新限制器
+	minInterval := time.Hour     // 默认最小间隔1小时
+	maxInterval := time.Hour * 6 // 默认最大间隔6小时
+	qpsThreshold := 0.5          // 默认QPS阈值0.5
+
+	if backend == "123" {
+		minInterval = time.Hour * 2 // 123网盘更保守
+		qpsThreshold = 0.2
+	}
+
+	fsys.refreshLimiter = NewRefreshLimiter(minInterval, maxInterval, qpsThreshold)
+
+	fs.Infof(nil, "🛡️ [QPS] QPS 保护已启用: %s 网盘, 最大并发: %d, 刷新间隔: %v-%v",
+		backend, maxConcurrent, minInterval, maxInterval)
 
 	// 启动统计日志定时器
 	go fsys.startQPSStatsLogger()
@@ -187,6 +201,9 @@ func (fsys *STRMFS) startQPSStatsLogger() {
 		case <-ticker.C:
 			if fsys.rateLimiter != nil {
 				fsys.rateLimiter.LogStats()
+			}
+			if fsys.refreshLimiter != nil {
+				fsys.refreshLimiter.LogStats()
 			}
 		}
 	}
