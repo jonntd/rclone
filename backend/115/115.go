@@ -1263,7 +1263,7 @@ const (
 	defaultUserAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
 
 	// 🚦 115网盘统一QPS控制：全局账户级别限制，避免770004错误
-	unifiedMinSleep = fs.Duration(200 * time.Millisecond) // 🔧 平衡优化：~5 QPS - 平衡性能与稳定性
+	unifiedMinSleep = fs.Duration(300 * time.Millisecond) // 🔧 平衡优化：~5 QPS - 平衡性能与稳定性
 
 	maxSleep      = 2 * time.Second
 	decayConstant = 2 // bigger for slower decay, exponential

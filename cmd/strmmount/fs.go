@@ -62,6 +62,10 @@ type STRMFS struct {
 	persistentCache *STRMPersistentCache
 	cacheData       *CacheData
 	cacheMu         sync.RWMutex
+
+	// QPS 保护
+	rateLimiter        *APIRateLimiter
+	concurrencyLimiter *ConcurrencyLimiter
 }
 
 // NewSTRMFS creates a new STRM filesystem
@@ -77,6 +81,9 @@ func NewSTRMFS(VFS *vfs.VFS, opt *mountlib.Options, config *Config) *STRMFS {
 
 	// 初始化持久化缓存
 	fsys.initPersistentCache()
+
+	// 初始化 QPS 保护
+	fsys.initQPSProtection()
 
 	return fsys
 }
@@ -143,6 +150,46 @@ func (fsys *STRMFS) loadCacheData() {
 	fsys.cacheMu.Unlock()
 
 	fs.Infof(nil, "✅ [CACHE] 持久化缓存已加载: %d 个文件", cacheData.FileCount)
+}
+
+// initQPSProtection 初始化 QPS 保护
+func (fsys *STRMFS) initQPSProtection() {
+	// 获取后端类型
+	backend := fsys.getBackendType()
+	if backend == "" {
+		fs.Debugf(nil, "⚠️ [QPS] 未知后端类型，禁用 QPS 保护")
+		return
+	}
+
+	// 初始化速率限制器
+	fsys.rateLimiter = NewAPIRateLimiter(backend)
+
+	// 初始化并发限制器
+	maxConcurrent := 3 // 默认最多3个并发 API 调用
+	if backend == "123" {
+		maxConcurrent = 2 // 123网盘更保守
+	}
+	fsys.concurrencyLimiter = NewConcurrencyLimiter(maxConcurrent)
+
+	fs.Infof(nil, "🛡️ [QPS] QPS 保护已启用: %s 网盘, 最大并发: %d", backend, maxConcurrent)
+
+	// 启动统计日志定时器
+	go fsys.startQPSStatsLogger()
+}
+
+// startQPSStatsLogger 启动 QPS 统计日志定时器
+func (fsys *STRMFS) startQPSStatsLogger() {
+	ticker := time.NewTicker(5 * time.Minute) // 每5分钟记录一次统计
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if fsys.rateLimiter != nil {
+				fsys.rateLimiter.LogStats()
+			}
+		}
+	}
 }
 
 // getCachedFileInfo 从持久化缓存中获取文件信息
