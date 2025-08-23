@@ -14,7 +14,6 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/hash"
-	"github.com/rclone/rclone/fs/walk"
 )
 
 // STRMPersistentCache 持久化缓存管理器
@@ -367,27 +366,29 @@ func (spc *STRMPersistentCache) createFreshCache(ctx context.Context, fsys fs.Fs
 	return cacheData, nil
 }
 
-// fetchRemoteFiles 获取远程文件列表
+// fetchRemoteFiles 获取远程文件列表（智能限制扫描范围）
 func (spc *STRMPersistentCache) fetchRemoteFiles(ctx context.Context, fsys fs.Fs) ([]fs.Object, error) {
+	// 🛡️ 智能QPS保护：只扫描根目录，避免深度递归
+	fs.Infof(nil, "🔍 [CACHE] 智能扫描模式：仅扫描根目录，避免深度递归")
+
 	var files []fs.Object
 
-	err := walk.ListR(ctx, fsys, "", true, -1, walk.ListObjects, func(entries fs.DirEntries) error {
-		for _, entry := range entries {
-			if obj, ok := entry.(fs.Object); ok {
-				// 只缓存视频文件
-				if spc.isVideoFile(obj) {
-					files = append(files, obj)
-				}
-			}
-		}
-		return nil
-	})
-
+	// 只列出根目录，不递归子目录
+	entries, err := fsys.List(ctx, "")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("列出根目录失败: %w", err)
 	}
 
-	fs.Debugf(nil, "📁 [CACHE] 获取到 %d 个视频文件", len(files))
+	// 只处理根目录中的视频文件
+	for _, entry := range entries {
+		if obj, ok := entry.(fs.Object); ok {
+			if spc.isVideoFile(obj) {
+				files = append(files, obj)
+			}
+		}
+	}
+
+	fs.Infof(nil, "📁 [CACHE] 根目录扫描完成: %d 个视频文件", len(files))
 	return files, nil
 }
 
@@ -526,12 +527,12 @@ func (spc *STRMPersistentCache) saveToDisk(cacheData *CacheData) error {
 	return nil
 }
 
-// incrementalSync 执行增量同步
+// incrementalSync 执行增量同步（智能限制扫描范围）
 func (spc *STRMPersistentCache) incrementalSync(ctx context.Context, fsys fs.Fs, oldCache *CacheData) (*CacheData, error) {
 	startTime := time.Now()
-	fs.Infof(nil, "🔄 [SYNC] 开始增量同步...")
+	fs.Infof(nil, "🔄 [SYNC] 开始智能增量同步（仅根目录）...")
 
-	// 获取远程最新文件列表
+	// 🛡️ 智能QPS保护：只获取根目录文件，避免深度递归
 	remoteFiles, err := spc.fetchRemoteFiles(ctx, fsys)
 	if err != nil {
 		return nil, fmt.Errorf("获取远程文件失败: %w", err)
@@ -552,20 +553,25 @@ func (spc *STRMPersistentCache) incrementalSync(ctx context.Context, fsys fs.Fs,
 		Added:     changes.Added,
 		Modified:  changes.Modified,
 		Deleted:   changes.Deleted,
-		APICount:  1, // 一次 List 调用
+		APICount:  1, // 一次根目录List调用
 	}
 
 	newCache.Metadata.SyncHistory = append(newCache.Metadata.SyncHistory, syncRecord)
+	if len(newCache.Metadata.SyncHistory) > 10 {
+		newCache.Metadata.SyncHistory = newCache.Metadata.SyncHistory[1:]
+	}
+
 	newCache.Metadata.LastSyncDuration = syncRecord.Duration
-	newCache.Metadata.APICallsCount++
+	newCache.Metadata.APICallsCount += syncRecord.APICount
 
 	// 保存新缓存
 	if err := spc.saveToDisk(newCache); err != nil {
 		return nil, fmt.Errorf("保存缓存失败: %w", err)
 	}
 
-	fs.Infof(nil, "✅ [SYNC] 增量同步完成: +%d -%d ~%d (耗时 %v)",
-		changes.Added, changes.Deleted, changes.Modified, time.Since(startTime))
+	duration := time.Since(startTime)
+	fs.Infof(nil, "✅ [SYNC] 智能同步完成: +%d -%d ~%d (耗时 %v, 仅根目录)",
+		changes.Added, changes.Deleted, changes.Modified, duration)
 
 	return newCache, nil
 }

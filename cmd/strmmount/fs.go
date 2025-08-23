@@ -153,6 +153,146 @@ func (fsys *STRMFS) loadCacheData() {
 	fs.Infof(nil, "✅ [CACHE] 持久化缓存已加载: %d 个文件", cacheData.FileCount)
 }
 
+// cacheDirectoryOnDemand 按需缓存目录
+func (fsys *STRMFS) cacheDirectoryOnDemand(dirPath string) {
+	if fsys.persistentCache == nil {
+		return
+	}
+
+	// 避免重复缓存根目录（启动时已缓存）
+	if dirPath == "" || dirPath == "/" {
+		return
+	}
+
+	// 检查是否已经缓存过这个目录
+	if fsys.isDirectoryCached(dirPath) {
+		fs.Debugf(nil, "📁 [ON-DEMAND] 目录已缓存: %s", dirPath)
+		return
+	}
+
+	fs.Debugf(nil, "🔍 [ON-DEMAND] 开始缓存目录: %s", dirPath)
+
+	ctx := context.Background()
+	startTime := time.Now()
+
+	// 获取目录中的视频文件
+	entries, err := fsys.f.List(ctx, dirPath)
+	if err != nil {
+		fs.Debugf(nil, "❌ [ON-DEMAND] 列出目录失败: %s, %v", dirPath, err)
+		return
+	}
+
+	var videoFiles []fs.Object
+	for _, entry := range entries {
+		if obj, ok := entry.(fs.Object); ok {
+			if isVideoFile(obj.Remote(), obj.Size(), fsys.config) {
+				videoFiles = append(videoFiles, obj)
+			}
+		}
+	}
+
+	// 更新持久化缓存
+	if len(videoFiles) > 0 {
+		fsys.updateDirectoryCache(dirPath, videoFiles)
+		fs.Infof(nil, "✅ [ON-DEMAND] 缓存目录完成: %s (%d个视频文件, 耗时 %v)",
+			dirPath, len(videoFiles), time.Since(startTime))
+	} else {
+		fs.Debugf(nil, "📁 [ON-DEMAND] 目录无视频文件: %s", dirPath)
+	}
+}
+
+// isDirectoryCached 检查目录是否已缓存
+func (fsys *STRMFS) isDirectoryCached(dirPath string) bool {
+	fsys.cacheMu.RLock()
+	defer fsys.cacheMu.RUnlock()
+
+	if fsys.cacheData == nil {
+		return false
+	}
+
+	for _, dir := range fsys.cacheData.Directories {
+		if dir.Path == dirPath {
+			return true
+		}
+	}
+	return false
+}
+
+// updateDirectoryCache 更新目录缓存
+func (fsys *STRMFS) updateDirectoryCache(dirPath string, videoFiles []fs.Object) {
+	fsys.cacheMu.Lock()
+	defer fsys.cacheMu.Unlock()
+
+	if fsys.cacheData == nil {
+		return
+	}
+
+	// 创建新的目录缓存条目
+	newDir := CachedDirectory{
+		Path:      dirPath,
+		ModTime:   time.Now(),
+		FileCount: len(videoFiles),
+		TotalSize: 0,
+		Files:     make([]CachedFile, 0, len(videoFiles)),
+	}
+
+	// 添加文件信息
+	for _, obj := range videoFiles {
+		file := CachedFile{
+			Name:     filepath.Base(obj.Remote()),
+			Size:     obj.Size(),
+			ModTime:  obj.ModTime(context.Background()),
+			FileID:   "", // 将在后续获取
+			PickCode: "", // 将在后续获取
+			Hash:     "", // 将在后续获取
+			MimeType: "", // 将在后续获取
+		}
+
+		// 根据后端类型获取特定信息
+		backend := fsys.getBackendType()
+		switch backend {
+		case "123":
+			if obj123, ok := obj.(interface{ GetID() string }); ok {
+				file.FileID = obj123.GetID()
+			}
+		case "115":
+			if obj115, ok := obj.(interface{ GetPickCode() string }); ok {
+				file.PickCode = obj115.GetPickCode()
+			}
+		}
+
+		newDir.Files = append(newDir.Files, file)
+		newDir.TotalSize += file.Size
+	}
+
+	// 更新或添加目录缓存
+	found := false
+	for i, dir := range fsys.cacheData.Directories {
+		if dir.Path == dirPath {
+			fsys.cacheData.Directories[i] = newDir
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		fsys.cacheData.Directories = append(fsys.cacheData.Directories, newDir)
+	}
+
+	// 更新文件计数
+	fsys.cacheData.FileCount = 0
+	for _, dir := range fsys.cacheData.Directories {
+		fsys.cacheData.FileCount += dir.FileCount
+	}
+
+	// 异步保存到磁盘
+	go func() {
+		if fsys.persistentCache != nil {
+			fsys.persistentCache.saveToDisk(fsys.cacheData)
+		}
+	}()
+}
+
 // initQPSProtection 初始化 QPS 保护
 func (fsys *STRMFS) initQPSProtection() {
 	// 获取后端类型
@@ -428,6 +568,11 @@ func (fsys *STRMFS) Readdir(dirPath string,
 
 	if !dir.IsDir() {
 		return -fuse.ENOTDIR
+	}
+
+	// 🚀 按需缓存：访问目录时缓存该目录
+	if fsys.persistentCache != nil {
+		go fsys.cacheDirectoryOnDemand(dirPath)
 	}
 
 	// Read directory entries

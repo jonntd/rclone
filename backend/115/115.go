@@ -3071,18 +3071,16 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		f.rootFolderID = "0"
 	}
 
-	// Initialize directory cache with persistent support
-	configData := map[string]string{
-		"root_folder_id": f.rootFolderID,
-		"endpoint":       openAPIRootURL,
-	}
-	f.dirCache = dircache.NewWithPersistent(f.root, f.rootFolderID, f, "115", configData)
+	// 🛡️ QPS保护：禁用持久化缓存，避免缓存冲突导致的大量API调用
+	// Initialize directory cache WITHOUT persistent support
+	f.dirCache = dircache.New(f.root, f.rootFolderID, f)
 
-	// 💾 初始化持久化缓存系统
-	f.initPersistentCache115()
+	// 🛡️ QPS保护：禁用网盘自身的持久化缓存系统，避免与STRM-Mount缓存冲突
+	// 💾 初始化持久化缓存系统 - 已禁用
+	// f.initPersistentCache115()
 
-	// 💾 加载持久化缓存
-	f.loadPersistentCaches115()
+	// 💾 加载持久化缓存 - 已禁用
+	// f.loadPersistentCaches115()
 
 	// 🔧 优化的rclone模式：结合标准模式和115网盘特性
 	// Find the current root

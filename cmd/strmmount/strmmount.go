@@ -9,6 +9,7 @@ package strmmount
 
 import (
 	"fmt"
+	"runtime"
 	"time"
 
 	"github.com/rclone/rclone/cmd/mountlib"
@@ -237,6 +238,30 @@ func createMountOptions(VFS *vfs.VFS, deviceName, mountpoint string, opt *mountl
 
 	// Read-only mount for safety
 	options = append(options, "-o", "ro")
+
+	// 🛡️ QPS保护：禁用系统自动扫描，避免大量API调用
+	switch runtime.GOOS {
+	case "darwin":
+		// macOS: 禁用Finder和Spotlight自动扫描
+		options = append(options, "-o", "noappledouble") // 禁用Apple双叉文件
+		options = append(options, "-o", "noapplexattr")  // 禁用Apple扩展属性
+		options = append(options, "-o", "nobrowse")      // 不在Finder侧边栏显示
+		options = append(options, "-o", "noatime")       // 不更新访问时间
+	case "linux":
+		// Linux: 禁用updatedb、Tracker、Baloo等自动索引
+		options = append(options, "-o", "noatime")    // 不更新访问时间
+		options = append(options, "-o", "nodiratime") // 不更新目录访问时间
+		options = append(options, "-o", "nodev")      // 不解释设备文件
+		options = append(options, "-o", "nosuid")     // 忽略suid位
+		options = append(options, "-o", "noexec")     // 不允许执行文件
+	case "windows":
+		// Windows: 禁用Windows Search和Defender自动扫描
+		options = append(options, "-o", "noatime") // 不更新访问时间
+		// Windows特有的选项会由WinFSP处理
+	default:
+		// 其他系统: 基本的QPS保护
+		options = append(options, "-o", "noatime") // 不更新访问时间
+	}
 
 	return options
 }
