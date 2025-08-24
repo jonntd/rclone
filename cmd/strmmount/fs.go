@@ -67,6 +67,9 @@ type STRMFS struct {
 	rateLimiter        *APIRateLimiter
 	concurrencyLimiter *ConcurrencyLimiter
 	refreshLimiter     *RefreshLimiter
+
+	// 访问控制
+	accessController *AccessController
 }
 
 // NewSTRMFS creates a new STRM filesystem
@@ -86,7 +89,23 @@ func NewSTRMFS(VFS *vfs.VFS, opt *mountlib.Options, config *Config) *STRMFS {
 	// 初始化 QPS 保护
 	fsys.initQPSProtection()
 
+	// 初始化访问控制
+	fsys.initAccessControl()
+
 	return fsys
+}
+
+// initAccessControl 初始化访问控制
+func (fsys *STRMFS) initAccessControl() {
+	// 获取remote名称并创建访问控制器
+	remoteName := fsys.f.Name()
+	var err error
+	fsys.accessController, err = NewAccessControllerWithRemote(remoteName)
+	if err != nil {
+		fs.Errorf(nil, "❌ [ACCESS] 访问控制器初始化失败: %v", err)
+		// 不返回错误，继续运行但没有访问控制
+		fsys.accessController = nil
+	}
 }
 
 // initPersistentCache 初始化持久化缓存
@@ -115,6 +134,14 @@ func (fsys *STRMFS) initPersistentCache() {
 	}
 
 	fsys.persistentCache = persistentCache
+
+	// 应用 TTL 配置
+	if fsys.config.CacheTTL > 0 {
+		persistentCache.SetTTL(time.Duration(fsys.config.CacheTTL))
+		fs.Infof(nil, "🕐 [CACHE] TTL 设置为: %v", time.Duration(fsys.config.CacheTTL))
+	} else {
+		fs.Infof(nil, "🕐 [CACHE] 使用默认 TTL: 5分钟")
+	}
 
 	// 异步加载缓存数据
 	go fsys.loadCacheData()
@@ -411,6 +438,15 @@ func (fsys *STRMFS) Init() {
 // Destroy is called when the filesystem is being destroyed
 func (fsys *STRMFS) Destroy() {
 	fsys.destroyed.Store(1)
+
+	// 关闭访问控制器
+	if fsys.accessController != nil {
+		if err := fsys.accessController.Close(); err != nil {
+			fs.Errorf(nil, "❌ [ACCESS] 关闭访问控制器失败: %v", err)
+		} else {
+			fs.Infof(nil, "✅ [ACCESS] 访问控制器已关闭")
+		}
+	}
 }
 
 // Statfs returns filesystem statistics
@@ -553,6 +589,14 @@ func (fsys *STRMFS) Readdir(dirPath string,
 			dirPath, totalFiles, videoFiles, strmFiles, duration)
 		log.Trace(dirPath, "ofst=%d, fh=0x%X", ofst, fh)("duration=%v", duration)
 	}()
+
+	// 🔒 访问控制检查
+	if fsys.accessController != nil {
+		if !fsys.accessController.CheckAccess(dirPath, "Readdir") {
+			fs.Debugf(nil, "🚫 [ACCESS] Readdir access denied for: %s", dirPath)
+			return -fuse.EACCES
+		}
+	}
 
 	// We don't support seeking in directories
 	if ofst > 0 {
@@ -923,6 +967,15 @@ func (fsys *STRMFS) getHandle(fh uint64) vfs.Handle {
 // Access checks file access permissions
 func (fsys *STRMFS) Access(path string, mask uint32) int {
 	defer log.Trace(path, "mask=0%o", mask)("")
+
+	// 🔒 访问控制检查
+	if fsys.accessController != nil {
+		if !fsys.accessController.CheckAccess(path, "Access") {
+			fs.Debugf(nil, "🚫 [ACCESS] Access denied for: %s (mask=0%o)", path, mask)
+			return -fuse.EACCES
+		}
+	}
+
 	// This is a no-op for rclone - we allow all access
 	return 0
 }
@@ -1003,6 +1056,14 @@ func (fsys *STRMFS) Mknod(path string, mode uint32, dev uint64) int {
 // Opendir opens a directory
 func (fsys *STRMFS) Opendir(path string) (int, uint64) {
 	defer log.Trace(path, "")("")
+
+	// 🔒 访问控制检查
+	if fsys.accessController != nil {
+		if !fsys.accessController.CheckAccess(path, "Opendir") {
+			fs.Debugf(nil, "🚫 [ACCESS] Opendir access denied for: %s", path)
+			return -fuse.EACCES, fhUnset
+		}
+	}
 
 	// Check if directory exists
 	node, err := fsys.VFS.Stat(path)

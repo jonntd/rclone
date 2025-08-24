@@ -9,6 +9,7 @@ package strmmount
 
 import (
 	"fmt"
+	"os"
 	"runtime"
 	"time"
 
@@ -220,6 +221,23 @@ func createMountOptions(VFS *vfs.VFS, deviceName, mountpoint string, opt *mountl
 		"-o", fmt.Sprintf("attr_timeout=%g", time.Duration(opt.AttrTimeout).Seconds()),
 	}
 
+	// 设置自定义卷名称
+	volumeName := opt.VolumeName
+	if volumeName == "" {
+		// 如果没有指定卷名称，使用remote名称
+		remoteName := VFS.Fs().Name()
+		if remoteName != "" {
+			volumeName = fmt.Sprintf("%s (STRM)", remoteName)
+		} else {
+			volumeName = "STRM Mount"
+		}
+	}
+
+	// 在macOS上设置volname
+	if runtime.GOOS == "darwin" {
+		options = append(options, "-o", fmt.Sprintf("volname=%s", volumeName))
+	}
+
 	if opt.DebugFUSE {
 		options = append(options, "-o", "debug")
 	}
@@ -245,8 +263,13 @@ func createMountOptions(VFS *vfs.VFS, deviceName, mountpoint string, opt *mountl
 		// macOS: 禁用Finder和Spotlight自动扫描
 		options = append(options, "-o", "noappledouble") // 禁用Apple双叉文件
 		options = append(options, "-o", "noapplexattr")  // 禁用Apple扩展属性
-		options = append(options, "-o", "nobrowse")      // 不在Finder侧边栏显示
-		options = append(options, "-o", "noatime")       // 不更新访问时间
+		// 注释掉nobrowse，让挂载点在Finder中可见
+		// options = append(options, "-o", "nobrowse")      // 不在Finder侧边栏显示
+		options = append(options, "-o", "noatime")     // 不更新访问时间
+		options = append(options, "-o", "allow_other") // 允许其他用户访问
+		// 设置用户权限，让当前用户可以访问
+		options = append(options, "-o", fmt.Sprintf("uid=%d", os.Getuid())) // 设置用户ID
+		options = append(options, "-o", fmt.Sprintf("gid=%d", os.Getgid())) // 设置组ID
 	case "linux":
 		// Linux: 禁用updatedb、Tracker、Baloo等自动索引
 		options = append(options, "-o", "noatime")    // 不更新访问时间

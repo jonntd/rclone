@@ -1463,6 +1463,19 @@ type PersistentDownloadURLCache struct {
 	Version string                       `json:"version"`
 }
 
+// 💾 115网盘listAll持久化缓存数据结构
+type PersistentListAllCache struct {
+	Data    map[string]*CachedListAllResponse `json:"data"`
+	SavedAt time.Time                         `json:"saved_at"`
+	Version string                            `json:"version"`
+}
+
+type CachedListAllResponse struct {
+	Files     []*File   `json:"files"`
+	CachedAt  time.Time `json:"cached_at"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
 // Valid 检查缓存的URL是否仍然有效
 func (c CachedDownloadURL) Valid() bool {
 	return time.Now().Before(c.ExpiresAt)
@@ -1563,6 +1576,7 @@ type Fs struct {
 	// 💾 持久化缓存系统
 	persistentCacheDir   string // 持久化缓存目录
 	downloadURLCacheFile string // 下载URL缓存文件路径
+	listAllCacheFile     string // listAll缓存文件路径
 }
 
 // NewTransferSpeedMonitor 创建新的传输速度监控器
@@ -2967,7 +2981,7 @@ func createBasicFs115(name, originalName, root string, opt *Options, m configmap
 		opt:             *opt,
 		m:               m,
 		activeTransfers: make(map[string]*TransferSpeedMonitor),
-		listAllCache:    cache.New(), // 🚀 初始化listAll结果缓存，避免重复API调用
+		listAllCache:    cache.New().SetExpireDuration(30 * time.Minute), // 🚀 初始化listAll结果缓存，30分钟过期时间
 	}
 }
 
@@ -5480,12 +5494,27 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly boo
 	fs.Debugf(f, "📋 listAll开始: dirID=%q, limit=%d, filesOnly=%v", dirID, limit, filesOnly)
 
 	// 🚀 性能优化：智能listAll缓存（类似123网盘的listFileCache）
-	// 只缓存简单的列表查询（无特殊限制）
+	// 只缓存标准的列表查询（limit=defaultListChunkSize，无特殊限制）
 	if limit == defaultListChunkSize && !filesOnly {
 		cacheKey := fmt.Sprintf("listall_%s_%d_%v", dirID, limit, filesOnly)
 		if cached, found := f.listAllCache.GetMaybe(cacheKey); found {
 			if cachedFiles, ok := cached.([]*File); ok {
 				fs.Debugf(f, "🎯 listAll缓存命中: dirID=%s (%d个文件)", dirID, len(cachedFiles))
+				// 使用缓存的结果调用回调函数
+				for _, file := range cachedFiles {
+					if fn(file) {
+						return true, nil // 找到目标，停止处理
+					}
+				}
+				return false, nil // 处理完所有缓存文件，未找到目标
+			}
+		}
+
+		// 🧠 智能缓存：检查完整目录缓存
+		fullCacheKey := fmt.Sprintf("listall_full_%s", dirID)
+		if cached, found := f.listAllCache.GetMaybe(fullCacheKey); found {
+			if cachedFiles, ok := cached.([]*File); ok {
+				fs.Debugf(f, "🎯 listAll完整目录缓存命中: dirID=%s (%d个文件)", dirID, len(cachedFiles))
 				// 使用缓存的结果调用回调函数
 				for _, file := range cachedFiles {
 					if fn(file) {
@@ -5571,6 +5600,8 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly boo
 				if limit == defaultListChunkSize && !filesOnly && len(allFiles) > 0 {
 					cacheKey := fmt.Sprintf("listall_%s_%d_%v", dirID, limit, filesOnly)
 					f.listAllCache.Put(cacheKey, allFiles)
+					// 💾 同时保存到持久化缓存
+					f.saveListAllCacheEntry(cacheKey, allFiles)
 					fs.Debugf(f, "💾 listAll结果已缓存(早期退出): dirID=%s (%d个文件)", dirID, len(allFiles))
 				}
 				return found, nil // Early exit
@@ -5591,7 +5622,17 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly boo
 	if limit == defaultListChunkSize && !filesOnly && len(allFiles) > 0 {
 		cacheKey := fmt.Sprintf("listall_%s_%d_%v", dirID, limit, filesOnly)
 		f.listAllCache.Put(cacheKey, allFiles)
+		// 💾 同时保存到持久化缓存
+		f.saveListAllCacheEntry(cacheKey, allFiles)
 		fs.Debugf(f, "💾 listAll结果已缓存: dirID=%s (%d个文件)", dirID, len(allFiles))
+
+		// 🧠 智能缓存：如果返回的文件数少于limit，说明是完整目录，额外缓存
+		if len(allFiles) < limit {
+			fullCacheKey := fmt.Sprintf("listall_full_%s", dirID)
+			f.listAllCache.Put(fullCacheKey, allFiles)
+			f.saveListAllCacheEntry(fullCacheKey, allFiles)
+			fs.Debugf(f, "💾 listAll完整目录已缓存: dirID=%s (%d个文件)", dirID, len(allFiles))
+		}
 	}
 
 	return found, nil
@@ -9690,6 +9731,12 @@ func (f *Fs) refreshCacheCommand(ctx context.Context, args []string) (any, error
 	f.dirCache.Flush()
 	fs.Infof(f, "✅ 已重置内存dirCache")
 
+	// 清理listAll缓存
+	if f.listAllCache != nil {
+		f.listAllCache.Clear()
+		fs.Infof(f, "✅ 已清理listAll内存缓存")
+	}
+
 	// 如果指定了路径，尝试重新构建该路径的缓存
 	if len(args) > 0 && args[0] != "" {
 		targetPath := args[0]
@@ -10301,14 +10348,18 @@ func (f *Fs) initPersistentCache115() {
 
 	// 设置缓存文件路径
 	f.downloadURLCacheFile = filepath.Join(f.persistentCacheDir, "download_url_cache.json")
+	f.listAllCacheFile = filepath.Join(f.persistentCacheDir, "list_all_cache.json")
 
 	fs.Debugf(f, "💾 115持久化缓存目录: %s", f.persistentCacheDir)
+	fs.Debugf(f, "💾 listAll缓存文件: %s", f.listAllCacheFile)
 }
 
 // loadPersistentCaches115 加载115网盘持久化缓存
 func (f *Fs) loadPersistentCaches115() {
 	// 加载下载URL缓存
 	f.loadDownloadURLCache()
+	// 加载listAll缓存
+	f.loadListAllCache()
 }
 
 // loadDownloadURLCache 加载下载URL缓存
@@ -10392,6 +10443,84 @@ func (f *Fs) saveDownloadURLCache() {
 	fs.Debugf(f, "💾 下载URL缓存已保存: %d 个条目", len(data))
 }
 
+// saveListAllCacheEntry 保存单个listAll缓存条目
+func (f *Fs) saveListAllCacheEntry(key string, files []*File) {
+	if f.listAllCacheFile == "" {
+		return
+	}
+
+	// 读取现有缓存
+	var cache PersistentListAllCache
+	if data, err := os.ReadFile(f.listAllCacheFile); err == nil {
+		json.Unmarshal(data, &cache)
+	}
+
+	// 初始化数据结构
+	if cache.Data == nil {
+		cache.Data = make(map[string]*CachedListAllResponse)
+	}
+
+	// 添加新条目
+	cache.Data[key] = &CachedListAllResponse{
+		Files:     files,
+		CachedAt:  time.Now(),
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+	}
+	cache.SavedAt = time.Now()
+	cache.Version = "1.0"
+
+	// 清理过期条目
+	for k, v := range cache.Data {
+		if time.Since(v.CachedAt) > 5*time.Minute {
+			delete(cache.Data, k)
+		}
+	}
+
+	// 保存到磁盘
+	if jsonData, err := json.Marshal(cache); err == nil {
+		os.WriteFile(f.listAllCacheFile, jsonData, 0644)
+		fs.Debugf(f, "💾 listAll缓存条目已保存: %s", key)
+	}
+}
+
+// loadListAllCache 加载listAll缓存
+func (f *Fs) loadListAllCache() {
+	if f.listAllCacheFile == "" {
+		return
+	}
+
+	data, err := os.ReadFile(f.listAllCacheFile)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			fs.Debugf(f, "⚠️ 读取listAll缓存失败: %v", err)
+		}
+		return
+	}
+
+	var cache PersistentListAllCache
+	if err := json.Unmarshal(data, &cache); err != nil {
+		fs.Debugf(f, "⚠️ 解析listAll缓存失败: %v", err)
+		return
+	}
+
+	// 检查缓存是否过期（24小时）
+	if time.Since(cache.SavedAt) > 24*time.Hour {
+		fs.Debugf(f, "🔄 listAll缓存已过期，跳过加载")
+		return
+	}
+
+	// 过滤过期的条目（5分钟）
+	validCount := 0
+	for key, cachedResp := range cache.Data {
+		if time.Since(cachedResp.CachedAt) <= 5*time.Minute {
+			f.listAllCache.Put(key, cachedResp.Files)
+			validCount++
+		}
+	}
+
+	fs.Debugf(f, "📋 从持久化缓存加载 %d 个有效listAll条目", validCount)
+}
+
 // 🧹 115网盘缓存管理方法
 
 // clearPersistentCache115 清理115网盘持久化缓存
@@ -10450,6 +10579,30 @@ func (f *Fs) getCacheStats115() map[string]interface{} {
 		stats["download_url_cache_modified"] = info.ModTime()
 	}
 
+	// 检查listAll缓存文件
+	if info, err := os.Stat(f.listAllCacheFile); err == nil {
+		stats["listall_cache_size"] = info.Size()
+		stats["listall_cache_modified"] = info.ModTime()
+
+		// 读取并统计listAll缓存条目
+		if data, err := os.ReadFile(f.listAllCacheFile); err == nil {
+			var cache PersistentListAllCache
+			if err := json.Unmarshal(data, &cache); err == nil {
+				stats["listall_cache_entries"] = len(cache.Data)
+				stats["listall_cache_saved_at"] = cache.SavedAt
+
+				// 统计有效条目
+				validEntries := 0
+				for _, cachedResp := range cache.Data {
+					if time.Since(cachedResp.CachedAt) <= 5*time.Minute {
+						validEntries++
+					}
+				}
+				stats["listall_cache_valid_entries"] = validEntries
+			}
+		}
+	}
+
 	// 统计内存中的下载URL缓存
 	urlCacheCount := 0
 	f.downloadURLCache.Range(func(key, value interface{}) bool {
@@ -10457,6 +10610,12 @@ func (f *Fs) getCacheStats115() map[string]interface{} {
 		return true
 	})
 	stats["memory_url_cache_count"] = urlCacheCount
+
+	// 统计内存中的listAll缓存
+	if f.listAllCache != nil {
+		// 由于cache.Cache没有直接的计数方法，我们提供一个状态指示
+		stats["memory_listall_cache_count"] = "available"
+	}
 
 	return stats
 }
@@ -10468,6 +10627,12 @@ func (f *Fs) clearCacheCommand115(ctx context.Context, args []string, opt map[st
 	// 清理内存中的下载URL缓存
 	f.downloadURLCache = sync.Map{}
 	result["memory_download_url_cache_cleared"] = true
+
+	// 清理内存中的listAll缓存
+	if f.listAllCache != nil {
+		f.listAllCache.Clear()
+		result["memory_listall_cache_cleared"] = true
+	}
 
 	// 清理持久化缓存
 	if err := f.clearPersistentCache115(); err != nil {

@@ -1018,14 +1018,26 @@ type FileListInfoRespDataV2 struct {
 func (f *Fs) ListFile(ctx context.Context, parentFileID, limit int, searchData, searchMode string, lastFileID int) (*ListResponse, error) {
 	fs.Debugf(f, "📋 调用ListFile，参数：parentFileID=%d, limit=%d, lastFileID=%d", parentFileID, limit, lastFileID)
 
-	// 🔧 性能优化：智能ListFile缓存（带失效机制）
-	// 只缓存简单的列表查询（无搜索、无分页）
-	if searchData == "" && searchMode == "" && lastFileID == 0 && limit == 100 {
-		cacheKey := fmt.Sprintf("listfile_%d", parentFileID)
+	// 🔧 性能优化：智能ListFile缓存（支持分页缓存）
+	// 缓存条件：无搜索查询，limit=100（标准分页大小）
+	if searchData == "" && searchMode == "" && limit == 100 {
+		// 🚀 改进：支持分页缓存，为每个分页单独缓存
+		cacheKey := fmt.Sprintf("listfile_%d_%d", parentFileID, lastFileID)
 		if cached, found := f.listFileCache.GetMaybe(cacheKey); found {
 			if result, ok := cached.(*ListResponse); ok {
-				fs.Debugf(f, "🎯 ListFile缓存命中: parentFileID=%d", parentFileID)
+				fs.Debugf(f, "🎯 ListFile缓存命中: parentFileID=%d, lastFileID=%d", parentFileID, lastFileID)
 				return result, nil
+			}
+		}
+
+		// 🚀 智能缓存：如果是第一页(lastFileID=0)，也检查完整目录缓存
+		if lastFileID == 0 {
+			fullCacheKey := fmt.Sprintf("listfile_full_%d", parentFileID)
+			if cached, found := f.listFileCache.GetMaybe(fullCacheKey); found {
+				if result, ok := cached.(*ListResponse); ok {
+					fs.Debugf(f, "🎯 ListFile完整目录缓存命中: parentFileID=%d", parentFileID)
+					return result, nil
+				}
 			}
 		}
 	}
@@ -1059,13 +1071,22 @@ func (f *Fs) ListFile(ctx context.Context, parentFileID, limit int, searchData, 
 
 	fs.Debugf(f, "✅ ListFile API响应: code=%d, message=%s, fileCount=%d", result.Code, result.Message, len(result.Data.FileList))
 
-	// 🔧 性能优化：智能缓存存储（带失效机制）
-	if searchData == "" && searchMode == "" && lastFileID == 0 && limit == 100 {
-		cacheKey := fmt.Sprintf("listfile_%d", parentFileID)
+	// 🔧 性能优化：智能缓存存储（支持分页缓存）
+	if searchData == "" && searchMode == "" && limit == 100 {
+		// 🚀 改进：为每个分页单独缓存
+		cacheKey := fmt.Sprintf("listfile_%d_%d", parentFileID, lastFileID)
 		f.listFileCache.Put(cacheKey, &result)
 		// 💾 同时保存到持久化缓存
 		f.saveListFileCacheEntry(cacheKey, &result)
-		fs.Debugf(f, "💾 ListFile结果已缓存: parentFileID=%d", parentFileID)
+		fs.Debugf(f, "💾 ListFile结果已缓存: parentFileID=%d, lastFileID=%d", parentFileID, lastFileID)
+
+		// 🚀 智能缓存：如果是第一页且返回的文件数少于limit，说明是完整目录，额外缓存
+		if lastFileID == 0 && len(result.Data.FileList) < limit {
+			fullCacheKey := fmt.Sprintf("listfile_full_%d", parentFileID)
+			f.listFileCache.Put(fullCacheKey, &result)
+			f.saveListFileCacheEntry(fullCacheKey, &result)
+			fs.Debugf(f, "💾 ListFile完整目录已缓存: parentFileID=%d (%d个文件)", parentFileID, len(result.Data.FileList))
+		}
 	}
 
 	return &result, nil
@@ -1102,9 +1123,21 @@ func (f *Fs) listFileDirectAPI(ctx context.Context, parentFileID, limit int, sea
 
 // clearListFileCache 清除指定父目录的ListFile缓存
 func (f *Fs) clearListFileCache(parentFileID int64, reason string) {
-	cacheKey := fmt.Sprintf("listfile_%d", parentFileID)
-	if f.listFileCache.Delete(cacheKey) {
-		fs.Debugf(f, "🗑️ 清除ListFile缓存: parentFileID=%d (%s)", parentFileID, reason)
+	// 🚀 改进：清除所有相关的缓存键（分页缓存和完整目录缓存）
+
+	// 清除完整目录缓存
+	fullCacheKey := fmt.Sprintf("listfile_full_%d", parentFileID)
+	if f.listFileCache.Delete(fullCacheKey) {
+		fs.Debugf(f, "🗑️ 清除ListFile完整目录缓存: parentFileID=%d (%s)", parentFileID, reason)
+	}
+
+	// 清除分页缓存（尝试清除常见的分页）
+	// 注意：这里只能清除已知的分页，实际使用中可能需要更智能的缓存管理
+	for lastFileID := 0; lastFileID < 10; lastFileID++ {
+		cacheKey := fmt.Sprintf("listfile_%d_%d", parentFileID, lastFileID)
+		if f.listFileCache.Delete(cacheKey) {
+			fs.Debugf(f, "🗑️ 清除ListFile分页缓存: parentFileID=%d, lastFileID=%d (%s)", parentFileID, lastFileID, reason)
+		}
 	}
 }
 
