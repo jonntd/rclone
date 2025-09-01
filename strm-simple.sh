@@ -151,8 +151,10 @@ start_115() {
         --uid $(id -u) \
         --gid $(id -g) \
         --daemon \
+        --log-level=DEBUG \
+        --log-file="$log_file" \
         -vv \
-        > "$log_file" 2>&1 &
+        > /dev/null 2>&1 &
 
     # 验证挂载
     if verify_mount "$MOUNT_115" "115网盘"; then
@@ -201,8 +203,10 @@ start_123() {
         --uid $(id -u) \
         --gid $(id -g) \
         --daemon \
+        --log-level=DEBUG \
+        --log-file="$log_file" \
         -vv \
-        > "$log_file" 2>&1 &
+        > /dev/null 2>&1 &
 
     # 验证挂载
     if verify_mount "$MOUNT_123" "123网盘"; then
@@ -431,6 +435,10 @@ show_help() {
     echo "  start        启动所有网盘 (115 + 123)"
     echo "  start-115    只启动 115 网盘"
     echo "  start-123    只启动 123 网盘"
+    echo "  debug        启动DEBUG模式 (详细日志)"
+    echo "  debug-115    启动115网盘DEBUG模式"
+    echo "  debug-123    启动123网盘DEBUG模式"
+    echo "  refresh      强制刷新缓存 (触发DEBUG日志)"
     echo "  stop         停止所有网盘"
     echo "  umount       卸载所有挂载点 (同 stop)"
     echo "  restart      重启所有网盘"
@@ -852,6 +860,48 @@ main() {
             ;;
         start-123)
             start_123
+            ;;
+        debug)
+            info "🔍 启动DEBUG模式 (详细日志)..."
+            DEBUG_MODE=true
+            start_115
+            echo
+            start_123
+            echo
+            show_status
+            info "📋 DEBUG模式已启用，查看详细日志："
+            info "  115网盘: tail -f $LOG_DIR/strm-115.log"
+            info "  123网盘: tail -f $LOG_DIR/strm-123.log"
+            ;;
+        debug-115)
+            info "🔍 启动115网盘DEBUG模式..."
+            DEBUG_MODE=true
+            start_115
+            info "📋 查看详细日志: tail -f $LOG_DIR/strm-115.log"
+            ;;
+        debug-123)
+            info "🔍 启动123网盘DEBUG模式..."
+            DEBUG_MODE=true
+            start_123
+            info "📋 查看详细日志: tail -f $LOG_DIR/strm-123.log"
+            ;;
+        refresh)
+            info "🔄 强制刷新缓存以触发DEBUG日志..."
+            clean_cache
+            echo
+            info "📋 访问目录以触发新的DEBUG日志..."
+            if is_mounted "$MOUNT_115"; then
+                info "🔍 触发115网盘目录访问..."
+                ls "$MOUNT_115" > /dev/null 2>&1 || true
+            fi
+            if is_mounted "$MOUNT_123"; then
+                info "🔍 触发123网盘目录访问..."
+                ls "$MOUNT_123" > /dev/null 2>&1 || true
+            fi
+            echo
+            info "📋 查看最新DEBUG日志："
+            info "  115网盘: tail -20 $LOG_DIR/strm-115.log"
+            info "  123网盘: tail -20 $LOG_DIR/strm-123.log"
             ;;
         stop|umount)
             umount_all
