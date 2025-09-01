@@ -5124,7 +5124,7 @@ func (tpr *TwoStepProgressReader115) Read(p []byte) (n int, err error) {
 func (tpr *TwoStepProgressReader115) SwitchToUpload() {
 	tpr.phase = "upload"
 	tpr.uploadBytes = 0
-	fs.Infof(tpr.fs, "🔄 跨云传输切换到上传阶段: %s", tpr.remote)
+	fs.Debugf(tpr.fs, "🔄 跨云传输切换到上传阶段: %s", tpr.remote)
 }
 
 // UpdateUploadProgress 更新上传进度
@@ -9150,7 +9150,7 @@ func (w *ossChunkWriter) performChunkedUpload(ctx context.Context, in io.Reader,
 			timeoutCount := w.getTimeoutStats()
 			// 如果超时次数过多，提供警告
 			if timeoutCount >= 5 {
-				fs.Logf(w.o, "⚠️ 分片上传健康检查: 已发生 %d 次超时，建议检查网络连接", timeoutCount)
+				fs.Infof(w.o, "⚠️ 分片上传健康检查: 已发生 %d 次超时，建议检查网络连接", timeoutCount)
 			}
 		}
 
@@ -9228,9 +9228,14 @@ func (w *ossChunkWriter) logUploadProgress(partNum, n, off int64, params *upload
 			remainingParts := params.totalParts - currentPart
 			estimatedRemaining := avgTimePerPart * time.Duration(remainingParts)
 
-			fs.Infof(w.o, "📤 上传进度: %d/%d (%.1f%%) | %v | ⏱️ %v | 🕒 剩余 %v",
-				currentPart, params.totalParts, percentage, fs.SizeSuffix(n),
-				elapsed.Truncate(time.Second), estimatedRemaining.Truncate(time.Second))
+			// 减少进度日志频率：只在每10个分片或关键节点时输出
+			if currentPart%10 == 0 || currentPart == 1 || currentPart == params.totalParts {
+				fs.Infof(w.o, "📤 上传进度: %d/%d (%.1f%%) | %v | ⏱️ %v | 🕒 剩余 %v",
+					currentPart, params.totalParts, percentage, fs.SizeSuffix(n),
+					elapsed.Truncate(time.Second), estimatedRemaining.Truncate(time.Second))
+			} else {
+				fs.Debugf(w.o, "📤 上传分片: %d/%d", currentPart, params.totalParts)
+			}
 		}
 	} else if currentPart == 1 {
 		// 未知大小时只在第一个分片输出日志
@@ -9281,7 +9286,7 @@ func (w *ossChunkWriter) finalizeUpload(ctx context.Context, actualParts int64, 
 
 	// 如果有超时，提供建议
 	if timeoutCount > 0 {
-		fs.Logf(w.o, "💡 建议：如果经常出现超时，可以尝试增加chunk_timeout配置或检查网络连接")
+		fs.Infof(w.o, "💡 建议：如果经常出现超时，可以尝试增加chunk_timeout配置或检查网络连接")
 	}
 
 	return nil
@@ -9320,7 +9325,7 @@ func (f *Fs) newChunkWriterWithClient(ctx context.Context, src fs.ObjectInfo, ui
 	// 处理未知文件大小的情况（流式上传）
 	if size == -1 {
 		warnStreamUpload.Do(func() {
-			fs.Logf(f, "流式上传使用分片大小 %v，最大文件大小限制为 %v",
+			fs.Infof(f, "流式上传使用分片大小 %v，最大文件大小限制为 %v",
 				chunkSize, fs.SizeSuffix(int64(chunkSize)*int64(uploadParts)))
 		})
 	} else {
@@ -9722,31 +9727,31 @@ func (f *Fs) refreshCacheCommand(ctx context.Context, args []string) (any, error
 
 	// 清除持久化dirCache
 	if err := f.dirCache.ForceRefreshPersistent(); err != nil {
-		fs.Logf(f, "⚠️ 清除持久化缓存失败: %v", err)
+		fs.Errorf(f, "❌ 清除持久化缓存失败: %v", err)
 	} else {
-		fs.Infof(f, "✅ 已清除持久化dirCache")
+		fs.Debugf(f, "✅ 已清除持久化dirCache")
 	}
 
 	// 重置dirCache
 	f.dirCache.Flush()
-	fs.Infof(f, "✅ 已重置内存dirCache")
+	fs.Debugf(f, "✅ 已重置内存dirCache")
 
 	// 清理listAll缓存
 	if f.listAllCache != nil {
 		f.listAllCache.Clear()
-		fs.Infof(f, "✅ 已清理listAll内存缓存")
+		fs.Debugf(f, "✅ 已清理listAll内存缓存")
 	}
 
 	// 如果指定了路径，尝试重新构建该路径的缓存
 	if len(args) > 0 && args[0] != "" {
 		targetPath := args[0]
-		fs.Infof(f, "🔄 重新构建路径缓存: %s", targetPath)
+		fs.Debugf(f, "🔄 重新构建路径缓存: %s", targetPath)
 
 		// 尝试查找目录以重新构建缓存
 		if _, err := f.dirCache.FindDir(ctx, targetPath, false); err != nil {
-			fs.Logf(f, "⚠️ 重新构建路径缓存失败: %v", err)
+			fs.Errorf(f, "❌ 重新构建路径缓存失败: %v", err)
 		} else {
-			fs.Infof(f, "✅ 路径缓存重新构建成功: %s", targetPath)
+			fs.Debugf(f, "✅ 路径缓存重新构建成功: %s", targetPath)
 		}
 	}
 

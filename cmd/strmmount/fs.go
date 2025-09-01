@@ -616,10 +616,11 @@ func (fsys *STRMFS) Readdir(dirPath string,
 
 	// 🚀 按需同步：访问目录时触发同步
 	if fsys.persistentCache != nil {
+		fs.Debugf(nil, "🎯 [READDIR] 访问目录 %s，准备触发按需同步", dirPath)
 		go func() {
 			ctx := context.Background()
 			if err := fsys.persistentCache.OnDemandSync(ctx, fsys.f, dirPath); err != nil {
-				fs.Debugf(nil, "⚠️ [ON-DEMAND] 目录 %s 同步失败: %v", dirPath, err)
+				fs.Errorf(nil, "❌ [ON-DEMAND] 目录 %s 同步失败: %v", dirPath, err)
 			}
 		}()
 	}
@@ -1358,7 +1359,7 @@ func (fsys *STRMFS) syncMemoryToPersistent() int {
 	// 获取当前持久化缓存
 	cacheData, err := fsys.persistentCache.loadFromDisk()
 	if err != nil {
-		fs.Logf(nil, "⚠️ [SYNC] 加载持久化缓存失败: %v", err)
+		fs.Errorf(nil, "❌ [SYNC] 加载持久化缓存失败: %v", err)
 		return 0
 	}
 
@@ -1377,7 +1378,7 @@ func (fsys *STRMFS) syncMemoryToPersistent() int {
 	if syncedCount > 0 {
 		// 保存更新后的缓存
 		if err := fsys.persistentCache.saveToDisk(cacheData); err != nil {
-			fs.Logf(nil, "⚠️ [SYNC] 保存持久化缓存失败: %v", err)
+			fs.Errorf(nil, "❌ [SYNC] 保存持久化缓存失败: %v", err)
 			return 0
 		}
 		fs.Infof(nil, "💾 [SYNC] 成功同步 %d 个内存缓存条目到持久化缓存", syncedCount)

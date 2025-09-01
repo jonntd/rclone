@@ -753,7 +753,10 @@ func (spc *STRMPersistentCache) updateLastSyncTime() {
 
 // OnDemandSync 按需同步：访问目录时触发同步（带防重复机制）
 func (spc *STRMPersistentCache) OnDemandSync(ctx context.Context, fsys fs.Fs, dirPath string) error {
+	fs.Debugf(nil, "🎯 [ON-DEMAND] 开始处理目录: %s", dirPath)
+
 	if !spc.enabled {
+		fs.Debugf(nil, "⏭️ [ON-DEMAND] 持久化缓存未启用，跳过同步")
 		return nil
 	}
 
@@ -762,39 +765,40 @@ func (spc *STRMPersistentCache) OnDemandSync(ctx context.Context, fsys fs.Fs, di
 
 	// 智能跳过机制：多重检查减少不必要的API调用
 	if !spc.shouldSyncDirectory(dirPath) {
+		fs.Debugf(nil, "⏭️ [ON-DEMAND] 智能跳过目录同步: %s", dirPath)
 		return nil
 	}
 
 	timeSinceLastSync := time.Since(spc.lastSync)
 	minSyncInterval := spc.getDirectorySyncInterval(dirPath)
 
-	fs.Infof(nil, "📂 [ON-DEMAND] 访问目录 %s，触发精确同步（距离上次同步 %v，缓存间隔 %v）",
+	fs.Debugf(nil, "📂 [ON-DEMAND] 访问目录 %s，触发精确同步（距离上次同步 %v，缓存间隔 %v）",
 		dirPath, timeSinceLastSync, minSyncInterval)
 
 	// 加载当前缓存
 	cacheData, err := spc.loadFromDisk()
 	if err != nil {
-		fs.Logf(nil, "⚠️ [ON-DEMAND] 加载缓存失败: %v", err)
+		fs.Errorf(nil, "❌ [ON-DEMAND] 加载缓存失败: %v", err)
 		return err
 	}
 
 	// 执行精确的目录同步，而不是总是扫描根目录
 	newCache, err := spc.incrementalSyncDirectory(ctx, fsys, cacheData, dirPath)
 	if err != nil {
-		fs.Logf(nil, "⚠️ [ON-DEMAND] 同步失败: %v", err)
+		fs.Errorf(nil, "❌ [ON-DEMAND] 同步失败: %v", err)
 		return err
 	}
 
 	// 保存更新后的缓存
 	if err := spc.saveToDisk(newCache); err != nil {
-		fs.Logf(nil, "⚠️ [ON-DEMAND] 保存缓存失败: %v", err)
+		fs.Errorf(nil, "❌ [ON-DEMAND] 保存缓存失败: %v", err)
 		return err
 	}
 
 	// 更新最后同步时间
 	spc.lastSync = time.Now()
 
-	fs.Infof(nil, "✅ [ON-DEMAND] 目录 %s 同步完成", dirPath)
+	fs.Infof(nil, "✅ [SYNC] 目录同步完成: %s", dirPath)
 	return nil
 }
 
@@ -823,7 +827,7 @@ func (spc *STRMPersistentCache) addFileToDirectories(directories *[]CachedDirect
 		if existingFile.Name == file.Name {
 			// 更新现有文件
 			rootDir.Files[i] = file
-			fs.Infof(nil, "📝 [ADD] 更新现有文件: %s", file.Name)
+			fs.Debugf(nil, "📝 [ADD] 更新现有文件: %s", file.Name)
 			return
 		}
 	}
@@ -832,7 +836,7 @@ func (spc *STRMPersistentCache) addFileToDirectories(directories *[]CachedDirect
 	rootDir.Files = append(rootDir.Files, file)
 	rootDir.FileCount++
 	rootDir.TotalSize += file.Size
-	fs.Infof(nil, "📁 [ADD] 添加新文件: %s (大小: %d)", file.Name, file.Size)
+	fs.Debugf(nil, "📁 [ADD] 添加新文件: %s (大小: %d)", file.Name, file.Size)
 }
 
 // updateFileInDirectories 真正更新目录列表中的文件
@@ -840,7 +844,7 @@ func (spc *STRMPersistentCache) updateFileInDirectories(directories *[]CachedDir
 	// 先删除旧文件，再添加新文件
 	spc.removeFileFromDirectories(directories, file.Name)
 	spc.addFileToDirectories(directories, file)
-	fs.Infof(nil, "📝 [UPDATE] 更新文件: %s", file.Name)
+	fs.Debugf(nil, "📝 [UPDATE] 更新文件: %s", file.Name)
 }
 
 // removeFileFromDirectories 从目录列表中删除文件
@@ -857,7 +861,7 @@ func (spc *STRMPersistentCache) removeFileFromDirectories(directories *[]CachedD
 				dir.Files = append(dir.Files[:j], dir.Files[j+1:]...)
 				dir.FileCount--
 				dir.TotalSize -= file.Size
-				fs.Infof(nil, "✅ [DELETE] 已删除文件: %s", fileName)
+				fs.Debugf(nil, "✅ [DELETE] 已删除文件: %s", fileName)
 				return
 			}
 		}
@@ -889,7 +893,7 @@ func (spc *STRMPersistentCache) getDirectorySyncInterval(dirPath string) time.Du
 // incrementalSyncDirectory 精确同步指定目录，减少不必要的API调用
 func (spc *STRMPersistentCache) incrementalSyncDirectory(ctx context.Context, fsys fs.Fs, oldCache *CacheData, targetDir string) (*CacheData, error) {
 	startTime := time.Now()
-	fs.Infof(nil, "🎯 [SYNC] 开始精确同步目录: %s", targetDir)
+	fs.Debugf(nil, "🎯 [SYNC] 开始精确同步目录: %s", targetDir)
 
 	// 精确获取指定目录的文件，而不是总是扫描根目录
 	remoteFiles, err := spc.fetchRemoteFilesFromDirectory(ctx, fsys, targetDir)
@@ -939,7 +943,7 @@ func (spc *STRMPersistentCache) incrementalSyncDirectory(ctx context.Context, fs
 
 // fetchRemoteFilesFromDirectory 精确获取指定目录的文件列表
 func (spc *STRMPersistentCache) fetchRemoteFilesFromDirectory(ctx context.Context, fsys fs.Fs, targetDir string) ([]fs.Object, error) {
-	fs.Infof(nil, "🔍 [CACHE] 精确扫描目录: %s", targetDir)
+	fs.Debugf(nil, "🔍 [CACHE] 精确扫描目录: %s", targetDir)
 
 	var files []fs.Object
 
@@ -958,7 +962,7 @@ func (spc *STRMPersistentCache) fetchRemoteFilesFromDirectory(ctx context.Contex
 		}
 	}
 
-	fs.Infof(nil, "📁 [CACHE] 目录 %s 扫描完成: %d 个视频文件", targetDir, len(files))
+	fs.Debugf(nil, "📁 [CACHE] 目录 %s 扫描完成: %d 个视频文件", targetDir, len(files))
 	return files, nil
 }
 

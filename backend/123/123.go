@@ -317,7 +317,7 @@ func (tpr *TwoStepProgressReader) Read(p []byte) (n int, err error) {
 func (tpr *TwoStepProgressReader) SwitchToUpload() {
 	tpr.phase = "upload"
 	tpr.uploadBytes = 0
-	fs.Infof(tpr.fs, "🔄 跨云传输切换到上传阶段: %s", tpr.remote)
+	fs.Debugf(tpr.fs, "🔄 跨云传输切换到上传阶段: %s", tpr.remote)
 }
 
 // UpdateUploadProgress 更新上传进度
@@ -1578,29 +1578,29 @@ func (f *Fs) refreshCacheCommand(ctx context.Context, args []string) (any, error
 
 	// 清除内存中的listFileCache
 	f.listFileCache.Clear()
-	fs.Infof(f, "✅ 已清除ListFile缓存")
+	fs.Debugf(f, "✅ 已清除ListFile缓存")
 
 	// 清除持久化dirCache
 	if err := f.dirCache.ForceRefreshPersistent(); err != nil {
 		fs.Logf(f, "⚠️ 清除持久化缓存失败: %v", err)
 	} else {
-		fs.Infof(f, "✅ 已清除持久化dirCache")
+		fs.Debugf(f, "✅ 已清除持久化dirCache")
 	}
 
 	// 重置dirCache
 	f.dirCache.Flush()
-	fs.Infof(f, "✅ 已重置内存dirCache")
+	fs.Debugf(f, "✅ 已重置内存dirCache")
 
 	// 如果指定了路径，尝试重新构建该路径的缓存
 	if len(args) > 0 && args[0] != "" {
 		targetPath := args[0]
-		fs.Infof(f, "🔄 重新构建路径缓存: %s", targetPath)
+		fs.Debugf(f, "🔄 重新构建路径缓存: %s", targetPath)
 
 		// 尝试查找目录以重新构建缓存
 		if _, err := f.dirCache.FindDir(ctx, targetPath, false); err != nil {
 			fs.Logf(f, "⚠️ 重新构建路径缓存失败: %v", err)
 		} else {
-			fs.Infof(f, "✅ 路径缓存重新构建成功: %s", targetPath)
+			fs.Debugf(f, "✅ 路径缓存重新构建成功: %s", targetPath)
 		}
 	}
 
@@ -2477,7 +2477,12 @@ func (f *Fs) uploadMultiPart(ctx context.Context, in io.Reader, preuploadID stri
 			return fmt.Errorf("failed to upload part %d: %w", partNumber, err)
 		}
 
-		fs.Debugf(f, "已上传分片 %d/%d", partNumber, uploadNums)
+		// 减少进度日志频率：只在每10个分片或最后一个分片时输出
+		if partNumber%10 == 0 || partNumber == uploadNums {
+			fs.Infof(f, "📤 上传进度: %d/%d (%.1f%%)", partNumber, uploadNums, float64(partNumber)/float64(uploadNums)*100)
+		} else {
+			fs.Debugf(f, "已上传分片 %d/%d", partNumber, uploadNums)
+		}
 	}
 
 	// 完成上传
@@ -2620,8 +2625,11 @@ func (f *Fs) uploadPartWithRetry(ctx context.Context, preuploadID string, partNu
 		err := f.uploadPartWithMultipart(ctx, preuploadID, partNumber, chunkHash, data)
 		if err == nil {
 			duration := time.Since(attemptStart)
-			fs.Debugf(f, "✅ 分片 %d 上传成功，耗时: %v，速度: %s/s",
-				partNumber, duration, fs.SizeSuffix(int64(float64(len(data))/duration.Seconds())))
+			// 只在关键分片记录详细信息
+			if partNumber%10 == 0 || partNumber == 1 {
+				fs.Debugf(f, "✅ 分片 %d 上传成功，耗时: %v，速度: %s/s",
+					partNumber, duration, fs.SizeSuffix(int64(float64(len(data))/duration.Seconds())))
+			}
 			return nil
 		}
 

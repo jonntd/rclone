@@ -132,8 +132,8 @@ start_115() {
     # 创建必要目录
     mkdir -p "$MOUNT_115" "$cache_dir" "$LOG_DIR"
 
-    # 启动挂载 - 性能优化版本
-    info "启动命令: $RCLONE strm-mount 115: $MOUNT_115 --min-size 50M --persistent-cache=true --cache-ttl=24h --dir-cache-time=1h --vfs-cache-mode=minimal --allow-other --default-permissions"
+    # 启动挂载 - 性能优化版本（带详细调试日志）
+    info "启动命令: $RCLONE strm-mount 115: $MOUNT_115 --min-size 50M --persistent-cache=true --cache-ttl=24h --dir-cache-time=1h --vfs-cache-mode=minimal --allow-other --default-permissions -vv"
 
     nohup "$RCLONE" strm-mount 115: "$MOUNT_115" \
         --min-size 50M \
@@ -151,7 +151,7 @@ start_115() {
         --uid $(id -u) \
         --gid $(id -g) \
         --daemon \
-        -v \
+        -vv \
         > "$log_file" 2>&1 &
 
     # 验证挂载
@@ -182,8 +182,8 @@ start_123() {
     # 创建必要目录
     mkdir -p "$MOUNT_123" "$cache_dir" "$LOG_DIR"
 
-    # 启动挂载 - 性能优化版本
-    info "启动命令: $RCLONE strm-mount 123: $MOUNT_123 --min-size 50M --persistent-cache=true --cache-ttl=24h --dir-cache-time=1h --vfs-cache-mode=minimal --allow-other --default-permissions"
+    # 启动挂载 - 性能优化版本（带详细调试日志）
+    info "启动命令: $RCLONE strm-mount 123: $MOUNT_123 --min-size 50M --persistent-cache=true --cache-ttl=24h --dir-cache-time=1h --vfs-cache-mode=minimal --allow-other --default-permissions -vv"
 
     nohup "$RCLONE" strm-mount 123: "$MOUNT_123" \
         --min-size 50M \
@@ -201,7 +201,7 @@ start_123() {
         --uid $(id -u) \
         --gid $(id -g) \
         --daemon \
-        -v \
+        -vv \
         > "$log_file" 2>&1 &
 
     # 验证挂载
