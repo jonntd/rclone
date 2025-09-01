@@ -66,6 +66,9 @@ type AccessController struct {
 
 	// 系统进程识别
 	systemProcesses map[string]bool
+
+	// 日志计数器，减少重复日志
+	fuseContextLogCount int
 }
 
 // loadAccessControlConfigFromRclone 从rclone配置中加载访问控制配置
@@ -318,9 +321,10 @@ func (ac *AccessController) getCallerProcessInfo() (processName string, processI
 		return "", 0, fmt.Errorf("failed to get process name for PID %d: %w", pid, err)
 	}
 
-	// 记录调试信息
-	if ac.config.VerboseLogging {
+	// 减少重复的FUSE context日志
+	if ac.config.VerboseLogging && ac.fuseContextLogCount < 5 {
 		fs.Debugf(nil, "🔍 [ACCESS] FUSE context: uid=%d, gid=%d, pid=%d, name=%s", uid, gid, pid, name)
+		ac.fuseContextLogCount++
 	}
 
 	return name, int32(pid), nil

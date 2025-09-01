@@ -753,10 +753,10 @@ func (spc *STRMPersistentCache) updateLastSyncTime() {
 
 // OnDemandSync 按需同步：访问目录时触发同步（带防重复机制）
 func (spc *STRMPersistentCache) OnDemandSync(ctx context.Context, fsys fs.Fs, dirPath string) error {
-	fs.Debugf(nil, "🎯 [ON-DEMAND] 开始处理目录: %s", dirPath)
+	fs.Infof(nil, "🎯 [CACHE] 按需同步开始 - 处理目录: %s", dirPath)
 
 	if !spc.enabled {
-		fs.Debugf(nil, "⏭️ [ON-DEMAND] 持久化缓存未启用，跳过同步")
+		fs.Infof(nil, "⏭️ [CACHE] 持久化缓存功能未启用 - 跳过同步操作")
 		return nil
 	}
 
@@ -765,14 +765,14 @@ func (spc *STRMPersistentCache) OnDemandSync(ctx context.Context, fsys fs.Fs, di
 
 	// 智能跳过机制：多重检查减少不必要的API调用
 	if !spc.shouldSyncDirectory(dirPath) {
-		fs.Debugf(nil, "⏭️ [ON-DEMAND] 智能跳过目录同步: %s", dirPath)
+		fs.Infof(nil, "✅ [CACHE] 缓存命中 - 目录 %s 缓存仍然有效，跳过同步", dirPath)
 		return nil
 	}
 
 	timeSinceLastSync := time.Since(spc.lastSync)
 	minSyncInterval := spc.getDirectorySyncInterval(dirPath)
 
-	fs.Debugf(nil, "📂 [ON-DEMAND] 访问目录 %s，触发精确同步（距离上次同步 %v，缓存间隔 %v）",
+	fs.Infof(nil, "🔄 [CACHE] 缓存失效，开始同步 - %s (上次同步: %v前, 缓存间隔: %v)",
 		dirPath, timeSinceLastSync, minSyncInterval)
 
 	// 加载当前缓存
@@ -798,7 +798,7 @@ func (spc *STRMPersistentCache) OnDemandSync(ctx context.Context, fsys fs.Fs, di
 	// 更新最后同步时间
 	spc.lastSync = time.Now()
 
-	fs.Infof(nil, "✅ [SYNC] 目录同步完成: %s", dirPath)
+	fs.Infof(nil, "✅ [SYNC] 目录同步成功完成 - %s (数据已更新)", dirPath)
 	return nil
 }
 
@@ -893,7 +893,7 @@ func (spc *STRMPersistentCache) getDirectorySyncInterval(dirPath string) time.Du
 // incrementalSyncDirectory 精确同步指定目录，减少不必要的API调用
 func (spc *STRMPersistentCache) incrementalSyncDirectory(ctx context.Context, fsys fs.Fs, oldCache *CacheData, targetDir string) (*CacheData, error) {
 	startTime := time.Now()
-	fs.Debugf(nil, "🎯 [SYNC] 开始精确同步目录: %s", targetDir)
+	fs.Debugf(nil, "🎯 [SYNC] 开始精确同步 - 目标目录: %s (检查文件变更)", targetDir)
 
 	// 精确获取指定目录的文件，而不是总是扫描根目录
 	remoteFiles, err := spc.fetchRemoteFilesFromDirectory(ctx, fsys, targetDir)
@@ -943,7 +943,7 @@ func (spc *STRMPersistentCache) incrementalSyncDirectory(ctx context.Context, fs
 
 // fetchRemoteFilesFromDirectory 精确获取指定目录的文件列表
 func (spc *STRMPersistentCache) fetchRemoteFilesFromDirectory(ctx context.Context, fsys fs.Fs, targetDir string) ([]fs.Object, error) {
-	fs.Debugf(nil, "🔍 [CACHE] 精确扫描目录: %s", targetDir)
+	fs.Infof(nil, "🔍 [CACHE] 精确扫描开始 - 目录: %s (查找视频文件)", targetDir)
 
 	var files []fs.Object
 
@@ -962,7 +962,7 @@ func (spc *STRMPersistentCache) fetchRemoteFilesFromDirectory(ctx context.Contex
 		}
 	}
 
-	fs.Debugf(nil, "📁 [CACHE] 目录 %s 扫描完成: %d 个视频文件", targetDir, len(files))
+	fs.Infof(nil, "📁 [CACHE] 扫描完成 - 目录: %s, 发现 %d 个视频文件", targetDir, len(files))
 	return files, nil
 }
 

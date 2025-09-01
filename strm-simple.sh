@@ -151,9 +151,8 @@ start_115() {
         --uid $(id -u) \
         --gid $(id -g) \
         --daemon \
-        --log-level=DEBUG \
         --log-file="$log_file" \
-        -vv \
+        --log-level=INFO \
         > /dev/null 2>&1 &
 
     # 验证挂载
@@ -203,9 +202,8 @@ start_123() {
         --uid $(id -u) \
         --gid $(id -g) \
         --daemon \
-        --log-level=DEBUG \
         --log-file="$log_file" \
-        -vv \
+        --log-level=INFO \
         > /dev/null 2>&1 &
 
     # 验证挂载

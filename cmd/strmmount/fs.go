@@ -60,8 +60,12 @@ type STRMFS struct {
 
 	// 持久化缓存
 	persistentCache *STRMPersistentCache
-	cacheData       *CacheData
-	cacheMu         sync.RWMutex
+
+	// 日志计数器，减少重复日志
+	statfsLogCount     int
+	rootAccessLogCount int
+	cacheData          *CacheData
+	cacheMu            sync.RWMutex
 
 	// QPS 保护
 	rateLimiter        *APIRateLimiter
@@ -455,7 +459,11 @@ func (fsys *STRMFS) Statfs(path string, stat *fuse.Statfs_t) int {
 
 	// 🚀 优化：避免调用 VFS.Statfs()，这会触发 About() API 调用
 	// 直接返回合理的固定值，避免不必要的网络请求
-	fs.Debugf(nil, "📊 [STATFS] Using optimized stats (avoiding About API call)")
+	// 减少重复日志：只在首次调用时记录
+	if fsys.statfsLogCount == 0 {
+		fs.Debugf(nil, "📊 [STATFS] 使用优化的文件系统统计 (避免About API调用，提升性能)")
+		fsys.statfsLogCount = 1
+	}
 
 	const blockSize = 4096
 	// 使用固定的合理值而不是调用 fsys.VFS.Statfs()
@@ -493,7 +501,11 @@ func (fsys *STRMFS) Getattr(filePath string, stat *fuse.Stat_t, fh uint64) int {
 	if filePath == "/" {
 		stat.Mode = fuse.S_IFDIR | 0755
 		stat.Nlink = 1
-		fs.Debugf(nil, "📁 [ACCESS] Root directory access")
+		// 减少重复的根目录访问日志
+		if fsys.rootAccessLogCount < 3 {
+			fs.Debugf(nil, "📁 [ACCESS] 根目录访问 - 系统正在查询根目录状态")
+			fsys.rootAccessLogCount++
+		}
 		return 0
 	}
 
@@ -585,8 +597,11 @@ func (fsys *STRMFS) Readdir(dirPath string,
 
 	defer func() {
 		duration := time.Since(startTime)
-		fs.Infof(nil, "📂 [PERF] Readdir(%s): %d total, %d videos→%d strm files, took %v",
-			dirPath, totalFiles, videoFiles, strmFiles, duration)
+		// 只在耗时较长或有实际文件操作时记录性能日志
+		if duration > 50*time.Millisecond || videoFiles > 0 {
+			fs.Infof(nil, "📂 [PERF] Readdir(%s): %d total, %d videos→%d strm files, took %v",
+				dirPath, totalFiles, videoFiles, strmFiles, duration)
+		}
 		log.Trace(dirPath, "ofst=%d, fh=0x%X", ofst, fh)("duration=%v", duration)
 	}()
 
@@ -616,7 +631,7 @@ func (fsys *STRMFS) Readdir(dirPath string,
 
 	// 🚀 按需同步：访问目录时触发同步
 	if fsys.persistentCache != nil {
-		fs.Debugf(nil, "🎯 [READDIR] 访问目录 %s，准备触发按需同步", dirPath)
+		fs.Debugf(nil, "🎯 [READDIR] 目录访问检测 %s - 准备触发智能按需同步", dirPath)
 		go func() {
 			ctx := context.Background()
 			if err := fsys.persistentCache.OnDemandSync(ctx, fsys.f, dirPath); err != nil {
