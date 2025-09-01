@@ -729,18 +729,23 @@ func (spc *STRMPersistentCache) shouldPerformBackgroundSync(cacheData *CacheData
 		return true
 	}
 
-	// 检查缓存年龄，如果缓存很旧，也执行同步
-	cacheAge := time.Since(cacheData.UpdatedAt)
-	maxCacheAge := 24 * time.Hour // 最大缓存年龄24小时
+	// 🚫 禁用24小时后台全量同步，只使用按需同步
+	// 注释掉原来的24小时强制同步逻辑
+	/*
+		cacheAge := time.Since(cacheData.UpdatedAt)
+		maxCacheAge := 24 * time.Hour // 最大缓存年龄24小时
 
-	if cacheAge > maxCacheAge {
-		fs.Debugf(nil, "📅 [CACHE] 缓存年龄 %v 超过最大年龄 %v，需要同步",
-			cacheAge, maxCacheAge)
-		return true
-	}
+		if cacheAge > maxCacheAge {
+			fs.Debugf(nil, "📅 [CACHE] 缓存年龄 %v 超过最大年龄 %v，需要同步",
+				cacheAge, maxCacheAge)
+			return true
+		}
+	*/
 
-	fs.Debugf(nil, "⏭️ [CACHE] 无需同步：距离上次同步 %v，缓存年龄 %v",
-		timeSinceLastSync, cacheAge)
+	fs.Debugf(nil, "✅ [CACHE] 纯按需模式 - 禁用后台全量同步，只在用户访问时同步")
+
+	fs.Debugf(nil, "⏭️ [CACHE] 无需同步：距离上次同步 %v",
+		timeSinceLastSync)
 	return false
 }
 
@@ -753,7 +758,7 @@ func (spc *STRMPersistentCache) updateLastSyncTime() {
 
 // OnDemandSync 按需同步：访问目录时触发同步（带防重复机制）
 func (spc *STRMPersistentCache) OnDemandSync(ctx context.Context, fsys fs.Fs, dirPath string) error {
-	fs.Infof(nil, "🎯 [CACHE] 按需同步开始 - 处理目录: %s", dirPath)
+	fs.Infof(nil, "🎯 [CACHE] 纯按需同步开始 - 处理目录: %s (无后台全量扫描)", dirPath)
 
 	if !spc.enabled {
 		fs.Infof(nil, "⏭️ [CACHE] 持久化缓存功能未启用 - 跳过同步操作")
@@ -868,25 +873,25 @@ func (spc *STRMPersistentCache) removeFileFromDirectories(directories *[]CachedD
 	}
 }
 
-// getDirectorySyncInterval 根据目录类型返回智能缓存间隔
+// getDirectorySyncInterval 根据目录类型返回智能缓存间隔 (纯按需模式优化)
 func (spc *STRMPersistentCache) getDirectorySyncInterval(dirPath string) time.Duration {
-	// 根据目录特性设置不同的缓存时间，大幅减少API调用
+	// 纯按需模式：大幅延长缓存间隔，减少不必要的API调用
 	switch {
 	case dirPath == "" || dirPath == "/":
-		// 根目录：变化较少，设置长缓存时间
-		return 4 * time.Hour
+		// 根目录：变化很少，大幅延长缓存时间
+		return 12 * time.Hour
 	case strings.Contains(strings.ToLower(dirPath), "download"):
-		// 下载目录：可能有新文件，但不需要太频繁检查
-		return 1 * time.Hour
+		// 下载目录：可能有新文件，但按需同步已足够
+		return 4 * time.Hour
 	case strings.Contains(strings.ToLower(dirPath), "temp") || strings.Contains(strings.ToLower(dirPath), "tmp"):
-		// 临时目录：变化频繁，但用户访问少
-		return 30 * time.Minute
-	case strings.Count(dirPath, "/") > 2:
-		// 深层目录：很少变化，设置最长缓存时间
-		return 8 * time.Hour
-	default:
-		// 普通目录：中等缓存时间
+		// 临时目录：变化频繁，但用户很少访问
 		return 2 * time.Hour
+	case strings.Count(dirPath, "/") > 2:
+		// 深层目录：几乎不变化，设置最长缓存时间
+		return 24 * time.Hour
+	default:
+		// 普通目录：延长缓存时间
+		return 6 * time.Hour
 	}
 }
 
