@@ -971,6 +971,12 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 	}
 }
 
+// APIResponse 定义API响应的通用接口，用于检查响应码
+type APIResponse interface {
+	GetCode() int
+	GetMessage() string
+}
+
 type ListRequest struct {
 	ParentFileID int    `json:"parentFileId"`
 	Limit        int    `json:"limit"`
@@ -983,6 +989,16 @@ type ListResponse struct {
 	Code    int                   `json:"code"`
 	Message string                `json:"message"`
 	Data    GetFileListRespDataV2 `json:"data"` // 更改为特定类型
+}
+
+// GetCode 实现APIResponse接口
+func (r *ListResponse) GetCode() int {
+	return r.Code
+}
+
+// GetMessage 实现APIResponse接口
+func (r *ListResponse) GetMessage() string {
+	return r.Message
 }
 
 // GetFileListRespDataV2 表示文件列表响应的数据结构
@@ -1300,6 +1316,16 @@ type FileInfoResponse struct {
 	TraceID string `json:"x-traceID"`
 }
 
+// GetCode 实现APIResponse接口
+func (r *FileInfoResponse) GetCode() int {
+	return r.Code
+}
+
+// GetMessage 实现APIResponse接口
+func (r *FileInfoResponse) GetMessage() string {
+	return r.Message
+}
+
 type FileDetailResponse struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
@@ -1315,6 +1341,16 @@ type FileDetailResponse struct {
 		Trashed      int    `json:"trashed"`
 	} `json:"data"`
 	TraceID string `json:"x-traceID"`
+}
+
+// GetCode 实现APIResponse接口
+func (r *FileDetailResponse) GetCode() int {
+	return r.Code
+}
+
+// GetMessage 实现APIResponse接口
+func (r *FileDetailResponse) GetMessage() string {
+	return r.Message
 }
 
 // FileInfo 表示'list'数组中单个文件的信息
@@ -1350,6 +1386,16 @@ type FileInfosResponse struct {
 	XTraceID string `json:"x-traceID"`
 }
 
+// GetCode 实现APIResponse接口
+func (r *FileInfosResponse) GetCode() int {
+	return r.Code
+}
+
+// GetMessage 实现APIResponse接口
+func (r *FileInfosResponse) GetMessage() string {
+	return r.Message
+}
+
 // 定义FileInfoRequest结构体，用于发送请求的payload
 type FileInfoRequest struct {
 	FileIDs []int64 `json:"fileIDs"`
@@ -1364,6 +1410,16 @@ type DownloadInfoResponse struct {
 	} `json:"data"`
 }
 
+// GetCode 实现APIResponse接口
+func (r *DownloadInfoResponse) GetCode() int {
+	return r.Code
+}
+
+// GetMessage 实现APIResponse接口
+func (r *DownloadInfoResponse) GetMessage() string {
+	return r.Message
+}
+
 type UploadCreateResp struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
@@ -1373,6 +1429,16 @@ type UploadCreateResp struct {
 		Reuse       bool   `json:"reuse"`
 		SliceSize   int64  `json:"sliceSize"`
 	} `json:"data"`
+}
+
+// GetCode 实现APIResponse接口
+func (r *UploadCreateResp) GetCode() int {
+	return r.Code
+}
+
+// GetMessage 实现APIResponse接口
+func (r *UploadCreateResp) GetMessage() string {
+	return r.Message
 }
 
 type UserInfoResp struct {
@@ -1393,6 +1459,16 @@ type UserInfoResp struct {
 		DirectTraffic  int64  `json:"directTraffic"`
 		IsHideUID      bool   `json:"isHideUID"`
 	} `json:"data"`
+}
+
+// GetCode 实现APIResponse接口
+func (r *UserInfoResp) GetCode() int {
+	return r.Code
+}
+
+// GetMessage 实现APIResponse接口
+func (r *UserInfoResp) GetMessage() string {
+	return r.Message
 }
 
 func (f *Fs) getDownloadURLByUA(ctx context.Context, filePath string, userAgent string) (string, error) {
@@ -1791,9 +1867,9 @@ func (f *Fs) makeAPICallWithRest(ctx context.Context, endpoint string, method st
 		var err error
 		resp, err = f.rst.CallJSON(ctx, &opts, reqBody, respBody)
 
-		// 检查是否是401错误，如果是则尝试刷新token
+		// 检查是否是HTTP 401错误，如果是则尝试刷新token
 		if resp != nil && resp.StatusCode == http.StatusUnauthorized {
-			fs.Debugf(f, "🔐 收到401错误，强制刷新token")
+			fs.Debugf(f, "🔐 收到HTTP 401错误，强制刷新token")
 			// 强制刷新token，忽略时间检查
 			refreshErr := f.refreshTokenIfNecessary(true, true)
 			if refreshErr != nil {
@@ -1804,6 +1880,26 @@ func (f *Fs) makeAPICallWithRest(ctx context.Context, endpoint string, method st
 			opts.ExtraHeaders["Authorization"] = "Bearer " + f.token
 			fs.Debugf(f, "✅ token已强制刷新，将重试API调用")
 			return true, nil // 重试
+		}
+
+		// 检查响应体中的code字段是否为401（token过期）
+		if err == nil && resp != nil && resp.StatusCode == 200 && respBody != nil {
+			if apiResp, ok := respBody.(APIResponse); ok {
+				if apiResp.GetCode() == 401 {
+					fs.Debugf(f, "🔐 响应体中检测到401错误(token过期)，API消息: %s", apiResp.GetMessage())
+					fs.Debugf(f, "🔄 当前token过期时间: %v", f.tokenExpiry)
+					// 强制刷新token，忽略时间检查
+					refreshErr := f.refreshTokenIfNecessary(true, true)
+					if refreshErr != nil {
+						fs.Errorf(f, "❌ token刷新失败: %v", refreshErr)
+						return false, fmt.Errorf("身份验证失败: %w", refreshErr)
+					}
+					// 更新Authorization头
+					opts.ExtraHeaders["Authorization"] = "Bearer " + f.token
+					fs.Debugf(f, "✅ token已强制刷新，新过期时间: %v，将重试API调用", f.tokenExpiry)
+					return true, nil // 重试
+				}
+			}
 		}
 
 		return shouldRetry(err)
@@ -4786,6 +4882,16 @@ type Response struct {
 	Message  string `json:"message"`
 	Data     AccessTokenData
 	XTraceID string `json:"x-traceID"`
+}
+
+// GetCode 实现APIResponse接口
+func (r *Response) GetCode() int {
+	return r.Code
+}
+
+// GetMessage 实现APIResponse接口
+func (r *Response) GetMessage() string {
+	return r.Message
 }
 
 func GetAccessToken(clientID, clientSecret string) (string, time.Time, error) {

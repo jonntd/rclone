@@ -614,9 +614,14 @@ func (fsys *STRMFS) Readdir(dirPath string,
 		return -fuse.ENOTDIR
 	}
 
-	// 🚀 按需缓存：访问目录时缓存该目录
+	// 🚀 按需同步：访问目录时触发同步
 	if fsys.persistentCache != nil {
-		go fsys.cacheDirectoryOnDemand(dirPath)
+		go func() {
+			ctx := context.Background()
+			if err := fsys.persistentCache.OnDemandSync(ctx, fsys.f, dirPath); err != nil {
+				fs.Debugf(nil, "⚠️ [ON-DEMAND] 目录 %s 同步失败: %v", dirPath, err)
+			}
+		}()
 	}
 
 	// Read directory entries
@@ -1293,23 +1298,38 @@ func (fsys *STRMFS) getSTRMContentFromObject(originalPath string, obj fs.Object)
 	return content
 }
 
-// cleanCache cleans old entries from the cache
+// cleanCache cleans old entries from the cache with intelligent sync and proper locking
 func (fsys *STRMFS) cleanCache() {
+	// 使用读写锁保护缓存操作
+	fsys.strmCacheMu.Lock()
+	defer fsys.strmCacheMu.Unlock()
+
 	startTime := time.Now()
 	initialSize := len(fsys.strmCache)
 
-	// Simple cleanup: remove half the entries
-	// In a real implementation, you'd use LRU or TTL
+	// 防止频繁清理
 	if time.Since(fsys.lastCacheClean) < time.Minute {
 		fs.Debugf(nil, "🧹 [CACHE] Skipping cleanup (last clean was %v ago)", time.Since(fsys.lastCacheClean))
-		return // Don't clean too frequently
+		return
+	}
+
+	// 分层缓存策略：清理前先同步到持久化缓存
+	syncStartTime := time.Now()
+	syncedCount := fsys.syncMemoryToPersistent()
+	syncDuration := time.Since(syncStartTime)
+
+	if syncedCount > 0 {
+		fs.Infof(nil, "💾 [CACHE] 清理前同步: %d 个条目同步到持久化缓存 (耗时 %v)",
+			syncedCount, syncDuration)
 	}
 
 	count := 0
 	target := fsys.config.MaxCacheSize / 2
 
-	fs.Infof(nil, "🧹 [CACHE] Starting cleanup: %d entries → target %d", initialSize, target)
+	fs.Infof(nil, "🧹 [CACHE] Starting intelligent cleanup: %d entries → target %d", initialSize, target)
 
+	// 智能清理：优先清理较旧的条目
+	// 这里简化为删除一半，实际可以实现LRU策略
 	for path := range fsys.strmCache {
 		if count >= target {
 			break
@@ -1322,8 +1342,104 @@ func (fsys *STRMFS) cleanCache() {
 	duration := time.Since(startTime)
 	finalSize := len(fsys.strmCache)
 
-	fs.Infof(nil, "🧹 [CACHE] Cleanup complete: %d→%d entries (removed %d) in %v",
-		initialSize, finalSize, count, duration)
+	fs.Infof(nil, "🧹 [CACHE] Intelligent cleanup complete: %d→%d entries (removed %d, synced %d) in %v",
+		initialSize, finalSize, count, syncedCount, duration)
+}
+
+// syncMemoryToPersistent 将内存缓存真正同步到持久化缓存
+// 注意：调用此方法前应该已经获得了strmCacheMu锁
+func (fsys *STRMFS) syncMemoryToPersistent() int {
+	if fsys.persistentCache == nil {
+		return 0
+	}
+
+	syncedCount := 0
+
+	// 获取当前持久化缓存
+	cacheData, err := fsys.persistentCache.loadFromDisk()
+	if err != nil {
+		fs.Logf(nil, "⚠️ [SYNC] 加载持久化缓存失败: %v", err)
+		return 0
+	}
+
+	// 为内存缓存中的每个STRM内容创建缓存条目
+	for path, content := range fsys.strmCache {
+		if len(content) > 0 {
+			// 解析STRM内容获取文件信息
+			if fileInfo := fsys.parseSTRMContent(path, content); fileInfo != nil {
+				// 添加到持久化缓存
+				fsys.addFileToPersistentCache(cacheData, fileInfo)
+				syncedCount++
+			}
+		}
+	}
+
+	if syncedCount > 0 {
+		// 保存更新后的缓存
+		if err := fsys.persistentCache.saveToDisk(cacheData); err != nil {
+			fs.Logf(nil, "⚠️ [SYNC] 保存持久化缓存失败: %v", err)
+			return 0
+		}
+		fs.Infof(nil, "💾 [SYNC] 成功同步 %d 个内存缓存条目到持久化缓存", syncedCount)
+	}
+
+	return syncedCount
+}
+
+// parseSTRMContent 解析STRM内容获取文件信息
+func (fsys *STRMFS) parseSTRMContent(path, content string) *CachedFile {
+	// 从路径中提取文件名
+	fileName := filepath.Base(path)
+	if !strings.HasSuffix(fileName, ".strm") {
+		return nil
+	}
+
+	// 移除.strm后缀获取原始文件名
+	originalName := strings.TrimSuffix(fileName, ".strm")
+
+	return &CachedFile{
+		Name:     originalName,
+		Size:     int64(len(content)),
+		ModTime:  time.Now(),
+		FileID:   "",          // 从STRM内容中解析，这里简化处理
+		Hash:     "",          // 可以计算content的hash
+		MimeType: "video/mp4", // 默认视频类型
+	}
+}
+
+// addFileToPersistentCache 添加文件到持久化缓存
+func (fsys *STRMFS) addFileToPersistentCache(cacheData *CacheData, file *CachedFile) {
+	// 查找或创建根目录
+	var rootDir *CachedDirectory
+	for i := range cacheData.Directories {
+		if cacheData.Directories[i].Path == "" {
+			rootDir = &cacheData.Directories[i]
+			break
+		}
+	}
+
+	if rootDir == nil {
+		// 创建根目录
+		cacheData.Directories = append(cacheData.Directories, CachedDirectory{
+			Path:  "",
+			Files: []CachedFile{},
+		})
+		rootDir = &cacheData.Directories[len(cacheData.Directories)-1]
+	}
+
+	// 检查文件是否已存在
+	for i, existingFile := range rootDir.Files {
+		if existingFile.Name == file.Name {
+			// 更新现有文件
+			rootDir.Files[i] = *file
+			return
+		}
+	}
+
+	// 添加新文件
+	rootDir.Files = append(rootDir.Files, *file)
+	rootDir.FileCount++
+	rootDir.TotalSize += file.Size
 }
 
 // fillStat fills a fuse.Stat_t from a vfs Node

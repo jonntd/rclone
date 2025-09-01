@@ -205,14 +205,18 @@ func (spc *STRMPersistentCache) LoadOrCreate(ctx context.Context, fsys fs.Fs) (*
 		return spc.createFreshCache(ctx, fsys)
 	}
 
-	// 检查缓存是否过期
-	if time.Now().After(cacheData.ExpiresAt) {
-		fs.Infof(nil, "⏰ [CACHE] 缓存已过期，执行增量同步")
-		return spc.incrementalSync(ctx, fsys, cacheData)
+	// 分层缓存策略：持久化缓存永不过期，但有安全限制
+	cacheAge := time.Since(cacheData.CreatedAt)
+	maxSafeAge := 7 * 24 * time.Hour // 最大安全年龄：7天
+
+	if cacheAge > maxSafeAge {
+		fs.Logf(nil, "⚠️ [CACHE] 缓存年龄过大 (%v > %v)，建议手动刷新", cacheAge, maxSafeAge)
 	}
 
-	fs.Infof(nil, "💾 [CACHE] 使用有效缓存 (%d 个文件, 过期时间: %v)",
-		cacheData.FileCount, cacheData.ExpiresAt.Format("15:04:05"))
+	fs.Infof(nil, "♾️ [CACHE] 使用持久化缓存 (%d 个文件, 创建时间: %v, 年龄: %v)",
+		cacheData.FileCount, cacheData.CreatedAt.Format("15:04:05"), cacheAge)
+	fs.Infof(nil, "📂 [CACHE] 按需同步模式：访问目录时才同步新文件")
+
 	return cacheData, nil
 }
 
@@ -569,6 +573,9 @@ func (spc *STRMPersistentCache) incrementalSync(ctx context.Context, fsys fs.Fs,
 		return nil, fmt.Errorf("保存缓存失败: %w", err)
 	}
 
+	// 更新最后同步时间
+	spc.updateLastSyncTime()
+
 	duration := time.Since(startTime)
 	fs.Infof(nil, "✅ [SYNC] 智能同步完成: +%d -%d ~%d (耗时 %v, 仅根目录)",
 		changes.Added, changes.Deleted, changes.Modified, duration)
@@ -612,12 +619,19 @@ func (spc *STRMPersistentCache) detectChanges(oldCache *CacheData, remoteFiles [
 		}
 	}
 
-	// 检测删除的文件
-	for localPath := range localFiles {
-		if _, exists := remoteFileMap[localPath]; !exists {
-			changes.DeletedFiles = append(changes.DeletedFiles, localPath)
-			changes.Deleted++
+	// 安全的删除检测：只有在有远程文件数据时才检测删除
+	if len(remoteFiles) > 0 {
+		// 有远程文件数据，可以安全地检测删除
+		for localPath := range localFiles {
+			if _, exists := remoteFileMap[localPath]; !exists {
+				changes.DeletedFiles = append(changes.DeletedFiles, localPath)
+				changes.Deleted++
+				fs.Debugf(nil, "🗑️ [DETECT] 检测到删除文件: %s", localPath)
+			}
 		}
+	} else {
+		// 没有远程文件数据，可能是API调用失败，不执行删除检测避免误删
+		fs.Debugf(nil, "⚠️ [DETECT] 没有远程文件数据，跳过删除检测以避免误删")
 	}
 
 	return changes
@@ -646,31 +660,42 @@ func (spc *STRMPersistentCache) isFileModified(local CachedFile, remote fs.Objec
 	return false
 }
 
-// applyChanges 应用变更到缓存
+// applyChanges 应用增量变更到缓存
 func (spc *STRMPersistentCache) applyChanges(oldCache *CacheData, changes *SyncChanges) *CacheData {
-	// 创建新的缓存数据
+	// 创建新的缓存数据，复制原有数据
 	newCache := &CacheData{
-		Version:    oldCache.Version,
-		Backend:    oldCache.Backend,
-		RemotePath: oldCache.RemotePath,
-		ConfigHash: oldCache.ConfigHash,
-		CreatedAt:  oldCache.CreatedAt,
-		Metadata:   oldCache.Metadata,
+		Version:     oldCache.Version,
+		Backend:     oldCache.Backend,
+		RemotePath:  oldCache.RemotePath,
+		ConfigHash:  oldCache.ConfigHash,
+		CreatedAt:   oldCache.CreatedAt,
+		Metadata:    oldCache.Metadata,
+		Directories: make([]CachedDirectory, len(oldCache.Directories)),
 	}
 
-	// 合并所有文件
-	allFiles := []fs.Object{}
+	// 复制原有目录结构
+	copy(newCache.Directories, oldCache.Directories)
 
-	// 添加新增的文件
-	for range changes.AddedFiles {
-		// 这里需要从 CachedFile 重建 fs.Object，暂时跳过
-		// 实际实现中需要更复杂的逻辑
+	// 应用增量变更
+	fs.Infof(nil, "🔄 [APPLY] 应用增量变更: +%d ~%d -%d",
+		changes.Added, changes.Modified, changes.Deleted)
+
+	// 1. 添加新文件
+	for _, addedFile := range changes.AddedFiles {
+		spc.addFileToDirectories(&newCache.Directories, addedFile)
 	}
 
-	// 重新组织目录结构
-	newCache.Directories = spc.organizeFilesByDirectory(allFiles)
+	// 2. 更新修改的文件
+	for _, modifiedFile := range changes.ModifiedFiles {
+		spc.updateFileInDirectories(&newCache.Directories, modifiedFile)
+	}
 
-	// 更新统计信息
+	// 3. 删除已删除的文件
+	for _, deletedPath := range changes.DeletedFiles {
+		spc.removeFileFromDirectories(&newCache.Directories, deletedPath)
+	}
+
+	// 重新计算统计信息
 	newCache.FileCount = 0
 	newCache.TotalSize = 0
 	for _, dir := range newCache.Directories {
@@ -678,5 +703,310 @@ func (spc *STRMPersistentCache) applyChanges(oldCache *CacheData, changes *SyncC
 		newCache.TotalSize += dir.TotalSize
 	}
 
+	fs.Infof(nil, "✅ [APPLY] 增量变更应用完成: %d 个文件, 总大小 %d",
+		newCache.FileCount, newCache.TotalSize)
+
 	return newCache
+}
+
+// shouldPerformBackgroundSync 判断是否需要执行后台增量同步
+func (spc *STRMPersistentCache) shouldPerformBackgroundSync(cacheData *CacheData) bool {
+	spc.mu.RLock()
+	defer spc.mu.RUnlock()
+
+	// 如果缓存被禁用，不执行同步
+	if !spc.enabled {
+		return false
+	}
+
+	// 检查距离上次同步的时间
+	timeSinceLastSync := time.Since(spc.lastSync)
+
+	// 如果距离上次同步超过同步间隔，执行同步
+	if timeSinceLastSync > spc.syncInterval {
+		fs.Debugf(nil, "🕐 [CACHE] 距离上次同步 %v，超过间隔 %v，需要同步",
+			timeSinceLastSync, spc.syncInterval)
+		return true
+	}
+
+	// 检查缓存年龄，如果缓存很旧，也执行同步
+	cacheAge := time.Since(cacheData.UpdatedAt)
+	maxCacheAge := 24 * time.Hour // 最大缓存年龄24小时
+
+	if cacheAge > maxCacheAge {
+		fs.Debugf(nil, "📅 [CACHE] 缓存年龄 %v 超过最大年龄 %v，需要同步",
+			cacheAge, maxCacheAge)
+		return true
+	}
+
+	fs.Debugf(nil, "⏭️ [CACHE] 无需同步：距离上次同步 %v，缓存年龄 %v",
+		timeSinceLastSync, cacheAge)
+	return false
+}
+
+// updateLastSyncTime 更新最后同步时间
+func (spc *STRMPersistentCache) updateLastSyncTime() {
+	spc.mu.Lock()
+	defer spc.mu.Unlock()
+	spc.lastSync = time.Now()
+}
+
+// OnDemandSync 按需同步：访问目录时触发同步（带防重复机制）
+func (spc *STRMPersistentCache) OnDemandSync(ctx context.Context, fsys fs.Fs, dirPath string) error {
+	if !spc.enabled {
+		return nil
+	}
+
+	spc.mu.Lock()
+	defer spc.mu.Unlock()
+
+	// 智能跳过机制：多重检查减少不必要的API调用
+	if !spc.shouldSyncDirectory(dirPath) {
+		return nil
+	}
+
+	timeSinceLastSync := time.Since(spc.lastSync)
+	minSyncInterval := spc.getDirectorySyncInterval(dirPath)
+
+	fs.Infof(nil, "📂 [ON-DEMAND] 访问目录 %s，触发精确同步（距离上次同步 %v，缓存间隔 %v）",
+		dirPath, timeSinceLastSync, minSyncInterval)
+
+	// 加载当前缓存
+	cacheData, err := spc.loadFromDisk()
+	if err != nil {
+		fs.Logf(nil, "⚠️ [ON-DEMAND] 加载缓存失败: %v", err)
+		return err
+	}
+
+	// 执行精确的目录同步，而不是总是扫描根目录
+	newCache, err := spc.incrementalSyncDirectory(ctx, fsys, cacheData, dirPath)
+	if err != nil {
+		fs.Logf(nil, "⚠️ [ON-DEMAND] 同步失败: %v", err)
+		return err
+	}
+
+	// 保存更新后的缓存
+	if err := spc.saveToDisk(newCache); err != nil {
+		fs.Logf(nil, "⚠️ [ON-DEMAND] 保存缓存失败: %v", err)
+		return err
+	}
+
+	// 更新最后同步时间
+	spc.lastSync = time.Now()
+
+	fs.Infof(nil, "✅ [ON-DEMAND] 目录 %s 同步完成", dirPath)
+	return nil
+}
+
+// addFileToDirectories 真正添加文件到目录列表
+func (spc *STRMPersistentCache) addFileToDirectories(directories *[]CachedDirectory, file CachedFile) {
+	// 查找或创建根目录
+	var rootDir *CachedDirectory
+	for i := range *directories {
+		if (*directories)[i].Path == "" {
+			rootDir = &(*directories)[i]
+			break
+		}
+	}
+
+	if rootDir == nil {
+		// 创建根目录
+		*directories = append(*directories, CachedDirectory{
+			Path:  "",
+			Files: []CachedFile{},
+		})
+		rootDir = &(*directories)[len(*directories)-1]
+	}
+
+	// 检查文件是否已存在
+	for i, existingFile := range rootDir.Files {
+		if existingFile.Name == file.Name {
+			// 更新现有文件
+			rootDir.Files[i] = file
+			fs.Infof(nil, "📝 [ADD] 更新现有文件: %s", file.Name)
+			return
+		}
+	}
+
+	// 添加新文件
+	rootDir.Files = append(rootDir.Files, file)
+	rootDir.FileCount++
+	rootDir.TotalSize += file.Size
+	fs.Infof(nil, "📁 [ADD] 添加新文件: %s (大小: %d)", file.Name, file.Size)
+}
+
+// updateFileInDirectories 真正更新目录列表中的文件
+func (spc *STRMPersistentCache) updateFileInDirectories(directories *[]CachedDirectory, file CachedFile) {
+	// 先删除旧文件，再添加新文件
+	spc.removeFileFromDirectories(directories, file.Name)
+	spc.addFileToDirectories(directories, file)
+	fs.Infof(nil, "📝 [UPDATE] 更新文件: %s", file.Name)
+}
+
+// removeFileFromDirectories 从目录列表中删除文件
+func (spc *STRMPersistentCache) removeFileFromDirectories(directories *[]CachedDirectory, filePath string) {
+	fileName := filepath.Base(filePath)
+	fs.Debugf(nil, "🗑️ [DELETE] 删除文件: %s", fileName)
+
+	// 遍历所有目录，找到并删除文件
+	for i := range *directories {
+		dir := &(*directories)[i]
+		for j, file := range dir.Files {
+			if file.Name == fileName {
+				// 删除文件
+				dir.Files = append(dir.Files[:j], dir.Files[j+1:]...)
+				dir.FileCount--
+				dir.TotalSize -= file.Size
+				fs.Infof(nil, "✅ [DELETE] 已删除文件: %s", fileName)
+				return
+			}
+		}
+	}
+}
+
+// getDirectorySyncInterval 根据目录类型返回智能缓存间隔
+func (spc *STRMPersistentCache) getDirectorySyncInterval(dirPath string) time.Duration {
+	// 根据目录特性设置不同的缓存时间，大幅减少API调用
+	switch {
+	case dirPath == "" || dirPath == "/":
+		// 根目录：变化较少，设置长缓存时间
+		return 4 * time.Hour
+	case strings.Contains(strings.ToLower(dirPath), "download"):
+		// 下载目录：可能有新文件，但不需要太频繁检查
+		return 1 * time.Hour
+	case strings.Contains(strings.ToLower(dirPath), "temp") || strings.Contains(strings.ToLower(dirPath), "tmp"):
+		// 临时目录：变化频繁，但用户访问少
+		return 30 * time.Minute
+	case strings.Count(dirPath, "/") > 2:
+		// 深层目录：很少变化，设置最长缓存时间
+		return 8 * time.Hour
+	default:
+		// 普通目录：中等缓存时间
+		return 2 * time.Hour
+	}
+}
+
+// incrementalSyncDirectory 精确同步指定目录，减少不必要的API调用
+func (spc *STRMPersistentCache) incrementalSyncDirectory(ctx context.Context, fsys fs.Fs, oldCache *CacheData, targetDir string) (*CacheData, error) {
+	startTime := time.Now()
+	fs.Infof(nil, "🎯 [SYNC] 开始精确同步目录: %s", targetDir)
+
+	// 精确获取指定目录的文件，而不是总是扫描根目录
+	remoteFiles, err := spc.fetchRemoteFilesFromDirectory(ctx, fsys, targetDir)
+	if err != nil {
+		return nil, fmt.Errorf("获取目录 %s 文件失败: %w", targetDir, err)
+	}
+
+	// 检测变更
+	changes := spc.detectChanges(oldCache, remoteFiles)
+
+	// 应用变更
+	newCache := spc.applyChanges(oldCache, changes)
+	newCache.UpdatedAt = time.Now()
+
+	// 更新元数据
+	syncRecord := SyncRecord{
+		Timestamp: time.Now(),
+		Duration:  time.Since(startTime).String(),
+		Added:     changes.Added,
+		Modified:  changes.Modified,
+		Deleted:   changes.Deleted,
+		APICount:  1, // 一次精确目录调用
+	}
+
+	newCache.Metadata.SyncHistory = append(newCache.Metadata.SyncHistory, syncRecord)
+	if len(newCache.Metadata.SyncHistory) > 10 {
+		newCache.Metadata.SyncHistory = newCache.Metadata.SyncHistory[1:]
+	}
+
+	newCache.Metadata.LastSyncDuration = syncRecord.Duration
+	newCache.Metadata.APICallsCount += syncRecord.APICount
+
+	// 保存新缓存
+	if err := spc.saveToDisk(newCache); err != nil {
+		return nil, fmt.Errorf("保存缓存失败: %w", err)
+	}
+
+	// 更新最后同步时间
+	spc.updateLastSyncTime()
+
+	duration := time.Since(startTime)
+	fs.Infof(nil, "✅ [SYNC] 精确同步完成 %s: +%d -%d ~%d (耗时 %v)",
+		targetDir, changes.Added, changes.Deleted, changes.Modified, duration)
+
+	return newCache, nil
+}
+
+// fetchRemoteFilesFromDirectory 精确获取指定目录的文件列表
+func (spc *STRMPersistentCache) fetchRemoteFilesFromDirectory(ctx context.Context, fsys fs.Fs, targetDir string) ([]fs.Object, error) {
+	fs.Infof(nil, "🔍 [CACHE] 精确扫描目录: %s", targetDir)
+
+	var files []fs.Object
+
+	// 精确列出指定目录，而不是总是扫描根目录
+	entries, err := fsys.List(ctx, targetDir)
+	if err != nil {
+		return nil, fmt.Errorf("列出目录 %s 失败: %w", targetDir, err)
+	}
+
+	// 只处理该目录中的视频文件
+	for _, entry := range entries {
+		if obj, ok := entry.(fs.Object); ok {
+			if spc.isVideoFile(obj) {
+				files = append(files, obj)
+			}
+		}
+	}
+
+	fs.Infof(nil, "📁 [CACHE] 目录 %s 扫描完成: %d 个视频文件", targetDir, len(files))
+	return files, nil
+}
+
+// shouldSyncDirectory 智能判断是否需要同步目录，大幅减少API调用
+func (spc *STRMPersistentCache) shouldSyncDirectory(dirPath string) bool {
+	// 1. 检查全局同步时间
+	timeSinceLastSync := time.Since(spc.lastSync)
+	minSyncInterval := spc.getDirectorySyncInterval(dirPath)
+
+	if timeSinceLastSync < minSyncInterval {
+		fs.Debugf(nil, "⏭️ [SKIP] 跳过同步 %s：距离上次同步 %v < %v",
+			dirPath, timeSinceLastSync, minSyncInterval)
+		return false
+	}
+
+	// 2. 检查缓存数据是否存在且较新
+	cacheData, err := spc.loadFromDisk()
+	if err == nil && cacheData != nil {
+		cacheAge := time.Since(cacheData.UpdatedAt)
+		maxCacheAge := spc.getDirectorySyncInterval(dirPath)
+
+		if cacheAge < maxCacheAge {
+			fs.Debugf(nil, "⏭️ [SKIP] 跳过同步 %s：缓存年龄 %v < %v",
+				dirPath, cacheAge, maxCacheAge)
+			return false
+		}
+	}
+
+	// 3. 对于深层目录，更加保守
+	if strings.Count(dirPath, "/") > 3 {
+		// 深层目录很少变化，延长检查间隔
+		if timeSinceLastSync < 12*time.Hour {
+			fs.Debugf(nil, "⏭️ [SKIP] 跳过深层目录同步 %s：%v < 12h",
+				dirPath, timeSinceLastSync)
+			return false
+		}
+	}
+
+	// 4. 对于特殊目录名，跳过同步
+	lowerPath := strings.ToLower(dirPath)
+	skipDirs := []string{"temp", "tmp", "cache", "log", "logs", ".git", ".svn"}
+	for _, skipDir := range skipDirs {
+		if strings.Contains(lowerPath, skipDir) {
+			fs.Debugf(nil, "⏭️ [SKIP] 跳过特殊目录同步: %s", dirPath)
+			return false
+		}
+	}
+
+	fs.Debugf(nil, "✅ [SYNC] 需要同步目录: %s", dirPath)
+	return true
 }
