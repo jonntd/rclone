@@ -63,7 +63,7 @@ jobs:
           - job_name: linux
             os: ubuntu-latest
             go: '>=1.25.0-rc.1'
-            gotags: cmount,noselfupdate
+            gotags: cmount,noselfupdate,fuse3
             build_flags: '-include "^linux/"'
             check: true
             quicktest: true
@@ -75,13 +75,13 @@ jobs:
             os: ubuntu-latest
             go: '>=1.25.0-rc.1'
             goarch: 386
-            gotags: cmount,noselfupdate
+            gotags: cmount,noselfupdate,fuse3
             quicktest: true
 
           - job_name: mac_amd64
             os: macos-latest
             go: '>=1.25.0-rc.1'
-            gotags: 'cmount,noselfupdate'
+            gotags: 'cmount,noselfupdate,fuse3'
             build_flags: '-include "^darwin/amd64" -cgo'
             quicktest: true
             racequicktest: true
@@ -90,14 +90,14 @@ jobs:
           - job_name: mac_arm64
             os: macos-latest
             go: '>=1.25.0-rc.1'
-            gotags: 'cmount,noselfupdate'
+            gotags: 'cmount,noselfupdate,fuse3'
             build_flags: '-include "^darwin/arm64" -cgo -macos-arch arm64 -cgo-cflags=-I/usr/local/include -cgo-ldflags=-L/usr/local/lib'
             deploy: true
 
           - job_name: windows
             os: windows-latest
             go: '>=1.25.0-rc.1'
-            gotags: cmount,noselfupdate
+            gotags: cmount,noselfupdate,fuse3
             cgo: '0'
             build_flags: '-include "^windows/"'
             build_args: '-buildmode exe'
@@ -157,6 +157,12 @@ jobs:
           # Try to install FUSE2 compatibility if available
           sudo apt-get install -y libfuse2 || echo "libfuse2 not available, using FUSE3"
 
+          # Configure cgofuse to use FUSE3
+          export CGO_CFLAGS="$(pkg-config --cflags fuse3) $CGO_CFLAGS"
+          export CGO_LDFLAGS="$(pkg-config --libs fuse3) $CGO_LDFLAGS"
+          echo "CGO_CFLAGS=$(pkg-config --cflags fuse3) $CGO_CFLAGS" >> $GITHUB_ENV
+          echo "CGO_LDFLAGS=$(pkg-config --libs fuse3) $CGO_LDFLAGS" >> $GITHUB_ENV
+
           # Install additional tools for 32-bit builds if needed
           if [[ "${{ matrix.goarch }}" == "386" ]]; then
             echo "🔧 Installing additional 32-bit development tools..."
@@ -168,9 +174,15 @@ jobs:
               libc6-dev-i386 \
               pkg-config:i386
 
-            # Set up 32-bit environment
+            # Set up 32-bit environment with FUSE3 support
             export PKG_CONFIG_PATH="/usr/lib/i386-linux-gnu/pkgconfig:$PKG_CONFIG_PATH"
             echo "PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
+
+            # Ensure cgofuse can find FUSE3 for 32-bit builds
+            export CGO_CFLAGS="$(pkg-config --cflags fuse3) $CGO_CFLAGS"
+            export CGO_LDFLAGS="$(pkg-config --libs fuse3) $CGO_LDFLAGS"
+            echo "CGO_CFLAGS=$(pkg-config --cflags fuse3) $CGO_CFLAGS" >> $GITHUB_ENV
+            echo "CGO_LDFLAGS=$(pkg-config --libs fuse3) $CGO_LDFLAGS" >> $GITHUB_ENV
           fi
         if: matrix.os == 'ubuntu-latest'
 
