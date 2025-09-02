@@ -149,10 +149,13 @@ jobs:
           sudo chown root:$USER /etc/fuse.conf
           sudo apt-get update
 
-          # Install FUSE2 libraries for all Linux builds to fix cgofuse v1.6.0 compatibility
-          echo "🔧 Installing FUSE2 libraries for cgofuse v1.6.0 compatibility..."
-          # Use FUSE2 for all Linux builds to maintain compatibility with cgofuse v1.6.0
-          sudo apt-get install -y fuse libfuse2-dev rpm pkg-config git-annex git-annex-remote-rclone nfs-common
+          # Install FUSE libraries with compatibility layer for cgofuse v1.6.0
+          echo "🔧 Installing FUSE libraries with compatibility for cgofuse v1.6.0..."
+          # Ubuntu 24.04 doesn't have libfuse2-dev, so we need to use available packages
+          sudo apt-get install -y fuse3 libfuse3-dev libfuse-dev rpm pkg-config git-annex git-annex-remote-rclone nfs-common
+
+          # Try to install FUSE2 compatibility if available
+          sudo apt-get install -y libfuse2 || echo "libfuse2 not available, using FUSE3"
 
           # Install additional tools for 32-bit builds if needed
           if [[ "${{ matrix.goarch }}" == "386" ]]; then
