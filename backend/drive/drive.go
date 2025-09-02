@@ -18,7 +18,6 @@ import (
 	"net/http"
 	"os"
 	"path"
-	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -66,8 +65,6 @@ const (
 	timeFormatIn                = time.RFC3339
 	timeFormatOut               = "2006-01-02T15:04:05.000000000Z07:00"
 	defaultMinSleep             = fs.Duration(100 * time.Millisecond)
-	defaultSAMinSleep           = fs.Duration(100 * time.Millisecond) // mod
-	defaultSAMaxLoad            = 5                                   // mod
 	defaultBurst                = 100
 	defaultExportExtensions     = "docx,xlsx,pptx,svg"
 	scopePrefix                 = "https://www.googleapis.com/auth/"
@@ -330,27 +327,6 @@ a non root folder as its starting point.
 		}, {
 			Name: "service_account_file",
 			Help: "Service Account Credentials JSON file path.\n\nLeave blank normally.\nNeeded only if you want use SA instead of interactive login." + env.ShellExpandHelp,
-		}, { // mod
-			Name: "service_account_file_path",
-			Help: "Service Account Credentials JSON folder path.",
-		}, { // mod
-			Name:     "service_account_min_sleep",
-			Default:  defaultSAMinSleep,
-			Help:     "Minimum time to sleep between change service account.",
-			Hide:     fs.OptionHideConfigurator,
-			Advanced: true,
-		}, { // mod
-			Name:     "service_account_per_file",
-			Default:  false,
-			Help:     "Changes service account for each file copy.",
-			Hide:     fs.OptionHideConfigurator,
-			Advanced: true,
-		}, { // mod
-			Name:     "service_account_max_load",
-			Default:  defaultSAMaxLoad,
-			Help:     "Maximum number of loads for service account.",
-			Hide:     fs.OptionHideConfigurator,
-			Advanced: true,
 		}, {
 			Name:      "service_account_credentials",
 			Help:      "Service Account Credentials JSON blob.\n\nLeave blank normally.\nNeeded only if you want use SA instead of interactive login.",
@@ -512,44 +488,6 @@ date is used.`,
 			Help:      `Impersonate this user when using a service account.`,
 			Advanced:  true,
 			Sensitive: true,
-		}, { // mod
-			Name:      "impersonate_list",
-			Default:   "",
-			Help:      `A list of names to be used for impersonation.`,
-			Advanced:  true,
-			Sensitive: true,
-		}, { // mod
-			Name:      "gds_userid",
-			Default:   "",
-			Help:      `userid for custom google drive authentication server.`,
-			Advanced:  true,
-			Sensitive: true,
-		}, { // mod
-			Name:      "gds_apikey",
-			Default:   "",
-			Help:      `apikey for custom google drive authentication server.`,
-			Advanced:  true,
-			Sensitive: true,
-		}, { // mod
-			Name:      "gds_endpoint",
-			Default:   "",
-			Help:      `api endpoint for custom google drive authentication server.`,
-			Advanced:  true,
-			Sensitive: true,
-		}, { // mod
-			Name:     "gds_mode",
-			Default:  "default",
-			Help:     `api mode for custom google drive authentication server.`,
-			Advanced: true,
-		}, { // mod
-			Name:     "activity_targets",
-			Help:     `Comma-separated list of folder IDs to monitor for file/directory changes using Drive Activity API.`,
-			Advanced: true,
-		}, { // mod
-			Name:     "activity_sleep",
-			Default:  fs.Duration(1 * time.Second),
-			Help:     `Sleep duration between Drive Activity requests (per target).`,
-			Advanced: true,
 		}, {
 			Name:    "alternate_export",
 			Default: false,
@@ -837,11 +775,17 @@ type Options struct {
 	Scope                     string               `config:"scope"`
 	RootFolderID              string               `config:"root_folder_id"`
 	ServiceAccountFile        string               `config:"service_account_file"`
-	ServiceAccountFilePath    string               `config:"service_account_file_path"` // mod
-	ServiceAccountMinSleep    fs.Duration          `config:"service_account_min_sleep"` // mod
-	ServiceAccountPerFile     bool                 `config:"service_account_per_file"`  // mod
-	ServiceAccountMaxLoad     int                  `config:"service_account_max_load"`  // mod
 	ServiceAccountCredentials string               `config:"service_account_credentials"`
+	ServiceAccountFilePath    string               `config:"service_account_file_path"`
+	ImpersonateList           string               `config:"impersonate_list"`
+	ServiceAccountMaxLoad     int                  `config:"service_account_max_load"`
+	ServiceAccountMinSleep    fs.Duration          `config:"service_account_min_sleep"`
+	GdsUserid                 string               `config:"gds_userid"`
+	GdsApikey                 string               `config:"gds_apikey"`
+	GdsEndpoint               string               `config:"gds_endpoint"`
+	GdsMode                   string               `config:"gds_mode"`
+	ActivityTargets           []string             `config:"activity_targets"`
+	ActivitySleep             fs.Duration          `config:"activity_sleep"`
 	TeamDriveID               string               `config:"team_drive"`
 	AuthOwnerOnly             bool                 `config:"auth_owner_only"`
 	UseTrash                  bool                 `config:"use_trash"`
@@ -860,13 +804,6 @@ type Options struct {
 	UseSharedDate             bool                 `config:"use_shared_date"`
 	ListChunk                 int64                `config:"list_chunk"`
 	Impersonate               string               `config:"impersonate"`
-	ImpersonateList           string               `config:"impersonate_list"` // mod
-	GdsUserid                 string               `config:"gds_userid"`       // mod
-	GdsApikey                 string               `config:"gds_apikey"`       // mod
-	GdsEndpoint               string               `config:"gds_endpoint"`     // mod
-	GdsMode                   string               `config:"gds_mode"`         // mod
-	ActivityTargets           fs.CommaSepList      `config:"activity_targets"` // mod
-	ActivitySleep             fs.Duration          `config:"activity_sleep"`   // mod
 	UploadCutoff              fs.SizeSuffix        `config:"upload_cutoff"`
 	ChunkSize                 fs.SizeSuffix        `config:"chunk_size"`
 	AcknowledgeAbuse          bool                 `config:"acknowledge_abuse"`
@@ -892,35 +829,34 @@ type Options struct {
 
 // Fs represents a remote drive server
 type Fs struct {
-	name             string             // name of this remote
-	root             string             // the path we are working on
-	opt              Options            // parsed options
-	ci               *fs.ConfigInfo     // global config
-	features         *fs.Features       // optional features
-	svc              *drive.Service     // the connection to the drive server
-	v2Svc            *drive_v2.Service  // used to create download links for the v2 api
-	client           *http.Client       // authorized client
-	rootFolderID     string             // the id of the root folder
-	dirCache         *dircache.DirCache // Map of directory path to directory id
-	lastQuery        string             // Last query string to check in unit tests
-	pacer            *fs.Pacer          // To pace the API calls
-	exportExtensions []string           // preferred extensions to download docs
-	importMimeTypes  []string           // MIME types to convert to docs
-	isTeamDrive      bool               // true if this is a team drive
+	name             string                 // name of this remote
+	root             string                 // the path we are working on
+	opt              Options                // parsed options
+	ci               *fs.ConfigInfo         // global config
+	features         *fs.Features           // optional features
+	svc              *drive.Service         // the connection to the drive server
+	v2Svc            *drive_v2.Service      // used to create download links for the v2 api
+	actSvc           *driveactivity.Service // the connection to the drive activity server
+	client           *http.Client           // authorized client
+	rootFolderID     string                 // the id of the root folder
+	dirCache         *dircache.DirCache     // Map of directory path to directory id
+	lastQuery        string                 // Last query string to check in unit tests
+	pacer            *fs.Pacer              // To pace the API calls
+	exportExtensions []string               // preferred extensions to download docs
+	importMimeTypes  []string               // MIME types to convert to docs
+	isTeamDrive      bool                   // true if this is a team drive
 	m                configmap.Mapper
 	grouping         int32                        // number of IDs to search at once in ListR - read with atomic
 	listRmu          *sync.Mutex                  // protects listRempties
 	listRempties     map[string]struct{}          // IDs of supposedly empty directories which triggered grouping disable
-	changeSAenabled  bool                         // mod
-	changeSApool     *ServiceAccountPool          // mod
-	changeSAmu       *sync.Mutex                  // mod
-	changeSAtime     time.Time                    // mod
-	fileObj          *fs.Object                   // mod
-	gdsSvc           *drive.Service               // mod
-	actSvc           *driveactivity.Service       // mod
 	dirResourceKeys  *sync.Map                    // map directory ID to resource key
 	permissionsMu    *sync.Mutex                  // protect the below
 	permissions      map[string]*drive.Permission // map permission IDs to Permissions
+
+	// Service account switching support
+	changeSAmu   *sync.Mutex         // protects changeSA fields
+	changeSAtime time.Time           // time of last service account change
+	changeSApool *ServiceAccountPool // pool of service accounts
 }
 
 type baseObject struct {
@@ -1002,14 +938,7 @@ func (f *Fs) shouldRetry(ctx context.Context, err error) (bool, error) {
 		}
 		if len(gerr.Errors) > 0 {
 			reason := gerr.Errors[0].Reason
-			message := gerr.Errors[0].Message
-			if reason == "rateLimitExceeded" || reason == "userRateLimitExceeded" || (reason == "dailyLimitExceededUnreg" || strings.HasPrefix(message, "Daily Limit")) {
-				// mod - try changing service account
-				if f.changeSAenabled {
-					if saerr := f.changeServiceAccount(ctx); saerr == nil {
-						return true, err
-					}
-				}
+			if reason == "rateLimitExceeded" || reason == "userRateLimitExceeded" {
 				if f.opt.StopOnUploadLimit && gerr.Errors[0].Message == "User rate limit exceeded." {
 					fs.Errorf(f, "Received upload limit error: %v", err)
 					return false, fserrors.FatalError(err)
@@ -1163,9 +1092,6 @@ func (f *Fs) list(ctx context.Context, dirIDs []string, title string, directorie
 	}
 
 	list := f.svc.Files.List()
-	if f.gdsSvc != nil { // mod
-		list = f.gdsSvc.Files.List()
-	}
 	queryString := strings.Join(query, " and ")
 	if queryString != "" {
 		list.Q(queryString)
@@ -1428,13 +1354,6 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 	// Parse config into Options struct
 	opt := new(Options)
 	err := configstruct.Set(m, opt)
-
-	// mod - parse object id from path remote:{ID}
-	if rootID, _ := parseRootID(path); len(rootID) > 6 {
-		name += rootID
-		path = path[strings.Index(path, "}")+1:]
-	}
-
 	if err != nil {
 		return nil, err
 	}
@@ -1445,54 +1364,6 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 	err = checkUploadChunkSize(opt.ChunkSize)
 	if err != nil {
 		return nil, fmt.Errorf("drive: chunk size: %w", err)
-	}
-
-	// mod
-	pool, err := newServiceAccountPool(opt)
-	if err != nil {
-		return nil, err
-	}
-	if sa, err := pool.GetSA(); err == nil {
-		opt.ServiceAccountFile = sa[0].ServiceAccountFile
-		opt.Impersonate = sa[0].Impersonate
-		if opt.Impersonate != "" {
-			fs.Debugf(nil, "Starting newFs with %q as %q", filepath.Base(opt.ServiceAccountFile), opt.Impersonate)
-		} else {
-			fs.Debugf(nil, "Starting newFs with %q", filepath.Base(opt.ServiceAccountFile))
-		}
-	}
-
-	// mod
-	var gdsSvc *drive.Service
-	var actSvc *driveactivity.Service
-	if gds, ok, err := newGdsClient(ctx, opt); err != nil {
-		return nil, err
-	} else if ok {
-		gdsRemote, authErr := gds.getGdsRemote(ctx)
-		if authErr != nil {
-			return nil, fmt.Errorf("gds: failed to get remote: %w", authErr)
-		}
-		if token, ok := m.Get("token"); ok && token != "" {
-			cli, _, err := oauthutil.NewClientWithBaseClient(ctx, name, m, driveConfig, getClient(ctx, opt))
-			if err != nil {
-				return nil, fmt.Errorf("gds: failed to create oauth client: %w", err)
-			}
-			gdsSvc, err = drive.NewService(context.Background(), option.WithHTTPClient(cli))
-			if err != nil {
-				return nil, fmt.Errorf("gds: couldn't create Drive client: %w", err)
-			}
-			if len(opt.ActivityTargets) > 0 {
-				actSvc, err = driveactivity.NewService(context.Background(), option.WithHTTPClient(cli))
-				if err != nil {
-					return nil, fmt.Errorf("gds: couldn't create Drive Activity client: %w", err)
-				}
-			}
-		}
-		opt.Scope = gdsRemote.Scope
-		opt.ServiceAccountCredentials = string(gdsRemote.SA)
-		opt.Impersonate = gdsRemote.Impersonate
-		opt.RootFolderID = gdsRemote.RootFolderID
-		fs.Debugf(nil, "Starting newFs with remote from gds")
 	}
 
 	oAuthClient, err := createOAuthClient(ctx, opt, name, m)
@@ -1519,6 +1390,7 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 		dirResourceKeys: new(sync.Map),
 		permissionsMu:   new(sync.Mutex),
 		permissions:     make(map[string]*drive.Permission),
+		changeSAmu:      new(sync.Mutex),
 	}
 	f.isTeamDrive = opt.TeamDriveID != ""
 	f.features = (&fs.Features{
@@ -1538,27 +1410,11 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 		DirModTimeUpdatesOnWrite: false, // FIXME need to check!
 	}).Fill(ctx, f)
 
-	// mod
-	if len(pool.SAs) > 0 {
-		f.changeSAenabled = true
-		f.changeSApool = pool
-		f.changeSAmu = new(sync.Mutex)
-		fs.Infof(nil, "Changing service account is enabled")
-	}
-	f.gdsSvc = gdsSvc
-	f.actSvc = actSvc
-
 	// Create a new authorized Drive client.
 	f.client = oAuthClient
 	f.svc, err = drive.NewService(context.Background(), option.WithHTTPClient(f.client))
 	if err != nil {
 		return nil, fmt.Errorf("couldn't create Drive client: %w", err)
-	}
-	if f.actSvc == nil && len(f.opt.ActivityTargets) > 0 { // mod
-		f.actSvc, err = driveactivity.NewService(context.Background(), option.WithHTTPClient(f.client))
-		if err != nil {
-			return nil, fmt.Errorf("couldn't create Drive Activity client: %w", err)
-		}
 	}
 
 	if f.opt.V2DownloadMinSize >= 0 {
@@ -1576,29 +1432,6 @@ func NewFs(ctx context.Context, name, path string, m configmap.Mapper) (fs.Fs, e
 	f, err := newFs(ctx, name, path, m)
 	if err != nil {
 		return nil, err
-	}
-
-	// mod - parse object id from path remote:{ID}
-	var srcFile *drive.File
-	if rootID, _ := parseRootID(path); len(rootID) > 6 {
-		srcFile, err = f.getFile(ctx, rootID, "name,id,size,mimeType,driveId,md5Checksum")
-		if err != nil {
-			return nil, err
-		}
-		f.opt.RootFolderID = rootID
-		if srcFile.MimeType != "" && srcFile.MimeType != "application/vnd.google-apps.folder" {
-			fs.Debugf(nil, "Root ID (File): %s", rootID)
-		} else {
-			if srcFile.DriveId == rootID {
-				fs.Debugf(nil, "Root ID (Drive): %s", rootID)
-				f.opt.RootFolderID = ""
-				f.opt.TeamDriveID = rootID
-			} else {
-				fs.Debugf(nil, "Root ID (Folder): %s", rootID)
-			}
-			srcFile = nil
-		}
-		f.isTeamDrive = f.opt.TeamDriveID != ""
 	}
 
 	// Set the root folder ID
@@ -1647,22 +1480,6 @@ func NewFs(ctx context.Context, name, path string, m configmap.Mapper) (fs.Fs, e
 	_, f.importMimeTypes, err = parseExtensions(f.opt.ImportExtensions)
 	if err != nil {
 		return nil, err
-	}
-
-	// mod
-	if srcFile != nil {
-		tempF := *f
-		newRoot := ""
-		tempF.dirCache = dircache.New(newRoot, f.rootFolderID, &tempF)
-		tempF.root = newRoot
-		f.dirCache = tempF.dirCache
-		f.root = tempF.root
-
-		extension, exportName, exportMimeType, isDocument := f.findExportFormat(ctx, srcFile)
-		obj, _ := f.newObjectWithExportInfo(ctx, srcFile.Name, srcFile, extension, exportName, exportMimeType, isDocument)
-		f.root = "isFile:" + srcFile.Name
-		f.fileObj = &obj
-		return f, fs.ErrorIsFile
 	}
 
 	// Find the current root
@@ -1891,11 +1708,6 @@ func (f *Fs) newObjectWithExportInfo(
 // NewObject finds the Object at remote.  If it can't be found
 // it returns the error fs.ErrorObjectNotFound.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	// mod
-	if f.fileObj != nil {
-		return *f.fileObj, nil
-	}
-
 	if strings.HasSuffix(remote, "/") {
 		return nil, fs.ErrorIsDir
 	}
@@ -3002,10 +2814,6 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		id = actualID(srcObj.id)
 	}
 
-	// mod
-	if f.changeSAenabled && f.opt.ServiceAccountPerFile {
-		_ = f.changeServiceAccount(ctx) // ignore error
-	}
 	var info *drive.File
 	err = f.pacer.Call(func() (bool, error) {
 		copy := f.svc.Files.Copy(id, createInfo).
@@ -3338,9 +3146,6 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 //
 // Close the returned channel to stop being notified.
 func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryType), pollIntervalChan <-chan time.Duration) {
-	if f.actSvc != nil { // mod
-		f.activityNotify(ctx, notifyFunc, pollIntervalChan)
-	}
 	go func() {
 		// get the StartPageToken early so all changes from now on get processed
 		startPageToken, err := f.changeNotifyStartPageToken(ctx)
@@ -3515,7 +3320,7 @@ func (f *Fs) changeChunkSize(chunkSizeString string) (err error) {
 }
 
 func (f *Fs) changeServiceAccountFile(ctx context.Context, file string) (err error) {
-	fs.Debugf(nil, "Changing Service Account File from %s to %s", filepath.Base(f.opt.ServiceAccountFile), filepath.Base(file)) // mod - shorter debug log
+	fs.Debugf(nil, "Changing Service Account File from %s to %s", f.opt.ServiceAccountFile, file)
 	if file == f.opt.ServiceAccountFile {
 		return nil
 	}
@@ -3766,9 +3571,6 @@ func (f *Fs) copyOrMoveID(ctx context.Context, operation string, id, dest string
 // Run the drive query calling fn on each entry found
 func (f *Fs) queryFn(ctx context.Context, query string, fn func(*drive.File)) (err error) {
 	list := f.svc.Files.List()
-	if f.gdsSvc != nil { // mod
-		list = f.gdsSvc.Files.List()
-	}
 	if query != "" {
 		list.Q(query)
 	}
@@ -3974,48 +3776,6 @@ Result:
         "Untrashed": 17,
         "Errors": 0
     }
-`,
-}, { // mod
-	Name:  "getid",
-	Short: "Get an ID of a file or directory",
-	Long: `This command is to obtain an ID of a file or directory.
-
-Usage:
-
-    rclone backend getid drive:path {subpath} -o real
-
-The "path" should point to a directory not a file. Use an extra argument
-"subpath" to get an ID of a file located in "drive:path". By default,
-it will return an ID of shortcut unless otherwise the flag "-o real" set.
-`,
-}, { // mod
-	Name:  "getfile",
-	Short: "Get a file's metadata",
-	Long: `This command returns a file's metadata in json.
-
-Usage:
-
-    rclone backend getfile drive:path {subpath} -o real -o all
-
-It retrieves a 'Files resource' using the method of 'Files.Get(ID)' and
-returns in a json-formatted string. The usage is basically the same as 
-for 'getid'. For development you can pass '-o all' to return all fields.
-`,
-}, { // mod
-	Name:  "chpar",
-	Short: "Change parents of files or directories",
-	Long: `This command changes parents of files or directories to a new one,
-results in a move of the source under the destination.
-
-Usage:
-
-    rclone backend chpar src:path dst:path
-    rclone backend chpar src:path dst:path -o depth=1
-    rclone backend chpar src:path dst:path -o delete-empty-src-dir
-
-The "path" should point to a directory not a file. To apply for children of
-given "src:path", pass "-o depth=1". Also, use "-o delete-empty-src-dir" to
-remove "src:path."
 `,
 }, {
 	Name:  "copyid",
@@ -4240,51 +4000,6 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 			dir = arg[0]
 		}
 		return f.unTrashDir(ctx, dir, true)
-	case "getid":
-		// mod
-		path := ""
-		if len(arg) > 0 {
-			path = arg[0]
-		}
-		_, real := opt["real"]
-		return f.getID(ctx, path, real)
-	case "getfile":
-		// mod
-		path := ""
-		if len(arg) > 0 {
-			path = arg[0]
-		}
-		_, real := opt["real"]
-		id, err := f.getID(ctx, path, real)
-		if err != nil {
-			return nil, fmt.Errorf("couldn't get id: %w", err)
-		}
-		if _, all := opt["all"]; all {
-			return f.getFile(ctx, id, "*")
-		}
-		return f.getFile(ctx, id, f.getFileFields(ctx))
-	case "chpar":
-		// mod
-		if len(arg) != 1 {
-			return nil, errors.New("need an argument for dst:path")
-		}
-		srcDepth := "0"
-		if depth, ok := opt["depth"]; ok {
-			if !(depth == "0" || depth == "1") {
-				return nil, fmt.Errorf("invalid depth: %q", depth)
-			}
-			srcDepth = depth
-		}
-		_, srcDelete := opt["delete-empty-src-dir"]
-		dst, err := cache.Get(ctx, arg[0])
-		if err != nil {
-			return nil, fmt.Errorf("couldn't find destination: %w", err)
-		}
-		dstFs, ok := dst.(*Fs)
-		if !ok {
-			return nil, errors.New("destination is not a drive backend")
-		}
-		return f.changeParents(ctx, dstFs, true, srcDepth, srcDelete)
 	case "copyid", "moveid":
 		if len(arg)%2 != 0 {
 			return nil, errors.New("need an even number of arguments")

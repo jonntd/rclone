@@ -51,10 +51,6 @@ type resumableUpload struct {
 
 // Upload the io.Reader in of size bytes with contentType and info
 func (f *Fs) Upload(ctx context.Context, in io.Reader, size int64, contentType, fileID, remote string, info *drive.File) (*drive.File, error) {
-	// mod
-	if f.changeSAenabled && f.opt.ServiceAccountPerFile {
-		_ = f.changeServiceAccount(ctx) // ignore error
-	}
 	params := url.Values{
 		"alt":        {"json"},
 		"uploadType": {"resumable"},
