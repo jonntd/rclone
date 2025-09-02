@@ -5,11 +5,13 @@
 
 # 配置
 RCLONE="./rclone"
-MOUNT_115="/Users/jonntd/cloud/115"
-MOUNT_123="/Users/jonntd/cloud/123"
-CACHE_DIR="$HOME/.cache/rclone-strm"
-LOG_DIR="$HOME/.rclone/logs"
-PERSISTENT_CACHE_DIR="/Users/jonntd/Library/Caches/rclone/strm-cache"
+BASE_MOUNT_DIR="/Users/jonntd/cloud"
+MOUNT_115="$BASE_MOUNT_DIR/115"
+MOUNT_123="$BASE_MOUNT_DIR/123"
+DATA_DIR="$HOME/.rclone-strm"           # 统一数据目录
+CACHE_DIR="$DATA_DIR/cache"             # 临时缓存
+LOG_DIR="$DATA_DIR/logs"                # 日志文件
+PERSISTENT_CACHE_DIR="$DATA_DIR/persistent"  # 持久化缓存
 
 # 颜色
 RED='\033[0;31m'
@@ -130,7 +132,7 @@ start_115() {
     cleanup_mount "$MOUNT_115" "115网盘"
 
     # 创建必要目录
-    mkdir -p "$MOUNT_115" "$cache_dir" "$LOG_DIR"
+    mkdir -p "$MOUNT_115" "$cache_dir" "$LOG_DIR" "$PERSISTENT_CACHE_DIR"
 
     # 启动挂载 - 性能优化版本（带详细调试日志）
     info "启动命令: $RCLONE strm-mount 115: $MOUNT_115 --min-size 50M --persistent-cache=true --cache-ttl=24h --dir-cache-time=1h --vfs-cache-mode=minimal --allow-other --default-permissions -vv"
@@ -181,7 +183,7 @@ start_123() {
     cleanup_mount "$MOUNT_123" "123网盘"
 
     # 创建必要目录
-    mkdir -p "$MOUNT_123" "$cache_dir" "$LOG_DIR"
+    mkdir -p "$MOUNT_123" "$cache_dir" "$LOG_DIR" "$PERSISTENT_CACHE_DIR"
 
     # 启动挂载 - 性能优化版本（带详细调试日志）
     info "启动命令: $RCLONE strm-mount 123: $MOUNT_123 --min-size 50M --persistent-cache=true --cache-ttl=24h --dir-cache-time=1h --vfs-cache-mode=minimal --allow-other --default-permissions -vv"
@@ -373,22 +375,22 @@ show_status() {
         fi
     done
 
-    # 缓存目录
-    echo -e "${YELLOW}缓存目录:${NC}"
-    if [[ -d "$CACHE_DIR" ]]; then
-        local cache_size=$(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1)
-        echo "  $CACHE_DIR ($cache_size)"
+    # 数据目录
+    echo -e "${YELLOW}数据目录:${NC}"
+    if [[ -d "$DATA_DIR" ]]; then
+        local data_size=$(du -sh "$DATA_DIR" 2>/dev/null | cut -f1)
+        echo "  $DATA_DIR ($data_size)"
 
-        # 显示各网盘缓存大小
-        for cache_subdir in "$CACHE_DIR"/*; do
-            if [[ -d "$cache_subdir" ]]; then
-                local subdir_name=$(basename "$cache_subdir")
-                local subdir_size=$(du -sh "$cache_subdir" 2>/dev/null | cut -f1)
+        # 显示子目录大小
+        for subdir in "$CACHE_DIR" "$LOG_DIR" "$PERSISTENT_CACHE_DIR"; do
+            if [[ -d "$subdir" ]]; then
+                local subdir_name=$(basename "$subdir")
+                local subdir_size=$(du -sh "$subdir" 2>/dev/null | cut -f1)
                 echo "    $subdir_name: $subdir_size"
             fi
         done
     else
-        echo "  缓存目录不存在"
+        echo "  数据目录不存在"
     fi
 
     # 持久化缓存状态
@@ -450,6 +452,7 @@ show_help() {
     echo "  sync-123     智能同步123网盘"
     echo "  force-sync   强制同步所有网盘"
     echo "  health       健康检查"
+    echo "  config       显示配置信息"
     echo "  help         显示此帮助"
     echo
     echo "示例:"
@@ -460,12 +463,13 @@ show_help() {
     echo
     echo "配置:"
     echo "  rclone 路径: $RCLONE"
+    echo "  基础挂载目录: $BASE_MOUNT_DIR"
     echo "  115 挂载点: $MOUNT_115"
     echo "  123 挂载点: $MOUNT_123"
-    echo "  缓存目录: $CACHE_DIR"
-    echo "  日志目录: $LOG_DIR"
-    echo "  115 日志: $LOG_DIR/strm-115.log"
-    echo "  123 日志: $LOG_DIR/strm-123.log"
+    echo "  数据目录: $DATA_DIR"
+    echo "    ├── 缓存: $CACHE_DIR"
+    echo "    ├── 日志: $LOG_DIR"
+    echo "    └── 持久化: $PERSISTENT_CACHE_DIR"
 }
 
 # 显示日志
@@ -497,40 +501,42 @@ show_logs() {
 
 # 清理缓存
 clean_cache() {
-    echo -e "${BLUE}=== 清理缓存 ===${NC}"
+    echo -e "${BLUE}=== 清理数据目录 ===${NC}"
     echo
 
-    if [[ -d "$CACHE_DIR" ]]; then
-        local cache_size_before=$(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1)
-        info "清理前缓存大小: $cache_size_before"
+    if [[ -d "$DATA_DIR" ]]; then
+        local data_size_before=$(du -sh "$DATA_DIR" 2>/dev/null | cut -f1)
+        info "清理前数据目录大小: $data_size_before"
 
-        # 清理缓存
-        rm -rf "$CACHE_DIR"/* 2>/dev/null || true
-
-        local cache_size_after=$(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1)
-        success "✅ 缓存清理完成"
-        info "清理后缓存大小: $cache_size_after"
-    else
-        info "缓存目录不存在，无需清理"
-    fi
-
-    # 清理持久化缓存
-    if [[ -d "$PERSISTENT_CACHE_DIR" ]]; then
-        local persistent_files=$(find "$PERSISTENT_CACHE_DIR" -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
-        if [[ $persistent_files -gt 0 ]]; then
-            info "清理持久化缓存文件 ($persistent_files 个)..."
-            rm -f "$PERSISTENT_CACHE_DIR"/*.json 2>/dev/null || true
-            success "✅ 持久化缓存清理完成"
-        else
-            info "无持久化缓存文件需要清理"
+        # 清理临时缓存
+        if [[ -d "$CACHE_DIR" ]]; then
+            rm -rf "$CACHE_DIR"/* 2>/dev/null || true
+            success "✅ 临时缓存清理完成"
         fi
-    fi
 
-    # 清理旧日志
-    if [[ -d "$LOG_DIR" ]]; then
-        info "清理 7 天前的日志文件..."
-        find "$LOG_DIR" -name "*.log" -mtime +7 -delete 2>/dev/null || true
-        success "✅ 旧日志清理完成"
+        # 清理持久化缓存
+        if [[ -d "$PERSISTENT_CACHE_DIR" ]]; then
+            local persistent_files=$(find "$PERSISTENT_CACHE_DIR" -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
+            if [[ $persistent_files -gt 0 ]]; then
+                info "清理持久化缓存文件 ($persistent_files 个)..."
+                rm -f "$PERSISTENT_CACHE_DIR"/*.json 2>/dev/null || true
+                success "✅ 持久化缓存清理完成"
+            else
+                info "无持久化缓存文件需要清理"
+            fi
+        fi
+
+        # 清理旧日志
+        if [[ -d "$LOG_DIR" ]]; then
+            info "清理 7 天前的日志文件..."
+            find "$LOG_DIR" -name "*.log" -mtime +7 -delete 2>/dev/null || true
+            success "✅ 旧日志清理完成"
+        fi
+
+        local data_size_after=$(du -sh "$DATA_DIR" 2>/dev/null | cut -f1)
+        info "清理后数据目录大小: $data_size_after"
+    else
+        info "数据目录不存在，无需清理"
     fi
 }
 
@@ -780,6 +786,76 @@ force_sync_all_backends() {
     success "🎉 强制同步完成！"
 }
 
+# 显示配置信息
+show_config() {
+    echo -e "${BLUE}=== STRM-Mount 配置信息 ===${NC}"
+    echo
+
+    echo -e "${YELLOW}基础配置:${NC}"
+    echo "  rclone 路径: $RCLONE"
+    echo "  基础挂载目录: $BASE_MOUNT_DIR"
+    echo "  115 挂载点: $MOUNT_115"
+    echo "  123 挂载点: $MOUNT_123"
+    echo
+
+    echo -e "${YELLOW}数据目录结构:${NC}"
+    echo "  数据目录: $DATA_DIR"
+    echo "    ├── 缓存: $CACHE_DIR"
+    echo "    ├── 日志: $LOG_DIR"
+    echo "    └── 持久化: $PERSISTENT_CACHE_DIR"
+    echo
+
+    echo -e "${YELLOW}目录状态:${NC}"
+    for dir in "$BASE_MOUNT_DIR" "$DATA_DIR" "$CACHE_DIR" "$LOG_DIR" "$PERSISTENT_CACHE_DIR"; do
+        local dir_name=$(basename "$dir")
+        if [[ -d "$dir" ]]; then
+            # 检查是否是挂载点
+            if mount | grep -q "$dir"; then
+                echo "  🔗 $dir_name: $dir (挂载点)"
+            else
+                # 简化大小计算，避免超时问题
+                local dir_size=$(du -sh "$dir" 2>/dev/null | cut -f1)
+                if [[ -n "$dir_size" ]]; then
+                    echo "  ✅ $dir_name: $dir ($dir_size)"
+                else
+                    echo "  ⚠️ $dir_name: $dir (存在)"
+                fi
+            fi
+        else
+            echo "  ❌ $dir_name: $dir (不存在)"
+        fi
+    done
+    echo
+
+    echo -e "${YELLOW}文件权限:${NC}"
+    if [[ -f "$RCLONE" ]]; then
+        local perms=$(ls -la "$RCLONE" 2>/dev/null | awk '{print $1}')
+        if [[ -n "$perms" ]]; then
+            echo "  rclone: $perms"
+        else
+            echo "  rclone: 无法读取权限"
+        fi
+    else
+        echo "  rclone: 文件不存在"
+    fi
+
+    for mount in "$MOUNT_115" "$MOUNT_123"; do
+        if [[ -d "$mount" ]]; then
+            # 使用超时避免挂载点问题
+            local perms=$(timeout 3 ls -ld "$mount" 2>/dev/null | awk '{print $1}')
+            local mount_name=$(basename "$mount")
+            if [[ -n "$perms" ]]; then
+                echo "  $mount_name: $perms"
+            else
+                echo "  $mount_name: 无法读取权限"
+            fi
+        else
+            local mount_name=$(basename "$mount")
+            echo "  $mount_name: 目录不存在"
+        fi
+    done
+}
+
 # 健康检查
 health_check() {
     echo -e "${BLUE}=== 健康检查 ===${NC}"
@@ -944,6 +1020,9 @@ main() {
             ;;
         health|check)
             health_check
+            ;;
+        config)
+            show_config
             ;;
         help|--help|-h)
             show_help
