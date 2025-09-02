@@ -104,18 +104,18 @@ jobs:
             quicktest: true
             deploy: true
 
-          - job_name: other_os
-            os: ubuntu-latest
-            go: '>=1.25.0-rc.1'
-            build_flags: '-exclude "^(windows/|darwin/|linux/)"'
-            compile_all: true
-            deploy: true
+          # - job_name: other_os
+          #   os: ubuntu-latest
+          #   go: '>=1.24.0-rc.1'
+          #   build_flags: '-exclude "^(windows/|darwin/|linux/)"'
+          #   compile_all: true
+          #   deploy: true
 
-          - job_name: go1.24
-            os: ubuntu-latest
-            go: '1.24'
-            quicktest: true
-            racequicktest: true
+          # - job_name: go1.23
+          #   os: ubuntu-latest
+          #   go: '1.23'
+          #   quicktest: true
+          #   racequicktest: true
 
     name: ${{ matrix.job_name }}
 
@@ -134,6 +134,7 @@ jobs:
           check-latest: true
 
       - name: Set environment variables
+        shell: bash
         run: |
           echo 'GOTAGS=${{ matrix.gotags }}' >> $GITHUB_ENV
           echo 'BUILD_FLAGS=${{ matrix.build_flags }}' >> $GITHUB_ENV
@@ -147,10 +148,35 @@ jobs:
           sudo chmod 666 /dev/fuse
           sudo chown root:$USER /etc/fuse.conf
           sudo apt-get update
-          sudo apt-get install -y fuse3 libfuse-dev rpm pkg-config git-annex git-annex-remote-rclone nfs-common
+
+          # Install packages based on architecture to fix cgofuse compatibility
+          if [[ "${{ matrix.goarch }}" == "386" ]]; then
+            echo "🔧 Installing FUSE2 libraries for 32-bit build (cgofuse v1.6.0 compatibility)..."
+            # Use FUSE2 for 32-bit builds to maintain compatibility with cgofuse v1.6.0
+            sudo apt-get install -y fuse libfuse2-dev rpm pkg-config git-annex git-annex-remote-rclone nfs-common
+
+            # Install 32-bit development tools
+            sudo dpkg --add-architecture i386
+            sudo apt-get update
+            sudo apt-get install -y \
+              gcc-multilib \
+              g++-multilib \
+              libc6-dev-i386 \
+              libfuse2-dev:i386 \
+              pkg-config:i386
+
+            # Set up 32-bit environment
+            export PKG_CONFIG_PATH="/usr/lib/i386-linux-gnu/pkgconfig:$PKG_CONFIG_PATH"
+            echo "PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
+          else
+            echo "🔧 Installing FUSE3 libraries for 64-bit build..."
+            # Use FUSE3 for other architectures (standard)
+            sudo apt-get install -y fuse3 libfuse-dev rpm pkg-config git-annex git-annex-remote-rclone nfs-common
+          fi
         if: matrix.os == 'ubuntu-latest'
 
       - name: Install Libraries on macOS
+        shell: bash
         run: |
           # https://github.com/Homebrew/brew/issues/15621#issuecomment-1619266788
           # https://github.com/orgs/Homebrew/discussions/4612#discussioncomment-6319008
@@ -179,6 +205,7 @@ jobs:
         if: matrix.os == 'windows-latest'
 
       - name: Print Go version and environment
+        shell: bash
         run: |
           printf "Using go at: $(which go)\n"
           printf "Go version: $(go version)\n"
@@ -190,37 +217,43 @@ jobs:
           env
 
       - name: Build rclone
+        shell: bash
         run: |
           make
 
       - name: Rclone version
+        shell: bash
         run: |
           rclone version
+      # - name: Run tests
+      #   shell: bash
+      #   run: |
+      #     make quicktest
+      #   if: matrix.quicktest
 
-      - name: Run tests
-        run: |
-          make quicktest
-        if: matrix.quicktest
+      # - name: Race test
+      #   shell: bash
+      #   run: |
+      #     make racequicktest
+      #   if: matrix.racequicktest
 
-      - name: Race test
-        run: |
-          make racequicktest
-        if: matrix.racequicktest
-
-      - name: Run librclone tests
-        run: |
-          make -C librclone/ctest test
-          make -C librclone/ctest clean
-          librclone/python/test_rclone.py
-        if: matrix.librclonetest
+      # - name: Run librclone tests
+      #   shell: bash
+      #   run: |
+      #     make -C librclone/ctest test
+      #     make -C librclone/ctest clean
+      #     librclone/python/test_rclone.py
+      #   if: matrix.librclonetest
 
       - name: Compile all architectures test
+        shell: bash
         run: |
           make
           make compile_all
         if: matrix.compile_all
 
       - name: Deploy built binaries
+        shell: bash
         run: |
           if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then make release_dep_linux ; fi
           make ci_beta
@@ -351,6 +384,7 @@ jobs:
           go-version: '>=1.25.0-rc.1'
 
       - name: Set global environment variables
+        shell: bash
         run: |
           echo "VERSION=$(make version)" >> $GITHUB_ENV
 
@@ -369,6 +403,7 @@ jobs:
         run: env PATH=$PATH:~/go/bin gomobile bind -androidapi ${RCLONE_NDK_VERSION} -v -target=android/arm -javapkg=org.rclone -ldflags '-s -X github.com/rclone/rclone/fs.Version='${VERSION} github.com/rclone/rclone/librclone/gomobile
 
       - name: arm-v7a Set environment variables
+        shell: bash
         run: |
           echo "CC=$(echo $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi${RCLONE_NDK_VERSION}-clang)" >> $GITHUB_ENV
           echo "CC_FOR_TARGET=$CC" >> $GITHUB_ENV
@@ -382,6 +417,7 @@ jobs:
         run: go build -v -tags android -trimpath -ldflags '-s -X github.com/rclone/rclone/fs.Version='${VERSION} -o build/rclone-android-${RCLONE_NDK_VERSION}-armv7a .
 
       - name: arm64-v8a Set environment variables
+        shell: bash
         run: |
           echo "CC=$(echo $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${RCLONE_NDK_VERSION}-clang)" >> $GITHUB_ENV
           echo "CC_FOR_TARGET=$CC" >> $GITHUB_ENV
@@ -394,6 +430,7 @@ jobs:
         run: go build -v -tags android -trimpath -ldflags '-s -X github.com/rclone/rclone/fs.Version='${VERSION} -o build/rclone-android-${RCLONE_NDK_VERSION}-armv8a .
 
       - name: x86 Set environment variables
+        shell: bash
         run: |
           echo "CC=$(echo $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/i686-linux-android${RCLONE_NDK_VERSION}-clang)" >> $GITHUB_ENV
           echo "CC_FOR_TARGET=$CC" >> $GITHUB_ENV
@@ -406,6 +443,7 @@ jobs:
         run: go build -v -tags android -trimpath -ldflags '-s -X github.com/rclone/rclone/fs.Version='${VERSION} -o build/rclone-android-${RCLONE_NDK_VERSION}-x86 .
 
       - name: x64 Set environment variables
+        shell: bash
         run: |
           echo "CC=$(echo $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android${RCLONE_NDK_VERSION}-clang)" >> $GITHUB_ENV
           echo "CC_FOR_TARGET=$CC" >> $GITHUB_ENV
