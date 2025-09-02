@@ -205,10 +205,24 @@ upload:
 upload_github:
 	./bin/upload-github $(TAG)
 
-cross:	doc
+# Fix cgofuse cross-compilation issues
+fix-cgofuse:
+ifeq ($(findstring cmount,$(GOTAGS)),cmount)
+	@echo "🔧 Fixing cgofuse cross-compilation issues..."
+	@if [ -f bin/fix-cgofuse.sh ]; then \
+		chmod +x bin/fix-cgofuse.sh && \
+		./bin/fix-cgofuse.sh; \
+	else \
+		echo "⚠️  cgofuse fix script not found, skipping..."; \
+	fi
+else
+	@echo "⏭️  cmount not in build tags, skipping cgofuse fix"
+endif
+
+cross:	doc fix-cgofuse
 	go run bin/cross-compile.go -release current $(BUILD_FLAGS) $(BUILDTAGS) $(BUILD_ARGS) $(TAG)
 
-beta:
+beta:	fix-cgofuse
 	go run bin/cross-compile.go $(BUILD_FLAGS) $(BUILDTAGS) $(BUILD_ARGS) $(TAG)
 	rclone -v copy build/ pub.rclone.org:/$(TAG)
 	@echo Beta release ready at https://pub.rclone.org/$(TAG)/
@@ -229,7 +243,7 @@ ifeq ($(or $(BRANCH_PATH),$(RELEASE_TAG)),)
 endif
 	@echo Beta release ready at $(BETA_URL)/testbuilds
 
-ci_beta:
+ci_beta:	fix-cgofuse
 	git log $(LAST_TAG).. > /tmp/git-log.txt
 	go run bin/cross-compile.go -release beta-latest -git-log /tmp/git-log.txt $(BUILD_FLAGS) $(BUILDTAGS) $(BUILD_ARGS) $(TAG)
 	rclone --no-check-dest --config bin/ci.rclone.conf -v copy --exclude '*beta-latest*' build/ $(BETA_UPLOAD)
