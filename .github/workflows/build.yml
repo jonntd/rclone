@@ -253,35 +253,65 @@ jobs:
           make compile_all
         if: matrix.compile_all
 
-      - name: Deploy built binaries
+      - name: Build binaries for upload
         shell: bash
         run: |
           if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then make release_dep_linux ; fi
-          make ci_beta
+          # Build binaries but don't clean up for artifact upload
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          git log $LAST_TAG.. > /tmp/git-log.txt 2>/dev/null || echo "No previous tags" > /tmp/git-log.txt
+          # Use compile-only flag to prevent cleanup, then manually create artifacts
+          go run bin/cross-compile.go -compile-only -release beta-latest -git-log /tmp/git-log.txt ${{ matrix.build_flags }} -tags "${{ matrix.gotags }}" ${{ matrix.build_args }} $LAST_TAG
+          # Create zip files manually for upload
+          cd build
+          for dir in rclone-*; do
+            if [ -d "$dir" ]; then
+              # Copy documentation files
+              cp -a ../MANUAL.txt "$dir/README.txt" 2>/dev/null || true
+              cp -a ../MANUAL.html "$dir/README.html" 2>/dev/null || true
+              cp -a ../rclone.1 "$dir/" 2>/dev/null || true
+              if [ -f /tmp/git-log.txt ]; then
+                cp -a /tmp/git-log.txt "$dir/" 2>/dev/null || true
+              fi
+              # Create zip file
+              zip -r9 "$dir.zip" "$dir"
+            fi
+          done
+          cd ..
         env:
-          RCLONE_CONFIG_PASS: ${{ secrets.RCLONE_CONFIG_PASS }}
-        # working-directory: '$(modulePath)'
-        # Deploy binaries if enabled in config && not a PR && not a fork
-        if: matrix.deploy && github.head_ref == '' && github.repository == 'jonntd/rclone'
-      - 
-        if: ${{ contains(github.ref, 'refs/tags/') }}
-        name: Upload Release Artifact
+          GOTAGS: ${{ matrix.gotags }}
+          BUILD_FLAGS: ${{ matrix.build_flags }}
+          BUILD_ARGS: ${{ matrix.build_args }}
+          CGO_CFLAGS: ${{ matrix.cgo_cflags }}
+          CGO_LDFLAGS: ${{ matrix.cgo_ldflags }}
+        # Build binaries for artifact upload
+        if: github.head_ref == '' && github.repository == 'jonntd/rclone'
+      - name: Upload Release Artifact
+        if: ${{ contains(github.ref, 'refs/tags/') && github.head_ref == '' && github.repository == 'jonntd/rclone' }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.job_name }}
           if-no-files-found: ignore
           path: |
             build/
-      - 
-        if: ${{ ! contains(github.ref, 'refs/tags/') }}
-        name: Upload Test Artifact
+      - name: Upload Test Artifact
+        if: ${{ ! contains(github.ref, 'refs/tags/') && github.head_ref == '' && github.repository == 'jonntd/rclone' }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.job_name }}
           if-no-files-found: ignore
           path: |
-            build/*amd64.zip
-            build/*arm64.zip
+            build/*.zip
+      - name: Deploy built binaries
+        shell: bash
+        run: |
+          # Now run the original ci_beta which cleans up
+          make ci_beta
+        env:
+          RCLONE_CONFIG_PASS: ${{ secrets.RCLONE_CONFIG_PASS }}
+        # working-directory: '$(modulePath)'
+        # Deploy binaries if enabled in config && not a PR && not a fork
+        if: matrix.deploy && github.head_ref == '' && github.repository == 'jonntd/rclone'
 
   # lint:
   #   if: inputs.manual || (github.repository == 'jonntd/rclone' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name))
