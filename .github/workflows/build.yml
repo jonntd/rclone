@@ -168,17 +168,23 @@ jobs:
               gcc-multilib \
               g++-multilib \
               libc6-dev-i386 \
+              libfuse3-dev:i386 \
               pkg-config:i386
 
             # Set up 32-bit environment with FUSE3 support
             export PKG_CONFIG_PATH="/usr/lib/i386-linux-gnu/pkgconfig:$PKG_CONFIG_PATH"
             echo "PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
 
+            # Set GO386 for maximum compatibility
+            export GO386=387
+            echo "GO386=387" >> $GITHUB_ENV
+
             # Ensure cgofuse can find FUSE3 for 32-bit builds
-            export CGO_CFLAGS="$(pkg-config --cflags fuse3) $CGO_CFLAGS"
-            export CGO_LDFLAGS="$(pkg-config --libs fuse3) $CGO_LDFLAGS"
-            echo "CGO_CFLAGS=$(pkg-config --cflags fuse3) $CGO_CFLAGS" >> $GITHUB_ENV
-            echo "CGO_LDFLAGS=$(pkg-config --libs fuse3) $CGO_LDFLAGS" >> $GITHUB_ENV
+            # Use pkg-config for 32-bit FUSE3 configuration
+            export CGO_CFLAGS="$(PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig pkg-config --cflags fuse3) -m32 $CGO_CFLAGS"
+            export CGO_LDFLAGS="$(PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig pkg-config --libs fuse3) -m32 $CGO_LDFLAGS"
+            echo "CGO_CFLAGS=$(PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig pkg-config --cflags fuse3) -m32 $CGO_CFLAGS" >> $GITHUB_ENV
+            echo "CGO_LDFLAGS=$(PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig pkg-config --libs fuse3) -m32 $CGO_LDFLAGS" >> $GITHUB_ENV
           fi
         if: matrix.os == 'ubuntu-latest'
 
