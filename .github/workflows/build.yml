@@ -69,7 +69,6 @@ jobs:
             quicktest: true
             racequicktest: true
             librclonetest: true
-            deploy: true
 
           - job_name: linux_386
             os: ubuntu-latest
@@ -85,14 +84,12 @@ jobs:
             build_flags: '-include "^darwin/amd64" -cgo'
             quicktest: true
             racequicktest: true
-            deploy: true
 
           - job_name: mac_arm64
             os: macos-latest
             go: '>=1.25.0-rc.1'
             gotags: 'cmount,noselfupdate,fuse3'
             build_flags: '-include "^darwin/arm64" -cgo -macos-arch arm64 -cgo-cflags=-I/usr/local/include -cgo-ldflags=-L/usr/local/lib'
-            deploy: true
 
           - job_name: windows
             os: windows-latest
@@ -102,7 +99,6 @@ jobs:
             build_flags: '-include "^windows/"'
             build_args: '-buildmode exe'
             quicktest: true
-            deploy: true
 
           # - job_name: other_os
           #   os: ubuntu-latest
