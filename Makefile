@@ -45,9 +45,9 @@ LINTTAGS=--build-tags "$(GOTAGS)"
 endif
 LDFLAGS=--ldflags "-s -X github.com/rclone/rclone/fs.Version=$(TAG)"
 
-.PHONY: rclone test_all vars version
+.PHONY: rclone test_all vars version fix-cgofuse
 
-rclone:
+rclone: fix-cgofuse
 ifeq ($(GO_OS),windows)
 	go run bin/resource_windows.go -version $(TAG) -syso resource_windows_`go env GOARCH`.syso
 endif
@@ -204,6 +204,20 @@ upload:
 
 upload_github:
 	./bin/upload-github $(TAG)
+
+# Fix cgofuse cross-compilation issues
+fix-cgofuse:
+ifeq ($(findstring cmount,$(GOTAGS)),cmount)
+	@echo "🔧 Fixing cgofuse cross-compilation issues..."
+	@if [ -f bin/fix-cgofuse.sh ]; then \
+		chmod +x bin/fix-cgofuse.sh && \
+		./bin/fix-cgofuse.sh; \
+	else \
+		echo "⚠️  cgofuse fix script not found, skipping..."; \
+	fi
+else
+	@echo "⏭️  cmount not in build tags, skipping cgofuse fix"
+endif
 
 cross:	doc
 	go run bin/cross-compile.go -release current $(BUILD_FLAGS) $(BUILDTAGS) $(BUILD_ARGS) $(TAG)
