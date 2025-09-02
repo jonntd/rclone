@@ -4138,15 +4138,58 @@ func (o *Object) Remote() string {
 	return o.remote
 }
 
+// readMetaData gets the metadata if it hasn't already been fetched
+func (o *Object) readMetaData(ctx context.Context) error {
+	if o.hasMetaData {
+		return nil
+	}
+
+	if o.id == "" {
+		return fs.ErrorObjectNotFound
+	}
+
+	startTime := time.Now()
+	fs.Debugf(o, "🚀 readMetaData开始: fileID=%s", o.id)
+
+	// 使用现有的getFileInfo API获取文件详细信息
+	fileInfo, err := o.fs.getFileInfo(ctx, o.id)
+	duration := time.Since(startTime)
+
+	if err != nil {
+		fs.Debugf(o, "❌ readMetaData失败: %v, 耗时=%v", err, duration)
+		return err
+	}
+
+	// 更新对象的元数据
+	o.size = fileInfo.Size
+	o.md5sum = fileInfo.Etag
+	// 注意：123网盘API可能不返回准确的修改时间，保持现有的modTime
+	o.hasMetaData = true
+
+	fs.Debugf(o, "✅ readMetaData成功: size=%d, md5=%s, 耗时=%v", o.size, o.md5sum, duration)
+	return nil
+}
+
 // ModTime returns the modification time
 func (o *Object) ModTime(ctx context.Context) time.Time {
-	// In a real implementation, you would fetch metadata if not already available.
+	// 🚀 优化：只在没有元数据时才获取，避免不必要的API调用
+	if !o.hasMetaData && o.id != "" {
+		if err := o.readMetaData(ctx); err != nil {
+			fs.Debugf(o, "Failed to read metadata for ModTime: %v", err)
+		}
+	}
 	return o.modTime
 }
 
 // Size returns the size of the file
 func (o *Object) Size() int64 {
-	// In a real implementation, you would fetch metadata if not already available.
+	// 🚀 优化：只在没有元数据时才获取，避免不必要的API调用
+	if !o.hasMetaData && o.id != "" {
+		if err := o.readMetaData(context.TODO()); err != nil {
+			fs.Debugf(o, "Failed to read metadata for Size: %v", err)
+			return -1
+		}
+	}
 	return o.size
 }
 
@@ -4155,7 +4198,13 @@ func (o *Object) Hash(ctx context.Context, t fshash.Type) (string, error) {
 	if t != fshash.MD5 {
 		return "", fshash.ErrUnsupported
 	}
-	// In a real implementation, you would fetch metadata if not already available.
+	// 🚀 优化：只在没有元数据时才获取，避免不必要的API调用
+	if !o.hasMetaData && o.id != "" {
+		if err := o.readMetaData(ctx); err != nil {
+			fs.Debugf(o, "Failed to read metadata for Hash: %v", err)
+			return "", err
+		}
+	}
 	return o.md5sum, nil
 }
 
@@ -4179,21 +4228,39 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		return o.openWithCDNFailover(ctx, options...)
 	}
 
-	// 跨云传输优化：检测大文件并启用多线程下载
-	// 检查是否已经有禁用并发下载选项，避免重复并发
+	// 🚀 优化：检测是否为小范围读取（如预览、MIME检测等）
+	var rangeOption *fs.RangeOption
 	hasDisableOption := false
 	hasRangeOption := false
+
 	for _, option := range options {
 		if option.String() == "DisableConcurrentDownload" {
 			hasDisableOption = true
-			break
 		}
-		// 修复：检查是否有Range请求，Range请求不应该使用并发下载
-		if _, ok := option.(*fs.RangeOption); ok {
+		// 检查是否有Range请求
+		if ro, ok := option.(*fs.RangeOption); ok {
 			hasRangeOption = true
+			rangeOption = ro
 		}
 	}
 
+	// 🚀 智能下载策略：小范围读取优化
+	if rangeOption != nil {
+		start, end := rangeOption.Decode(o.size)
+		requestSize := end - start + 1
+
+		// 如果请求的数据量很小（如前1MB用于预览/MIME检测），优先使用简单下载
+		if requestSize <= 1024*1024 { // 1MB阈值
+			fs.Debugf(o, "🎯 检测到小范围读取请求: %d-%d (%s)，使用简单下载避免下载整个文件",
+				start, end, fs.SizeSuffix(requestSize))
+			return o.openWithSimpleRetry(ctx, options...)
+		} else {
+			fs.Debugf(o, "📥 大范围读取请求: %d-%d (%s)，考虑并发下载",
+				start, end, fs.SizeSuffix(requestSize))
+		}
+	}
+
+	// 跨云传输优化：检测大文件并启用多线程下载
 	// 修复：Range请求不使用并发下载，避免下载整个文件
 	if !hasDisableOption && !hasRangeOption && o.size >= minFileSizeForConcurrency { // 使用常量定义的阈值
 		return o.openWithConcurrency(ctx, options...)

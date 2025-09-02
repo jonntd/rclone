@@ -4003,6 +4003,72 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *File, 
 	return info, nil
 }
 
+// getFileInfoByID 通过文件ID直接获取文件信息（避免listAll的低效查询）
+// 使用115网盘的 /open/folder/get_info API
+func (f *Fs) getFileInfoByID(ctx context.Context, fileID string) (*File, error) {
+	startTime := time.Now()
+	fs.Debugf(f, "🚀 getFileInfoByID: 使用直接API获取文件信息, fileID=%s", fileID)
+
+	if fileID == "" {
+		return nil, errors.New("文件ID不能为空")
+	}
+
+	// 🚀 性能优化：检查缓存（如果启用了listAllCache）
+	if f.listAllCache != nil {
+		cacheKey := fmt.Sprintf("fileinfo_%s", fileID)
+		if cached, found := f.listAllCache.GetMaybe(cacheKey); found {
+			if fileInfo, ok := cached.(*File); ok {
+				fs.Debugf(f, "🎯 getFileInfoByID缓存命中: fileID=%s, 耗时=%v", fileID, time.Since(startTime))
+				return fileInfo, nil
+			}
+		}
+	}
+
+	// 使用115网盘的直接文件信息API
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   "/open/folder/get_info",
+		Parameters: url.Values{
+			"file_id": {fileID},
+		},
+	}
+
+	var response struct {
+		State int    `json:"state"`
+		Error string `json:"error,omitempty"`
+		Data  *File  `json:"data,omitempty"`
+	}
+
+	err := f.CallOpenAPI(ctx, &opts, nil, &response, false)
+	duration := time.Since(startTime)
+
+	if err != nil {
+		fs.Debugf(f, "❌ getFileInfoByID API调用失败: %v, 耗时=%v", err, duration)
+		return nil, fmt.Errorf("failed to get file info by ID %s: %w", fileID, err)
+	}
+
+	if response.State != 1 {
+		fs.Debugf(f, "❌ getFileInfoByID API返回错误: state=%d, error=%s, 耗时=%v", response.State, response.Error, duration)
+		return nil, fmt.Errorf("API error for file ID %s: state=%d, error=%s", fileID, response.State, response.Error)
+	}
+
+	if response.Data == nil {
+		fs.Debugf(f, "❌ getFileInfoByID API返回空数据: fileID=%s, 耗时=%v", fileID, duration)
+		return nil, fmt.Errorf("no data returned for file ID %s", fileID)
+	}
+
+	// 🚀 性能优化：缓存结果（5分钟有效期）
+	if f.listAllCache != nil {
+		cacheKey := fmt.Sprintf("fileinfo_%s", fileID)
+		f.listAllCache.Put(cacheKey, response.Data)
+		fs.Debugf(f, "💾 getFileInfoByID结果已缓存: fileID=%s", fileID)
+	}
+
+	fs.Debugf(f, "✅ getFileInfoByID成功: fileID=%s, name=%s, size=%d, 耗时=%v",
+		fileID, response.Data.FileNameBest(), response.Data.Size, duration)
+	return response.Data, nil
+}
+
 // createObject creates a placeholder Object struct before upload.
 func (f *Fs) createObject(ctx context.Context, remote string, modTime time.Time, size int64) (o *Object, leaf string, dirID string, err error) {
 	// Fix: 正确分割路径，避免将文件名当作目录创建
@@ -4320,16 +4386,19 @@ func (o *Object) Remote() string {
 
 // ModTime returns the modification time
 func (o *Object) ModTime(ctx context.Context) time.Time {
-	err := o.readMetaData(ctx)
-	if err != nil {
-		// 在跨云传输时，目标文件不存在是正常情况，降级为调试信息
-		if err == fs.ErrorObjectNotFound {
-			fs.Debugf(o, "目标文件不存在，ModTime将使用零值: %v", err)
-		} else {
-			fs.Logf(o, "failed to read metadata for ModTime: %v", err)
+	// 🚀 优化：只在没有元数据时才调用readMetaData，避免重复API调用
+	if !o.hasMetaData {
+		err := o.readMetaData(ctx)
+		if err != nil {
+			// 在跨云传输时，目标文件不存在是正常情况，降级为调试信息
+			if err == fs.ErrorObjectNotFound {
+				fs.Debugf(o, "目标文件不存在，ModTime将使用零值: %v", err)
+			} else {
+				fs.Logf(o, "failed to read metadata for ModTime: %v", err)
+			}
+			// Return a zero time instead of Now() as Precision is NotSupported
+			return time.Time{}
 		}
-		// Return a zero time instead of Now() as Precision is NotSupported
-		return time.Time{}
 	}
 	return o.modTime
 }
@@ -4420,8 +4489,31 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
 
-	// 115网盘下载策略说明：完全禁用并发策略
-	fs.Debugf(o, "📥 115下载策略: 禁用并发下载 (1TB阈值 + 1GB分片，强制普通下载)")
+	// 🚀 优化：检测是否为小范围读取（如预览、MIME检测等）
+	var rangeOption *fs.RangeOption
+	for _, option := range options {
+		if ro, ok := option.(*fs.RangeOption); ok {
+			rangeOption = ro
+			break
+		}
+	}
+
+	// 🚀 智能下载策略：小范围读取优化
+	if rangeOption != nil {
+		start, end := rangeOption.Decode(o.size)
+		requestSize := end - start + 1
+
+		// 如果请求的数据量很小（如前1MB用于预览/MIME检测），使用范围下载
+		if requestSize <= 1024*1024 { // 1MB阈值
+			fs.Debugf(o, "🎯 检测到小范围读取请求: %d-%d (%s)，使用范围下载避免下载整个文件",
+				start, end, fs.SizeSuffix(requestSize))
+		} else {
+			fs.Debugf(o, "📥 大范围读取请求: %d-%d (%s)，使用普通下载",
+				start, end, fs.SizeSuffix(requestSize))
+		}
+	} else {
+		fs.Debugf(o, "📥 115下载策略: 禁用并发下载 (1TB阈值 + 1GB分片，强制普通下载)")
+	}
 
 	// Get/refresh download URL
 	err = o.setDownloadURL(ctx)
@@ -4711,16 +4803,35 @@ func (o *Object) readMetaData(ctx context.Context) error {
 		return nil
 	}
 
-	// Use the path-based lookup
+	// 🚀 优化：如果有文件ID，优先使用直接API获取文件信息
+	if o.id != "" {
+		fs.Debugf(o.fs, "🚀 readMetaData: 使用直接API获取元数据, fileID=%s", o.id)
+		info, err := o.fs.getFileInfoByID(ctx, o.id)
+		if err == nil {
+			// 直接API成功，设置元数据
+			err = o.setMetaData(info)
+			if err != nil {
+				fs.Debugf(o.fs, "readMetaData: setMetaData失败: %v", err)
+			} else {
+				fs.Debugf(o.fs, "✅ readMetaData: 直接API成功获取元数据")
+			}
+			return err
+		}
+		// 直接API失败，记录日志但继续尝试路径查找
+		fs.Debugf(o.fs, "⚠️ readMetaData: 直接API失败，回退到路径查找: %v", err)
+	}
+
+	// 回退到原来的路径查找方法
+	fs.Debugf(o.fs, "🔄 readMetaData: 使用路径查找方法")
 	info, err := o.fs.readMetaDataForPath(ctx, o.remote)
 	if err != nil {
-		fs.Debugf(o.fs, " readMetaData失败: %v", err)
+		fs.Debugf(o.fs, "readMetaData失败: %v", err)
 		return err // fs.ErrorObjectNotFound or other errors
 	}
 
 	err = o.setMetaData(info)
 	if err != nil {
-		fs.Debugf(o.fs, " readMetaData: setMetaData失败: %v", err)
+		fs.Debugf(o.fs, "readMetaData: setMetaData失败: %v", err)
 	}
 	return err
 }
