@@ -138,15 +138,6 @@ jobs:
         run: |
           go get github.com/ebitengine/purego@5047c08
 
-      - name: Fix cgofuse cross-compilation
-        shell: bash
-        run: |
-          # Download dependencies first to populate module cache
-          go mod download
-          # Run our cgofuse fix script
-          ./bin/fix-cgofuse.sh
-        if: matrix.os == 'ubuntu-latest' && matrix.gotags && contains(matrix.gotags, 'cmount')
-
       - name: Set environment variables
         shell: bash
         run: |
@@ -156,22 +147,6 @@ jobs:
           if [[ "${{ matrix.goarch }}" != "" ]]; then echo 'GOARCH=${{ matrix.goarch }}' >> $GITHUB_ENV ; fi
           if [[ "${{ matrix.cgo }}" != "" ]]; then echo 'CGO_ENABLED=${{ matrix.cgo }}' >> $GITHUB_ENV ; fi
 
-          # Set CGO environment for cross-compilation
-          if [[ "${{ matrix.goarch }}" == "386" && "${{ matrix.os }}" == "ubuntu-latest" ]]; then
-            echo 'CGO_ENABLED=1' >> $GITHUB_ENV
-            echo 'CC=gcc -m32' >> $GITHUB_ENV
-            echo 'CXX=g++ -m32' >> $GITHUB_ENV
-            echo 'PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig:/usr/lib/pkgconfig' >> $GITHUB_ENV
-            echo 'CGO_CFLAGS=-I/usr/include -I/usr/include/fuse' >> $GITHUB_ENV
-            echo 'CGO_LDFLAGS=-L/usr/lib/i386-linux-gnu -lfuse' >> $GITHUB_ENV
-            echo 'CGO_CPPFLAGS=-I/usr/include -I/usr/include/fuse' >> $GITHUB_ENV
-          fi
-
-          # Ensure CGO is enabled for cmount builds
-          if [[ "${{ matrix.gotags }}" == *"cmount"* ]]; then
-            echo 'CGO_ENABLED=1' >> $GITHUB_ENV
-          fi
-
       - name: Install Libraries on Linux
         shell: bash
         run: |
@@ -180,19 +155,6 @@ jobs:
           sudo chown root:$USER /etc/fuse.conf
           sudo apt-get update
           sudo apt-get install -y fuse3 libfuse-dev rpm pkg-config git-annex git-annex-remote-rclone nfs-common
-
-          # Install cross-compilation toolchains and libraries
-          sudo apt-get install -y gcc-multilib g++-multilib
-          sudo apt-get install -y gcc-arm-linux-gnueabihf gcc-aarch64-linux-gnu
-
-          # Install 32-bit FUSE libraries for 386 builds
-          sudo dpkg --add-architecture i386
-          sudo apt-get update
-          sudo apt-get install -y libfuse-dev:i386 libc6-dev:i386
-
-          # Set up pkg-config for cross-compilation
-          export PKG_CONFIG_PATH_i386="/usr/lib/i386-linux-gnu/pkgconfig:/usr/lib/pkgconfig"
-          echo "PKG_CONFIG_PATH_i386=$PKG_CONFIG_PATH_i386" >> $GITHUB_ENV
         if: matrix.os == 'ubuntu-latest'
 
       - name: Install Libraries on macOS
