@@ -71,10 +71,10 @@ jobs:
             librclonetest: true
 
           - job_name: linux_386
-            os: ubuntu-latest
+            os: ubuntu-22.04
             go: '>=1.25.0-rc.1'
             goarch: 386
-            gotags: cmount,noselfupdate,fuse3
+            gotags: cmount,noselfupdate
             quicktest: true
 
           - job_name: mac_amd64
@@ -168,7 +168,7 @@ jobs:
               gcc-multilib \
               g++-multilib \
               libc6-dev-i386 \
-              libfuse3-dev:i386 \
+              libfuse2-dev:i386 \
               pkg-config:i386
 
             # Set up 32-bit environment with FUSE3 support
@@ -179,12 +179,12 @@ jobs:
             export GO386=387
             echo "GO386=387" >> $GITHUB_ENV
 
-            # Ensure cgofuse can find FUSE3 for 32-bit builds
-            # Use pkg-config for 32-bit FUSE3 configuration
-            export CGO_CFLAGS="$(PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig pkg-config --cflags fuse3) -m32 $CGO_CFLAGS"
-            export CGO_LDFLAGS="$(PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig pkg-config --libs fuse3) -m32 $CGO_LDFLAGS"
-            echo "CGO_CFLAGS=$(PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig pkg-config --cflags fuse3) -m32 $CGO_CFLAGS" >> $GITHUB_ENV
-            echo "CGO_LDFLAGS=$(PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig pkg-config --libs fuse3) -m32 $CGO_LDFLAGS" >> $GITHUB_ENV
+            # Ensure cgofuse can find FUSE2 for 32-bit builds on Ubuntu 22.04
+            # Use pkg-config for 32-bit FUSE2 configuration
+            export CGO_CFLAGS="$(PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig pkg-config --cflags fuse) -m32 $CGO_CFLAGS"
+            export CGO_LDFLAGS="$(PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig pkg-config --libs fuse) -m32 $CGO_LDFLAGS"
+            echo "CGO_CFLAGS=$(PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig pkg-config --cflags fuse) -m32 $CGO_CFLAGS" >> $GITHUB_ENV
+            echo "CGO_LDFLAGS=$(PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig pkg-config --libs fuse) -m32 $CGO_LDFLAGS" >> $GITHUB_ENV
           fi
         if: matrix.os == 'ubuntu-latest'
 
