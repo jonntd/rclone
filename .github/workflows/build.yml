@@ -74,7 +74,7 @@ jobs:
             os: ubuntu-22.04
             go: '>=1.25.0-rc.1'
             goarch: 386
-            gotags: cmount,noselfupdate
+            gotags: noselfupdate
             quicktest: true
 
           - job_name: mac_amd64
@@ -167,24 +167,12 @@ jobs:
             sudo apt-get install -y \
               gcc-multilib \
               g++-multilib \
-              libc6-dev-i386 \
-              libfuse2-dev:i386 \
-              pkg-config:i386
+              libc6-dev-i386
 
-            # Set up 32-bit environment with FUSE3 support
-            export PKG_CONFIG_PATH="/usr/lib/i386-linux-gnu/pkgconfig:$PKG_CONFIG_PATH"
-            echo "PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
-
+            # Set up 32-bit environment (no FUSE support for 386 builds)
             # Set GO386 for maximum compatibility
             export GO386=387
             echo "GO386=387" >> $GITHUB_ENV
-
-            # Ensure cgofuse can find FUSE2 for 32-bit builds on Ubuntu 22.04
-            # Use pkg-config for 32-bit FUSE2 configuration
-            export CGO_CFLAGS="$(PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig pkg-config --cflags fuse) -m32 $CGO_CFLAGS"
-            export CGO_LDFLAGS="$(PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig pkg-config --libs fuse) -m32 $CGO_LDFLAGS"
-            echo "CGO_CFLAGS=$(PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig pkg-config --cflags fuse) -m32 $CGO_CFLAGS" >> $GITHUB_ENV
-            echo "CGO_LDFLAGS=$(PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig pkg-config --libs fuse) -m32 $CGO_LDFLAGS" >> $GITHUB_ENV
           fi
         if: matrix.os == 'ubuntu-latest'
 
