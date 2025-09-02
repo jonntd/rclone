@@ -149,13 +149,14 @@ jobs:
           sudo chown root:$USER /etc/fuse.conf
           sudo apt-get update
 
-          # Install packages based on architecture to fix cgofuse compatibility
-          if [[ "${{ matrix.goarch }}" == "386" ]]; then
-            echo "🔧 Installing FUSE2 libraries for 32-bit build (cgofuse v1.6.0 compatibility)..."
-            # Use FUSE2 for 32-bit builds to maintain compatibility with cgofuse v1.6.0
-            sudo apt-get install -y fuse libfuse2-dev rpm pkg-config git-annex git-annex-remote-rclone nfs-common
+          # Install FUSE2 libraries for all Linux builds to fix cgofuse v1.6.0 compatibility
+          echo "🔧 Installing FUSE2 libraries for cgofuse v1.6.0 compatibility..."
+          # Use FUSE2 for all Linux builds to maintain compatibility with cgofuse v1.6.0
+          sudo apt-get install -y fuse libfuse2-dev rpm pkg-config git-annex git-annex-remote-rclone nfs-common
 
-            # Install 32-bit development tools
+          # Install additional tools for 32-bit builds if needed
+          if [[ "${{ matrix.goarch }}" == "386" ]]; then
+            echo "🔧 Installing additional 32-bit development tools..."
             sudo dpkg --add-architecture i386
             sudo apt-get update
             sudo apt-get install -y \
@@ -168,10 +169,6 @@ jobs:
             # Set up 32-bit environment
             export PKG_CONFIG_PATH="/usr/lib/i386-linux-gnu/pkgconfig:$PKG_CONFIG_PATH"
             echo "PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
-          else
-            echo "🔧 Installing FUSE3 libraries for 64-bit build..."
-            # Use FUSE3 for other architectures (standard)
-            sudo apt-get install -y fuse3 libfuse-dev rpm pkg-config git-annex git-annex-remote-rclone nfs-common
           fi
         if: matrix.os == 'ubuntu-latest'
 
