@@ -63,7 +63,7 @@ jobs:
           - job_name: linux
             os: ubuntu-latest
             go: '>=1.25.0-rc.1'
-            gotags: cmount,noselfupdate,fuse3
+            gotags: cmount,noselfupdate
             build_flags: '-include "^linux/"'
             check: true
             quicktest: true
@@ -144,36 +144,7 @@ jobs:
           sudo chmod 666 /dev/fuse
           sudo chown root:$USER /etc/fuse.conf
           sudo apt-get update
-
-          # Install FUSE libraries with compatibility layer for cgofuse v1.6.0
-          echo "🔧 Installing FUSE libraries with compatibility for cgofuse v1.6.0..."
-          # Ubuntu 24.04 doesn't have libfuse2-dev, so we need to use available packages
           sudo apt-get install -y fuse3 libfuse3-dev libfuse-dev rpm pkg-config git-annex git-annex-remote-rclone nfs-common
-
-          # Try to install FUSE2 compatibility if available
-          sudo apt-get install -y libfuse2 || echo "libfuse2 not available, using FUSE3"
-
-          # Configure cgofuse to use FUSE3
-          export CGO_CFLAGS="$(pkg-config --cflags fuse3) $CGO_CFLAGS"
-          export CGO_LDFLAGS="$(pkg-config --libs fuse3) $CGO_LDFLAGS"
-          echo "CGO_CFLAGS=$(pkg-config --cflags fuse3) $CGO_CFLAGS" >> $GITHUB_ENV
-          echo "CGO_LDFLAGS=$(pkg-config --libs fuse3) $CGO_LDFLAGS" >> $GITHUB_ENV
-
-          # Install additional tools for 32-bit builds if needed
-          if [[ "${{ matrix.goarch }}" == "386" ]]; then
-            echo "🔧 Installing additional 32-bit development tools..."
-            sudo dpkg --add-architecture i386
-            sudo apt-get update
-            sudo apt-get install -y \
-              gcc-multilib \
-              g++-multilib \
-              libc6-dev-i386
-
-            # Set up 32-bit environment (no FUSE support for 386 builds)
-            # Set GO386 for maximum compatibility
-            export GO386=387
-            echo "GO386=387" >> $GITHUB_ENV
-          fi
         if: matrix.os == 'ubuntu-latest'
 
       - name: Install Libraries on macOS
