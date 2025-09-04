@@ -85,6 +85,13 @@ jobs:
             quicktest: true
             racequicktest: true
 
+          - job_name: linux_arm64
+            os: ubuntu-latest
+            go: '>=1.25.0-rc.1'
+            gotags: cmount,noselfupdate,fuse3
+            build_flags: '-include "^linux/arm64" -cgo'
+            cc: 'aarch64-linux-gnu-gcc'
+            
           - job_name: mac_arm64
             os: macos-latest
             go: '>=1.25.0-rc.1'
@@ -137,6 +144,7 @@ jobs:
           echo 'BUILD_ARGS=${{ matrix.build_args }}' >> $GITHUB_ENV
           if [[ "${{ matrix.goarch }}" != "" ]]; then echo 'GOARCH=${{ matrix.goarch }}' >> $GITHUB_ENV ; fi
           if [[ "${{ matrix.cgo }}" != "" ]]; then echo 'CGO_ENABLED=${{ matrix.cgo }}' >> $GITHUB_ENV ; fi
+          if [[ "${{ matrix.cc }}" != "" ]]; then echo 'CC=${{ matrix.cc }}' >> $GITHUB_ENV ; fi
 
       - name: Install Libraries on Linux
         run: |
@@ -145,6 +153,9 @@ jobs:
           sudo chown root:$USER /etc/fuse.conf
           sudo apt-get update
           sudo apt-get install -y fuse3 libfuse3-dev libfuse-dev rpm pkg-config git-annex git-annex-remote-rclone nfs-common
+          if [[ "${{ matrix.job_name }}" == "linux_arm64" ]]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+          fi
         if: matrix.os == 'ubuntu-latest'
 
       - name: Install Libraries on macOS
@@ -232,7 +243,7 @@ jobs:
           LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
           git log $LAST_TAG.. > /tmp/git-log.txt 2>/dev/null || echo "No previous tags" > /tmp/git-log.txt
           # Use compile-only flag to prevent cleanup, then manually create artifacts
-          go run bin/cross-compile.go -compile-only -release beta-latest -git-log /tmp/git-log.txt ${{ matrix.build_flags }} -tags "${{ matrix.gotags }}" ${{ matrix.build_args }} $LAST_TAG
+          go run bin/cross-compile.go -compile-only -release beta-latest -git-log /tmp/git-log.txt ${{ matrix.build_flags }} -tags "${{ matrix.gotags }}" ${{ matrix.build_args }} -include "^linux/amd64" $LAST_TAG
           # Create zip files manually for upload
           cd build
           for dir in rclone-*; do
