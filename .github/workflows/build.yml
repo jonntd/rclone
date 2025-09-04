@@ -91,6 +91,36 @@ jobs:
             gotags: cmount,noselfupdate,fuse3
             build_flags: '-include "^linux/arm64" -cgo'
             cc: 'aarch64-linux-gnu-gcc'
+          - job_name: linux_arm
+            os: ubuntu-latest
+            go: '>=1.25.0-rc.1'
+            gotags: cmount,noselfupdate,fuse3
+            build_flags: '-include "^linux/arm" -cgo'
+            cc: 'arm-linux-gnueabi-gcc'
+          - job_name: linux_arm_v6
+            os: ubuntu-latest
+            go: '>=1.25.0-rc.1'
+            gotags: cmount,noselfupdate,fuse3
+            build_flags: '-include "^linux/arm-v6" -cgo'
+            cc: 'arm-linux-gnueabi-gcc'
+          - job_name: linux_arm_v7
+            os: ubuntu-latest
+            go: '>=1.25.0-rc.1'
+            gotags: cmount,noselfupdate,fuse3
+            build_flags: '-include "^linux/arm-v7" -cgo'
+            cc: 'arm-linux-gnueabihf-gcc'
+          - job_name: linux_mips
+            os: ubuntu-latest
+            go: '>=1.25.0-rc.1'
+            gotags: cmount,noselfupdate,fuse3
+            build_flags: '-include "^linux/mips" -cgo'
+            cc: 'mips-linux-gnu-gcc'
+          - job_name: linux_mipsle
+            os: ubuntu-latest
+            go: '>=1.25.0-rc.1'
+            gotags: cmount,noselfupdate,fuse3
+            build_flags: '-include "^linux/mipsle" -cgo'
+            cc: 'mipsel-linux-gnu-gcc'
             
           - job_name: mac_arm64
             os: macos-latest
@@ -155,6 +185,15 @@ jobs:
           sudo apt-get install -y fuse3 libfuse3-dev libfuse-dev rpm pkg-config git-annex git-annex-remote-rclone nfs-common
           if [[ "${{ matrix.job_name }}" == "linux_arm64" ]]; then
             sudo apt-get install -y gcc-aarch64-linux-gnu
+          elif [[ "${{ matrix.job_name }}" == "linux_386" ]]; then
+            sudo apt-get install -y gcc-multilib
+          elif [[ "${{ matrix.job_name }}" == "linux_mips" ]] || [[ "${{ matrix.job_name }}" == "linux_mipsle" ]]; then
+            sudo apt-get install -y gcc-mips-linux-gnu gcc-mipsel-linux-gnu
+          elif [[ "${{ matrix.job_name }}" == "linux_arm64" ]]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+          elif [[ "${{ matrix.job_name }}" == "linux" ]]; then
+            # Install cross-compilation tools for all supported architectures
+            sudo apt-get install -y gcc-arm-linux-gnueabi gcc-arm-linux-gnueabihf
           fi
         if: matrix.os == 'ubuntu-latest'
 
