@@ -268,6 +268,8 @@ func (b *OpenAPIBase) Err() error {
 	}
 
 	switch code {
+	case 40140109: // access permission disabled - 访问权限已停用，无法访问此功能
+		return NewTokenError(out, true)
 	// Codes that require re-login
 	case 40140116: // refresh_token invalid (authorization revoked)
 		return NewTokenError(out, true)
