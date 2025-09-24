@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# 云盘挂载脚本 - 支持123和115网盘
+# 云盘挂载脚本 - 支持123和115网盘根目录挂载
 # 使用方法: ./mount_cloud_drives.sh [命令]
 
 set -e
@@ -60,7 +60,7 @@ check_dependencies() {
 create_directories() {
     log_info "创建挂载目录..."
     
-    mkdir -p "$MOUNT_BASE_DIR"/{123pan,115pan,123video,115tutorials}
+    mkdir -p "$MOUNT_BASE_DIR"/{123pan,115pan}
     mkdir -p "$LOG_DIR"
     
     log_info "目录创建完成"
@@ -154,83 +154,7 @@ mount_115pan() {
     fi
 }
 
-# 挂载123视频目录
-mount_123video() {
-    local mount_point="$MOUNT_BASE_DIR/123video"
-    local log_file="$LOG_DIR/123video.log"
-    
-    log_info "挂载123视频目录到: $mount_point"
-    
-    if check_mount_status "$mount_point"; then
-        log_warn "123视频目录已经挂载"
-        return
-    fi
-    
-    $RCLONE_PATH mount 123:/video "$mount_point" \
-        --daemon \
-        --vfs-cache-mode writes \
-        --vfs-cache-max-size 5G \
-        --vfs-read-chunk-size 64M \
-        --buffer-size 32M \
-        --log-file "$log_file" \
-        --log-level INFO \
-        --allow-other 2>/dev/null || \
-    $RCLONE_PATH mount 123:/video "$mount_point" \
-        --daemon \
-        --vfs-cache-mode writes \
-        --vfs-cache-max-size 5G \
-        --vfs-read-chunk-size 64M \
-        --buffer-size 32M \
-        --log-file "$log_file" \
-        --log-level INFO
-    
-    sleep 3
-    
-    if check_mount_status "$mount_point"; then
-        log_info "123视频目录挂载成功"
-    else
-        log_error "123视频目录挂载失败，请检查日志: $log_file"
-    fi
-}
 
-# 挂载115教程目录
-mount_115tutorials() {
-    local mount_point="$MOUNT_BASE_DIR/115tutorials"
-    local log_file="$LOG_DIR/115tutorials.log"
-    
-    log_info "挂载115教程目录到: $mount_point"
-    
-    if check_mount_status "$mount_point"; then
-        log_warn "115教程目录已经挂载"
-        return
-    fi
-    
-    $RCLONE_PATH mount 115:/教程 "$mount_point" \
-        --daemon \
-        --vfs-cache-mode writes \
-        --vfs-cache-max-size 5G \
-        --vfs-read-chunk-size 64M \
-        --buffer-size 32M \
-        --log-file "$log_file" \
-        --log-level INFO \
-        --allow-other 2>/dev/null || \
-    $RCLONE_PATH mount 115:/教程 "$mount_point" \
-        --daemon \
-        --vfs-cache-mode writes \
-        --vfs-cache-max-size 5G \
-        --vfs-read-chunk-size 64M \
-        --buffer-size 32M \
-        --log-file "$log_file" \
-        --log-level INFO
-    
-    sleep 3
-    
-    if check_mount_status "$mount_point"; then
-        log_info "115教程目录挂载成功"
-    else
-        log_error "115教程目录挂载失败，请检查日志: $log_file"
-    fi
-}
 
 # 卸载所有挂载
 unmount_all() {
@@ -279,8 +203,6 @@ main() {
             create_directories
             mount_123pan
             mount_115pan
-            mount_123video
-            mount_115tutorials
             show_status
             ;;
         "mount-123")
@@ -295,18 +217,7 @@ main() {
             mount_115pan
             show_status
             ;;
-        "mount-video")
-            check_dependencies
-            create_directories
-            mount_123video
-            show_status
-            ;;
-        "mount-tutorials")
-            check_dependencies
-            create_directories
-            mount_115tutorials
-            show_status
-            ;;
+
         "unmount")
             unmount_all
             show_status
@@ -320,22 +231,22 @@ main() {
             echo "用法: $0 [命令]"
             echo
             echo "命令:"
-            echo "  mount-all       挂载所有云盘"
-            echo "  mount-123       只挂载123网盘"
-            echo "  mount-115       只挂载115网盘"
-            echo "  mount-video     只挂载123视频目录"
-            echo "  mount-tutorials 只挂载115教程目录"
-            echo "  unmount         卸载所有挂载"
-            echo "  status          显示挂载状态"
-            echo "  help            显示此帮助"
+echo "  mount-all       挂载所有云盘"
+echo "  mount-123       只挂载123网盘"
+echo "  mount-115       只挂载115网盘"
+echo "  unmount         卸载所有挂载"
+echo "  status          显示挂载状态"
+echo "  help            显示此帮助"
             echo
             echo "挂载点: $MOUNT_BASE_DIR"
             echo "日志目录: $LOG_DIR"
             echo
             echo "示例:"
-            echo "  $0 mount-all    # 挂载所有云盘"
-            echo "  $0 status       # 查看挂载状态"
-            echo "  $0 unmount      # 卸载所有挂载"
+echo "  $0 mount-all    # 挂载123和115网盘根目录"
+echo "  $0 mount-123    # 只挂载123网盘根目录"
+echo "  $0 mount-115    # 只挂载115网盘根目录"
+echo "  $0 status       # 查看挂载状态"
+echo "  $0 unmount      # 卸载所有挂载"
             ;;
     esac
 }

@@ -317,7 +317,7 @@ func (tpr *TwoStepProgressReader) Read(p []byte) (n int, err error) {
 func (tpr *TwoStepProgressReader) SwitchToUpload() {
 	tpr.phase = "upload"
 	tpr.uploadBytes = 0
-	fs.Infof(tpr.fs, "🔄 跨云传输切换到上传阶段: %s", tpr.remote)
+	fs.Debugf(tpr.fs, "🔄 跨云传输切换到上传阶段: %s", tpr.remote)
 }
 
 // UpdateUploadProgress 更新上传进度
@@ -971,6 +971,12 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 	}
 }
 
+// APIResponse 定义API响应的通用接口，用于检查响应码
+type APIResponse interface {
+	GetCode() int
+	GetMessage() string
+}
+
 type ListRequest struct {
 	ParentFileID int    `json:"parentFileId"`
 	Limit        int    `json:"limit"`
@@ -983,6 +989,16 @@ type ListResponse struct {
 	Code    int                   `json:"code"`
 	Message string                `json:"message"`
 	Data    GetFileListRespDataV2 `json:"data"` // 更改为特定类型
+}
+
+// GetCode 实现APIResponse接口
+func (r *ListResponse) GetCode() int {
+	return r.Code
+}
+
+// GetMessage 实现APIResponse接口
+func (r *ListResponse) GetMessage() string {
+	return r.Message
 }
 
 // GetFileListRespDataV2 表示文件列表响应的数据结构
@@ -1018,14 +1034,26 @@ type FileListInfoRespDataV2 struct {
 func (f *Fs) ListFile(ctx context.Context, parentFileID, limit int, searchData, searchMode string, lastFileID int) (*ListResponse, error) {
 	fs.Debugf(f, "📋 调用ListFile，参数：parentFileID=%d, limit=%d, lastFileID=%d", parentFileID, limit, lastFileID)
 
-	// 🔧 性能优化：智能ListFile缓存（带失效机制）
-	// 只缓存简单的列表查询（无搜索、无分页）
-	if searchData == "" && searchMode == "" && lastFileID == 0 && limit == 100 {
-		cacheKey := fmt.Sprintf("listfile_%d", parentFileID)
+	// 🔧 性能优化：智能ListFile缓存（支持分页缓存）
+	// 缓存条件：无搜索查询，limit=100（标准分页大小）
+	if searchData == "" && searchMode == "" && limit == 100 {
+		// 🚀 改进：支持分页缓存，为每个分页单独缓存
+		cacheKey := fmt.Sprintf("listfile_%d_%d", parentFileID, lastFileID)
 		if cached, found := f.listFileCache.GetMaybe(cacheKey); found {
 			if result, ok := cached.(*ListResponse); ok {
-				fs.Debugf(f, "🎯 ListFile缓存命中: parentFileID=%d", parentFileID)
+				fs.Debugf(f, "🎯 ListFile缓存命中: parentFileID=%d, lastFileID=%d", parentFileID, lastFileID)
 				return result, nil
+			}
+		}
+
+		// 🚀 智能缓存：如果是第一页(lastFileID=0)，也检查完整目录缓存
+		if lastFileID == 0 {
+			fullCacheKey := fmt.Sprintf("listfile_full_%d", parentFileID)
+			if cached, found := f.listFileCache.GetMaybe(fullCacheKey); found {
+				if result, ok := cached.(*ListResponse); ok {
+					fs.Debugf(f, "🎯 ListFile完整目录缓存命中: parentFileID=%d", parentFileID)
+					return result, nil
+				}
 			}
 		}
 	}
@@ -1059,13 +1087,22 @@ func (f *Fs) ListFile(ctx context.Context, parentFileID, limit int, searchData, 
 
 	fs.Debugf(f, "✅ ListFile API响应: code=%d, message=%s, fileCount=%d", result.Code, result.Message, len(result.Data.FileList))
 
-	// 🔧 性能优化：智能缓存存储（带失效机制）
-	if searchData == "" && searchMode == "" && lastFileID == 0 && limit == 100 {
-		cacheKey := fmt.Sprintf("listfile_%d", parentFileID)
+	// 🔧 性能优化：智能缓存存储（支持分页缓存）
+	if searchData == "" && searchMode == "" && limit == 100 {
+		// 🚀 改进：为每个分页单独缓存
+		cacheKey := fmt.Sprintf("listfile_%d_%d", parentFileID, lastFileID)
 		f.listFileCache.Put(cacheKey, &result)
 		// 💾 同时保存到持久化缓存
 		f.saveListFileCacheEntry(cacheKey, &result)
-		fs.Debugf(f, "💾 ListFile结果已缓存: parentFileID=%d", parentFileID)
+		fs.Debugf(f, "💾 ListFile结果已缓存: parentFileID=%d, lastFileID=%d", parentFileID, lastFileID)
+
+		// 🚀 智能缓存：如果是第一页且返回的文件数少于limit，说明是完整目录，额外缓存
+		if lastFileID == 0 && len(result.Data.FileList) < limit {
+			fullCacheKey := fmt.Sprintf("listfile_full_%d", parentFileID)
+			f.listFileCache.Put(fullCacheKey, &result)
+			f.saveListFileCacheEntry(fullCacheKey, &result)
+			fs.Debugf(f, "💾 ListFile完整目录已缓存: parentFileID=%d (%d个文件)", parentFileID, len(result.Data.FileList))
+		}
 	}
 
 	return &result, nil
@@ -1102,9 +1139,21 @@ func (f *Fs) listFileDirectAPI(ctx context.Context, parentFileID, limit int, sea
 
 // clearListFileCache 清除指定父目录的ListFile缓存
 func (f *Fs) clearListFileCache(parentFileID int64, reason string) {
-	cacheKey := fmt.Sprintf("listfile_%d", parentFileID)
-	if f.listFileCache.Delete(cacheKey) {
-		fs.Debugf(f, "🗑️ 清除ListFile缓存: parentFileID=%d (%s)", parentFileID, reason)
+	// 🚀 改进：清除所有相关的缓存键（分页缓存和完整目录缓存）
+
+	// 清除完整目录缓存
+	fullCacheKey := fmt.Sprintf("listfile_full_%d", parentFileID)
+	if f.listFileCache.Delete(fullCacheKey) {
+		fs.Debugf(f, "🗑️ 清除ListFile完整目录缓存: parentFileID=%d (%s)", parentFileID, reason)
+	}
+
+	// 清除分页缓存（尝试清除常见的分页）
+	// 注意：这里只能清除已知的分页，实际使用中可能需要更智能的缓存管理
+	for lastFileID := 0; lastFileID < 10; lastFileID++ {
+		cacheKey := fmt.Sprintf("listfile_%d_%d", parentFileID, lastFileID)
+		if f.listFileCache.Delete(cacheKey) {
+			fs.Debugf(f, "🗑️ 清除ListFile分页缓存: parentFileID=%d, lastFileID=%d (%s)", parentFileID, lastFileID, reason)
+		}
 	}
 }
 
@@ -1267,6 +1316,16 @@ type FileInfoResponse struct {
 	TraceID string `json:"x-traceID"`
 }
 
+// GetCode 实现APIResponse接口
+func (r *FileInfoResponse) GetCode() int {
+	return r.Code
+}
+
+// GetMessage 实现APIResponse接口
+func (r *FileInfoResponse) GetMessage() string {
+	return r.Message
+}
+
 type FileDetailResponse struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
@@ -1282,6 +1341,16 @@ type FileDetailResponse struct {
 		Trashed      int    `json:"trashed"`
 	} `json:"data"`
 	TraceID string `json:"x-traceID"`
+}
+
+// GetCode 实现APIResponse接口
+func (r *FileDetailResponse) GetCode() int {
+	return r.Code
+}
+
+// GetMessage 实现APIResponse接口
+func (r *FileDetailResponse) GetMessage() string {
+	return r.Message
 }
 
 // FileInfo 表示'list'数组中单个文件的信息
@@ -1317,6 +1386,16 @@ type FileInfosResponse struct {
 	XTraceID string `json:"x-traceID"`
 }
 
+// GetCode 实现APIResponse接口
+func (r *FileInfosResponse) GetCode() int {
+	return r.Code
+}
+
+// GetMessage 实现APIResponse接口
+func (r *FileInfosResponse) GetMessage() string {
+	return r.Message
+}
+
 // 定义FileInfoRequest结构体，用于发送请求的payload
 type FileInfoRequest struct {
 	FileIDs []int64 `json:"fileIDs"`
@@ -1331,6 +1410,16 @@ type DownloadInfoResponse struct {
 	} `json:"data"`
 }
 
+// GetCode 实现APIResponse接口
+func (r *DownloadInfoResponse) GetCode() int {
+	return r.Code
+}
+
+// GetMessage 实现APIResponse接口
+func (r *DownloadInfoResponse) GetMessage() string {
+	return r.Message
+}
+
 type UploadCreateResp struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
@@ -1340,6 +1429,16 @@ type UploadCreateResp struct {
 		Reuse       bool   `json:"reuse"`
 		SliceSize   int64  `json:"sliceSize"`
 	} `json:"data"`
+}
+
+// GetCode 实现APIResponse接口
+func (r *UploadCreateResp) GetCode() int {
+	return r.Code
+}
+
+// GetMessage 实现APIResponse接口
+func (r *UploadCreateResp) GetMessage() string {
+	return r.Message
 }
 
 type UserInfoResp struct {
@@ -1360,6 +1459,16 @@ type UserInfoResp struct {
 		DirectTraffic  int64  `json:"directTraffic"`
 		IsHideUID      bool   `json:"isHideUID"`
 	} `json:"data"`
+}
+
+// GetCode 实现APIResponse接口
+func (r *UserInfoResp) GetCode() int {
+	return r.Code
+}
+
+// GetMessage 实现APIResponse接口
+func (r *UserInfoResp) GetMessage() string {
+	return r.Message
 }
 
 func (f *Fs) getDownloadURLByUA(ctx context.Context, filePath string, userAgent string) (string, error) {
@@ -1469,29 +1578,29 @@ func (f *Fs) refreshCacheCommand(ctx context.Context, args []string) (any, error
 
 	// 清除内存中的listFileCache
 	f.listFileCache.Clear()
-	fs.Infof(f, "✅ 已清除ListFile缓存")
+	fs.Debugf(f, "✅ 已清除ListFile缓存")
 
 	// 清除持久化dirCache
 	if err := f.dirCache.ForceRefreshPersistent(); err != nil {
 		fs.Logf(f, "⚠️ 清除持久化缓存失败: %v", err)
 	} else {
-		fs.Infof(f, "✅ 已清除持久化dirCache")
+		fs.Debugf(f, "✅ 已清除持久化dirCache")
 	}
 
 	// 重置dirCache
 	f.dirCache.Flush()
-	fs.Infof(f, "✅ 已重置内存dirCache")
+	fs.Debugf(f, "✅ 已重置内存dirCache")
 
 	// 如果指定了路径，尝试重新构建该路径的缓存
 	if len(args) > 0 && args[0] != "" {
 		targetPath := args[0]
-		fs.Infof(f, "🔄 重新构建路径缓存: %s", targetPath)
+		fs.Debugf(f, "🔄 重新构建路径缓存: %s", targetPath)
 
 		// 尝试查找目录以重新构建缓存
 		if _, err := f.dirCache.FindDir(ctx, targetPath, false); err != nil {
 			fs.Logf(f, "⚠️ 重新构建路径缓存失败: %v", err)
 		} else {
-			fs.Infof(f, "✅ 路径缓存重新构建成功: %s", targetPath)
+			fs.Debugf(f, "✅ 路径缓存重新构建成功: %s", targetPath)
 		}
 	}
 
@@ -1758,9 +1867,9 @@ func (f *Fs) makeAPICallWithRest(ctx context.Context, endpoint string, method st
 		var err error
 		resp, err = f.rst.CallJSON(ctx, &opts, reqBody, respBody)
 
-		// 检查是否是401错误，如果是则尝试刷新token
+		// 检查是否是HTTP 401错误，如果是则尝试刷新token
 		if resp != nil && resp.StatusCode == http.StatusUnauthorized {
-			fs.Debugf(f, "🔐 收到401错误，强制刷新token")
+			fs.Debugf(f, "🔐 收到HTTP 401错误，强制刷新token")
 			// 强制刷新token，忽略时间检查
 			refreshErr := f.refreshTokenIfNecessary(true, true)
 			if refreshErr != nil {
@@ -1771,6 +1880,26 @@ func (f *Fs) makeAPICallWithRest(ctx context.Context, endpoint string, method st
 			opts.ExtraHeaders["Authorization"] = "Bearer " + f.token
 			fs.Debugf(f, "✅ token已强制刷新，将重试API调用")
 			return true, nil // 重试
+		}
+
+		// 检查响应体中的code字段是否为401（token过期）
+		if err == nil && resp != nil && resp.StatusCode == 200 && respBody != nil {
+			if apiResp, ok := respBody.(APIResponse); ok {
+				if apiResp.GetCode() == 401 {
+					fs.Debugf(f, "🔐 响应体中检测到401错误(token过期)，API消息: %s", apiResp.GetMessage())
+					fs.Debugf(f, "🔄 当前token过期时间: %v", f.tokenExpiry)
+					// 强制刷新token，忽略时间检查
+					refreshErr := f.refreshTokenIfNecessary(true, true)
+					if refreshErr != nil {
+						fs.Errorf(f, "❌ token刷新失败: %v", refreshErr)
+						return false, fmt.Errorf("身份验证失败: %w", refreshErr)
+					}
+					// 更新Authorization头
+					opts.ExtraHeaders["Authorization"] = "Bearer " + f.token
+					fs.Debugf(f, "✅ token已强制刷新，新过期时间: %v，将重试API调用", f.tokenExpiry)
+					return true, nil // 重试
+				}
+			}
 		}
 
 		return shouldRetry(err)
@@ -2348,7 +2477,12 @@ func (f *Fs) uploadMultiPart(ctx context.Context, in io.Reader, preuploadID stri
 			return fmt.Errorf("failed to upload part %d: %w", partNumber, err)
 		}
 
-		fs.Debugf(f, "已上传分片 %d/%d", partNumber, uploadNums)
+		// 减少进度日志频率：只在每10个分片或最后一个分片时输出
+		if partNumber%10 == 0 || partNumber == uploadNums {
+			fs.Infof(f, "📤 上传进度: %d/%d (%.1f%%)", partNumber, uploadNums, float64(partNumber)/float64(uploadNums)*100)
+		} else {
+			fs.Debugf(f, "已上传分片 %d/%d", partNumber, uploadNums)
+		}
 	}
 
 	// 完成上传
@@ -2491,8 +2625,11 @@ func (f *Fs) uploadPartWithRetry(ctx context.Context, preuploadID string, partNu
 		err := f.uploadPartWithMultipart(ctx, preuploadID, partNumber, chunkHash, data)
 		if err == nil {
 			duration := time.Since(attemptStart)
-			fs.Debugf(f, "✅ 分片 %d 上传成功，耗时: %v，速度: %s/s",
-				partNumber, duration, fs.SizeSuffix(int64(float64(len(data))/duration.Seconds())))
+			// 只在关键分片记录详细信息
+			if partNumber%10 == 0 || partNumber == 1 {
+				fs.Debugf(f, "✅ 分片 %d 上传成功，耗时: %v，速度: %s/s",
+					partNumber, duration, fs.SizeSuffix(int64(float64(len(data))/duration.Seconds())))
+			}
 			return nil
 		}
 
@@ -4001,15 +4138,58 @@ func (o *Object) Remote() string {
 	return o.remote
 }
 
+// readMetaData gets the metadata if it hasn't already been fetched
+func (o *Object) readMetaData(ctx context.Context) error {
+	if o.hasMetaData {
+		return nil
+	}
+
+	if o.id == "" {
+		return fs.ErrorObjectNotFound
+	}
+
+	startTime := time.Now()
+	fs.Debugf(o, "🚀 readMetaData开始: fileID=%s", o.id)
+
+	// 使用现有的getFileInfo API获取文件详细信息
+	fileInfo, err := o.fs.getFileInfo(ctx, o.id)
+	duration := time.Since(startTime)
+
+	if err != nil {
+		fs.Debugf(o, "❌ readMetaData失败: %v, 耗时=%v", err, duration)
+		return err
+	}
+
+	// 更新对象的元数据
+	o.size = fileInfo.Size
+	o.md5sum = fileInfo.Etag
+	// 注意：123网盘API可能不返回准确的修改时间，保持现有的modTime
+	o.hasMetaData = true
+
+	fs.Debugf(o, "✅ readMetaData成功: size=%d, md5=%s, 耗时=%v", o.size, o.md5sum, duration)
+	return nil
+}
+
 // ModTime returns the modification time
 func (o *Object) ModTime(ctx context.Context) time.Time {
-	// In a real implementation, you would fetch metadata if not already available.
+	// 🚀 优化：只在没有元数据时才获取，避免不必要的API调用
+	if !o.hasMetaData && o.id != "" {
+		if err := o.readMetaData(ctx); err != nil {
+			fs.Debugf(o, "Failed to read metadata for ModTime: %v", err)
+		}
+	}
 	return o.modTime
 }
 
 // Size returns the size of the file
 func (o *Object) Size() int64 {
-	// In a real implementation, you would fetch metadata if not already available.
+	// 🚀 优化：只在没有元数据时才获取，避免不必要的API调用
+	if !o.hasMetaData && o.id != "" {
+		if err := o.readMetaData(context.TODO()); err != nil {
+			fs.Debugf(o, "Failed to read metadata for Size: %v", err)
+			return -1
+		}
+	}
 	return o.size
 }
 
@@ -4018,7 +4198,13 @@ func (o *Object) Hash(ctx context.Context, t fshash.Type) (string, error) {
 	if t != fshash.MD5 {
 		return "", fshash.ErrUnsupported
 	}
-	// In a real implementation, you would fetch metadata if not already available.
+	// 🚀 优化：只在没有元数据时才获取，避免不必要的API调用
+	if !o.hasMetaData && o.id != "" {
+		if err := o.readMetaData(ctx); err != nil {
+			fs.Debugf(o, "Failed to read metadata for Hash: %v", err)
+			return "", err
+		}
+	}
 	return o.md5sum, nil
 }
 
@@ -4042,21 +4228,39 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		return o.openWithCDNFailover(ctx, options...)
 	}
 
-	// 跨云传输优化：检测大文件并启用多线程下载
-	// 检查是否已经有禁用并发下载选项，避免重复并发
+	// 🚀 优化：检测是否为小范围读取（如预览、MIME检测等）
+	var rangeOption *fs.RangeOption
 	hasDisableOption := false
 	hasRangeOption := false
+
 	for _, option := range options {
 		if option.String() == "DisableConcurrentDownload" {
 			hasDisableOption = true
-			break
 		}
-		// 修复：检查是否有Range请求，Range请求不应该使用并发下载
-		if _, ok := option.(*fs.RangeOption); ok {
+		// 检查是否有Range请求
+		if ro, ok := option.(*fs.RangeOption); ok {
 			hasRangeOption = true
+			rangeOption = ro
 		}
 	}
 
+	// 🚀 智能下载策略：小范围读取优化
+	if rangeOption != nil {
+		start, end := rangeOption.Decode(o.size)
+		requestSize := end - start + 1
+
+		// 如果请求的数据量很小（如前1MB用于预览/MIME检测），优先使用简单下载
+		if requestSize <= 1024*1024 { // 1MB阈值
+			fs.Debugf(o, "🎯 检测到小范围读取请求: %d-%d (%s)，使用简单下载避免下载整个文件",
+				start, end, fs.SizeSuffix(requestSize))
+			return o.openWithSimpleRetry(ctx, options...)
+		} else {
+			fs.Debugf(o, "📥 大范围读取请求: %d-%d (%s)，考虑并发下载",
+				start, end, fs.SizeSuffix(requestSize))
+		}
+	}
+
+	// 跨云传输优化：检测大文件并启用多线程下载
 	// 修复：Range请求不使用并发下载，避免下载整个文件
 	if !hasDisableOption && !hasRangeOption && o.size >= minFileSizeForConcurrency { // 使用常量定义的阈值
 		return o.openWithConcurrency(ctx, options...)
@@ -4753,6 +4957,16 @@ type Response struct {
 	Message  string `json:"message"`
 	Data     AccessTokenData
 	XTraceID string `json:"x-traceID"`
+}
+
+// GetCode 实现APIResponse接口
+func (r *Response) GetCode() int {
+	return r.Code
+}
+
+// GetMessage 实现APIResponse接口
+func (r *Response) GetMessage() string {
+	return r.Message
 }
 
 func GetAccessToken(clientID, clientSecret string) (string, time.Time, error) {

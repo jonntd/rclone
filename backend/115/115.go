@@ -38,6 +38,7 @@ import (
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/cache"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/oauthutil"
@@ -268,8 +269,6 @@ func (b *OpenAPIBase) Err() error {
 
 	switch code {
 	// Codes that require re-login
-	case 40140109: // access permission disabled - 访问权限已停用，无法访问此功能
-		return NewTokenError(out, true)
 	case 40140116: // refresh_token invalid (authorization revoked)
 		return NewTokenError(out, true)
 	case 40140117: // access_token refreshed too frequently
@@ -1260,12 +1259,12 @@ const (
 	passportRootURL    = "https://passportapi.115.com"
 	qrCodeAPIRootURL   = "https://qrcodeapi.115.com"
 	hnQrCodeAPIRootURL = "https://hnqrcodeapi.115.com"     // For confirm step
-	defaultAppID       = "100195741"                       // Provided App ID
+	defaultAppID       = "100195123"                       // Provided App ID
 	tradUserAgent      = "Mozilla/5.0 115Browser/27.0.7.5" // Keep for traditional login mimicry?
 	defaultUserAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
 
 	// 🚦 115网盘统一QPS控制：全局账户级别限制，避免770004错误
-	unifiedMinSleep = fs.Duration(200 * time.Millisecond) // 🔧 平衡优化：~5 QPS - 平衡性能与稳定性
+	unifiedMinSleep = fs.Duration(300 * time.Millisecond) // 🔧 平衡优化：~5 QPS - 平衡性能与稳定性
 
 	maxSleep      = 2 * time.Second
 	decayConstant = 2 // bigger for slower decay, exponential
@@ -1464,6 +1463,19 @@ type PersistentDownloadURLCache struct {
 	Version string                       `json:"version"`
 }
 
+// 💾 115网盘listAll持久化缓存数据结构
+type PersistentListAllCache struct {
+	Data    map[string]*CachedListAllResponse `json:"data"`
+	SavedAt time.Time                         `json:"saved_at"`
+	Version string                            `json:"version"`
+}
+
+type CachedListAllResponse struct {
+	Files     []*File   `json:"files"`
+	CachedAt  time.Time `json:"cached_at"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
 // Valid 检查缓存的URL是否仍然有效
 func (c CachedDownloadURL) Valid() bool {
 	return time.Now().Before(c.ExpiresAt)
@@ -1558,9 +1570,13 @@ type Fs struct {
 	// 🔧 性能优化：下载URL缓存系统
 	downloadURLCache sync.Map // 下载URL缓存 (map[string]CachedDownloadURL)
 
+	// 🚀 性能优化：listAll结果缓存系统（类似123网盘的listFileCache）
+	listAllCache *cache.Cache // listAll结果缓存，避免重复API调用
+
 	// 💾 持久化缓存系统
 	persistentCacheDir   string // 持久化缓存目录
 	downloadURLCacheFile string // 下载URL缓存文件路径
+	listAllCacheFile     string // listAll缓存文件路径
 }
 
 // NewTransferSpeedMonitor 创建新的传输速度监控器
@@ -2026,12 +2042,6 @@ func (f *Fs) getAuthDeviceCode(ctx context.Context, challenge string) (string, e
 	if err != nil {
 		return "", fmt.Errorf("authDeviceCode failed: %w", err)
 	}
-	
-	// Check for API-level errors first (including 40140109 access permission disabled)
-	if apiErr := authResp.Err(); apiErr != nil {
-		return "", fmt.Errorf("authDeviceCode API error: %w", apiErr)
-	}
-	
 	if authResp.Data == nil || authResp.Data.UID == "" {
 		return "", fmt.Errorf("authDeviceCode returned empty data: %v", authResp)
 	}
@@ -2971,6 +2981,7 @@ func createBasicFs115(name, originalName, root string, opt *Options, m configmap
 		opt:             *opt,
 		m:               m,
 		activeTransfers: make(map[string]*TransferSpeedMonitor),
+		listAllCache:    cache.New().SetExpireDuration(30 * time.Minute), // 🚀 初始化listAll结果缓存，30分钟过期时间
 	}
 }
 
@@ -3992,6 +4003,72 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *File, 
 	return info, nil
 }
 
+// getFileInfoByID 通过文件ID直接获取文件信息（避免listAll的低效查询）
+// 使用115网盘的 /open/folder/get_info API
+func (f *Fs) getFileInfoByID(ctx context.Context, fileID string) (*File, error) {
+	startTime := time.Now()
+	fs.Debugf(f, "🚀 getFileInfoByID: 使用直接API获取文件信息, fileID=%s", fileID)
+
+	if fileID == "" {
+		return nil, errors.New("文件ID不能为空")
+	}
+
+	// 🚀 性能优化：检查缓存（如果启用了listAllCache）
+	if f.listAllCache != nil {
+		cacheKey := fmt.Sprintf("fileinfo_%s", fileID)
+		if cached, found := f.listAllCache.GetMaybe(cacheKey); found {
+			if fileInfo, ok := cached.(*File); ok {
+				fs.Debugf(f, "🎯 getFileInfoByID缓存命中: fileID=%s, 耗时=%v", fileID, time.Since(startTime))
+				return fileInfo, nil
+			}
+		}
+	}
+
+	// 使用115网盘的直接文件信息API
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   "/open/folder/get_info",
+		Parameters: url.Values{
+			"file_id": {fileID},
+		},
+	}
+
+	var response struct {
+		State int    `json:"state"`
+		Error string `json:"error,omitempty"`
+		Data  *File  `json:"data,omitempty"`
+	}
+
+	err := f.CallOpenAPI(ctx, &opts, nil, &response, false)
+	duration := time.Since(startTime)
+
+	if err != nil {
+		fs.Debugf(f, "❌ getFileInfoByID API调用失败: %v, 耗时=%v", err, duration)
+		return nil, fmt.Errorf("failed to get file info by ID %s: %w", fileID, err)
+	}
+
+	if response.State != 1 {
+		fs.Debugf(f, "❌ getFileInfoByID API返回错误: state=%d, error=%s, 耗时=%v", response.State, response.Error, duration)
+		return nil, fmt.Errorf("API error for file ID %s: state=%d, error=%s", fileID, response.State, response.Error)
+	}
+
+	if response.Data == nil {
+		fs.Debugf(f, "❌ getFileInfoByID API返回空数据: fileID=%s, 耗时=%v", fileID, duration)
+		return nil, fmt.Errorf("no data returned for file ID %s", fileID)
+	}
+
+	// 🚀 性能优化：缓存结果（5分钟有效期）
+	if f.listAllCache != nil {
+		cacheKey := fmt.Sprintf("fileinfo_%s", fileID)
+		f.listAllCache.Put(cacheKey, response.Data)
+		fs.Debugf(f, "💾 getFileInfoByID结果已缓存: fileID=%s", fileID)
+	}
+
+	fs.Debugf(f, "✅ getFileInfoByID成功: fileID=%s, name=%s, size=%d, 耗时=%v",
+		fileID, response.Data.FileNameBest(), response.Data.Size, duration)
+	return response.Data, nil
+}
+
 // createObject creates a placeholder Object struct before upload.
 func (f *Fs) createObject(ctx context.Context, remote string, modTime time.Time, size int64) (o *Object, leaf string, dirID string, err error) {
 	// Fix: 正确分割路径，避免将文件名当作目录创建
@@ -4297,6 +4374,11 @@ func (o *Object) String() string {
 	return o.remote
 }
 
+// GetPickCode returns the pick code for STRM file generation
+func (o *Object) GetPickCode() string {
+	return o.pickCode
+}
+
 // Remote returns the remote path
 func (o *Object) Remote() string {
 	return o.remote
@@ -4304,16 +4386,19 @@ func (o *Object) Remote() string {
 
 // ModTime returns the modification time
 func (o *Object) ModTime(ctx context.Context) time.Time {
-	err := o.readMetaData(ctx)
-	if err != nil {
-		// 在跨云传输时，目标文件不存在是正常情况，降级为调试信息
-		if err == fs.ErrorObjectNotFound {
-			fs.Debugf(o, "目标文件不存在，ModTime将使用零值: %v", err)
-		} else {
-			fs.Logf(o, "failed to read metadata for ModTime: %v", err)
+	// 🚀 优化：只在没有元数据时才调用readMetaData，避免重复API调用
+	if !o.hasMetaData {
+		err := o.readMetaData(ctx)
+		if err != nil {
+			// 在跨云传输时，目标文件不存在是正常情况，降级为调试信息
+			if err == fs.ErrorObjectNotFound {
+				fs.Debugf(o, "目标文件不存在，ModTime将使用零值: %v", err)
+			} else {
+				fs.Logf(o, "failed to read metadata for ModTime: %v", err)
+			}
+			// Return a zero time instead of Now() as Precision is NotSupported
+			return time.Time{}
 		}
-		// Return a zero time instead of Now() as Precision is NotSupported
-		return time.Time{}
 	}
 	return o.modTime
 }
@@ -4404,8 +4489,31 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
 
-	// 115网盘下载策略说明：完全禁用并发策略
-	fs.Debugf(o, "📥 115下载策略: 禁用并发下载 (1TB阈值 + 1GB分片，强制普通下载)")
+	// 🚀 优化：检测是否为小范围读取（如预览、MIME检测等）
+	var rangeOption *fs.RangeOption
+	for _, option := range options {
+		if ro, ok := option.(*fs.RangeOption); ok {
+			rangeOption = ro
+			break
+		}
+	}
+
+	// 🚀 智能下载策略：小范围读取优化
+	if rangeOption != nil {
+		start, end := rangeOption.Decode(o.size)
+		requestSize := end - start + 1
+
+		// 如果请求的数据量很小（如前1MB用于预览/MIME检测），使用范围下载
+		if requestSize <= 1024*1024 { // 1MB阈值
+			fs.Debugf(o, "🎯 检测到小范围读取请求: %d-%d (%s)，使用范围下载避免下载整个文件",
+				start, end, fs.SizeSuffix(requestSize))
+		} else {
+			fs.Debugf(o, "📥 大范围读取请求: %d-%d (%s)，使用普通下载",
+				start, end, fs.SizeSuffix(requestSize))
+		}
+	} else {
+		fs.Debugf(o, "📥 115下载策略: 禁用并发下载 (1TB阈值 + 1GB分片，强制普通下载)")
+	}
 
 	// Get/refresh download URL
 	err = o.setDownloadURL(ctx)
@@ -4695,16 +4803,35 @@ func (o *Object) readMetaData(ctx context.Context) error {
 		return nil
 	}
 
-	// Use the path-based lookup
+	// 🚀 优化：如果有文件ID，优先使用直接API获取文件信息
+	if o.id != "" {
+		fs.Debugf(o.fs, "🚀 readMetaData: 使用直接API获取元数据, fileID=%s", o.id)
+		info, err := o.fs.getFileInfoByID(ctx, o.id)
+		if err == nil {
+			// 直接API成功，设置元数据
+			err = o.setMetaData(info)
+			if err != nil {
+				fs.Debugf(o.fs, "readMetaData: setMetaData失败: %v", err)
+			} else {
+				fs.Debugf(o.fs, "✅ readMetaData: 直接API成功获取元数据")
+			}
+			return err
+		}
+		// 直接API失败，记录日志但继续尝试路径查找
+		fs.Debugf(o.fs, "⚠️ readMetaData: 直接API失败，回退到路径查找: %v", err)
+	}
+
+	// 回退到原来的路径查找方法
+	fs.Debugf(o.fs, "🔄 readMetaData: 使用路径查找方法")
 	info, err := o.fs.readMetaDataForPath(ctx, o.remote)
 	if err != nil {
-		fs.Debugf(o.fs, " readMetaData失败: %v", err)
+		fs.Debugf(o.fs, "readMetaData失败: %v", err)
 		return err // fs.ErrorObjectNotFound or other errors
 	}
 
 	err = o.setMetaData(info)
 	if err != nil {
-		fs.Debugf(o.fs, " readMetaData: setMetaData失败: %v", err)
+		fs.Debugf(o.fs, "readMetaData: setMetaData失败: %v", err)
 	}
 	return err
 }
@@ -5108,7 +5235,7 @@ func (tpr *TwoStepProgressReader115) Read(p []byte) (n int, err error) {
 func (tpr *TwoStepProgressReader115) SwitchToUpload() {
 	tpr.phase = "upload"
 	tpr.uploadBytes = 0
-	fs.Infof(tpr.fs, "🔄 跨云传输切换到上传阶段: %s", tpr.remote)
+	fs.Debugf(tpr.fs, "🔄 跨云传输切换到上传阶段: %s", tpr.remote)
 }
 
 // UpdateUploadProgress 更新上传进度
@@ -5477,6 +5604,39 @@ type listAllFn func(*File) bool
 func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly bool, fn listAllFn) (found bool, err error) {
 	fs.Debugf(f, "📋 listAll开始: dirID=%q, limit=%d, filesOnly=%v", dirID, limit, filesOnly)
 
+	// 🚀 性能优化：智能listAll缓存（类似123网盘的listFileCache）
+	// 只缓存标准的列表查询（limit=defaultListChunkSize，无特殊限制）
+	if limit == defaultListChunkSize && !filesOnly {
+		cacheKey := fmt.Sprintf("listall_%s_%d_%v", dirID, limit, filesOnly)
+		if cached, found := f.listAllCache.GetMaybe(cacheKey); found {
+			if cachedFiles, ok := cached.([]*File); ok {
+				fs.Debugf(f, "🎯 listAll缓存命中: dirID=%s (%d个文件)", dirID, len(cachedFiles))
+				// 使用缓存的结果调用回调函数
+				for _, file := range cachedFiles {
+					if fn(file) {
+						return true, nil // 找到目标，停止处理
+					}
+				}
+				return false, nil // 处理完所有缓存文件，未找到目标
+			}
+		}
+
+		// 🧠 智能缓存：检查完整目录缓存
+		fullCacheKey := fmt.Sprintf("listall_full_%s", dirID)
+		if cached, found := f.listAllCache.GetMaybe(fullCacheKey); found {
+			if cachedFiles, ok := cached.([]*File); ok {
+				fs.Debugf(f, "🎯 listAll完整目录缓存命中: dirID=%s (%d个文件)", dirID, len(cachedFiles))
+				// 使用缓存的结果调用回调函数
+				for _, file := range cachedFiles {
+					if fn(file) {
+						return true, nil // 找到目标，停止处理
+					}
+				}
+				return false, nil // 处理完所有缓存文件，未找到目标
+			}
+		}
+	}
+
 	// 验证目录ID
 	if dirID == "" {
 		fs.Errorf(f, "❌ listAll: 目录ID为空，这可能导致查询根目录")
@@ -5501,6 +5661,7 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly boo
 	params.Set("asc", "0")        // Default sort: descending
 
 	offset := 0
+	var allFiles []*File // 🚀 收集所有文件用于缓存
 
 	fs.Debugf(f, "🔄 listAll: 开始分页循环")
 	for {
@@ -5539,8 +5700,21 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly boo
 			// Decode name
 			item.FileName = f.opt.Enc.ToStandardName(item.FileNameBest()) // Use best name getter
 
+			// 🚀 收集文件用于缓存（只在可缓存的查询中收集）
+			if limit == defaultListChunkSize && !filesOnly {
+				allFiles = append(allFiles, item)
+			}
+
 			if fn(item) {
 				found = true
+				// 🚀 即使找到目标，也要缓存已收集的文件
+				if limit == defaultListChunkSize && !filesOnly && len(allFiles) > 0 {
+					cacheKey := fmt.Sprintf("listall_%s_%d_%v", dirID, limit, filesOnly)
+					f.listAllCache.Put(cacheKey, allFiles)
+					// 💾 同时保存到持久化缓存
+					f.saveListAllCacheEntry(cacheKey, allFiles)
+					fs.Debugf(f, "💾 listAll结果已缓存(早期退出): dirID=%s (%d个文件)", dirID, len(allFiles))
+				}
 				return found, nil // Early exit
 			}
 		}
@@ -5555,7 +5729,32 @@ func (f *Fs) listAll(ctx context.Context, dirID string, limit int, filesOnly boo
 		}
 	}
 
+	// 🚀 性能优化：智能缓存存储（类似123网盘的实现）
+	if limit == defaultListChunkSize && !filesOnly && len(allFiles) > 0 {
+		cacheKey := fmt.Sprintf("listall_%s_%d_%v", dirID, limit, filesOnly)
+		f.listAllCache.Put(cacheKey, allFiles)
+		// 💾 同时保存到持久化缓存
+		f.saveListAllCacheEntry(cacheKey, allFiles)
+		fs.Debugf(f, "💾 listAll结果已缓存: dirID=%s (%d个文件)", dirID, len(allFiles))
+
+		// 🧠 智能缓存：如果返回的文件数少于limit，说明是完整目录，额外缓存
+		if len(allFiles) < limit {
+			fullCacheKey := fmt.Sprintf("listall_full_%s", dirID)
+			f.listAllCache.Put(fullCacheKey, allFiles)
+			f.saveListAllCacheEntry(fullCacheKey, allFiles)
+			fs.Debugf(f, "💾 listAll完整目录已缓存: dirID=%s (%d个文件)", dirID, len(allFiles))
+		}
+	}
+
 	return found, nil
+}
+
+// clearListAllCache 清除指定目录的listAll缓存
+func (f *Fs) clearListAllCache(dirID string, reason string) {
+	cacheKey := fmt.Sprintf("listall_%s_%d_%v", dirID, defaultListChunkSize, false)
+	if f.listAllCache.Delete(cacheKey) {
+		fs.Debugf(f, "🗑️ 清除listAll缓存: dirID=%s (%s)", dirID, reason)
+	}
 }
 
 // updateAPILimitStats 更新API限流统计信息
@@ -9062,7 +9261,7 @@ func (w *ossChunkWriter) performChunkedUpload(ctx context.Context, in io.Reader,
 			timeoutCount := w.getTimeoutStats()
 			// 如果超时次数过多，提供警告
 			if timeoutCount >= 5 {
-				fs.Logf(w.o, "⚠️ 分片上传健康检查: 已发生 %d 次超时，建议检查网络连接", timeoutCount)
+				fs.Infof(w.o, "⚠️ 分片上传健康检查: 已发生 %d 次超时，建议检查网络连接", timeoutCount)
 			}
 		}
 
@@ -9140,9 +9339,14 @@ func (w *ossChunkWriter) logUploadProgress(partNum, n, off int64, params *upload
 			remainingParts := params.totalParts - currentPart
 			estimatedRemaining := avgTimePerPart * time.Duration(remainingParts)
 
-			fs.Infof(w.o, "📤 上传进度: %d/%d (%.1f%%) | %v | ⏱️ %v | 🕒 剩余 %v",
-				currentPart, params.totalParts, percentage, fs.SizeSuffix(n),
-				elapsed.Truncate(time.Second), estimatedRemaining.Truncate(time.Second))
+			// 减少进度日志频率：只在每10个分片或关键节点时输出
+			if currentPart%10 == 0 || currentPart == 1 || currentPart == params.totalParts {
+				fs.Infof(w.o, "📤 上传进度: %d/%d (%.1f%%) | %v | ⏱️ %v | 🕒 剩余 %v",
+					currentPart, params.totalParts, percentage, fs.SizeSuffix(n),
+					elapsed.Truncate(time.Second), estimatedRemaining.Truncate(time.Second))
+			} else {
+				fs.Debugf(w.o, "📤 上传分片: %d/%d", currentPart, params.totalParts)
+			}
 		}
 	} else if currentPart == 1 {
 		// 未知大小时只在第一个分片输出日志
@@ -9193,7 +9397,7 @@ func (w *ossChunkWriter) finalizeUpload(ctx context.Context, actualParts int64, 
 
 	// 如果有超时，提供建议
 	if timeoutCount > 0 {
-		fs.Logf(w.o, "💡 建议：如果经常出现超时，可以尝试增加chunk_timeout配置或检查网络连接")
+		fs.Infof(w.o, "💡 建议：如果经常出现超时，可以尝试增加chunk_timeout配置或检查网络连接")
 	}
 
 	return nil
@@ -9232,7 +9436,7 @@ func (f *Fs) newChunkWriterWithClient(ctx context.Context, src fs.ObjectInfo, ui
 	// 处理未知文件大小的情况（流式上传）
 	if size == -1 {
 		warnStreamUpload.Do(func() {
-			fs.Logf(f, "流式上传使用分片大小 %v，最大文件大小限制为 %v",
+			fs.Infof(f, "流式上传使用分片大小 %v，最大文件大小限制为 %v",
 				chunkSize, fs.SizeSuffix(int64(chunkSize)*int64(uploadParts)))
 		})
 	} else {
@@ -9634,25 +9838,31 @@ func (f *Fs) refreshCacheCommand(ctx context.Context, args []string) (any, error
 
 	// 清除持久化dirCache
 	if err := f.dirCache.ForceRefreshPersistent(); err != nil {
-		fs.Logf(f, "⚠️ 清除持久化缓存失败: %v", err)
+		fs.Errorf(f, "❌ 清除持久化缓存失败: %v", err)
 	} else {
-		fs.Infof(f, "✅ 已清除持久化dirCache")
+		fs.Debugf(f, "✅ 已清除持久化dirCache")
 	}
 
 	// 重置dirCache
 	f.dirCache.Flush()
-	fs.Infof(f, "✅ 已重置内存dirCache")
+	fs.Debugf(f, "✅ 已重置内存dirCache")
+
+	// 清理listAll缓存
+	if f.listAllCache != nil {
+		f.listAllCache.Clear()
+		fs.Debugf(f, "✅ 已清理listAll内存缓存")
+	}
 
 	// 如果指定了路径，尝试重新构建该路径的缓存
 	if len(args) > 0 && args[0] != "" {
 		targetPath := args[0]
-		fs.Infof(f, "🔄 重新构建路径缓存: %s", targetPath)
+		fs.Debugf(f, "🔄 重新构建路径缓存: %s", targetPath)
 
 		// 尝试查找目录以重新构建缓存
 		if _, err := f.dirCache.FindDir(ctx, targetPath, false); err != nil {
-			fs.Logf(f, "⚠️ 重新构建路径缓存失败: %v", err)
+			fs.Errorf(f, "❌ 重新构建路径缓存失败: %v", err)
 		} else {
-			fs.Infof(f, "✅ 路径缓存重新构建成功: %s", targetPath)
+			fs.Debugf(f, "✅ 路径缓存重新构建成功: %s", targetPath)
 		}
 	}
 
@@ -10254,14 +10464,18 @@ func (f *Fs) initPersistentCache115() {
 
 	// 设置缓存文件路径
 	f.downloadURLCacheFile = filepath.Join(f.persistentCacheDir, "download_url_cache.json")
+	f.listAllCacheFile = filepath.Join(f.persistentCacheDir, "list_all_cache.json")
 
 	fs.Debugf(f, "💾 115持久化缓存目录: %s", f.persistentCacheDir)
+	fs.Debugf(f, "💾 listAll缓存文件: %s", f.listAllCacheFile)
 }
 
 // loadPersistentCaches115 加载115网盘持久化缓存
 func (f *Fs) loadPersistentCaches115() {
 	// 加载下载URL缓存
 	f.loadDownloadURLCache()
+	// 加载listAll缓存
+	f.loadListAllCache()
 }
 
 // loadDownloadURLCache 加载下载URL缓存
@@ -10345,6 +10559,84 @@ func (f *Fs) saveDownloadURLCache() {
 	fs.Debugf(f, "💾 下载URL缓存已保存: %d 个条目", len(data))
 }
 
+// saveListAllCacheEntry 保存单个listAll缓存条目
+func (f *Fs) saveListAllCacheEntry(key string, files []*File) {
+	if f.listAllCacheFile == "" {
+		return
+	}
+
+	// 读取现有缓存
+	var cache PersistentListAllCache
+	if data, err := os.ReadFile(f.listAllCacheFile); err == nil {
+		json.Unmarshal(data, &cache)
+	}
+
+	// 初始化数据结构
+	if cache.Data == nil {
+		cache.Data = make(map[string]*CachedListAllResponse)
+	}
+
+	// 添加新条目
+	cache.Data[key] = &CachedListAllResponse{
+		Files:     files,
+		CachedAt:  time.Now(),
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+	}
+	cache.SavedAt = time.Now()
+	cache.Version = "1.0"
+
+	// 清理过期条目
+	for k, v := range cache.Data {
+		if time.Since(v.CachedAt) > 5*time.Minute {
+			delete(cache.Data, k)
+		}
+	}
+
+	// 保存到磁盘
+	if jsonData, err := json.Marshal(cache); err == nil {
+		os.WriteFile(f.listAllCacheFile, jsonData, 0644)
+		fs.Debugf(f, "💾 listAll缓存条目已保存: %s", key)
+	}
+}
+
+// loadListAllCache 加载listAll缓存
+func (f *Fs) loadListAllCache() {
+	if f.listAllCacheFile == "" {
+		return
+	}
+
+	data, err := os.ReadFile(f.listAllCacheFile)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			fs.Debugf(f, "⚠️ 读取listAll缓存失败: %v", err)
+		}
+		return
+	}
+
+	var cache PersistentListAllCache
+	if err := json.Unmarshal(data, &cache); err != nil {
+		fs.Debugf(f, "⚠️ 解析listAll缓存失败: %v", err)
+		return
+	}
+
+	// 检查缓存是否过期（24小时）
+	if time.Since(cache.SavedAt) > 24*time.Hour {
+		fs.Debugf(f, "🔄 listAll缓存已过期，跳过加载")
+		return
+	}
+
+	// 过滤过期的条目（5分钟）
+	validCount := 0
+	for key, cachedResp := range cache.Data {
+		if time.Since(cachedResp.CachedAt) <= 5*time.Minute {
+			f.listAllCache.Put(key, cachedResp.Files)
+			validCount++
+		}
+	}
+
+	fs.Debugf(f, "📋 从持久化缓存加载 %d 个有效listAll条目", validCount)
+}
+
 // 🧹 115网盘缓存管理方法
 
 // clearPersistentCache115 清理115网盘持久化缓存
@@ -10403,6 +10695,30 @@ func (f *Fs) getCacheStats115() map[string]interface{} {
 		stats["download_url_cache_modified"] = info.ModTime()
 	}
 
+	// 检查listAll缓存文件
+	if info, err := os.Stat(f.listAllCacheFile); err == nil {
+		stats["listall_cache_size"] = info.Size()
+		stats["listall_cache_modified"] = info.ModTime()
+
+		// 读取并统计listAll缓存条目
+		if data, err := os.ReadFile(f.listAllCacheFile); err == nil {
+			var cache PersistentListAllCache
+			if err := json.Unmarshal(data, &cache); err == nil {
+				stats["listall_cache_entries"] = len(cache.Data)
+				stats["listall_cache_saved_at"] = cache.SavedAt
+
+				// 统计有效条目
+				validEntries := 0
+				for _, cachedResp := range cache.Data {
+					if time.Since(cachedResp.CachedAt) <= 5*time.Minute {
+						validEntries++
+					}
+				}
+				stats["listall_cache_valid_entries"] = validEntries
+			}
+		}
+	}
+
 	// 统计内存中的下载URL缓存
 	urlCacheCount := 0
 	f.downloadURLCache.Range(func(key, value interface{}) bool {
@@ -10410,6 +10726,12 @@ func (f *Fs) getCacheStats115() map[string]interface{} {
 		return true
 	})
 	stats["memory_url_cache_count"] = urlCacheCount
+
+	// 统计内存中的listAll缓存
+	if f.listAllCache != nil {
+		// 由于cache.Cache没有直接的计数方法，我们提供一个状态指示
+		stats["memory_listall_cache_count"] = "available"
+	}
 
 	return stats
 }
@@ -10421,6 +10743,12 @@ func (f *Fs) clearCacheCommand115(ctx context.Context, args []string, opt map[st
 	// 清理内存中的下载URL缓存
 	f.downloadURLCache = sync.Map{}
 	result["memory_download_url_cache_cleared"] = true
+
+	// 清理内存中的listAll缓存
+	if f.listAllCache != nil {
+		f.listAllCache.Clear()
+		result["memory_listall_cache_cleared"] = true
+	}
 
 	// 清理持久化缓存
 	if err := f.clearPersistentCache115(); err != nil {
