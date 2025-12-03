@@ -8,7 +8,7 @@ set -e
 # 配置
 MOUNT_BASE_DIR="$HOME/CloudDrives"
 RCLONE_PATH="./rclone"
-LOG_DIR="$HOME/.rclone/logs"
+LOG_DIR="$(pwd)/log"
 
 # 颜色输出
 RED='\033[0;31m'
@@ -45,13 +45,7 @@ check_dependencies() {
         log_error "rclone mount功能不可用，请重新编译: go build -tags cmount -o rclone ./"
         exit 1
     fi
-    
-    # 检查macFUSE (macOS)
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        if ! command -v mount_macfuse &> /dev/null; then
-            log_warn "macFUSE未安装，请安装: brew install macfuse"
-        fi
-    fi
+
     
     log_info "依赖检查完成"
 }
@@ -90,7 +84,14 @@ mount_123pan() {
     
     $RCLONE_PATH mount 123: "$mount_point" \
         --daemon \
-        --vfs-cache-mode writes \
+        --vfs-cache-mode minimal \
+        --vfs-read-ahead 0 \
+        --attr-timeout 1m \
+        --dir-cache-time 1h \
+        --no-checksum \
+        --no-modtime \
+        --no-unicode-normalization \
+        --log-level INFO \
         --vfs-cache-max-size 10G \
         --vfs-read-chunk-size 128M \
         --buffer-size 64M \
@@ -99,7 +100,13 @@ mount_123pan() {
         --allow-other 2>/dev/null || \
     $RCLONE_PATH mount 123: "$mount_point" \
         --daemon \
-        --vfs-cache-mode writes \
+        --vfs-cache-mode minimal \
+        --vfs-read-ahead 0 \
+        --attr-timeout 1m \
+        --dir-cache-time 1h \
+        --no-checksum \
+        --no-modtime \
+        --no-unicode-normalization \
         --vfs-cache-max-size 10G \
         --vfs-read-chunk-size 128M \
         --buffer-size 64M \
@@ -129,7 +136,13 @@ mount_115pan() {
     
     $RCLONE_PATH mount 115: "$mount_point" \
         --daemon \
-        --vfs-cache-mode writes \
+        --vfs-cache-mode minimal \
+        --vfs-read-ahead 0 \
+        --attr-timeout 1m \
+        --dir-cache-time 1h \
+        --no-checksum \
+        --no-modtime \
+        --no-unicode-normalization \
         --vfs-cache-max-size 10G \
         --vfs-read-chunk-size 128M \
         --buffer-size 64M \
@@ -138,7 +151,13 @@ mount_115pan() {
         --allow-other 2>/dev/null || \
     $RCLONE_PATH mount 115: "$mount_point" \
         --daemon \
-        --vfs-cache-mode writes \
+        --vfs-cache-mode minimal \
+        --vfs-read-ahead 0 \
+        --attr-timeout 1m \
+        --dir-cache-time 1h \
+        --no-checksum \
+        --no-modtime \
+        --no-unicode-normalization \
         --vfs-cache-max-size 10G \
         --vfs-read-chunk-size 128M \
         --buffer-size 64M \
@@ -239,7 +258,7 @@ echo "  status          显示挂载状态"
 echo "  help            显示此帮助"
             echo
             echo "挂载点: $MOUNT_BASE_DIR"
-            echo "日志目录: $LOG_DIR"
+            echo "日志目录: 当前目录/log"
             echo
             echo "示例:"
 echo "  $0 mount-all    # 挂载123和115网盘根目录"

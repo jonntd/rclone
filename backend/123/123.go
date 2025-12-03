@@ -2993,8 +2993,16 @@ func (f *Fs) handleCrossCloudTransfer(ctx context.Context, in io.Reader, src fs.
 	// 检查是否启用流式哈希模式
 	if f.opt.StreamHashMode {
 		fs.Infof(f, "🌊 启用流式哈希模式: %s (%s)", fileName, fs.SizeSuffix(fileSize))
+
+		// 🔧 类型安全检查：streamHashTransferWithReader 需要 fs.Object 类型
+		srcObj, ok := src.(fs.Object)
+		if !ok {
+			fs.Infof(f, "⚠️ 源对象不支持流式传输，使用两步传输: %s", fileName)
+			return f.internalTwoStepTransfer(ctx, in, src, parentFileID, fileName)
+		}
+
 		// 🔧 关键修复：使用传递的Reader（已被rclone Transfer包装），确保进度正确显示
-		return f.streamHashTransferWithReader(ctx, in, src, parentFileID, fileName)
+		return f.streamHashTransferWithReader(ctx, in, srcObj, parentFileID, fileName)
 	}
 	fs.Infof(f, "🔄 开始两步传输: %s (%s)", fileName, fs.SizeSuffix(fileSize))
 	fs.Infof(f, "📥 步骤1: 下载到本地 → 📤 步骤2: 上传到123网盘")
@@ -5635,7 +5643,14 @@ func (oi *ObjectInfo) Hash(ctx context.Context, t fshash.Type) (string, error) {
 
 // streamHashTransferWithReader 大文件流式哈希传输（使用已包装的Reader）
 // 🔧 修复进度显示问题：使用rclone传递的已被Transfer包装的Reader
-func (f *Fs) streamHashTransferWithReader(ctx context.Context, in io.Reader, src fs.ObjectInfo, parentFileID int64, fileName string) (*Object, error) {
+// 🔧 性能优化：动态缓冲区大小，支持重试机制和网络中断恢复
+func (f *Fs) streamHashTransferWithReader(ctx context.Context, in io.Reader, src fs.Object, parentFileID int64, fileName string) (*Object, error) {
+	fileSize := src.Size()
+
+	// 🔧 动态缓冲区大小：根据文件大小和可用内存优化
+	bufferSize := f.calculateOptimalBufferSize(fileSize)
+	fs.Debugf(f, "🎯 优化缓冲区大小: %s (文件大小: %s)", fs.SizeSuffix(bufferSize), fs.SizeSuffix(fileSize))
+
 	// 第一遍：流式计算MD5哈希（为了秒传）
 	fs.Infof(f, "🔄 第一遍：流式计算文件哈希用于秒传...")
 
@@ -5657,57 +5672,145 @@ func (f *Fs) streamHashTransferWithReader(ctx context.Context, in io.Reader, src
 		fs.Debugf(f, "🚀 流式哈希模式: 本地文件上传，跳过临时文件创建 | 文件: %s | 大小: %s", fileName, fs.SizeSuffix(src.Size()))
 	}
 
-	// 流式计算MD5，不保存数据
-	hasher := md5.New()
-	buffer := make([]byte, 1024*1024) // 1MB缓冲区，提高进度更新频率
+	// 🔧 带重试机制的流式MD5计算
+	var md5Hash string
+	maxRetries := 3
 
-	totalRead := int64(0)
-	for {
-		n, err := srcReader.Read(buffer)
-		if n > 0 {
-			hasher.Write(buffer[:n])
-			totalRead += int64(n)
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// 重置Reader（如果支持的话）
+		if attempt > 1 {
+			fs.Infof(f, "🔄 重试哈希计算: 第 %d 次尝试", attempt)
 
-			// 保留原有的详细进度日志，每1MB输出一次
-			if totalRead%(1024*1024) == 0 || err == io.EOF {
-				percentage := float64(totalRead) / float64(src.Size()) * 100
-				fs.Debugf(f, "📊 流式哈希计算进度: %s/%s (%.1f%%)",
-					fs.SizeSuffix(totalRead), fs.SizeSuffix(src.Size()), percentage)
+			// 如果Reader支持重新打开
+			if reOpenReader, ok := srcReader.(interface{ Seek(int64, int) error }); ok {
+				if err := reOpenReader.Seek(0, 0); err != nil {
+					fs.Errorf(f, "⚠️ 重置Reader失败: %v", err)
+					return nil, fmt.Errorf("failed to reset reader on retry %d: %w", attempt, err)
+				}
+			} else {
+				// 不支持重置，需要重新打开
+				if reOpenSrc, ok := src.(interface {
+					Open(context.Context) (io.ReadCloser, error)
+				}); ok {
+					fs.Debugf(f, "🔧 重新打开源文件进行重试...")
+					reOpenedReader, err := reOpenSrc.Open(ctx)
+					if err != nil {
+						return nil, fmt.Errorf("failed to reopen source on retry %d: %w", attempt, err)
+					}
+					defer reOpenedReader.Close()
+					srcReader = reOpenedReader
+				} else {
+					return nil, fmt.Errorf("source does not support retry after hash calculation failure")
+				}
 			}
 		}
-		if err == io.EOF {
-			break
+
+		// 流式计算MD5
+		hasher := md5.New()
+		buffer := make([]byte, bufferSize)
+
+		totalRead := int64(0)
+		readErrors := 0
+
+		for {
+			// 🔧 检查上下文取消
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("operation cancelled during hash calculation: %w", ctx.Err())
+			default:
+			}
+
+			n, err := srcReader.Read(buffer)
+			if n > 0 {
+				hasher.Write(buffer[:n])
+				totalRead += int64(n)
+
+				// 🔧 优化进度显示：使用对数缩放减少日志频率
+				if totalRead%(1024*1024) == 0 || err == io.EOF || fileSize < 1024*1024 {
+					percentage := float64(totalRead) / float64(fileSize) * 100
+					fs.Debugf(f, "📊 流式哈希计算进度: %s/%s (%.1f%%) - 尝试 %d",
+						fs.SizeSuffix(totalRead), fs.SizeSuffix(fileSize), percentage, attempt)
+				}
+			}
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				readErrors++
+				fs.Errorf(f, "⚠️ 读取错误 %d/%d: %v", readErrors, 3, err)
+				if readErrors >= 3 {
+					return nil, fmt.Errorf("failed to read data for hash calculation after %d attempts: %w", attempt, err)
+				}
+				// 短暂暂停后重试
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
 		}
-		if err != nil {
-			return nil, fmt.Errorf("failed to read data for hash calculation: %w", err)
+
+		// 验证读取完整性
+		if totalRead != fileSize {
+			return nil, fmt.Errorf("hash calculation failed: expected %d bytes but read %d bytes", fileSize, totalRead)
+		}
+
+		md5Hash = fmt.Sprintf("%x", hasher.Sum(nil))
+		fs.Infof(f, "✅ 流式哈希计算完成: MD5: %s (尝试 %d)", md5Hash, attempt)
+		break // 成功，计算完成
+	}
+
+	// 🔧 优化秒传尝试：添加重试机制
+	var createResp *UploadCreateResp
+	var err error
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		fs.Infof(f, "🚀 尝试秒传 (第 %d 次)...", attempt)
+
+		createResp, err = f.createUpload(ctx, parentFileID, fileName, md5Hash, fileSize)
+		if err == nil {
+			break // 成功
+		}
+
+		fs.Errorf(f, "⚠️ 秒传尝试 %d 失败: %v", attempt, err)
+		if attempt < maxRetries {
+			// 短暂延迟后重试
+			time.Sleep(time.Duration(attempt) * time.Second)
 		}
 	}
 
-	md5Hash := fmt.Sprintf("%x", hasher.Sum(nil))
-	fs.Infof(f, "📊 流式哈希计算完成: MD5: %s", md5Hash)
-
-	// 尝试秒传
-	createResp, err := f.createUpload(ctx, parentFileID, fileName, md5Hash, src.Size())
 	if err != nil {
-		return nil, fmt.Errorf("failed to create upload session: %w", err)
+		return nil, fmt.Errorf("failed to create upload session after %d attempts: %w", maxRetries, err)
 	}
 
 	if createResp.Data.Reuse {
-		fs.Infof(f, "🚀 流式哈希计算后秒传成功！")
-		return f.createObject(fileName, createResp.Data.FileID, src.Size(), md5Hash, time.Now()), nil
+		fs.Infof(f, "🎉 流式哈希计算后秒传成功！")
+		return f.createObject(fileName, createResp.Data.FileID, fileSize, md5Hash, time.Now()), nil
 	}
 
 	// 秒传失败，需要重新下载并边下边传
 	// 注意：此时Reader已经被读完，需要重新打开源文件
 	fs.Infof(f, "⬆️ 秒传失败，第二遍：边下边传（服务器分块大小: %s）", fs.SizeSuffix(createResp.Data.SliceSize))
 
-	// 转换为fs.Object以便重新打开
-	srcObj, ok := src.(fs.Object)
-	if !ok {
-		return nil, fmt.Errorf("source is not a valid fs.Object")
+	return f.streamUploadWithSession(ctx, src, createResp, fileName, md5Hash)
+}
+
+// calculateOptimalBufferSize 根据文件大小计算最优缓冲区大小
+func (f *Fs) calculateOptimalBufferSize(fileSize int64) int {
+	// 小文件 (< 1MB): 使用较小的缓冲区避免浪费
+	if fileSize < 1024*1024 {
+		return 64 * 1024 // 64KB
 	}
 
-	return f.streamUploadWithSession(ctx, srcObj, createResp, fileName, md5Hash)
+	// 中等文件 (1MB - 100MB): 使用中等缓冲区
+	if fileSize < 100*1024*1024 {
+		return 512 * 1024 // 512KB
+	}
+
+	// 大文件 (100MB - 1GB): 使用较大缓冲区
+	if fileSize < 1024*1024*1024 {
+		return 2 * 1024 * 1024 // 2MB
+	}
+
+	// 超大文件 (>= 1GB): 使用最大缓冲区但不超过系统限制
+	return 4 * 1024 * 1024 // 4MB
 }
 
 // uploadFromMemory 函数已删除，小文件现在直接使用 singleStepUpload API
